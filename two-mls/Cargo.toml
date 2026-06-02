@@ -2,29 +2,29 @@
 crate-type = ["cdylib", "staticlib"]
 
 [package]
-name = "two-mls"
-version = "0.1.0"
-edition.workspace = true
-rust-version.workspace = true
 authors.workspace = true
+edition.workspace = true
 license.workspace = true
+name = "two-mls"
 publish.workspace = true
+rust-version.workspace = true
+version = "0.1.0"
 
 [lints]
 workspace = true
 
 [features]
+cryptokit = []
 default = ["rustcrypto"]
 rustcrypto = []
-cryptokit = []
 test-utils = []
 
 [dependencies]
 mls-rs = { workspace = true }
-uniffi = { workspace = true }
-thiserror = { workspace = true }
-zeroize = { workspace = true }
 serde = { workspace = true }
+thiserror = { workspace = true }
+uniffi = { workspace = true }
+zeroize = { workspace = true }
 
 [build-dependencies]
 uniffi = { workspace = true, features = ["build"] }
