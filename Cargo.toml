@@ -1,0 +1,29 @@
+[workspace]
+members = ["two-mls", "uniffi-bindgen"]
+resolver = "3"
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.85"
+authors = ["Germ Network"]
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace.lints.rust]
+unused_imports = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+
+[workspace.dependencies]
+mls-rs = { version = "0.45", features = ["psk", "private_message", "serde"] }
+uniffi = "0.31"
+thiserror = "1"
+zeroize = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+
+[patch.crates-io]
+mls-rs = { git = "https://github.com/germ-mark/mls-rs", rev = "5224ee3afd6f9f026d579f3ed17a8fdda121946e" }

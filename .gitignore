@@ -1,0 +1,10 @@
+/target
+/buildIos
+/bindings
+Cargo.lock
+*.xcframework
+*.a
+*.d
+**/*.rs.bk
+.DS_Store
+.idea/

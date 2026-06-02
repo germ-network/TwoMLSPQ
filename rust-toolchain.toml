@@ -1,0 +1,4 @@
+[toolchain]
+channel = "stable"
+components = ["rustc", "cargo", "clippy", "rustfmt", "rust-analyzer"]
+targets = ["aarch64-apple-ios", "aarch64-apple-ios-sim", "x86_64-apple-ios"]
