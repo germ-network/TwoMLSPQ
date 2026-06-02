@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::{
     AgentState, Archive, ClientId, DecryptResult, EncryptResult, ListenChannels, MlsGroupId,
-    MlsSenderMessage, PrepareEncryptResult, PqCapability, RendezvousId, Result, SessionId,
+    MlsSenderMessage, PqCapability, PrepareEncryptResult, RendezvousId, Result, SessionId,
     TwoMlsDigest,
 };
 
@@ -86,10 +86,7 @@ impl TwoMlsSession {
 /// Returns (group_state, welcome_bytes). The Welcome is stapled into the
 /// first-round message so the remote party can join.
 #[allow(dead_code)]
-fn create_send_group(
-    _their_keypackage: &[u8],
-    _my_agent: &[u8],
-) -> Result<(Vec<u8>, Vec<u8>)> {
+fn create_send_group(_their_keypackage: &[u8], _my_agent: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
     todo!()
 }
 

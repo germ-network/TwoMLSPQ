@@ -20,7 +20,10 @@ pub struct BoundPsk {
 
 impl BoundPsk {
     pub fn new(bytes: Vec<u8>, id: PskId) -> Self {
-        Self { bytes: Zeroizing::new(bytes), id }
+        Self {
+            bytes: Zeroizing::new(bytes),
+            id,
+        }
     }
 
     pub fn as_bytes(&self) -> &[u8] {
