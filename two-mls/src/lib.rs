@@ -6,6 +6,8 @@ pub mod session;
 
 pub use session::TwoMlsSession;
 
+use std::sync::Arc;
+
 #[uniffi::export]
 pub fn version() -> String {
     env!("CARGO_PKG_VERSION").to_owned()
@@ -59,7 +61,7 @@ pub struct PrepareEncryptResult {
 /// Returned by `encrypt`.
 #[derive(Debug, uniffi::Record)]
 pub struct EncryptResult {
-    pub ciphertext: Vec<u8>,
+    pub cipher_text: Vec<u8>,
     pub sender: ClientId,
     pub recipient: ClientId,
     pub epoch: u64,
@@ -77,8 +79,9 @@ pub struct DecryptResult {
 /// Decrypted application message with its verified sender identity.
 #[derive(Debug, uniffi::Record)]
 pub struct MlsSenderMessage {
-    pub sender: ClientId,
-    pub message: Vec<u8>,
+    pub app_message_data: Vec<u8>,
+    pub sender_client_id: ClientId,
+    pub epoch: u64,
 }
 
 /// A remote proposal queued for app-layer acceptance. `sender` sent the
@@ -129,16 +132,70 @@ pub struct ListenChannels {
     pub rendezvous_by_epoch: Vec<EpochRendezvous>,
 }
 
-/// Whether a party has published a PQ-capable KeyPackage in their ATProto PDS.
-/// Detected by finding a `com.germnetwork.keypackage` record using the X-Wing
-/// ciphersuite (`MLS_128_XWING_AES128GCM_SHA256_Ed25519`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
-pub enum PqCapability {
-    /// `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519` (RFC 9420 ciphersuite 0x0001)
-    Classical,
-    /// `MLS_128_XWING_AES128GCM_SHA256_Ed25519` — X25519 + ML-KEM-768 hybrid
-    /// (draft-mahy-mls-xwing-00)
-    XWing,
+/// MLS cipher suite identified by its IANA-registered u16 value (RFC 9420 §17.1).
+/// Private-range values (0xF000–0xFFFF) are used for suites pending IANA assignment.
+#[derive(Debug, uniffi::Object)]
+pub struct MlsCipherSuite {
+    value: u16,
+}
+
+impl MlsCipherSuite {
+    // RFC 9420 §17.1
+    pub const DHKEM_X25519_AES128: u16 = 0x0001;
+    pub const DHKEM_P256_AES128: u16 = 0x0002;
+    pub const DHKEM_X25519_CHACHA: u16 = 0x0003;
+    pub const DHKEM_X448_AES256: u16 = 0x0004;
+    pub const DHKEM_P521_AES256: u16 = 0x0005;
+    pub const DHKEM_X448_CHACHA: u16 = 0x0006;
+    pub const DHKEM_P384_AES256: u16 = 0x0007;
+    // Private range (0xF000–0xFFFF) — pending IANA assignment
+    /// MLS_128_XWING_AES128GCM_SHA256_Ed25519 (draft-mahy-mls-xwing-00)
+    pub const XWING_AES128: u16 = 0xFE4C;
+}
+
+#[uniffi::export]
+impl MlsCipherSuite {
+    /// Construct from a raw IANA cipher suite value.
+    #[uniffi::constructor]
+    pub fn new(value: u16) -> Arc<Self> {
+        Arc::new(Self { value })
+    }
+
+    /// MLS_128_XWING_AES128GCM_SHA256_Ed25519 (0xFE4C, draft-mahy-mls-xwing-00)
+    #[uniffi::constructor]
+    pub fn xwing() -> Arc<Self> {
+        Arc::new(Self {
+            value: Self::XWING_AES128,
+        })
+    }
+
+    /// MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519 (0x0001)
+    #[uniffi::constructor]
+    pub fn x25519_aes128() -> Arc<Self> {
+        Arc::new(Self {
+            value: Self::DHKEM_X25519_AES128,
+        })
+    }
+
+    /// MLS_128_DHKEMX25519_CHACHA20POLY1305_SHA256_Ed25519 (0x0003)
+    #[uniffi::constructor]
+    pub fn x25519_chacha() -> Arc<Self> {
+        Arc::new(Self {
+            value: Self::DHKEM_X25519_CHACHA,
+        })
+    }
+
+    /// The raw IANA-registered (or private-range) u16 value.
+    pub fn value(&self) -> u16 {
+        self.value
+    }
+
+    /// True if this library handles the suite natively.
+    /// Classical suites return false — callers should route to the legacy library.
+    /// Designed to extend to future pure-PQ suites without API changes.
+    pub fn is_supported(&self) -> bool {
+        self.value == Self::XWING_AES128
+    }
 }
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
