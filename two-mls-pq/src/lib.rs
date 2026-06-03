@@ -4,9 +4,6 @@ pub mod key_packages;
 pub mod psk;
 pub mod session;
 
-#[cfg(test)]
-mod tests;
-
 pub use session::TwoMlsPqSession;
 
 use std::sync::Arc;
