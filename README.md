@@ -15,8 +15,19 @@ buildIos/         XCFramework output (after build)
 ## Building
 
 ```sh
-cargo test
-cargo clippy
+cargo build                        # compile
+cargo test                         # run tests
+cargo clippy --all-targets         # lint
+cargo fmt --all -- --check         # format check
+```
+
+## UniFFI bindings (Swift)
+
+```sh
+cargo build --package two-mls-pq
+cargo run --package uniffi-bindgen -- generate \
+    target/debug/libtwo_mls_pq.dylib \
+    --library --language swift --out-dir bindings
 ```
 
 ## iOS XCFramework
