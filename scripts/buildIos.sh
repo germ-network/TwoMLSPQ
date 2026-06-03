@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CRATE="two-mls"
-LIB_NAME="libtwo_mls"
-FRAMEWORK_NAME="TwoMLS"
+CRATE="two-mls-pq"
+LIB_NAME="libtwo_mls_pq"
+FRAMEWORK_NAME="TwoMLSPQ"
 OUT_DIR="buildIos"
 BINDINGS_DIR="bindings"
 
