@@ -1,20 +1,50 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::{
+    key_packages::{CombinerKeyPackage, TwoMlsClient},
     AgentState, Archive, ClientId, DecryptResult, EncryptResult, ListenChannels, MlsGroupId,
-    MlsSenderMessage, PqCapability, PrepareEncryptResult, RendezvousId, Result, SessionId,
-    TwoMlsDigest,
+    MlsSenderMessage, PrepareEncryptResult, RendezvousId, Result, SessionId, TwoMlsDigest,
 };
 
-/// A live TwoMLS session (two asymmetric send groups, one per direction).
-/// Interior mutability required — UniFFI Object methods take `&self`.
+#[allow(dead_code)]
 #[derive(uniffi::Object)]
-pub struct TwoMlsSession;
+pub struct TwoMlsSession {
+    client: Arc<TwoMlsClient>,
+    pending_outbound: Mutex<Option<Vec<u8>>>,
+}
 
 #[uniffi::export]
 impl TwoMlsSession {
+    /// Create a session as the initiating party targeting `their_key_package`.
+    /// Retrieve the outbound APQWelcome bytes via `pending_outbound`.
     #[uniffi::constructor]
-    pub fn from_archive(_archive: Archive) -> Result<Arc<Self>> {
+    pub fn initiate(
+        _client: Arc<TwoMlsClient>,
+        _their_key_package: CombinerKeyPackage,
+    ) -> Result<Arc<Self>> {
+        todo!()
+    }
+
+    /// Join a session from an APQWelcome produced by the remote `initiate`.
+    /// Retrieve this party's return Welcome via `pending_outbound`.
+    #[uniffi::constructor]
+    pub fn accept(
+        _client: Arc<TwoMlsClient>,
+        _welcome: Vec<u8>,
+        _their_key_package: CombinerKeyPackage,
+    ) -> Result<Arc<Self>> {
+        todo!()
+    }
+
+    /// Restore a session from a serialised archive.
+    #[uniffi::constructor]
+    pub fn from_archive(_archive: Archive, _client: Arc<TwoMlsClient>) -> Result<Arc<Self>> {
+        todo!()
+    }
+
+    /// Welcome bytes to deliver to the remote party to complete group establishment.
+    /// Returns `None` once consumed or when both groups are live.
+    pub fn pending_outbound(&self) -> Option<Vec<u8>> {
         todo!()
     }
 
@@ -82,36 +112,40 @@ impl TwoMlsSession {
     }
 }
 
-/// Create the initial send group targeting the other party's KeyPackage.
-/// Returns (group_state, welcome_bytes). The Welcome is stapled into the
-/// first-round message so the remote party can join.
 #[allow(dead_code)]
 fn create_send_group(_their_keypackage: &[u8], _my_agent: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
     todo!()
 }
 
-/// Join a send group from a stapled Welcome.
 #[allow(dead_code)]
 fn join_send_group(_welcome: &[u8], _my_agent: &[u8]) -> Result<Vec<u8>> {
     todo!()
 }
 
-/// Create Alice's send group cryptographically bound to Bob's via PSK injection.
-/// PSK: `exportSecret(label="exportSecret", context="derive", len=32)`.
-/// PSK ID: `LinearEncode(epoch, groupId)`.
-/// Uses `MLS_128_XWING_AES128GCM_SHA256_Ed25519` when `pq` is `XWing`.
 #[allow(dead_code)]
 fn create_bound_send_group(
     _their_keypackage: &[u8],
     _my_agent: &[u8],
     _psk: &crate::psk::BoundPsk,
-    _pq: PqCapability,
+    _suite: u16,
 ) -> Result<(Vec<u8>, Vec<u8>)> {
     todo!()
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore = "not yet implemented"]
+    fn test_initiate_stores_outbound_welcome() {}
+
+    #[test]
+    #[ignore = "not yet implemented"]
+    fn test_accept_stores_outbound_welcome() {}
+
+    #[test]
+    #[ignore = "not yet implemented"]
+    fn test_pending_outbound_returns_none_after_take() {}
+
     #[test]
     #[ignore = "not yet implemented"]
     fn test_create_send_group_with_valid_keypackage_succeeds() {}
