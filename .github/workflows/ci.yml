@@ -103,13 +103,13 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml') }}
 
-      - name: Build two-mls (default features)
-        run: cargo build --package two-mls
+      - name: Build two-mls-pq (default features)
+        run: cargo build --package two-mls-pq
 
       - name: Run uniffi-bindgen (swift)
         run: |
           cargo run --package uniffi-bindgen -- generate \
-            target/debug/libtwo_mls.dylib \
+            target/debug/libtwo_mls_pq.dylib \
             --library \
             --language swift \
             --out-dir /tmp/bindings
