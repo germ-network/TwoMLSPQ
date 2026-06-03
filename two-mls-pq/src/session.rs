@@ -1,25 +1,25 @@
 use std::sync::{Arc, Mutex};
 
 use crate::{
-    key_packages::{CombinerKeyPackage, TwoMlsClient},
-    AgentState, Archive, ClientId, DecryptResult, EncryptResult, ListenChannels, MlsGroupId,
-    MlsSenderMessage, PrepareEncryptResult, RendezvousId, Result, SessionId, TwoMlsDigest,
+    key_packages::{CombinerKeyPackage, TwoMlsPqClient},
+    AgentState, Archive, ClientId, CombinerGroupId, DecryptResult, EncryptResult, ListenChannels,
+    MlsSenderMessage, PrepareEncryptResult, RendezvousId, Result, SessionId, TwoMlsPqDigest,
 };
 
 #[allow(dead_code)]
 #[derive(uniffi::Object)]
-pub struct TwoMlsSession {
-    client: Arc<TwoMlsClient>,
+pub struct TwoMlsPqSession {
+    client: Arc<TwoMlsPqClient>,
     pending_outbound: Mutex<Option<Vec<u8>>>,
 }
 
 #[uniffi::export]
-impl TwoMlsSession {
+impl TwoMlsPqSession {
     /// Create a session as the initiating party targeting `their_key_package`.
     /// Retrieve the outbound APQWelcome bytes via `pending_outbound`.
     #[uniffi::constructor]
     pub fn initiate(
-        _client: Arc<TwoMlsClient>,
+        _client: Arc<TwoMlsPqClient>,
         _their_key_package: CombinerKeyPackage,
     ) -> Result<Arc<Self>> {
         todo!()
@@ -29,7 +29,7 @@ impl TwoMlsSession {
     /// Retrieve this party's return Welcome via `pending_outbound`.
     #[uniffi::constructor]
     pub fn accept(
-        _client: Arc<TwoMlsClient>,
+        _client: Arc<TwoMlsPqClient>,
         _welcome: Vec<u8>,
         _their_key_package: CombinerKeyPackage,
     ) -> Result<Arc<Self>> {
@@ -38,7 +38,7 @@ impl TwoMlsSession {
 
     /// Restore a session from a serialised archive.
     #[uniffi::constructor]
-    pub fn from_archive(_archive: Archive, _client: Arc<TwoMlsClient>) -> Result<Arc<Self>> {
+    pub fn from_archive(_archive: Archive, _client: Arc<TwoMlsPqClient>) -> Result<Arc<Self>> {
         todo!()
     }
 
@@ -48,7 +48,7 @@ impl TwoMlsSession {
         todo!()
     }
 
-    pub fn proposal_context(&self) -> Option<TwoMlsDigest> {
+    pub fn proposal_context(&self) -> Option<TwoMlsPqDigest> {
         todo!()
     }
 
@@ -75,10 +75,14 @@ impl TwoMlsSession {
         todo!()
     }
 
-    pub fn queue_proposal(&self, _digest: TwoMlsDigest) -> Result<()> {
+    pub fn queue_proposal(&self, _digest: TwoMlsPqDigest) -> Result<()> {
         todo!()
     }
 
+    /// Process a message forwarded from another of the user's own devices.
+    /// The transport envelope has already been decrypted by the originating device;
+    /// `header_decrypted` is the inner MLS payload. Returns `None` for non-application
+    /// messages (proposals, commits) forwarded in error.
     pub fn forwarded(&self, _header_decrypted: Vec<u8>) -> Result<Option<MlsSenderMessage>> {
         todo!()
     }
@@ -103,7 +107,7 @@ impl TwoMlsSession {
         todo!()
     }
 
-    pub fn receive_group_id(&self) -> Option<MlsGroupId> {
+    pub fn receive_group_id(&self) -> Option<CombinerGroupId> {
         todo!()
     }
 
@@ -112,22 +116,60 @@ impl TwoMlsSession {
     }
 }
 
+/// Create one half of a Combiner send group (classical or PQ, identified by suite).
+/// Returns (MLS Welcome bytes, serialised group state).
 #[allow(dead_code)]
-fn create_send_group(_their_keypackage: &[u8], _my_agent: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
+fn create_send_group(
+    _their_keypackage: &[u8],
+    _my_agent: &[u8],
+    _suite: u16,
+) -> Result<(Vec<u8>, Vec<u8>)> {
     todo!()
 }
 
+/// Join one half of a Combiner send group from an MLS Welcome.
+/// Returns the serialised group state.
 #[allow(dead_code)]
-fn join_send_group(_welcome: &[u8], _my_agent: &[u8]) -> Result<Vec<u8>> {
+fn join_send_group(_welcome: &[u8], _my_agent: &[u8], _suite: u16) -> Result<Vec<u8>> {
     todo!()
 }
 
+/// Create one half of a Combiner send group bound to the opposing direction via PSK.
+/// Returns (MLS Welcome bytes, serialised group state).
 #[allow(dead_code)]
 fn create_bound_send_group(
     _their_keypackage: &[u8],
     _my_agent: &[u8],
     _psk: &crate::psk::BoundPsk,
     _suite: u16,
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    todo!()
+}
+
+/// Create both halves of a Combiner send group (classical + PQ) from a CombinerKeyPackage.
+/// Returns (APQWelcome bytes, serialised CombinerGroupState).
+#[allow(dead_code)]
+fn create_combiner_send_group(
+    _their_kp: &CombinerKeyPackage,
+    _my_agent: &[u8],
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    todo!()
+}
+
+/// Join both halves of a Combiner send group from an APQWelcome.
+/// Returns the serialised CombinerGroupState.
+#[allow(dead_code)]
+fn join_combiner_send_group(_apq_welcome: &[u8], _my_agent: &[u8]) -> Result<Vec<u8>> {
+    todo!()
+}
+
+/// Create both halves of a Combiner send group bound to the opposing direction via PSK.
+/// Returns (APQWelcome bytes, serialised CombinerGroupState).
+#[allow(dead_code)]
+fn create_bound_combiner_send_group(
+    _their_kp: &CombinerKeyPackage,
+    _my_agent: &[u8],
+    _psk: &crate::psk::BoundPsk,
 ) -> Result<(Vec<u8>, Vec<u8>)> {
     todo!()
 }
@@ -204,7 +246,7 @@ mod tests {
 
     #[test]
     #[ignore = "not yet implemented"]
-    fn test_full_establishment_sequence_classical() {}
+    fn test_full_establishment_sequence_combiner() {}
 
     #[test]
     #[ignore = "not yet implemented"]

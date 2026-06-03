@@ -4,7 +4,10 @@ pub mod key_packages;
 pub mod psk;
 pub mod session;
 
-pub use session::TwoMlsSession;
+#[cfg(test)]
+mod tests;
+
+pub use session::TwoMlsPqSession;
 
 use std::sync::Arc;
 
@@ -25,6 +28,13 @@ pub struct MlsGroupId {
     pub bytes: Vec<u8>,
 }
 
+/// Paired MLS group identifiers for the classical and PQ halves of one Combiner direction.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct CombinerGroupId {
+    pub classical: MlsGroupId,
+    pub pq: MlsGroupId,
+}
+
 /// Session identifier derived from both parties' client IDs at init time.
 /// Both sides can derive the same ID independently, preventing identity
 /// confusion when both parties initiate simultaneously.
@@ -43,7 +53,7 @@ pub struct RendezvousId {
 /// Content-typed hash digest. Used by the app layer to identify and accept
 /// MLS proposals before signalling back to the encryption layer.
 #[derive(Debug, Clone, uniffi::Record)]
-pub struct TwoMlsDigest {
+pub struct TwoMlsPqDigest {
     pub hash_type: u8,
     pub digest: Vec<u8>,
 }
@@ -53,7 +63,7 @@ pub struct TwoMlsDigest {
 /// stuck in a prior epoch (no pending remote proposal to commit).
 #[derive(Debug, uniffi::Record)]
 pub struct PrepareEncryptResult {
-    pub proposal_hash: TwoMlsDigest,
+    pub proposal_hash: TwoMlsPqDigest,
     pub commited_remote_client_id: Option<ClientId>,
     pub did_commit: bool,
 }
@@ -90,10 +100,10 @@ pub struct MlsSenderMessage {
 /// used for ordering against the app-level sequence number.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct QueuedRemoteProposal {
-    pub digest: TwoMlsDigest,
+    pub digest: TwoMlsPqDigest,
     pub sender: ClientId,
     pub proposing: ClientId,
-    pub context: TwoMlsDigest,
+    pub context: TwoMlsPqDigest,
 }
 
 /// Result of processing a remote commit. `new_sender` is `None` in
@@ -112,7 +122,7 @@ pub enum AgentState {
     Pending { old: ClientId, new: ClientId },
 }
 
-/// Opaque serialised session state. Restore via `TwoMlsSession.fromArchive(_:)`.
+/// Opaque serialised session state. Restore via `TwoMlsPqSession.fromArchive(_:)`.
 #[derive(Debug, uniffi::Record)]
 pub struct Archive {
     pub bytes: Vec<u8>,
@@ -124,11 +134,11 @@ pub struct EpochRendezvous {
     pub rendezvous_id: RendezvousId,
 }
 
-/// Send-group ID and per-epoch rendezvous channels the transport should listen
-/// on. Returned by `should_listen_on`.
+/// Combiner group IDs and per-epoch rendezvous channels the transport should
+/// listen on. Returned by `should_listen_on`.
 #[derive(Debug, uniffi::Record)]
 pub struct ListenChannels {
-    pub send_group_id: MlsGroupId,
+    pub send_group: CombinerGroupId,
     pub rendezvous_by_epoch: Vec<EpochRendezvous>,
 }
 
@@ -190,16 +200,24 @@ impl MlsCipherSuite {
         self.value
     }
 
-    /// True if this library handles the suite natively.
-    /// Classical suites return false — callers should route to the legacy library.
-    /// Designed to extend to future pure-PQ suites without API changes.
+    /// True if this suite is handled by TwoMLS as the PQ component of a session.
+    /// Use `is_combiner_classical` to identify the classical half of a Combiner pair
+    /// before routing — do not route a Combiner classical KP to mls-rs-uniffi-ios.
     pub fn is_supported(&self) -> bool {
         self.value == Self::XWING_AES128
+    }
+
+    /// True if this suite is the classical component of a Combiner pair (0x0003).
+    /// When a key package with this suite is paired with an XWing key package,
+    /// both belong to TwoMLS as a `CombinerKeyPackage` — do not route the classical
+    /// half to mls-rs-uniffi-ios independently.
+    pub fn is_combiner_classical(&self) -> bool {
+        self.value == Self::DHKEM_X25519_CHACHA
     }
 }
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
-pub enum TwoMlsError {
+pub enum TwoMlsPqError {
     #[error("MLS group error")]
     Mls,
     #[error("invalid key package")]
@@ -220,10 +238,18 @@ pub enum TwoMlsError {
     ArchiveInvalid,
 }
 
-impl From<mls_rs::error::MlsError> for TwoMlsError {
+/// Derive the session identifier for a pair of clients.
+/// Both sides compute the same value from the same inputs regardless of who
+/// initiated, allowing CommProtocol to deduplicate concurrent session initiations.
+#[uniffi::export]
+pub fn derive_session_id(_my_id: ClientId, _their_id: ClientId) -> SessionId {
+    todo!()
+}
+
+impl From<mls_rs::error::MlsError> for TwoMlsPqError {
     fn from(_: mls_rs::error::MlsError) -> Self {
-        TwoMlsError::Mls
+        TwoMlsPqError::Mls
     }
 }
 
-pub type Result<T> = std::result::Result<T, TwoMlsError>;
+pub type Result<T> = std::result::Result<T, TwoMlsPqError>;

@@ -6,11 +6,11 @@ use crate::{ClientId, MlsCipherSuite, Result};
 /// The signing key's public component is the ClientId — the Basic Credential
 /// that identifies this agent as a leaf node in MLS groups.
 #[derive(uniffi::Object)]
-pub struct TwoMlsClient;
+pub struct TwoMlsPqClient;
 
 #[uniffi::export]
-impl TwoMlsClient {
-    /// Create a TwoMlsClient from an existing agent signing key.
+impl TwoMlsPqClient {
+    /// Create a TwoMlsPqClient from an existing agent signing key.
     #[uniffi::constructor]
     pub fn new(_signing_key: Vec<u8>) -> Result<Arc<Self>> {
         todo!()

@@ -1,11 +1,11 @@
-# TwoMLS
+# TwoMLSPQ
 
 Germ Network's implementation of 1:1 encrypted messaging sessions built on two asymmetric MLS send groups (Distributed MLS — draft-xue-distributed-mls).
 
 ## Structure
 
 ```
-two-mls/          Core library
+two-mls-pq/          Core library
 uniffi-bindgen/   UniFFI binding generator
 scripts/          iOS build tooling
 bindings/         Generated Swift output (after build)
