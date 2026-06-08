@@ -21,8 +21,8 @@ test-utils = []
 
 [dependencies]
 mls-rs = { workspace = true }
-mls-rs-crypto-rustcrypto = { workspace = true }
 mls-rs-crypto-awslc = { workspace = true, optional = true }
+mls-rs-crypto-rustcrypto = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 uniffi = { workspace = true }
