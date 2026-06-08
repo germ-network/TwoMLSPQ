@@ -272,6 +272,14 @@ pub fn derive_session_id(my_id: ClientId, their_id: ClientId) -> Result<SessionI
     Ok(SessionId { bytes })
 }
 
+impl From<mls_rs::error::MlsError> for TwoMlsPqError {
+    fn from(_: mls_rs::error::MlsError) -> Self {
+        TwoMlsPqError::Mls
+    }
+}
+
+pub type Result<T> = std::result::Result<T, TwoMlsPqError>;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -305,11 +313,3 @@ mod tests {
         Ok(())
     }
 }
-
-impl From<mls_rs::error::MlsError> for TwoMlsPqError {
-    fn from(_: mls_rs::error::MlsError) -> Self {
-        TwoMlsPqError::Mls
-    }
-}
-
-pub type Result<T> = std::result::Result<T, TwoMlsPqError>;

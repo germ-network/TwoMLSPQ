@@ -837,16 +837,14 @@ mod tests {
 
     use super::TwoMlsPqSession;
     use crate::{
-        assert_ok,
+        assert_ok, assert_some,
         key_packages::{CombinerKeyPackage, TwoMlsPqClient},
         MlsCipherSuite,
     };
 
     fn test_signing_key() -> Vec<u8> {
         let crypto = RustCryptoProvider::new();
-        let cs = crypto
-            .cipher_suite_provider(mls_rs::CipherSuite::CURVE25519_CHACHA)
-            .expect("suite supported");
+        let cs = assert_some!(crypto.cipher_suite_provider(mls_rs::CipherSuite::CURVE25519_CHACHA));
         let (secret, _) = assert_ok!(cs.signature_key_generate());
         secret.as_bytes().to_vec()
     }
@@ -870,14 +868,14 @@ mod tests {
         let bob_kp = make_combiner_kp(&bob);
 
         let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp));
-        let apq_welcome_a = alice_session.pending_outbound().expect("alice outbound");
+        let apq_welcome_a = assert_some!(alice_session.pending_outbound());
 
         let bob_session = assert_ok!(TwoMlsPqSession::accept(
             Arc::clone(&bob),
             apq_welcome_a,
             alice_kp
         ));
-        let apq_welcome_b = bob_session.pending_outbound().expect("bob outbound");
+        let apq_welcome_b = assert_some!(bob_session.pending_outbound());
 
         assert_ok!(alice_session.process_incoming(apq_welcome_b));
 
@@ -922,7 +920,7 @@ mod tests {
         let bob_kp = make_combiner_kp(&bob);
 
         let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp));
-        let apq_welcome_a = alice_session.pending_outbound().expect("alice welcome");
+        let apq_welcome_a = assert_some!(alice_session.pending_outbound());
 
         let bob_session = assert_ok!(TwoMlsPqSession::accept(bob, apq_welcome_a, alice_kp));
         assert!(bob_session.pending_outbound().is_some());
@@ -946,7 +944,7 @@ mod tests {
         let bob_kp = make_combiner_kp(&bob);
 
         let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp));
-        let apq_welcome_a = alice_session.pending_outbound().expect("alice outbound");
+        let apq_welcome_a = assert_some!(alice_session.pending_outbound());
 
         let bob_session = assert_ok!(TwoMlsPqSession::accept(
             Arc::clone(&bob),
@@ -964,7 +962,7 @@ mod tests {
     #[test]
     fn test_prepare_to_encrypt_returns_proposal_hash() {
         let (alice_session, _bob_session) = establish_sessions();
-        let result = assert_ok!(alice_session.prepare_to_encrypt(None)).expect("some result");
+        let result = assert_some!(assert_ok!(alice_session.prepare_to_encrypt(None)));
         assert!(!result.proposal_hash.digest.is_empty());
         assert!(!result.did_commit);
     }
@@ -985,10 +983,9 @@ mod tests {
         assert_ok!(alice_session.prepare_to_encrypt(None));
         let enc = assert_ok!(alice_session.encrypt(b"secret".to_vec()));
 
-        let result =
-            assert_ok!(bob_session.process_incoming(enc.cipher_text)).expect("some result");
+        let result = assert_some!(assert_ok!(bob_session.process_incoming(enc.cipher_text)));
 
-        let app_msg = result.application_message.expect("application message");
+        let app_msg = assert_some!(result.application_message);
         assert_eq!(app_msg.app_message_data, b"secret");
         assert_eq!(
             app_msg.sender_client_id,
@@ -1019,13 +1016,12 @@ mod tests {
         // Bob sends to Alice; Alice should receive a proposal in the result.
         assert_ok!(bob_session.prepare_to_encrypt(None));
         let enc = assert_ok!(bob_session.encrypt(b"hello from bob".to_vec()));
-        let result =
-            assert_ok!(alice_session.process_incoming(enc.cipher_text)).expect("some result");
-        let proposal = result.proposal.expect("proposal present");
+        let result = assert_some!(assert_ok!(alice_session.process_incoming(enc.cipher_text)));
+        let proposal = assert_some!(result.proposal);
 
         // Alice queues it; next prepare must commit.
         assert_ok!(alice_session.queue_proposal(proposal.digest));
-        let prep = assert_ok!(alice_session.prepare_to_encrypt(None)).expect("some result");
+        let prep = assert_some!(assert_ok!(alice_session.prepare_to_encrypt(None)));
 
         assert!(prep.did_commit, "should commit after queued proposal");
         assert!(prep.committed_remote_client_id.is_some());
@@ -1038,17 +1034,17 @@ mod tests {
         // Bob proposes; Alice queues; Alice sends bundled commit+app.
         assert_ok!(bob_session.prepare_to_encrypt(None));
         let enc = assert_ok!(bob_session.encrypt(b"proposal msg".to_vec()));
-        let result = assert_ok!(alice_session.process_incoming(enc.cipher_text)).expect("some");
-        assert_ok!(alice_session.queue_proposal(result.proposal.expect("proposal").digest));
+        let result = assert_some!(assert_ok!(alice_session.process_incoming(enc.cipher_text)));
+        assert_ok!(alice_session.queue_proposal(assert_some!(result.proposal).digest));
 
         assert_ok!(alice_session.prepare_to_encrypt(None));
         let enc = assert_ok!(alice_session.encrypt(b"reply".to_vec()));
 
-        let result = assert_ok!(bob_session.process_incoming(enc.cipher_text)).expect("some");
+        let result = assert_some!(assert_ok!(bob_session.process_incoming(enc.cipher_text)));
 
-        let app = result.application_message.expect("app message");
+        let app = assert_some!(result.application_message);
         assert_eq!(app.app_message_data, b"reply");
-        let commit = result.remote_commit.expect("remote commit");
+        let commit = assert_some!(result.remote_commit);
         assert!(
             commit.new_sender.is_none(),
             "no rotation, new_sender should be None"
@@ -1084,23 +1080,24 @@ mod tests {
 
         // Stage rotation and commit with new identity.
         assert_ok!(alice_session.stage_rotation(Arc::clone(&new_alice)));
-        let prep =
-            assert_ok!(alice_session.prepare_to_encrypt(Some(new_alice_id.clone()))).expect("some");
+        let prep = assert_some!(assert_ok!(
+            alice_session.prepare_to_encrypt(Some(new_alice_id.clone()))
+        ));
         assert!(prep.did_commit);
 
         let enc = assert_ok!(alice_session.encrypt(b"rotated".to_vec()));
 
         // Bob sees the new_sender in the commit result.
-        let result = assert_ok!(bob_session.process_incoming(enc.cipher_text)).expect("some");
+        let result = assert_some!(assert_ok!(bob_session.process_incoming(enc.cipher_text)));
 
-        let commit = result.remote_commit.expect("remote commit");
+        let commit = assert_some!(result.remote_commit);
         assert_eq!(
-            commit.new_sender.expect("new sender present"),
+            assert_some!(commit.new_sender),
             new_alice_id,
             "Bob must observe Alice's new identity"
         );
         assert_eq!(
-            result.application_message.expect("app").app_message_data,
+            assert_some!(result.application_message).app_message_data,
             b"rotated"
         );
         assert_eq!(bob_session.their_agent_state().client_id(), new_alice_id);
