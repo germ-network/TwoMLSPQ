@@ -11,11 +11,22 @@ use mls_rs::{
 };
 use mls_rs_crypto_rustcrypto::RustCryptoProvider;
 
+#[cfg(feature = "cryptokit")]
+use mls_rs_crypto_awslc::AwsLcCryptoProvider;
+
 use crate::{ClientId, MlsCipherSuite, Result, TwoMlsPqError};
 
 pub(crate) type OurConfig =
     WithIdentityProvider<BasicIdentityProvider, WithCryptoProvider<RustCryptoProvider, BaseConfig>>;
 pub(crate) type MlsClient = Client<OurConfig>;
+
+#[cfg(feature = "cryptokit")]
+pub(crate) type PqConfig = WithIdentityProvider<
+    BasicIdentityProvider,
+    WithCryptoProvider<AwsLcCryptoProvider, BaseConfig>,
+>;
+#[cfg(feature = "cryptokit")]
+pub(crate) type PqMlsClient = Client<PqConfig>;
 
 fn build_client(
     secret_key: mls_rs::crypto::SignatureSecretKey,

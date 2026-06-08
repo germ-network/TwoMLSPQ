@@ -27,6 +27,25 @@ macro_rules! assert_ok {
     }};
 }
 
+/// Assert an `Option` is `Some`, returning the inner value.
+///
+/// ```ignore
+/// let val = assert_some!(some_option);
+/// ```
+#[macro_export]
+macro_rules! assert_some {
+    ( $e:expr ) => {
+        assert_some!($e,)
+    };
+
+    ( $e:expr, ) => {{
+        match $e {
+            Some(v) => v,
+            None => panic!("assertion failed: None"),
+        }
+    }};
+}
+
 /// Assert a `Result` is `Err` matching the given pattern.
 ///
 /// ```ignore
