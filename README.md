@@ -15,9 +15,33 @@ buildIos/         XCFramework output (after build)
 ## Building
 
 ```sh
+# Default build (RustCrypto, no ML-KEM-768)
 cargo test
+
+# With ML-KEM-768 via AWS-LC (macOS, for local testing)
+cargo test -p two-mls-pq --features cryptokit
+
 cargo clippy
 ```
+
+## CryptoKit / ML-KEM-768 tests (macOS)
+
+The `cryptokit` feature enables real ML-KEM-768 (FIPS 203) session tests backed by
+`mls-rs-crypto-awslc` with the `post-quantum` feature. Run on macOS:
+
+```sh
+cargo test -p two-mls-pq --features cryptokit
+```
+
+This tests:
+- ML-KEM-768 key package generation via `AwsLcCryptoProvider`
+- Full APQ/Combiner session establishment with PQ groups using the real ML-KEM-768 cipher suite (0xFDEA)
+- Encrypt/decrypt through PQ groups
+- PSK chaining between classical and PQ group halves
+- Agent rotation through PQ groups
+
+The production iOS path (CryptoKit native `MLKEM768`) lives in the `mls-rs-crypto-cryptokit`
+fork at `mls-rs-crypto-cryptokit/src/ml_kem.rs` and requires iOS 26 / macOS 26.
 
 ## iOS XCFramework
 

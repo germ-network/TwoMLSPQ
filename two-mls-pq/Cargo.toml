@@ -17,16 +17,13 @@ workspace = true
 cryptokit = ["dep:mls-rs-crypto-awslc"]
 default = ["rustcrypto"]
 rustcrypto = []
-test-utils = []
 
 [dependencies]
 mls-rs = { workspace = true }
 mls-rs-crypto-awslc = { workspace = true, optional = true }
 mls-rs-crypto-rustcrypto = { workspace = true }
-serde = { workspace = true }
 thiserror = { workspace = true }
 uniffi = { workspace = true }
-zeroize = { workspace = true }
 
 [build-dependencies]
 uniffi = { workspace = true, features = ["build"] }

@@ -55,6 +55,11 @@ impl TwoMlsPqClient {
     pub(crate) fn classical(&self) -> &MlsClient {
         &self.classical
     }
+
+    #[cfg(feature = "cryptokit")]
+    pub(crate) fn pq(&self) -> &PqMlsClient {
+        &self.pq
+    }
 }
 
 #[uniffi::export]
@@ -127,7 +132,7 @@ pub struct MlsKeyPackage {
 /// Paired key package bundle for the APQ/Combiner construction.
 /// `classical` is MLS-encoded for suite 0x0003 (X25519+ChaCha20Poly1305);
 /// `pq` is MLS-encoded for suite 0xFDEA (ML-KEM-768).
-#[derive(Debug, uniffi::Record)]
+#[derive(Debug, Clone, uniffi::Record)]
 pub struct CombinerKeyPackage {
     pub classical: Vec<u8>,
     pub pq: Vec<u8>,
