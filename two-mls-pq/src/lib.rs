@@ -7,8 +7,6 @@ pub mod session;
 #[macro_use]
 mod test_macros;
 #[cfg(test)]
-mod demo;
-#[cfg(test)]
 mod test_utils;
 
 pub use session::TwoMlsPqSession;
