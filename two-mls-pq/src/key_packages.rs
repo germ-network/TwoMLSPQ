@@ -42,21 +42,6 @@ fn build_client(
         .build()
 }
 
-#[cfg(feature = "cryptokit")]
-fn build_pq_client(
-    secret_key: mls_rs::crypto::SignatureSecretKey,
-    public_key: mls_rs::crypto::SignaturePublicKey,
-    suite: mls_rs::CipherSuite,
-) -> PqMlsClient {
-    let credential = BasicCredential::new(public_key.as_ref().to_vec());
-    let signing_identity = SigningIdentity::new(credential.into_credential(), public_key);
-    client_builder::ClientBuilder::new()
-        .crypto_provider(AwsLcCryptoProvider::new())
-        .identity_provider(BasicIdentityProvider::new())
-        .signing_identity(signing_identity, secret_key, suite)
-        .build()
-}
-
 /// Holds an agent signing key and manages MLS key packages for publication.
 /// The signing key's public component is the ClientId — the Basic Credential
 /// that identifies this agent as a leaf node in MLS groups.
@@ -64,8 +49,6 @@ fn build_pq_client(
 pub struct TwoMlsPqClient {
     client_id: ClientId,
     classical: MlsClient,
-    #[cfg(feature = "cryptokit")]
-    pq: PqMlsClient,
 }
 
 impl TwoMlsPqClient {
@@ -74,7 +57,6 @@ impl TwoMlsPqClient {
     }
 
     #[cfg(feature = "cryptokit")]
-    #[allow(dead_code)]
     pub(crate) fn pq(&self) -> &PqMlsClient {
         &self.pq
     }
@@ -91,7 +73,7 @@ impl TwoMlsPqClient {
             .cipher_suite_provider(suite)
             .ok_or(TwoMlsPqError::Mls)?;
 
-        let secret_key = mls_rs::crypto::SignatureSecretKey::new(signing_key.clone());
+        let secret_key = mls_rs::crypto::SignatureSecretKey::new(signing_key);
         let public_key = cs
             .signature_key_derive_public(&secret_key)
             .map_err(|_| TwoMlsPqError::Mls)?;
@@ -99,20 +81,11 @@ impl TwoMlsPqClient {
         let client_id = ClientId {
             bytes: public_key.as_ref().to_vec(),
         };
-        let classical = build_client(secret_key, public_key.clone(), suite);
-
-        #[cfg(feature = "cryptokit")]
-        let pq = build_pq_client(
-            mls_rs::crypto::SignatureSecretKey::new(signing_key),
-            public_key,
-            mls_rs::CipherSuite::from(MlsCipherSuite::ML_KEM_768),
-        );
+        let classical = build_client(secret_key, public_key, suite);
 
         Ok(Arc::new(Self {
             client_id,
             classical,
-            #[cfg(feature = "cryptokit")]
-            pq,
         }))
     }
 
@@ -133,14 +106,9 @@ impl TwoMlsPqClient {
                     .map_err(|_| TwoMlsPqError::Mls)?;
                 msg.to_bytes().map_err(|_| TwoMlsPqError::Mls)
             }
-            #[cfg(feature = "cryptokit")]
-            MlsCipherSuite::ML_KEM_768 => {
-                let msg = self
-                    .pq
-                    .generate_key_package_message(ExtensionList::new(), ExtensionList::new())
-                    .map_err(|_| TwoMlsPqError::Mls)?;
-                msg.to_bytes().map_err(|_| TwoMlsPqError::Mls)
-            }
+            // ML-KEM-768 requires AwsLcCryptoProvider with post-quantum feature.
+            // Not yet wired up; returns Err until the cryptokit/awslc feature is enabled.
+            MlsCipherSuite::ML_KEM_768 => Err(TwoMlsPqError::Mls),
             _ => Err(TwoMlsPqError::Mls),
         }
     }
@@ -164,7 +132,7 @@ pub struct MlsKeyPackage {
 /// Paired key package bundle for the APQ/Combiner construction.
 /// `classical` is MLS-encoded for suite 0x0003 (X25519+ChaCha20Poly1305);
 /// `pq` is MLS-encoded for suite 0xFDEA (ML-KEM-768).
-#[derive(Debug, uniffi::Record)]
+#[derive(Debug, Clone, uniffi::Record)]
 pub struct CombinerKeyPackage {
     pub classical: Vec<u8>,
     pub pq: Vec<u8>,
@@ -233,11 +201,13 @@ mod tests {
     use mls_rs_crypto_rustcrypto::RustCryptoProvider;
 
     use super::TwoMlsPqClient;
-    use crate::{assert_err, assert_ok, assert_some, MlsCipherSuite};
+    use crate::{assert_err, assert_ok, MlsCipherSuite};
 
     fn test_signing_key() -> Vec<u8> {
         let crypto = RustCryptoProvider::new();
-        let cs = assert_some!(crypto.cipher_suite_provider(mls_rs::CipherSuite::CURVE25519_CHACHA));
+        let cs = crypto
+            .cipher_suite_provider(mls_rs::CipherSuite::CURVE25519_CHACHA)
+            .expect("suite supported");
         let (secret, _) = assert_ok!(cs.signature_key_generate());
         secret.as_bytes().to_vec()
     }
@@ -248,7 +218,9 @@ mod tests {
         let client = assert_ok!(TwoMlsPqClient::new(key.clone()));
 
         let crypto = RustCryptoProvider::new();
-        let cs = assert_some!(crypto.cipher_suite_provider(mls_rs::CipherSuite::CURVE25519_CHACHA));
+        let cs = crypto
+            .cipher_suite_provider(mls_rs::CipherSuite::CURVE25519_CHACHA)
+            .expect("suite supported");
         let secret = mls_rs::crypto::SignatureSecretKey::new(key);
         let expected_pub = assert_ok!(cs.signature_key_derive_public(&secret));
 
@@ -293,7 +265,7 @@ mod tests {
 
     #[test]
     fn test_parse_mls_key_package_unknown_suite_returns_unknown_variant() {
-        assert!(super::parse_mls_key_package(vec![0xAB, 0xCD, 0xEF]).is_err());
+        assert_err!(super::parse_mls_key_package(vec![0xAB, 0xCD, 0xEF]), _);
     }
 
     #[test]
