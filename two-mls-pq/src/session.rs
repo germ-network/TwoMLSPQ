@@ -260,7 +260,7 @@ fn create_group_with_member(
     psk_id: Option<ExternalPskId>,
 ) -> Result<(MlsGroup, Vec<u8>)> {
     let mut group = mls_client
-        .create_group(ExtensionList::new(), ExtensionList::new())
+        .create_group(ExtensionList::new(), ExtensionList::new(), None)
         .map_err(|_| TwoMlsPqError::Mls)?;
     let their_kp =
         MlsMessage::from_bytes(their_kp_bytes).map_err(|_| TwoMlsPqError::InvalidKeyPackage)?;
@@ -291,7 +291,7 @@ fn create_group_with_member(
 fn join_group_from_welcome(mls_client: &MlsClient, welcome_bytes: &[u8]) -> Result<MlsGroup> {
     let welcome = MlsMessage::from_bytes(welcome_bytes).map_err(|_| TwoMlsPqError::Mls)?;
     let (group, _) = mls_client
-        .join_group(None, &welcome)
+        .join_group(None, &welcome, None)
         .map_err(|_| TwoMlsPqError::Mls)?;
     Ok(group)
 }
@@ -304,7 +304,7 @@ fn pq_create_bound_group_with_member(
     psk_id: ExternalPskId,
 ) -> Result<(PqMlsGroup, Vec<u8>)> {
     let mut group = pq_client
-        .create_group(ExtensionList::new(), ExtensionList::new())
+        .create_group(ExtensionList::new(), ExtensionList::new(), None)
         .map_err(|_| TwoMlsPqError::Mls)?;
     let their_kp =
         MlsMessage::from_bytes(their_kp_bytes).map_err(|_| TwoMlsPqError::InvalidKeyPackage)?;
@@ -333,7 +333,7 @@ fn pq_create_bound_group_with_member(
 fn pq_join_group_from_welcome(pq_client: &PqMlsClient, welcome_bytes: &[u8]) -> Result<PqMlsGroup> {
     let welcome = MlsMessage::from_bytes(welcome_bytes).map_err(|_| TwoMlsPqError::Mls)?;
     let (group, _) = pq_client
-        .join_group(None, &welcome)
+        .join_group(None, &welcome, None)
         .map_err(|_| TwoMlsPqError::Mls)?;
     Ok(group)
 }

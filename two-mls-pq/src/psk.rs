@@ -25,14 +25,18 @@ mod tests {
         let alice = make_client();
         let bob = make_client();
 
-        let bob_kp_msg = assert_ok!(bob
-            .classical()
-            .generate_key_package_message(ExtensionList::new(), ExtensionList::new()));
+        let bob_kp_msg = assert_ok!(bob.classical().generate_key_package_message(
+            ExtensionList::new(),
+            ExtensionList::new(),
+            None
+        ));
         let bob_kp_bytes = assert_ok!(bob_kp_msg.to_bytes());
 
-        let mut group = assert_ok!(alice
-            .classical()
-            .create_group(ExtensionList::new(), ExtensionList::new()));
+        let mut group = assert_ok!(alice.classical().create_group(
+            ExtensionList::new(),
+            ExtensionList::new(),
+            None
+        ));
         let their_kp = assert_ok!(MlsMessage::from_bytes(&bob_kp_bytes));
         let builder = assert_ok!(group.commit_builder().add_member(their_kp));
         let _ = assert_ok!(builder.build());
@@ -94,14 +98,18 @@ mod tests {
         let psk = PreSharedKey::new(vec![0xAB; 32]);
         alice.classical().secret_store().insert(psk_id.clone(), psk);
 
-        let bob_kp_msg = assert_ok!(bob
-            .classical()
-            .generate_key_package_message(ExtensionList::new(), ExtensionList::new()));
+        let bob_kp_msg = assert_ok!(bob.classical().generate_key_package_message(
+            ExtensionList::new(),
+            ExtensionList::new(),
+            None
+        ));
         let bob_kp_bytes = assert_ok!(bob_kp_msg.to_bytes());
 
-        let mut alice_group = assert_ok!(alice
-            .classical()
-            .create_group(ExtensionList::new(), ExtensionList::new()));
+        let mut alice_group = assert_ok!(alice.classical().create_group(
+            ExtensionList::new(),
+            ExtensionList::new(),
+            None
+        ));
         let their_kp = assert_ok!(MlsMessage::from_bytes(&bob_kp_bytes));
         let builder = assert_ok!(alice_group.commit_builder().add_member(their_kp));
         let builder = assert_ok!(builder.add_external_psk(psk_id));
@@ -114,7 +122,9 @@ mod tests {
         // Bob has no PSK registered — join must fail.
         let welcome_msg = assert_ok!(MlsMessage::from_bytes(&welcome_bytes));
         assert!(
-            bob.classical().join_group(None, &welcome_msg).is_err(),
+            bob.classical()
+                .join_group(None, &welcome_msg, None)
+                .is_err(),
             "join must fail when required PSK is absent"
         );
     }
@@ -134,14 +144,18 @@ mod tests {
             .secret_store()
             .insert(psk_id.clone(), correct_psk);
 
-        let bob_kp_msg = assert_ok!(bob
-            .classical()
-            .generate_key_package_message(ExtensionList::new(), ExtensionList::new()));
+        let bob_kp_msg = assert_ok!(bob.classical().generate_key_package_message(
+            ExtensionList::new(),
+            ExtensionList::new(),
+            None
+        ));
         let bob_kp_bytes = assert_ok!(bob_kp_msg.to_bytes());
 
-        let mut alice_group = assert_ok!(alice
-            .classical()
-            .create_group(ExtensionList::new(), ExtensionList::new()));
+        let mut alice_group = assert_ok!(alice.classical().create_group(
+            ExtensionList::new(),
+            ExtensionList::new(),
+            None
+        ));
         let their_kp = assert_ok!(MlsMessage::from_bytes(&bob_kp_bytes));
         let builder = assert_ok!(alice_group.commit_builder().add_member(their_kp));
         let builder = assert_ok!(builder.add_external_psk(psk_id.clone()));
@@ -154,7 +168,7 @@ mod tests {
         // Bob registers the wrong PSK value — join may succeed but keys diverge.
         bob.classical().secret_store().insert(psk_id, wrong_psk);
         let welcome_msg = assert_ok!(MlsMessage::from_bytes(&welcome_bytes));
-        if let Ok((mut bob_group, _)) = bob.classical().join_group(None, &welcome_msg) {
+        if let Ok((mut bob_group, _)) = bob.classical().join_group(None, &welcome_msg, None) {
             // Alice encrypts; Bob's diverged key schedule must fail to decrypt.
             let app = assert_ok!(alice_group.encrypt_application_message(b"secret", vec![]));
             let app_bytes = assert_ok!(app.to_bytes());
