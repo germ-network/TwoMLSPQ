@@ -24,6 +24,7 @@ mls-rs-crypto-awslc = { workspace = true, optional = true }
 mls-rs-crypto-rustcrypto = { workspace = true }
 thiserror = { workspace = true }
 uniffi = { workspace = true }
+zeroize = "1.8.2"
 
 [build-dependencies]
 uniffi = { workspace = true, features = ["build"] }
