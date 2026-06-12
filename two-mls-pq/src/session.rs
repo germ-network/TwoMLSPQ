@@ -8,7 +8,8 @@ use mls_rs::{
 
 use crate::{
     key_packages::{
-        parse_mls_key_package, CombinerKeyPackage, MlsClient, OurConfig, TwoMlsPqClient,
+        ensure_pq_available, parse_mls_key_package, CombinerKeyPackage, MlsClient, OurConfig,
+        TwoMlsPqClient,
     },
     AgentState, Archive, ClientId, CombinerGroupId, CommitResult, DecryptResult, EncryptResult,
     ListenChannels, MlsGroupId, MlsSenderMessage, PrepareEncryptResult, RendezvousId, Result,

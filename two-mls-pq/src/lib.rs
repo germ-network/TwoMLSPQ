@@ -237,6 +237,8 @@ pub enum TwoMlsPqError {
     MissingWelcome,
     #[error("PSK binding failure")]
     PskBinding,
+    #[error("combiner key package carries no post-quantum cipher suite")]
+    PqNotAvailable,
     #[error("session not established")]
     SessionNotEstablished,
     #[error("session not ready for encryption")]
