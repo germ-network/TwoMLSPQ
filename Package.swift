@@ -31,10 +31,9 @@ let package = Package(
 		),
 		.binaryTarget(
 			name: "MLSrs",
-			path: "./LocalBinary/MLSrs.xcframework.zip",
-//			url:
-//				"https://github.com/germ-network/TwoMLS/releases/download/0.0.1/MLSrs.xcframework.zip",
-//			checksum: "sha256:e6a307ac2cdc01a8207408cfae1b33ab1c064e0ae71d7d7a4e9813aed79ba0c7"
+			url:
+				"https://github.com/germ-network/TwoMLSPQ/releases/download/0.0.1/MLSrs.xcframework.zip",
+			checksum: "e6a307ac2cdc01a8207408cfae1b33ab1c064e0ae71d7d7a4e9813aed79ba0c7"
 		),
 		.testTarget(
 			name: "AbstractTwoMLSTests",
