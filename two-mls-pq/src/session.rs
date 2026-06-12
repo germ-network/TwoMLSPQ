@@ -710,6 +710,7 @@ impl TwoMlsPqSession {
         client: Arc<TwoMlsPqClient>,
         their_key_package: CombinerKeyPackage,
     ) -> Result<Arc<Self>> {
+        ensure_pq_available(&their_key_package)?;
         let their_parsed = parse_mls_key_package(their_key_package.classical.clone())?;
         let their_id = their_parsed.client_id;
         let session_id = crate::derive_session_id(client.client_id(), their_id.clone())?;
@@ -734,6 +735,7 @@ impl TwoMlsPqSession {
         welcome: Vec<u8>,
         their_key_package: CombinerKeyPackage,
     ) -> Result<Arc<Self>> {
+        ensure_pq_available(&their_key_package)?;
         let their_parsed = parse_mls_key_package(their_key_package.classical.clone())?;
         let their_id = their_parsed.client_id;
         let session_id = crate::derive_session_id(client.client_id(), their_id.clone())?;
@@ -1303,6 +1305,21 @@ mod tests {
         assert!(
             alice_session.is_established(),
             "alice should be established"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "cryptokit")]
+    fn test_initiate_fails_when_both_suites_classical() {
+        let alice = make_client();
+        let bob = make_client();
+        let classical =
+            assert_ok!(bob.generate_key_package(crate::MlsCipherSuite::x25519_chacha()));
+        let pq = assert_ok!(bob.generate_key_package(crate::MlsCipherSuite::x25519_chacha()));
+        let bad_kp = crate::key_packages::CombinerKeyPackage { classical, pq };
+        assert_err!(
+            TwoMlsPqSession::initiate(alice, bad_kp),
+            TwoMlsPqError::PqNotAvailable
         );
     }
 
