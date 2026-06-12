@@ -3,6 +3,7 @@ uniffi::setup_scaffolding!();
 pub mod key_packages;
 pub mod psk;
 pub mod session;
+mod tests;
 
 pub use session::TwoMlsPqSession;
 
