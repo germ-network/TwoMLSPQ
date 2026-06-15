@@ -1,9 +1,13 @@
 uniffi::setup_scaffolding!();
 
 pub mod key_packages;
-pub mod psk;
+mod psk;
 pub mod session;
-mod tests;
+#[cfg(test)]
+#[macro_use]
+mod test_macros;
+#[cfg(test)]
+mod test_utils;
 
 pub use session::TwoMlsPqSession;
 
@@ -62,7 +66,7 @@ pub struct TwoMlsPqDigest {
 #[derive(Debug, uniffi::Record)]
 pub struct PrepareEncryptResult {
     pub proposal_hash: TwoMlsPqDigest,
-    pub commited_remote_client_id: Option<ClientId>,
+    pub committed_remote_client_id: Option<ClientId>,
     pub did_commit: bool,
 }
 
@@ -120,6 +124,15 @@ pub enum AgentState {
     Pending { old: ClientId, new: ClientId },
 }
 
+impl AgentState {
+    /// The current active client ID: the live identity for `Sync`, the pre-rotation one for `Pending`.
+    pub fn client_id(&self) -> ClientId {
+        match self {
+            Self::Sync { client_id } | Self::Pending { old: client_id, .. } => client_id.clone(),
+        }
+    }
+}
+
 /// Opaque serialised session state. Restore via `TwoMlsPqSession.fromArchive(_:)`.
 #[derive(Debug, uniffi::Record)]
 pub struct Archive {
@@ -157,8 +170,8 @@ impl MlsCipherSuite {
     pub const DHKEM_X448_CHACHA: u16 = 0x0006;
     pub const DHKEM_P384_AES256: u16 = 0x0007;
     // Private range (0xF000–0xFFFF) — pending IANA assignment
-    /// MLS_128_XWING_AES128GCM_SHA256_Ed25519 (draft-mahy-mls-xwing-00)
-    pub const XWING_AES128: u16 = 0xFE4C;
+    /// MLS_128_ML_KEM_768_AES128GCM_SHA256_Ed25519 (0xFDEA, FIPS 203 / draft-mls-pq)
+    pub const ML_KEM_768: u16 = 0xFDEA;
 }
 
 #[uniffi::export]
@@ -169,11 +182,11 @@ impl MlsCipherSuite {
         Arc::new(Self { value })
     }
 
-    /// MLS_128_XWING_AES128GCM_SHA256_Ed25519 (0xFE4C, draft-mahy-mls-xwing-00)
+    /// MLS_128_ML_KEM_768_AES128GCM_SHA256_Ed25519 (0xFDEA, FIPS 203)
     #[uniffi::constructor]
-    pub fn xwing() -> Arc<Self> {
+    pub fn ml_kem_768() -> Arc<Self> {
         Arc::new(Self {
-            value: Self::XWING_AES128,
+            value: Self::ML_KEM_768,
         })
     }
 
@@ -202,11 +215,11 @@ impl MlsCipherSuite {
     /// Use `is_combiner_classical` to identify the classical half of a Combiner pair
     /// before routing — do not route a Combiner classical KP to mls-rs-uniffi-ios.
     pub fn is_supported(&self) -> bool {
-        self.value == Self::XWING_AES128
+        self.value == Self::ML_KEM_768
     }
 
     /// True if this suite is the classical component of a Combiner pair (0x0003).
-    /// When a key package with this suite is paired with an XWing key package,
+    /// When a key package with this suite is paired with an ML-KEM-768 key package,
     /// both belong to TwoMLS as a `CombinerKeyPackage` — do not route the classical
     /// half to mls-rs-uniffi-ios independently.
     pub fn is_combiner_classical(&self) -> bool {
@@ -240,8 +253,25 @@ pub enum TwoMlsPqError {
 /// Both sides compute the same value from the same inputs regardless of who
 /// initiated, allowing CommProtocol to deduplicate concurrent session initiations.
 #[uniffi::export]
-pub fn derive_session_id(_my_id: ClientId, _their_id: ClientId) -> SessionId {
-    todo!()
+pub fn derive_session_id(my_id: ClientId, their_id: ClientId) -> Result<SessionId> {
+    use mls_rs::{CipherSuiteProvider, CryptoProvider};
+    use mls_rs_crypto_rustcrypto::RustCryptoProvider;
+
+    let cs = RustCryptoProvider::new()
+        .cipher_suite_provider(mls_rs::CipherSuite::CURVE25519_CHACHA)
+        .ok_or(TwoMlsPqError::Mls)?;
+
+    let (first, second) = if my_id.bytes <= their_id.bytes {
+        (my_id.bytes, their_id.bytes)
+    } else {
+        (their_id.bytes, my_id.bytes)
+    };
+
+    let mut input = first;
+    input.extend_from_slice(&second);
+
+    let bytes = cs.hash(&input).map_err(|_| TwoMlsPqError::Mls)?;
+    Ok(SessionId { bytes })
 }
 
 impl From<mls_rs::error::MlsError> for TwoMlsPqError {
@@ -251,3 +281,37 @@ impl From<mls_rs::error::MlsError> for TwoMlsPqError {
 }
 
 pub type Result<T> = std::result::Result<T, TwoMlsPqError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn client_id(bytes: &[u8]) -> ClientId {
+        ClientId {
+            bytes: bytes.to_vec(),
+        }
+    }
+
+    #[test]
+    fn test_derive_session_id_is_symmetric() -> Result<()> {
+        let alice = client_id(b"alice");
+        let bob = client_id(b"bob");
+        assert_eq!(
+            derive_session_id(alice.clone(), bob.clone())?.bytes,
+            derive_session_id(bob, alice)?.bytes
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_derive_session_id_differs_for_different_pairs() -> Result<()> {
+        let alice = client_id(b"alice");
+        let bob = client_id(b"bob");
+        let carol = client_id(b"carol");
+        assert_ne!(
+            derive_session_id(alice.clone(), bob)?.bytes,
+            derive_session_id(alice, carol)?.bytes
+        );
+        Ok(())
+    }
+}

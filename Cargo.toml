@@ -20,6 +20,11 @@ unwrap_used = "deny"
 
 [workspace.dependencies]
 mls-rs = { version = "0.45", features = ["psk", "private_message", "serde"] }
+mls-rs-crypto-awslc = { version = "0.15", git = "https://github.com/germ-mark/mls-rs", rev = "5224ee3afd6f9f026d579f3ed17a8fdda121946e", features = [
+  "non-fips",
+  "post-quantum",
+] }
+mls-rs-crypto-rustcrypto = { version = "0.15", git = "https://github.com/germ-mark/mls-rs", rev = "5224ee3afd6f9f026d579f3ed17a8fdda121946e" }
 serde = { version = "1", features = ["derive"] }
 thiserror = "1"
 uniffi = "0.31"
