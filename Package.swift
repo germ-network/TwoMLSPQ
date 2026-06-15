@@ -30,6 +30,12 @@ let package = Package(
 			]
 		),
 		.binaryTarget(
+			name: "MLSrsLegacy",
+			url:
+				"https://github.com/germ-network/mls-rs-uniffi/releases/download/1.1.6/MLSrs.xcframework.zip",
+			checksum: "3af8bb4d322d5622c5fcf369ef467436bd38658b7cd2ee780a81bc056ee49867"
+		),
+		.binaryTarget(
 			name: "MLSrs",
 			url:
 				"https://github.com/germ-network/TwoMLSPQ/releases/download/0.0.1/MLSrs.xcframework.zip",
