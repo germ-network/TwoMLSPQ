@@ -24,4 +24,4 @@ wildcards = "deny"
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
-allow-git = ["https://github.com/germ-mark/mls-rs"]
+allow-git = ["https://github.com/germ-network/mls-rs"]

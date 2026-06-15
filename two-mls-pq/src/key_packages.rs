@@ -128,7 +128,7 @@ impl TwoMlsPqClient {
             MlsCipherSuite::DHKEM_X25519_CHACHA => {
                 let msg = self
                     .classical
-                    .generate_key_package_message(ExtensionList::new(), ExtensionList::new())
+                    .generate_key_package_message(ExtensionList::new(), ExtensionList::new(), None)
                     .map_err(|_| TwoMlsPqError::Mls)?;
                 msg.to_bytes().map_err(|_| TwoMlsPqError::Mls)
             }
@@ -136,7 +136,7 @@ impl TwoMlsPqClient {
             MlsCipherSuite::ML_KEM_768 => {
                 let msg = self
                     .pq
-                    .generate_key_package_message(ExtensionList::new(), ExtensionList::new())
+                    .generate_key_package_message(ExtensionList::new(), ExtensionList::new(), None)
                     .map_err(|_| TwoMlsPqError::Mls)?;
                 msg.to_bytes().map_err(|_| TwoMlsPqError::Mls)
             }

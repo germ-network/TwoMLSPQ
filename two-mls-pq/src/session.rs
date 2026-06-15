@@ -1,16 +1,703 @@
 use std::sync::{Arc, Mutex};
 
-use crate::{
-    key_packages::{CombinerKeyPackage, TwoMlsPqClient},
-    AgentState, Archive, ClientId, CombinerGroupId, DecryptResult, EncryptResult, ListenChannels,
-    MlsSenderMessage, PrepareEncryptResult, RendezvousId, Result, SessionId, TwoMlsPqDigest,
+use mls_rs::{
+    group::ReceivedMessage,
+    psk::{ExternalPskId, PreSharedKey},
+    ExtensionList, Group, MlsMessage,
 };
 
-#[allow(dead_code)]
+use crate::{
+    key_packages::{
+        parse_mls_key_package, CombinerKeyPackage, MlsClient, OurConfig, TwoMlsPqClient,
+    },
+    AgentState, Archive, ClientId, CombinerGroupId, CommitResult, DecryptResult, EncryptResult,
+    ListenChannels, MlsGroupId, MlsSenderMessage, PrepareEncryptResult, RendezvousId, Result,
+    SessionId, TwoMlsPqDigest, TwoMlsPqError,
+};
+
+#[cfg(feature = "cryptokit")]
+use crate::key_packages::{PqConfig, PqMlsClient};
+
+type MlsGroup = Group<OurConfig>;
+
+#[cfg(feature = "cryptokit")]
+type PqMlsGroup = Group<PqConfig>;
+#[cfg(not(feature = "cryptokit"))]
+type PqMlsGroup = MlsGroup;
+
+struct CombinerGroup {
+    classical: MlsGroup,
+    pq: PqMlsGroup,
+}
+
+struct SessionInner {
+    client: Arc<TwoMlsPqClient>,
+    send_group: Option<CombinerGroup>,
+    recv_group: Option<CombinerGroup>,
+    pending_outbound: Option<Vec<u8>>,
+    pending_proposal_hash: Option<TwoMlsPqDigest>,
+    /// Send-group commit to bundle with the next outbound app message (rotation, or epoch advance).
+    pending_commit_message: Option<Vec<u8>>,
+    /// Recv-group commit to bundle with the next outbound app message (self-Update or PSK refresh).
+    pending_recv_commit_message: Option<Vec<u8>>,
+    queued_proposal: Option<TwoMlsPqDigest>,
+    pending_new_client: Option<Arc<TwoMlsPqClient>>,
+    session_id: SessionId,
+    my_state: AgentState,
+    their_state: AgentState,
+}
+
+/// A TwoMLSPQ session holding two asymmetric Combiner send groups.
 #[derive(uniffi::Object)]
 pub struct TwoMlsPqSession {
+    inner: Mutex<SessionInner>,
+}
+
+// APQWelcome wire format: [0x01 tag][u32-LE classical-len][classical bytes][u32-LE pq-len][pq bytes]
+const APQ_TAG: u8 = 0x01;
+// Rotation commit+app: [0x03 tag][u32-LE commit-len][commit][u32-LE app-len][app]
+// Used only for Phase 8 agent rotation (no PSK refresh).
+const BUNDLED_TAG: u8 = 0x03;
+// Partial commit: [0x05 tag][u32-LE recv-commit-len][recv-commit][u32-LE app-len][app]
+// Alice commits on Group_B (recv group) to refresh her HPKE leaf key, then sends app on Group_A.
+const PARTIAL_TAG: u8 = 0x05;
+// Full bundle: [0x07 tag][u32-LE send-commit-len][send-commit][u32-LE recv-commit-len][recv-commit][u32-LE app-len][app]
+// Epoch-advance commit on Group_A + PSK-refresh commit on Group_B + app on Group_A.
+const FULL_BUNDLE_TAG: u8 = 0x07;
+
+fn encode_apq_welcome(classical: Vec<u8>, pq: Vec<u8>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + 4 + classical.len() + 4 + pq.len());
+    out.push(APQ_TAG);
+    out.extend_from_slice(&(classical.len() as u32).to_le_bytes());
+    out.extend_from_slice(&classical);
+    out.extend_from_slice(&(pq.len() as u32).to_le_bytes());
+    out.extend_from_slice(&pq);
+    out
+}
+
+fn decode_apq_welcome(bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
+    let (&tag, rest) = bytes.split_first().ok_or(TwoMlsPqError::Mls)?;
+    if tag != APQ_TAG {
+        return Err(TwoMlsPqError::Mls);
+    }
+    if rest.len() < 4 {
+        return Err(TwoMlsPqError::Mls);
+    }
+    let c_len = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
+    let rest = &rest[4..];
+    if rest.len() < c_len + 4 {
+        return Err(TwoMlsPqError::Mls);
+    }
+    let classical = rest[..c_len].to_vec();
+    let rest = &rest[c_len..];
+    let p_len = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
+    let rest = &rest[4..];
+    if rest.len() != p_len {
+        return Err(TwoMlsPqError::Mls);
+    }
+    Ok((classical, rest.to_vec()))
+}
+
+fn encode_bundled(commit: Vec<u8>, app: Vec<u8>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + 4 + commit.len() + 4 + app.len());
+    out.push(BUNDLED_TAG);
+    out.extend_from_slice(&(commit.len() as u32).to_le_bytes());
+    out.extend_from_slice(&commit);
+    out.extend_from_slice(&(app.len() as u32).to_le_bytes());
+    out.extend_from_slice(&app);
+    out
+}
+
+fn decode_bundled(bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
+    let (&tag, rest) = bytes.split_first().ok_or(TwoMlsPqError::Mls)?;
+    if tag != BUNDLED_TAG {
+        return Err(TwoMlsPqError::Mls);
+    }
+    if rest.len() < 4 {
+        return Err(TwoMlsPqError::Mls);
+    }
+    let c_len = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
+    let rest = &rest[4..];
+    if rest.len() < c_len + 4 {
+        return Err(TwoMlsPqError::Mls);
+    }
+    let commit = rest[..c_len].to_vec();
+    let rest = &rest[c_len..];
+    let a_len = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
+    let rest = &rest[4..];
+    if rest.len() != a_len {
+        return Err(TwoMlsPqError::Mls);
+    }
+    Ok((commit, rest.to_vec()))
+}
+
+fn encode_partial(recv_commit: Vec<u8>, app: Vec<u8>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + 4 + recv_commit.len() + 4 + app.len());
+    out.push(PARTIAL_TAG);
+    out.extend_from_slice(&(recv_commit.len() as u32).to_le_bytes());
+    out.extend_from_slice(&recv_commit);
+    out.extend_from_slice(&(app.len() as u32).to_le_bytes());
+    out.extend_from_slice(&app);
+    out
+}
+
+fn decode_partial(bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
+    let (&tag, rest) = bytes.split_first().ok_or(TwoMlsPqError::Mls)?;
+    if tag != PARTIAL_TAG {
+        return Err(TwoMlsPqError::Mls);
+    }
+    if rest.len() < 4 {
+        return Err(TwoMlsPqError::Mls);
+    }
+    let rc_len = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
+    let rest = &rest[4..];
+    if rest.len() < rc_len + 4 {
+        return Err(TwoMlsPqError::Mls);
+    }
+    let recv_commit = rest[..rc_len].to_vec();
+    let rest = &rest[rc_len..];
+    let a_len = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
+    let rest = &rest[4..];
+    if rest.len() != a_len {
+        return Err(TwoMlsPqError::Mls);
+    }
+    Ok((recv_commit, rest.to_vec()))
+}
+
+fn encode_full_bundle(send_commit: Vec<u8>, recv_commit: Vec<u8>, app: Vec<u8>) -> Vec<u8> {
+    let mut out =
+        Vec::with_capacity(1 + 4 + send_commit.len() + 4 + recv_commit.len() + 4 + app.len());
+    out.push(FULL_BUNDLE_TAG);
+    out.extend_from_slice(&(send_commit.len() as u32).to_le_bytes());
+    out.extend_from_slice(&send_commit);
+    out.extend_from_slice(&(recv_commit.len() as u32).to_le_bytes());
+    out.extend_from_slice(&recv_commit);
+    out.extend_from_slice(&(app.len() as u32).to_le_bytes());
+    out.extend_from_slice(&app);
+    out
+}
+
+fn decode_full_bundle(bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+    let (&tag, mut rest) = bytes.split_first().ok_or(TwoMlsPqError::Mls)?;
+    if tag != FULL_BUNDLE_TAG {
+        return Err(TwoMlsPqError::Mls);
+    }
+    let (send_commit, recv_commit, app) = {
+        let mut read_chunk = || -> Result<Vec<u8>> {
+            if rest.len() < 4 {
+                return Err(TwoMlsPqError::Mls);
+            }
+            let len = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
+            rest = &rest[4..];
+            if rest.len() < len {
+                return Err(TwoMlsPqError::Mls);
+            }
+            let chunk = rest[..len].to_vec();
+            rest = &rest[len..];
+            Ok(chunk)
+        };
+        (read_chunk()?, read_chunk()?, read_chunk()?)
+    };
+    if !rest.is_empty() {
+        return Err(TwoMlsPqError::Mls);
+    }
+    Ok((send_commit, recv_commit, app))
+}
+
+/// Construct the PSK identifier: 8-byte LE epoch || group_id bytes.
+fn make_psk_id(epoch: u64, group_id: &[u8]) -> ExternalPskId {
+    let mut id = epoch.to_le_bytes().to_vec();
+    id.extend_from_slice(group_id);
+    ExternalPskId::new(id)
+}
+
+/// Export 32 bytes from `group` via exportSecret and register them in the client's PSK store.
+/// Both parties derive the same value from the same epoch, enabling independent PSK registration.
+/// Registers in both classical and PQ stores so both halves can use the PSK for group binding.
+fn export_and_register_psk(group: &MlsGroup, client: &TwoMlsPqClient) -> Result<ExternalPskId> {
+    let secret = group
+        .export_secret(b"exportSecret", b"derive", 32)
+        .map_err(|_| TwoMlsPqError::Mls)?;
+    let psk_id = make_psk_id(group.current_epoch(), group.group_id());
+    let psk = PreSharedKey::new(secret.as_bytes().to_vec());
+    let mut store = client.classical().secret_store();
+    store.insert(psk_id.clone(), psk.clone());
+    #[cfg(feature = "cryptokit")]
+    {
+        let mut pq_store = client.pq().secret_store();
+        pq_store.insert(psk_id.clone(), psk);
+    }
+    Ok(psk_id)
+}
+
+/// Export and register PSK from a PQ group. Identical to `export_and_register_psk` but
+/// accepts `PqMlsGroup`, which differs from `MlsGroup` when the `cryptokit` feature is on.
+#[cfg(feature = "cryptokit")]
+fn export_and_register_psk_pq(
+    group: &PqMlsGroup,
+    client: &TwoMlsPqClient,
+) -> Result<ExternalPskId> {
+    let secret = group
+        .export_secret(b"exportSecret", b"derive", 32)
+        .map_err(|_| TwoMlsPqError::Mls)?;
+    let psk_id = make_psk_id(group.current_epoch(), group.group_id());
+    let psk = PreSharedKey::new(secret.as_bytes().to_vec());
+    let mut store = client.classical().secret_store();
+    store.insert(psk_id.clone(), psk.clone());
+    {
+        let mut pq_store = client.pq().secret_store();
+        pq_store.insert(psk_id.clone(), psk);
+    }
+    Ok(psk_id)
+}
+
+/// Create a group and commit the given key package in as the first member.
+/// If `psk_id` is `Some`, the commit also injects that external PSK binding.
+/// Returns (group-at-epoch-1, MLS-encoded Welcome bytes).
+fn create_group_with_member(
+    mls_client: &MlsClient,
+    their_kp_bytes: &[u8],
+    psk_id: Option<ExternalPskId>,
+) -> Result<(MlsGroup, Vec<u8>)> {
+    let mut group = mls_client
+        .create_group(ExtensionList::new(), ExtensionList::new(), None)
+        .map_err(|_| TwoMlsPqError::Mls)?;
+    let their_kp =
+        MlsMessage::from_bytes(their_kp_bytes).map_err(|_| TwoMlsPqError::InvalidKeyPackage)?;
+    let builder = group
+        .commit_builder()
+        .add_member(their_kp)
+        .map_err(|_| TwoMlsPqError::Mls)?;
+    let builder = match psk_id {
+        Some(psk) => builder
+            .add_external_psk(psk)
+            .map_err(|_| TwoMlsPqError::Mls)?,
+        None => builder,
+    };
+    let commit_output = builder.build().map_err(|_| TwoMlsPqError::Mls)?;
+    group
+        .apply_pending_commit()
+        .map_err(|_| TwoMlsPqError::Mls)?;
+    let welcome = commit_output
+        .welcome_messages
+        .into_iter()
+        .next()
+        .ok_or(TwoMlsPqError::MissingWelcome)?;
+    let welcome_bytes = welcome.to_bytes().map_err(|_| TwoMlsPqError::Mls)?;
+    Ok((group, welcome_bytes))
+}
+
+/// Join a group from an MLS-encoded Welcome message.
+fn join_group_from_welcome(mls_client: &MlsClient, welcome_bytes: &[u8]) -> Result<MlsGroup> {
+    let welcome = MlsMessage::from_bytes(welcome_bytes).map_err(|_| TwoMlsPqError::Mls)?;
+    let (group, _) = mls_client
+        .join_group(None, &welcome, None)
+        .map_err(|_| TwoMlsPqError::Mls)?;
+    Ok(group)
+}
+
+/// Create a PQ group with a PSK-bound member commit.
+#[cfg(feature = "cryptokit")]
+fn pq_create_bound_group_with_member(
+    pq_client: &PqMlsClient,
+    their_kp_bytes: &[u8],
+    psk_id: ExternalPskId,
+) -> Result<(PqMlsGroup, Vec<u8>)> {
+    let mut group = pq_client
+        .create_group(ExtensionList::new(), ExtensionList::new(), None)
+        .map_err(|_| TwoMlsPqError::Mls)?;
+    let their_kp =
+        MlsMessage::from_bytes(their_kp_bytes).map_err(|_| TwoMlsPqError::InvalidKeyPackage)?;
+    let commit_output = group
+        .commit_builder()
+        .add_member(their_kp)
+        .map_err(|_| TwoMlsPqError::Mls)?
+        .add_external_psk(psk_id)
+        .map_err(|_| TwoMlsPqError::Mls)?
+        .build()
+        .map_err(|_| TwoMlsPqError::Mls)?;
+    group
+        .apply_pending_commit()
+        .map_err(|_| TwoMlsPqError::Mls)?;
+    let welcome = commit_output
+        .welcome_messages
+        .into_iter()
+        .next()
+        .ok_or(TwoMlsPqError::MissingWelcome)?;
+    let welcome_bytes = welcome.to_bytes().map_err(|_| TwoMlsPqError::Mls)?;
+    Ok((group, welcome_bytes))
+}
+
+/// Join a PQ group from an MLS-encoded Welcome message.
+#[cfg(feature = "cryptokit")]
+fn pq_join_group_from_welcome(pq_client: &PqMlsClient, welcome_bytes: &[u8]) -> Result<PqMlsGroup> {
+    let welcome = MlsMessage::from_bytes(welcome_bytes).map_err(|_| TwoMlsPqError::Mls)?;
+    let (group, _) = pq_client
+        .join_group(None, &welcome, None)
+        .map_err(|_| TwoMlsPqError::Mls)?;
+    Ok(group)
+}
+
+/// Create the initiator's Combiner send group (Group_A) from the remote's CombinerKeyPackage.
+/// Chain: classical Group_A → PSK → PQ Group_A.
+/// Returns (send_group, APQWelcome_A bytes).
+fn create_combiner_send_group(
+    their_kp: &CombinerKeyPackage,
+    client: &Arc<TwoMlsPqClient>,
+) -> Result<(CombinerGroup, Vec<u8>)> {
+    let (classical_group, classical_welcome) =
+        create_group_with_member(client.classical(), &their_kp.classical, None)?;
+    let psk_id = export_and_register_psk(&classical_group, client)?;
+    #[cfg(feature = "cryptokit")]
+    let (pq_group, pq_welcome) =
+        pq_create_bound_group_with_member(client.pq(), &their_kp.pq, psk_id)?;
+    #[cfg(not(feature = "cryptokit"))]
+    let (pq_group, pq_welcome) =
+        create_group_with_member(client.classical(), &their_kp.pq, Some(psk_id))?;
+    let apq = encode_apq_welcome(classical_welcome, pq_welcome);
+    Ok((
+        CombinerGroup {
+            classical: classical_group,
+            pq: pq_group,
+        },
+        apq,
+    ))
+}
+
+/// Join both halves of a Combiner group from an APQWelcome.
+/// The joiner independently re-derives the same PSK that was used to bind the PQ group,
+/// registering it before processing the PQ Welcome.
+fn join_combiner_group(apq_welcome: &[u8], client: &Arc<TwoMlsPqClient>) -> Result<CombinerGroup> {
+    let (classical_welcome, pq_welcome) = decode_apq_welcome(apq_welcome)?;
+    let classical = join_group_from_welcome(client.classical(), &classical_welcome)?;
+    // Derive the same PSK the creator used to bind the PQ group (registered in both stores).
+    export_and_register_psk(&classical, client)?;
+    #[cfg(feature = "cryptokit")]
+    let pq = pq_join_group_from_welcome(client.pq(), &pq_welcome)?;
+    #[cfg(not(feature = "cryptokit"))]
+    let pq = join_group_from_welcome(client.classical(), &pq_welcome)?;
+    Ok(CombinerGroup { classical, pq })
+}
+
+/// Create the acceptor's bound Combiner send group (Group_B) using the PSK exported from
+/// the already-joined recv group's classical half.
+/// Chain: recv classical (Group_A) → PSK_recv → Group_B classical → PSK_B → Group_B PQ.
+/// Returns (send_group, APQWelcome_B bytes).
+fn create_bound_combiner_send_group(
+    their_kp: &CombinerKeyPackage,
+    client: &Arc<TwoMlsPqClient>,
+    recv_classical: &MlsGroup,
+) -> Result<(CombinerGroup, Vec<u8>)> {
+    let psk_id = export_and_register_psk(recv_classical, client)?;
+    let (classical_group, classical_welcome) =
+        create_group_with_member(client.classical(), &their_kp.classical, Some(psk_id))?;
+    let psk_id2 = export_and_register_psk(&classical_group, client)?;
+    #[cfg(feature = "cryptokit")]
+    let (pq_group, pq_welcome) =
+        pq_create_bound_group_with_member(client.pq(), &their_kp.pq, psk_id2)?;
+    #[cfg(not(feature = "cryptokit"))]
+    let (pq_group, pq_welcome) =
+        create_group_with_member(client.classical(), &their_kp.pq, Some(psk_id2))?;
+    let apq = encode_apq_welcome(classical_welcome, pq_welcome);
+    Ok((
+        CombinerGroup {
+            classical: classical_group,
+            pq: pq_group,
+        },
+        apq,
+    ))
+}
+
+/// Extract the `ClientId` of the member at `leaf_index` in `group` using the Basic credential.
+fn sender_client_id(group: &PqMlsGroup, leaf_index: u32) -> Result<ClientId> {
+    let member = group
+        .roster()
+        .member_with_index(leaf_index)
+        .map_err(|_| TwoMlsPqError::DecryptionFailed)?;
+    let basic = member
+        .signing_identity
+        .credential
+        .as_basic()
+        .ok_or(TwoMlsPqError::DecryptionFailed)?;
+    Ok(ClientId {
+        bytes: basic.identifier.clone(),
+    })
+}
+
+/// Build a `QueuedRemoteProposal` from an application message's authenticated_data.
+/// Returns `None` when `authenticated_data` is empty (no proposal nonce).
+fn make_queued_proposal(
+    group_id: &[u8],
+    sender_id: &ClientId,
+    authenticated_data: &[u8],
+) -> Option<crate::QueuedRemoteProposal> {
+    if authenticated_data.is_empty() {
+        return None;
+    }
+    Some(crate::QueuedRemoteProposal {
+        digest: TwoMlsPqDigest {
+            hash_type: 0,
+            digest: authenticated_data.to_vec(),
+        },
+        sender: sender_id.clone(),
+        proposing: sender_id.clone(),
+        context: TwoMlsPqDigest {
+            hash_type: 0,
+            digest: group_id.to_vec(),
+        },
+    })
+}
+
+impl SessionInner {
+    /// Transition `my_state` from `Pending { old, new }` to `Sync { new }`.
+    /// Called when any message is successfully decrypted from the recv group,
+    /// confirming the peer has processed our rotation commit.
+    fn resolve_pending_rotation(&mut self) {
+        if let AgentState::Pending { new, .. } = &self.my_state {
+            self.my_state = AgentState::Sync {
+                client_id: new.clone(),
+            };
+        }
+    }
+
+    // --- Phase helpers for prepare_to_encrypt ---
+
+    /// Phase 8: encode a rotation commit on send_group.pq with `new_id` in authenticated_data.
+    fn prepare_rotation(&mut self, new_id: ClientId) -> Result<crate::PrepareEncryptResult> {
+        let new_client = self
+            .pending_new_client
+            .take()
+            .ok_or(TwoMlsPqError::SessionNotReady)?;
+
+        if new_client.client_id() != new_id {
+            return Err(TwoMlsPqError::SessionNotReady);
+        }
+
+        let commit_output = {
+            let send = self
+                .send_group
+                .as_mut()
+                .ok_or(TwoMlsPqError::SessionNotReady)?;
+            send.pq
+                .commit_builder()
+                .authenticated_data(new_id.bytes.clone())
+                .build()
+                .map_err(|_| TwoMlsPqError::Mls)?
+        };
+        {
+            let send = self
+                .send_group
+                .as_mut()
+                .ok_or(TwoMlsPqError::SessionNotReady)?;
+            send.pq
+                .apply_pending_commit()
+                .map_err(|_| TwoMlsPqError::Mls)?;
+        }
+
+        let commit_bytes = commit_output
+            .commit_message
+            .to_bytes()
+            .map_err(|_| TwoMlsPqError::Mls)?;
+        self.pending_commit_message = Some(commit_bytes);
+
+        let old_id = self.my_state.client_id();
+        self.my_state = AgentState::Pending {
+            old: old_id,
+            new: new_id,
+        };
+        self.client = new_client;
+
+        let nonce = self
+            .send_group
+            .as_ref()
+            .ok_or(TwoMlsPqError::SessionNotReady)?
+            .pq
+            .export_secret(b"proposal", b"prepare", 32)
+            .map_err(|_| TwoMlsPqError::Mls)?;
+
+        let proposal_hash = TwoMlsPqDigest {
+            hash_type: 0,
+            digest: nonce.as_bytes().to_vec(),
+        };
+        self.pending_proposal_hash = Some(proposal_hash.clone());
+
+        Ok(crate::PrepareEncryptResult {
+            proposal_hash,
+            committed_remote_client_id: None,
+            did_commit: true,
+        })
+    }
+
+    /// Phase 7: epoch-advance on send_group.pq + PSK-refresh commit on recv_group.pq.
+    fn prepare_full_commit(&mut self) -> Result<crate::PrepareEncryptResult> {
+        // Consume the queued proposal to enter this branch.
+        let _ = self.queued_proposal.take();
+        let client = self.client.clone();
+
+        let send_commit_output = {
+            let send = self
+                .send_group
+                .as_mut()
+                .ok_or(TwoMlsPqError::SessionNotReady)?;
+            send.pq
+                .commit_builder()
+                .build()
+                .map_err(|_| TwoMlsPqError::Mls)?
+        };
+        {
+            let send = self
+                .send_group
+                .as_mut()
+                .ok_or(TwoMlsPqError::SessionNotReady)?;
+            send.pq
+                .apply_pending_commit()
+                .map_err(|_| TwoMlsPqError::Mls)?;
+        }
+        let send_commit_bytes = send_commit_output
+            .commit_message
+            .to_bytes()
+            .map_err(|_| TwoMlsPqError::Mls)?;
+
+        let psk_id = {
+            let send = self
+                .send_group
+                .as_ref()
+                .ok_or(TwoMlsPqError::SessionNotReady)?;
+            #[cfg(feature = "cryptokit")]
+            let id = export_and_register_psk_pq(&send.pq, &client)?;
+            #[cfg(not(feature = "cryptokit"))]
+            let id = export_and_register_psk(&send.pq, &client)?;
+            id
+        };
+
+        let recv_commit_output = {
+            let recv = self
+                .recv_group
+                .as_mut()
+                .ok_or(TwoMlsPqError::SessionNotReady)?;
+            recv.pq
+                .commit_builder()
+                .add_external_psk(psk_id)
+                .map_err(|_| TwoMlsPqError::Mls)?
+                .build()
+                .map_err(|_| TwoMlsPqError::Mls)?
+        };
+        {
+            let recv = self
+                .recv_group
+                .as_mut()
+                .ok_or(TwoMlsPqError::SessionNotReady)?;
+            recv.pq
+                .apply_pending_commit()
+                .map_err(|_| TwoMlsPqError::Mls)?;
+        }
+        let recv_commit_bytes = recv_commit_output
+            .commit_message
+            .to_bytes()
+            .map_err(|_| TwoMlsPqError::Mls)?;
+
+        self.pending_commit_message = Some(send_commit_bytes);
+        self.pending_recv_commit_message = Some(recv_commit_bytes);
+
+        let their_id = self.their_state.client_id();
+
+        let nonce = self
+            .send_group
+            .as_ref()
+            .ok_or(TwoMlsPqError::SessionNotReady)?
+            .pq
+            .export_secret(b"proposal", b"prepare", 32)
+            .map_err(|_| TwoMlsPqError::Mls)?;
+
+        let proposal_hash = TwoMlsPqDigest {
+            hash_type: 0,
+            digest: nonce.as_bytes().to_vec(),
+        };
+        self.pending_proposal_hash = Some(proposal_hash.clone());
+
+        Ok(crate::PrepareEncryptResult {
+            proposal_hash,
+            committed_remote_client_id: Some(their_id),
+            did_commit: true,
+        })
+    }
+
+    /// Phase 6: self-Update commit on recv_group.pq to refresh HPKE leaf key.
+    fn prepare_partial_commit(&mut self) -> Result<crate::PrepareEncryptResult> {
+        let recv_commit_output = {
+            let recv = self
+                .recv_group
+                .as_mut()
+                .ok_or(TwoMlsPqError::SessionNotReady)?;
+            recv.pq
+                .commit_builder()
+                .build()
+                .map_err(|_| TwoMlsPqError::Mls)?
+        };
+        {
+            let recv = self
+                .recv_group
+                .as_mut()
+                .ok_or(TwoMlsPqError::SessionNotReady)?;
+            recv.pq
+                .apply_pending_commit()
+                .map_err(|_| TwoMlsPqError::Mls)?;
+        }
+        let recv_commit_bytes = recv_commit_output
+            .commit_message
+            .to_bytes()
+            .map_err(|_| TwoMlsPqError::Mls)?;
+        self.pending_recv_commit_message = Some(recv_commit_bytes);
+
+        let nonce = self
+            .send_group
+            .as_ref()
+            .ok_or(TwoMlsPqError::SessionNotReady)?
+            .pq
+            .export_secret(b"proposal", b"prepare", 32)
+            .map_err(|_| TwoMlsPqError::Mls)?;
+
+        let proposal_hash = TwoMlsPqDigest {
+            hash_type: 0,
+            digest: nonce.as_bytes().to_vec(),
+        };
+        self.pending_proposal_hash = Some(proposal_hash.clone());
+
+        Ok(crate::PrepareEncryptResult {
+            proposal_hash,
+            committed_remote_client_id: None,
+            did_commit: false,
+        })
+    }
+}
+
+fn build_session(
     client: Arc<TwoMlsPqClient>,
-    pending_outbound: Mutex<Option<Vec<u8>>>,
+    send_group: Option<CombinerGroup>,
+    recv_group: Option<CombinerGroup>,
+    pending_outbound: Option<Vec<u8>>,
+    session_id: SessionId,
+    their_id: ClientId,
+) -> Arc<TwoMlsPqSession> {
+    let my_id = client.client_id();
+    Arc::new(TwoMlsPqSession {
+        inner: Mutex::new(SessionInner {
+            client,
+            send_group,
+            recv_group,
+            pending_outbound,
+            pending_proposal_hash: None,
+            pending_commit_message: None,
+            pending_recv_commit_message: None,
+            queued_proposal: None,
+            pending_new_client: None,
+            session_id,
+            my_state: AgentState::Sync { client_id: my_id },
+            their_state: AgentState::Sync {
+                client_id: their_id,
+            },
+        }),
+    })
 }
 
 #[uniffi::export]
@@ -19,260 +706,1356 @@ impl TwoMlsPqSession {
     /// Retrieve the outbound APQWelcome bytes via `pending_outbound`.
     #[uniffi::constructor]
     pub fn initiate(
-        _client: Arc<TwoMlsPqClient>,
-        _their_key_package: CombinerKeyPackage,
+        client: Arc<TwoMlsPqClient>,
+        their_key_package: CombinerKeyPackage,
     ) -> Result<Arc<Self>> {
-        todo!()
+        let their_parsed = parse_mls_key_package(their_key_package.classical.clone())?;
+        let their_id = their_parsed.client_id;
+        let session_id = crate::derive_session_id(client.client_id(), their_id.clone())?;
+
+        let (send_group, apq_welcome) = create_combiner_send_group(&their_key_package, &client)?;
+
+        Ok(build_session(
+            client,
+            Some(send_group),
+            None,
+            Some(apq_welcome),
+            session_id,
+            their_id,
+        ))
     }
 
     /// Join a session from an APQWelcome produced by the remote `initiate`.
     /// Retrieve this party's return Welcome via `pending_outbound`.
     #[uniffi::constructor]
     pub fn accept(
-        _client: Arc<TwoMlsPqClient>,
-        _welcome: Vec<u8>,
-        _their_key_package: CombinerKeyPackage,
+        client: Arc<TwoMlsPqClient>,
+        welcome: Vec<u8>,
+        their_key_package: CombinerKeyPackage,
     ) -> Result<Arc<Self>> {
-        todo!()
+        let their_parsed = parse_mls_key_package(their_key_package.classical.clone())?;
+        let their_id = their_parsed.client_id;
+        let session_id = crate::derive_session_id(client.client_id(), their_id.clone())?;
+
+        let recv_group = join_combiner_group(&welcome, &client)?;
+        let (send_group, apq_welcome) =
+            create_bound_combiner_send_group(&their_key_package, &client, &recv_group.classical)?;
+
+        Ok(build_session(
+            client,
+            Some(send_group),
+            Some(recv_group),
+            Some(apq_welcome),
+            session_id,
+            their_id,
+        ))
     }
 
     /// Restore a session from a serialised archive.
     #[uniffi::constructor]
     pub fn from_archive(_archive: Archive, _client: Arc<TwoMlsPqClient>) -> Result<Arc<Self>> {
-        todo!()
+        Err(TwoMlsPqError::ArchiveInvalid)
     }
 
     /// Welcome bytes to deliver to the remote party to complete group establishment.
     /// Returns `None` once consumed or when both groups are live.
     pub fn pending_outbound(&self) -> Option<Vec<u8>> {
-        todo!()
-    }
-
-    pub fn proposal_context(&self) -> Option<TwoMlsPqDigest> {
-        todo!()
-    }
-
-    pub fn send_rendezvous(&self) -> Result<Option<RendezvousId>> {
-        todo!()
-    }
-
-    pub fn archive(&self) -> Result<Archive> {
-        todo!()
-    }
-
-    pub fn prepare_to_encrypt(
-        &self,
-        _proposing: Option<ClientId>,
-    ) -> Result<Option<PrepareEncryptResult>> {
-        todo!()
-    }
-
-    pub fn encrypt(&self, _app_message: Vec<u8>) -> Result<EncryptResult> {
-        todo!()
-    }
-
-    pub fn process_incoming(&self, _ciphertext: Vec<u8>) -> Result<Option<DecryptResult>> {
-        todo!()
-    }
-
-    pub fn queue_proposal(&self, _digest: TwoMlsPqDigest) -> Result<()> {
-        todo!()
-    }
-
-    /// Process a message forwarded from another of the user's own devices.
-    /// The transport envelope has already been decrypted by the originating device;
-    /// `header_decrypted` is the inner MLS payload. Returns `None` for non-application
-    /// messages (proposals, commits) forwarded in error.
-    pub fn forwarded(&self, _header_decrypted: Vec<u8>) -> Result<Option<MlsSenderMessage>> {
-        todo!()
-    }
-
-    pub fn should_listen_on(&self) -> Result<ListenChannels> {
-        todo!()
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pending_outbound
+            .take()
     }
 
     pub fn is_established(&self) -> bool {
-        todo!()
-    }
-
-    pub fn active_session_id(&self) -> SessionId {
-        todo!()
-    }
-
-    pub fn my_agent_state(&self) -> AgentState {
-        todo!()
-    }
-
-    pub fn their_agent_state(&self) -> AgentState {
-        todo!()
-    }
-
-    pub fn receive_group_id(&self) -> Option<CombinerGroupId> {
-        todo!()
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.send_group.is_some() && inner.recv_group.is_some()
     }
 
     pub fn has_receive_group(&self) -> bool {
-        todo!()
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .recv_group
+            .is_some()
     }
-}
 
-/// Create one half of a Combiner send group (classical or PQ, identified by suite).
-/// Returns (MLS Welcome bytes, serialised group state).
-#[allow(dead_code)]
-fn create_send_group(
-    _their_keypackage: &[u8],
-    _my_agent: &[u8],
-    _suite: u16,
-) -> Result<(Vec<u8>, Vec<u8>)> {
-    todo!()
-}
+    pub fn active_session_id(&self) -> SessionId {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .session_id
+            .clone()
+    }
 
-/// Join one half of a Combiner send group from an MLS Welcome.
-/// Returns the serialised group state.
-#[allow(dead_code)]
-fn join_send_group(_welcome: &[u8], _my_agent: &[u8], _suite: u16) -> Result<Vec<u8>> {
-    todo!()
-}
+    pub fn my_agent_state(&self) -> AgentState {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .my_state
+            .clone()
+    }
 
-/// Create one half of a Combiner send group bound to the opposing direction via PSK.
-/// Returns (MLS Welcome bytes, serialised group state).
-#[allow(dead_code)]
-fn create_bound_send_group(
-    _their_keypackage: &[u8],
-    _my_agent: &[u8],
-    _psk: &crate::psk::BoundPsk,
-    _suite: u16,
-) -> Result<(Vec<u8>, Vec<u8>)> {
-    todo!()
-}
+    pub fn their_agent_state(&self) -> AgentState {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .their_state
+            .clone()
+    }
 
-/// Create both halves of a Combiner send group (classical + PQ) from a CombinerKeyPackage.
-/// Returns (APQWelcome bytes, serialised CombinerGroupState).
-#[allow(dead_code)]
-fn create_combiner_send_group(
-    _their_kp: &CombinerKeyPackage,
-    _my_agent: &[u8],
-) -> Result<(Vec<u8>, Vec<u8>)> {
-    todo!()
-}
+    pub fn receive_group_id(&self) -> Option<CombinerGroupId> {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.recv_group.as_ref().map(|rg| CombinerGroupId {
+            classical: MlsGroupId {
+                bytes: rg.classical.group_id().to_vec(),
+            },
+            pq: MlsGroupId {
+                bytes: rg.pq.group_id().to_vec(),
+            },
+        })
+    }
 
-/// Join both halves of a Combiner send group from an APQWelcome.
-/// Returns the serialised CombinerGroupState.
-#[allow(dead_code)]
-fn join_combiner_send_group(_apq_welcome: &[u8], _my_agent: &[u8]) -> Result<Vec<u8>> {
-    todo!()
-}
+    /// Prepare a pending proposal nonce and stage it for binding into the next outbound message.
+    /// Returns `Err(SessionNotReady)` until both groups are established.
+    ///
+    /// - `proposing: None` with a queued remote proposal → full commit (epoch advance + PSK refresh), `did_commit: true`
+    /// - `proposing: Some(new_id)` → rotation commit with new leaf credential, `did_commit: true`
+    /// - Otherwise → recv self-Update only, `did_commit: false`
+    pub fn prepare_to_encrypt(&self, proposing: Option<ClientId>) -> Result<PrepareEncryptResult> {
+        let mut inner = self.inner.lock().map_err(|_| TwoMlsPqError::Mls)?;
+        if let Some(new_id) = proposing {
+            return inner.prepare_rotation(new_id);
+        }
+        if inner.queued_proposal.is_some() {
+            return inner.prepare_full_commit();
+        }
+        inner.prepare_partial_commit()
+    }
 
-/// Create both halves of a Combiner send group bound to the opposing direction via PSK.
-/// Returns (APQWelcome bytes, serialised CombinerGroupState).
-#[allow(dead_code)]
-fn create_bound_combiner_send_group(
-    _their_kp: &CombinerKeyPackage,
-    _my_agent: &[u8],
-    _psk: &crate::psk::BoundPsk,
-) -> Result<(Vec<u8>, Vec<u8>)> {
-    todo!()
+    /// Encrypt `app_message` using the PQ send group.
+    /// Must be called after `prepare_to_encrypt`; the pending proposal hash is used as
+    /// authenticated data and cleared on return.
+    /// When a commit was staged (did_commit: true), the output is a bundled commit+app message.
+    pub fn encrypt(&self, app_message: Vec<u8>) -> Result<EncryptResult> {
+        let mut inner = self.inner.lock().map_err(|_| TwoMlsPqError::Mls)?;
+
+        let proposal_hash = inner
+            .pending_proposal_hash
+            .take()
+            .ok_or(TwoMlsPqError::SessionNotReady)?;
+
+        let (app_bytes, epoch) = {
+            let send = inner
+                .send_group
+                .as_mut()
+                .ok_or(TwoMlsPqError::SessionNotReady)?;
+
+            let cipher_msg = send
+                .pq
+                .encrypt_application_message(&app_message, proposal_hash.digest)
+                .map_err(|_| TwoMlsPqError::Mls)?;
+
+            let epoch = send.pq.current_epoch();
+            let bytes = cipher_msg.to_bytes().map_err(|_| TwoMlsPqError::Mls)?;
+            (bytes, epoch)
+        };
+
+        let cipher_text = match (
+            inner.pending_commit_message.take(),
+            inner.pending_recv_commit_message.take(),
+        ) {
+            // Phase 7: epoch advance + PSK refresh → FULL_BUNDLE_TAG
+            (Some(send), Some(recv)) => encode_full_bundle(send, recv, app_bytes),
+            // Phase 8: rotation commit only → BUNDLED_TAG
+            (Some(send), None) => encode_bundled(send, app_bytes),
+            // Phase 6: recv self-Update only → PARTIAL_TAG
+            (None, Some(recv)) => encode_partial(recv, app_bytes),
+            // bare app message (should not occur after prepare_to_encrypt, but safe fallback)
+            (None, None) => app_bytes,
+        };
+
+        let sender = inner.my_state.client_id();
+        let recipient = inner.their_state.client_id();
+
+        Ok(EncryptResult {
+            cipher_text,
+            sender,
+            recipient,
+            epoch,
+        })
+    }
+
+    /// Process an incoming message.
+    ///
+    /// - APQWelcome (0x01) → join recv groups; `Ok(None)`
+    /// - Rotation commit+app (0x03) → advance send epoch then decrypt; `DecryptResult`
+    /// - Partial bundle (0x05) → advance send.pq then decrypt app; `DecryptResult`
+    /// - Full bundle (0x07) → epoch advance + PSK refresh then decrypt; `DecryptResult`
+    /// - MLS ciphertext → decrypt on recv_group.pq; `DecryptResult`
+    pub fn process_incoming(&self, ciphertext: Vec<u8>) -> Result<Option<DecryptResult>> {
+        if ciphertext.first() == Some(&APQ_TAG) {
+            let mut inner = self.inner.lock().map_err(|_| TwoMlsPqError::Mls)?;
+            let client = inner.client.clone();
+
+            // Re-derive the PSK that was used to bind Group_B classical (registers in both stores).
+            if let Some(sg) = &inner.send_group {
+                export_and_register_psk(&sg.classical, &client)?;
+            }
+
+            let (classical_welcome, pq_welcome) = decode_apq_welcome(&ciphertext)?;
+            let classical = join_group_from_welcome(client.classical(), &classical_welcome)?;
+            // Re-derive PSK used to bind Group_B PQ (registers in both stores).
+            export_and_register_psk(&classical, &client)?;
+            #[cfg(feature = "cryptokit")]
+            let pq = pq_join_group_from_welcome(client.pq(), &pq_welcome)?;
+            #[cfg(not(feature = "cryptokit"))]
+            let pq = join_group_from_welcome(client.classical(), &pq_welcome)?;
+
+            inner.recv_group = Some(CombinerGroup { classical, pq });
+            return Ok(None);
+        }
+
+        // Phase 6: partial bundle — recv-group self-Update commit + app message.
+        // The sender committed on their recv group (our send group) to refresh their HPKE leaf
+        // key. We must advance our send group epoch before reading the app message.
+        if ciphertext.first() == Some(&PARTIAL_TAG) {
+            let (recv_commit_bytes, app_bytes) = decode_partial(&ciphertext)?;
+
+            let recv_commit_msg = MlsMessage::from_bytes(&recv_commit_bytes)
+                .map_err(|_| TwoMlsPqError::DecryptionFailed)?;
+            let app_msg =
+                MlsMessage::from_bytes(&app_bytes).map_err(|_| TwoMlsPqError::DecryptionFailed)?;
+
+            let mut inner = self.inner.lock().map_err(|_| TwoMlsPqError::Mls)?;
+
+            // Advance send_group.pq (Group_B on sender's side) — updates sender's leaf key.
+            {
+                let send = inner
+                    .send_group
+                    .as_mut()
+                    .ok_or(TwoMlsPqError::SessionNotEstablished)?;
+                match send
+                    .pq
+                    .process_incoming_message(recv_commit_msg)
+                    .map_err(|_| TwoMlsPqError::DecryptionFailed)?
+                {
+                    ReceivedMessage::Commit(_) => {}
+                    _ => return Err(TwoMlsPqError::DecryptionFailed),
+                }
+            }
+
+            // Decrypt app message from recv_group.pq (Group_A — sender's send group).
+            let (app_data, sender_id, epoch, proposal) = {
+                let recv = inner
+                    .recv_group
+                    .as_mut()
+                    .ok_or(TwoMlsPqError::SessionNotEstablished)?;
+                match recv
+                    .pq
+                    .process_incoming_message(app_msg)
+                    .map_err(|_| TwoMlsPqError::DecryptionFailed)?
+                {
+                    ReceivedMessage::ApplicationMessage(desc) => {
+                        let sender = sender_client_id(&recv.pq, desc.sender_index)?;
+                        let ep = recv.pq.current_epoch();
+                        let proposal = make_queued_proposal(
+                            recv.pq.group_id(),
+                            &sender,
+                            &desc.authenticated_data,
+                        );
+                        (desc.data().to_vec(), sender, ep, proposal)
+                    }
+                    _ => return Err(TwoMlsPqError::DecryptionFailed),
+                }
+            };
+
+            inner.resolve_pending_rotation();
+
+            return Ok(Some(DecryptResult {
+                application_message: Some(MlsSenderMessage {
+                    app_message_data: app_data,
+                    sender_client_id: sender_id,
+                    epoch,
+                }),
+                proposal,
+                remote_commit: None,
+            }));
+        }
+
+        // Phase 7: full bundle — send-group epoch advance + recv-group PSK refresh + app.
+        // Order: apply send commit (advances Group_A) → derive new PSK → apply recv commit
+        // (injects PSK into Group_B) → decrypt app at new Group_A epoch.
+        if ciphertext.first() == Some(&FULL_BUNDLE_TAG) {
+            let (send_commit_bytes, recv_commit_bytes, app_bytes) =
+                decode_full_bundle(&ciphertext)?;
+
+            let send_commit_msg = MlsMessage::from_bytes(&send_commit_bytes)
+                .map_err(|_| TwoMlsPqError::DecryptionFailed)?;
+            let recv_commit_msg = MlsMessage::from_bytes(&recv_commit_bytes)
+                .map_err(|_| TwoMlsPqError::DecryptionFailed)?;
+            let app_msg =
+                MlsMessage::from_bytes(&app_bytes).map_err(|_| TwoMlsPqError::DecryptionFailed)?;
+
+            let mut inner = self.inner.lock().map_err(|_| TwoMlsPqError::Mls)?;
+            let client = inner.client.clone();
+
+            // Step 1 — advance recv_group.pq (Group_A) with the sender's epoch-advance commit.
+            {
+                let recv = inner
+                    .recv_group
+                    .as_mut()
+                    .ok_or(TwoMlsPqError::SessionNotEstablished)?;
+                match recv
+                    .pq
+                    .process_incoming_message(send_commit_msg)
+                    .map_err(|_| TwoMlsPqError::DecryptionFailed)?
+                {
+                    ReceivedMessage::Commit(_) => {}
+                    _ => return Err(TwoMlsPqError::DecryptionFailed),
+                }
+            }
+
+            // Step 2 — derive the same new PSK from Group_A at the new epoch and register it.
+            {
+                let recv = inner
+                    .recv_group
+                    .as_ref()
+                    .ok_or(TwoMlsPqError::SessionNotEstablished)?;
+                #[cfg(feature = "cryptokit")]
+                export_and_register_psk_pq(&recv.pq, &client)?;
+                #[cfg(not(feature = "cryptokit"))]
+                export_and_register_psk(&recv.pq, &client)?;
+            }
+
+            // Step 3 — apply the PSK-refresh commit on send_group.pq (Group_B).
+            {
+                let send = inner
+                    .send_group
+                    .as_mut()
+                    .ok_or(TwoMlsPqError::SessionNotEstablished)?;
+                match send
+                    .pq
+                    .process_incoming_message(recv_commit_msg)
+                    .map_err(|_| TwoMlsPqError::DecryptionFailed)?
+                {
+                    ReceivedMessage::Commit(_) => {}
+                    _ => return Err(TwoMlsPqError::DecryptionFailed),
+                }
+            }
+
+            // Step 4 — decrypt the app message from recv_group.pq at the new epoch.
+            let (app_data, sender_id, epoch) = {
+                let recv = inner
+                    .recv_group
+                    .as_mut()
+                    .ok_or(TwoMlsPqError::SessionNotEstablished)?;
+                match recv
+                    .pq
+                    .process_incoming_message(app_msg)
+                    .map_err(|_| TwoMlsPqError::DecryptionFailed)?
+                {
+                    ReceivedMessage::ApplicationMessage(desc) => {
+                        let sender = sender_client_id(&recv.pq, desc.sender_index)?;
+                        let ep = recv.pq.current_epoch();
+                        (desc.data().to_vec(), sender, ep)
+                    }
+                    _ => return Err(TwoMlsPqError::DecryptionFailed),
+                }
+            };
+
+            let my_id = inner.my_state.client_id();
+            inner.resolve_pending_rotation();
+
+            return Ok(Some(DecryptResult {
+                application_message: Some(MlsSenderMessage {
+                    app_message_data: app_data,
+                    sender_client_id: sender_id,
+                    epoch,
+                }),
+                proposal: None,
+                remote_commit: Some(CommitResult {
+                    new_sender: None,
+                    new_recipient: my_id,
+                }),
+            }));
+        }
+
+        // Phase 8: rotation commit (BUNDLED_TAG) — send-group commit only, no PSK refresh.
+        if ciphertext.first() == Some(&BUNDLED_TAG) {
+            let (commit_bytes, app_bytes) = decode_bundled(&ciphertext)?;
+
+            let commit_msg = MlsMessage::from_bytes(&commit_bytes)
+                .map_err(|_| TwoMlsPqError::DecryptionFailed)?;
+            let app_msg =
+                MlsMessage::from_bytes(&app_bytes).map_err(|_| TwoMlsPqError::DecryptionFailed)?;
+
+            let mut inner = self.inner.lock().map_err(|_| TwoMlsPqError::Mls)?;
+
+            // Process commit — advances epoch in recv_group.pq.
+            let (_committer_index, commit_auth_data) = {
+                let recv = inner
+                    .recv_group
+                    .as_mut()
+                    .ok_or(TwoMlsPqError::SessionNotEstablished)?;
+                match recv
+                    .pq
+                    .process_incoming_message(commit_msg)
+                    .map_err(|_| TwoMlsPqError::DecryptionFailed)?
+                {
+                    ReceivedMessage::Commit(desc) => (desc.committer, desc.authenticated_data),
+                    _ => return Err(TwoMlsPqError::DecryptionFailed),
+                }
+            };
+
+            // Detect key rotation: a non-empty commit authenticated_data carries
+            // the new agent's ClientId bytes (set in prepare_to_encrypt Phase 8).
+            let new_sender = if commit_auth_data.is_empty() {
+                None
+            } else {
+                Some(ClientId {
+                    bytes: commit_auth_data,
+                })
+            };
+
+            if let Some(ref new_id) = new_sender {
+                inner.their_state = AgentState::Sync {
+                    client_id: new_id.clone(),
+                };
+            }
+
+            // Process the bundled app message in the new epoch.
+            let (app_data, sender_id, epoch) = {
+                let recv = inner
+                    .recv_group
+                    .as_mut()
+                    .ok_or(TwoMlsPqError::SessionNotEstablished)?;
+                match recv
+                    .pq
+                    .process_incoming_message(app_msg)
+                    .map_err(|_| TwoMlsPqError::DecryptionFailed)?
+                {
+                    ReceivedMessage::ApplicationMessage(desc) => {
+                        let sender = sender_client_id(&recv.pq, desc.sender_index)?;
+                        let ep = recv.pq.current_epoch();
+                        (desc.data().to_vec(), sender, ep)
+                    }
+                    _ => return Err(TwoMlsPqError::DecryptionFailed),
+                }
+            };
+
+            let my_id = inner.my_state.client_id();
+            inner.resolve_pending_rotation();
+
+            return Ok(Some(DecryptResult {
+                application_message: Some(MlsSenderMessage {
+                    app_message_data: app_data,
+                    sender_client_id: sender_id,
+                    epoch,
+                }),
+                proposal: None,
+                remote_commit: Some(CommitResult {
+                    new_sender,
+                    new_recipient: my_id,
+                }),
+            }));
+        }
+
+        // MLS messages start with version bytes (0x00 ...) — attempt decryption.
+        let msg =
+            MlsMessage::from_bytes(&ciphertext).map_err(|_| TwoMlsPqError::DecryptionFailed)?;
+
+        let mut inner = self.inner.lock().map_err(|_| TwoMlsPqError::Mls)?;
+        let recv = inner
+            .recv_group
+            .as_mut()
+            .ok_or(TwoMlsPqError::SessionNotEstablished)?;
+
+        let received = recv
+            .pq
+            .process_incoming_message(msg)
+            .map_err(|_| TwoMlsPqError::DecryptionFailed)?;
+
+        match received {
+            ReceivedMessage::ApplicationMessage(desc) => {
+                let sender_id = sender_client_id(&recv.pq, desc.sender_index)?;
+                let epoch = recv.pq.current_epoch();
+                let proposal =
+                    make_queued_proposal(recv.pq.group_id(), &sender_id, &desc.authenticated_data);
+                let app_data = desc.data().to_vec();
+                inner.resolve_pending_rotation();
+                Ok(Some(DecryptResult {
+                    application_message: Some(MlsSenderMessage {
+                        app_message_data: app_data,
+                        sender_client_id: sender_id,
+                        epoch,
+                    }),
+                    proposal,
+                    remote_commit: None,
+                }))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    pub fn proposal_context(&self) -> Option<TwoMlsPqDigest> {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.recv_group.as_ref().map(|rg| TwoMlsPqDigest {
+            hash_type: 0,
+            digest: rg.pq.group_id().to_vec(),
+        })
+    }
+
+    pub fn send_rendezvous(&self) -> Result<Option<RendezvousId>> {
+        Err(TwoMlsPqError::SessionNotReady)
+    }
+
+    pub fn archive(&self) -> Result<Archive> {
+        Err(TwoMlsPqError::ArchiveInvalid)
+    }
+
+    /// Accept a remote proposal for the next epoch advance.
+    /// On the next `prepare_to_encrypt(None)` call, an empty commit will be staged.
+    pub fn queue_proposal(&self, digest: TwoMlsPqDigest) -> Result<()> {
+        let mut inner = self.inner.lock().map_err(|_| TwoMlsPqError::Mls)?;
+        inner.queued_proposal = Some(digest);
+        Ok(())
+    }
+
+    /// Register a new agent client for the next rotation commit.
+    /// Call before `prepare_to_encrypt(Some(new_client.client_id()))`.
+    pub fn stage_rotation(&self, new_client: Arc<TwoMlsPqClient>) -> Result<()> {
+        let mut inner = self.inner.lock().map_err(|_| TwoMlsPqError::Mls)?;
+        inner.pending_new_client = Some(new_client);
+        Ok(())
+    }
+
+    /// Process a message forwarded from another of the user's own devices.
+    pub fn forwarded(&self, _header_decrypted: Vec<u8>) -> Result<Option<MlsSenderMessage>> {
+        Err(TwoMlsPqError::SessionNotReady)
+    }
+
+    pub fn should_listen_on(&self) -> Result<ListenChannels> {
+        Err(TwoMlsPqError::SessionNotReady)
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    #[ignore = "not yet implemented"]
-    fn test_initiate_stores_outbound_welcome() {}
+    use std::sync::Arc;
+
+    use super::TwoMlsPqSession;
+    use crate::{
+        assert_err, assert_ok, assert_some,
+        test_utils::{establish_sessions, make_client, make_combiner_kp},
+        AgentState, TwoMlsPqError,
+    };
 
     #[test]
-    #[ignore = "not yet implemented"]
-    fn test_accept_stores_outbound_welcome() {}
+    fn test_initiate_stores_outbound_welcome() {
+        let alice = make_client();
+        let bob = make_client();
+        let bob_kp = make_combiner_kp(&bob);
+        let session = assert_ok!(TwoMlsPqSession::initiate(alice, bob_kp));
+        assert!(session.pending_outbound().is_some());
+    }
 
     #[test]
-    #[ignore = "not yet implemented"]
-    fn test_pending_outbound_returns_none_after_take() {}
+    fn test_pending_outbound_returns_none_after_take() {
+        let alice = make_client();
+        let bob = make_client();
+        let bob_kp = make_combiner_kp(&bob);
+        let session = assert_ok!(TwoMlsPqSession::initiate(alice, bob_kp));
+        let first = session.pending_outbound();
+        let second = session.pending_outbound();
+        assert!(first.is_some());
+        assert!(second.is_none());
+    }
 
     #[test]
-    #[ignore = "not yet implemented"]
-    fn test_create_send_group_with_valid_keypackage_succeeds() {}
+    fn test_is_established_false_before_both_groups_ready() {
+        let alice = make_client();
+        let bob = make_client();
+        let bob_kp = make_combiner_kp(&bob);
+        let session = assert_ok!(TwoMlsPqSession::initiate(alice, bob_kp));
+        assert!(!session.is_established());
+    }
 
     #[test]
-    #[ignore = "not yet implemented"]
-    fn test_join_send_group_with_my_agent_succeeds() {}
+    fn test_accept_stores_outbound_welcome() {
+        let alice = make_client();
+        let bob = make_client();
+        let alice_kp = make_combiner_kp(&alice);
+        let bob_kp = make_combiner_kp(&bob);
+
+        let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp));
+        let apq_welcome_a = assert_some!(alice_session.pending_outbound());
+
+        let bob_session = assert_ok!(TwoMlsPqSession::accept(bob, apq_welcome_a, alice_kp));
+        assert!(bob_session.pending_outbound().is_some());
+    }
 
     #[test]
-    #[ignore = "not yet implemented"]
-    fn test_create_bound_send_group_classical_with_psk_succeeds() {}
+    fn test_full_establishment_sequence_combiner() {
+        let (alice_session, bob_session) = establish_sessions();
+        assert!(bob_session.is_established(), "bob should be established");
+        assert!(
+            alice_session.is_established(),
+            "alice should be established"
+        );
+    }
 
     #[test]
-    #[ignore = "not yet implemented"]
-    fn test_create_bound_send_group_xwing_with_psk_succeeds() {}
+    fn test_accept_with_invalid_welcome_bytes_returns_error() {
+        let alice = make_client();
+        let bob = make_client();
+        let alice_kp = make_combiner_kp(&alice);
+        assert_err!(
+            TwoMlsPqSession::accept(bob, vec![0xFF; 32], alice_kp),
+            TwoMlsPqError::Mls
+        );
+    }
 
     #[test]
-    #[ignore = "not yet implemented"]
-    fn test_prepare_to_encrypt_returns_proposal_hash() {}
+    fn test_session_id_is_same_from_both_sides() {
+        let alice = make_client();
+        let bob = make_client();
+        let alice_kp = make_combiner_kp(&alice);
+        let bob_kp = make_combiner_kp(&bob);
+
+        let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp));
+        let apq_welcome_a = assert_some!(alice_session.pending_outbound());
+
+        let bob_session = assert_ok!(TwoMlsPqSession::accept(
+            Arc::clone(&bob),
+            apq_welcome_a,
+            alice_kp
+        ));
+
+        assert_eq!(
+            alice_session.active_session_id().bytes,
+            bob_session.active_session_id().bytes,
+            "session IDs must match"
+        );
+    }
 
     #[test]
-    #[ignore = "not yet implemented"]
-    fn test_prepare_to_encrypt_did_commit_true_when_remote_proposal_staged() {}
+    fn test_prepare_to_encrypt_returns_proposal_hash() {
+        let (alice_session, _bob_session) = establish_sessions();
+        let result = assert_ok!(alice_session.prepare_to_encrypt(None));
+        assert!(!result.proposal_hash.digest.is_empty());
+        assert!(!result.did_commit);
+    }
 
     #[test]
-    #[ignore = "not yet implemented"]
-    fn test_encrypt_after_prepare_succeeds() {}
+    fn test_encrypt_after_prepare_succeeds() {
+        let (alice_session, _bob_session) = establish_sessions();
+        assert_ok!(alice_session.prepare_to_encrypt(None));
+        let result = assert_ok!(alice_session.encrypt(b"hello world".to_vec()));
+        assert!(!result.cipher_text.is_empty());
+        assert_eq!(result.sender, alice_session.my_agent_state().client_id());
+    }
 
     #[test]
-    #[ignore = "not yet implemented"]
-    fn test_process_incoming_app_message_returns_decrypt_result() {}
+    fn test_encrypt_double_call_after_single_prepare_returns_error() {
+        let (alice_session, _) = establish_sessions();
+        assert_ok!(alice_session.prepare_to_encrypt(None));
+        assert_ok!(alice_session.encrypt(b"first".to_vec()));
+        assert_err!(
+            alice_session.encrypt(b"second".to_vec()),
+            TwoMlsPqError::SessionNotReady
+        );
+    }
 
     #[test]
-    #[ignore = "not yet implemented"]
-    fn test_process_incoming_proposal_returns_none_until_queued() {}
+    fn test_process_incoming_app_message_returns_decrypt_result() {
+        let (alice_session, bob_session) = establish_sessions();
+
+        assert_ok!(alice_session.prepare_to_encrypt(None));
+        let enc = assert_ok!(alice_session.encrypt(b"secret".to_vec()));
+
+        let result = assert_some!(assert_ok!(bob_session.process_incoming(enc.cipher_text)));
+
+        let app_msg = assert_some!(result.application_message);
+        assert_eq!(app_msg.app_message_data, b"secret");
+        assert_eq!(
+            app_msg.sender_client_id,
+            alice_session.my_agent_state().client_id()
+        );
+    }
+
+    #[test]
+    fn test_process_incoming_garbage_bytes_returns_error() {
+        let (_, bob_session) = establish_sessions();
+        assert_err!(
+            bob_session.process_incoming(vec![0xDE, 0xAD, 0xBE, 0xEF]),
+            TwoMlsPqError::DecryptionFailed
+        );
+    }
+
+    #[test]
+    fn test_process_incoming_empty_bytes_returns_error() {
+        let (_, bob_session) = establish_sessions();
+        assert_err!(
+            bob_session.process_incoming(vec![]),
+            TwoMlsPqError::DecryptionFailed
+        );
+    }
+
+    #[test]
+    fn test_create_send_group_with_valid_keypackage_succeeds() {
+        let alice = make_client();
+        let bob = make_client();
+        let alice_kp = make_combiner_kp(&alice);
+        let bob_kp = make_combiner_kp(&bob);
+        let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp));
+        let welcome = assert_some!(alice_session.pending_outbound());
+        assert_ok!(TwoMlsPqSession::accept(bob, welcome, alice_kp));
+    }
+
+    #[test]
+    fn test_join_send_group_with_my_agent_succeeds() {
+        let alice = make_client();
+        let bob = make_client();
+        let alice_kp = make_combiner_kp(&alice);
+        let bob_kp = make_combiner_kp(&bob);
+        let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp));
+        let welcome = assert_some!(alice_session.pending_outbound());
+        let bob_session = assert_ok!(TwoMlsPqSession::accept(Arc::clone(&bob), welcome, alice_kp));
+        assert!(bob_session.has_receive_group());
+        assert!(bob_session.is_established());
+    }
+
+    #[test]
+    fn test_create_bound_send_group_classical_with_psk_succeeds() {
+        let (alice_session, bob_session) = establish_sessions();
+        assert!(alice_session.receive_group_id().is_some());
+        assert!(bob_session.receive_group_id().is_some());
+    }
+
+    #[test]
+    #[cfg(feature = "cryptokit")]
+    fn test_create_bound_send_group_ml_kem_768_with_psk_succeeds() {
+        let (alice_session, bob_session) = establish_sessions();
+        assert!(alice_session.is_established());
+        assert!(bob_session.is_established());
+    }
+
+    #[test]
+    fn test_from_archive_returns_archive_invalid() {
+        let client = make_client();
+        assert_err!(
+            TwoMlsPqSession::from_archive(crate::Archive { bytes: vec![] }, client),
+            TwoMlsPqError::ArchiveInvalid
+        );
+    }
+
+    #[test]
+    fn test_archive_returns_archive_invalid() {
+        let (alice_session, _) = establish_sessions();
+        assert_err!(alice_session.archive(), TwoMlsPqError::ArchiveInvalid);
+    }
+
+    #[test]
+    fn test_send_rendezvous_returns_session_not_ready() {
+        let (alice_session, _) = establish_sessions();
+        assert_err!(
+            alice_session.send_rendezvous(),
+            TwoMlsPqError::SessionNotReady
+        );
+    }
+
+    #[test]
+    fn test_should_listen_on_returns_session_not_ready() {
+        let (alice_session, _) = establish_sessions();
+        assert_err!(
+            alice_session.should_listen_on(),
+            TwoMlsPqError::SessionNotReady
+        );
+    }
+
+    #[test]
+    fn test_forwarded_returns_session_not_ready() {
+        let (alice_session, _) = establish_sessions();
+        assert_err!(
+            alice_session.forwarded(vec![]),
+            TwoMlsPqError::SessionNotReady
+        );
+    }
+
+    #[test]
+    fn test_queue_proposal_stages_for_next_ratchet() {
+        let (alice_session, bob_session) = establish_sessions();
+
+        assert_ok!(bob_session.prepare_to_encrypt(None));
+        let enc = assert_ok!(bob_session.encrypt(b"hello from bob".to_vec()));
+        let result = assert_some!(assert_ok!(alice_session.process_incoming(enc.cipher_text)));
+        let proposal = assert_some!(result.proposal);
+
+        assert_ok!(alice_session.queue_proposal(proposal.digest));
+        let prep = assert_ok!(alice_session.prepare_to_encrypt(None));
+
+        assert!(prep.did_commit, "should commit after queued proposal");
+        assert!(prep.committed_remote_client_id.is_some());
+    }
+
+    #[test]
+    fn test_prepare_to_encrypt_did_commit_true_when_remote_proposal_staged() {
+        let (alice_session, bob_session) = establish_sessions();
+
+        assert_ok!(bob_session.prepare_to_encrypt(None));
+        let enc = assert_ok!(bob_session.encrypt(b"proposal msg".to_vec()));
+        let result = assert_some!(assert_ok!(alice_session.process_incoming(enc.cipher_text)));
+        assert_ok!(alice_session.queue_proposal(assert_some!(result.proposal).digest));
+
+        assert_ok!(alice_session.prepare_to_encrypt(None));
+        let enc = assert_ok!(alice_session.encrypt(b"reply".to_vec()));
+
+        let result = assert_some!(assert_ok!(bob_session.process_incoming(enc.cipher_text)));
+
+        let app = assert_some!(result.application_message);
+        assert_eq!(app.app_message_data, b"reply");
+        let commit = assert_some!(result.remote_commit);
+        assert!(
+            commit.new_sender.is_none(),
+            "no rotation, new_sender should be None"
+        );
+    }
+
+    #[test]
+    fn test_process_incoming_proposal_returns_none_until_queued() {
+        let (alice_session, bob_session) = establish_sessions();
+
+        assert_ok!(alice_session.prepare_to_encrypt(None));
+        let enc = assert_ok!(alice_session.encrypt(b"proposal".to_vec()));
+        let result = assert_some!(assert_ok!(bob_session.process_incoming(enc.cipher_text)));
+        let proposal = assert_some!(result.proposal);
+
+        let prep = assert_ok!(bob_session.prepare_to_encrypt(None));
+        assert!(!prep.did_commit, "no commit before queue_proposal");
+
+        let partial = assert_ok!(bob_session.encrypt(b"no-commit".to_vec()));
+        assert_some!(assert_ok!(
+            alice_session.process_incoming(partial.cipher_text)
+        ));
+
+        assert_ok!(bob_session.queue_proposal(proposal.digest));
+        let prep2 = assert_ok!(bob_session.prepare_to_encrypt(None));
+        assert!(prep2.did_commit, "must commit after queue_proposal");
+    }
 
     #[test]
     #[ignore = "not yet implemented"]
     fn test_process_incoming_returns_none_on_rejoin_needed() {}
 
     #[test]
-    #[ignore = "not yet implemented"]
-    fn test_queue_proposal_stages_for_next_ratchet() {}
+    fn test_session_id_differs_for_different_pairs() {
+        let alice = make_client();
+        let bob = make_client();
+        let carol = make_client();
+        let bob_kp = make_combiner_kp(&bob);
+        let carol_kp = make_combiner_kp(&carol);
+
+        let alice_bob = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp));
+        let alice_carol = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), carol_kp));
+
+        assert_ne!(
+            alice_bob.active_session_id().bytes,
+            alice_carol.active_session_id().bytes,
+            "different peer pairs must produce different session IDs"
+        );
+    }
 
     #[test]
-    #[ignore = "not yet implemented"]
-    fn test_session_id_is_same_from_both_sides() {}
+    #[cfg(feature = "cryptokit")]
+    fn test_full_establishment_sequence_ml_kem_768() {
+        let (alice_session, bob_session) = establish_sessions();
+        assert!(alice_session.is_established());
+        assert!(bob_session.is_established());
 
-    #[test]
-    #[ignore = "not yet implemented"]
-    fn test_session_id_differs_for_different_pairs() {}
-
-    #[test]
-    #[ignore = "not yet implemented"]
-    fn test_is_established_false_before_both_groups_ready() {}
-
-    #[test]
-    #[ignore = "not yet implemented"]
-    fn test_full_establishment_sequence_combiner() {}
-
-    #[test]
-    #[ignore = "not yet implemented"]
-    fn test_full_establishment_sequence_xwing() {}
+        assert_ok!(alice_session.prepare_to_encrypt(None));
+        let enc = assert_ok!(alice_session.encrypt(b"pq hello".to_vec()));
+        let result = assert_some!(assert_ok!(bob_session.process_incoming(enc.cipher_text)));
+        let app = assert_some!(result.application_message);
+        assert_eq!(app.app_message_data, b"pq hello");
+        assert_eq!(
+            app.sender_client_id,
+            alice_session.my_agent_state().client_id()
+        );
+    }
 
     #[test]
     #[ignore = "not yet implemented"]
     fn test_concurrent_sessions_same_did_pair_both_valid() {}
 
     #[test]
-    #[ignore = "not yet implemented"]
-    fn test_agent_rotation_migrates_session_to_new_agent() {}
+    fn test_agent_rotation_migrates_session_to_new_agent() {
+        let (alice_session, bob_session) = establish_sessions();
+
+        let new_alice = make_client();
+        let new_alice_id = new_alice.client_id();
+
+        assert_ok!(alice_session.stage_rotation(Arc::clone(&new_alice)));
+        let prep = assert_ok!(alice_session.prepare_to_encrypt(Some(new_alice_id.clone())));
+        assert!(prep.did_commit);
+
+        let enc = assert_ok!(alice_session.encrypt(b"rotated".to_vec()));
+        let result = assert_some!(assert_ok!(bob_session.process_incoming(enc.cipher_text)));
+
+        let commit = assert_some!(result.remote_commit);
+        assert_eq!(
+            assert_some!(commit.new_sender),
+            new_alice_id,
+            "Bob must observe Alice's new identity"
+        );
+        assert_eq!(
+            assert_some!(result.application_message).app_message_data,
+            b"rotated"
+        );
+        assert_eq!(bob_session.their_agent_state().client_id(), new_alice_id);
+    }
+
+    #[test]
+    fn test_agent_rotation_resolves_pending_state_after_peer_reply() {
+        let (alice_session, bob_session) = establish_sessions();
+
+        let new_alice = make_client();
+        let new_alice_id = new_alice.client_id();
+
+        assert_ok!(alice_session.stage_rotation(Arc::clone(&new_alice)));
+        assert_ok!(alice_session.prepare_to_encrypt(Some(new_alice_id.clone())));
+        let enc = assert_ok!(alice_session.encrypt(b"rotation".to_vec()));
+        assert_some!(assert_ok!(bob_session.process_incoming(enc.cipher_text)));
+
+        // Alice's state is Pending until she receives a message from Bob.
+        assert!(matches!(
+            alice_session.my_agent_state(),
+            AgentState::Pending { .. }
+        ));
+
+        // Bob replies; Alice's state must resolve to Sync { new }.
+        assert_ok!(bob_session.prepare_to_encrypt(None));
+        let reply = assert_ok!(bob_session.encrypt(b"ack".to_vec()));
+        assert_some!(assert_ok!(alice_session.process_incoming(reply.cipher_text)));
+
+        assert!(
+            matches!(alice_session.my_agent_state(), AgentState::Sync { .. }),
+            "Pending must resolve to Sync after peer reply"
+        );
+        assert_eq!(alice_session.my_agent_state().client_id(), new_alice_id);
+    }
+
+    #[test]
+    fn test_prepare_to_encrypt_rotation_without_stage_rotation_returns_error() {
+        let (alice_session, _) = establish_sessions();
+        let new_alice = make_client();
+        assert_err!(
+            alice_session.prepare_to_encrypt(Some(new_alice.client_id())),
+            TwoMlsPqError::SessionNotReady
+        );
+    }
+
+    // --- Gap 1: PSK refresh on full commit ---
+
+    #[test]
+    fn test_full_commit_advances_send_group_epoch() {
+        let (alice_session, bob_session) = establish_sessions();
+
+        assert_ok!(bob_session.prepare_to_encrypt(None));
+        let enc = assert_ok!(bob_session.encrypt(b"proposal".to_vec()));
+        let result = assert_some!(assert_ok!(alice_session.process_incoming(enc.cipher_text)));
+        assert_ok!(alice_session.queue_proposal(assert_some!(result.proposal).digest));
+
+        assert_ok!(alice_session.prepare_to_encrypt(None));
+        let enc = assert_ok!(alice_session.encrypt(b"after commit".to_vec()));
+
+        let result = assert_some!(assert_ok!(bob_session.process_incoming(enc.cipher_text)));
+        let app = assert_some!(result.application_message);
+        assert_eq!(app.app_message_data, b"after commit");
+        assert!(app.epoch > 1, "send epoch must advance after full commit");
+    }
+
+    #[test]
+    fn test_full_commit_enables_continued_messaging_after_psk_refresh() {
+        let (alice_session, bob_session) = establish_sessions();
+
+        assert_ok!(bob_session.prepare_to_encrypt(None));
+        let enc = assert_ok!(bob_session.encrypt(b"proposal".to_vec()));
+        let result = assert_some!(assert_ok!(alice_session.process_incoming(enc.cipher_text)));
+        assert_ok!(alice_session.queue_proposal(assert_some!(result.proposal).digest));
+        assert_ok!(alice_session.prepare_to_encrypt(None));
+        let enc = assert_ok!(alice_session.encrypt(b"msg1".to_vec()));
+        assert_some!(assert_ok!(bob_session.process_incoming(enc.cipher_text)));
+
+        assert_ok!(alice_session.prepare_to_encrypt(None));
+        let enc = assert_ok!(alice_session.encrypt(b"msg2".to_vec()));
+        let result = assert_some!(assert_ok!(bob_session.process_incoming(enc.cipher_text)));
+        assert_eq!(
+            assert_some!(result.application_message).app_message_data,
+            b"msg2"
+        );
+
+        assert_ok!(bob_session.prepare_to_encrypt(None));
+        let enc = assert_ok!(bob_session.encrypt(b"reply".to_vec()));
+        let result = assert_some!(assert_ok!(alice_session.process_incoming(enc.cipher_text)));
+        assert_eq!(
+            assert_some!(result.application_message).app_message_data,
+            b"reply"
+        );
+    }
+
+    // --- Gap 2: recv-group self-Update on partial commit ---
+
+    #[test]
+    fn test_partial_commit_recv_advances_send_group_on_peer() {
+        let (alice_session, bob_session) = establish_sessions();
+
+        assert_ok!(alice_session.prepare_to_encrypt(None));
+        let enc = assert_ok!(alice_session.encrypt(b"partial".to_vec()));
+
+        let result = assert_some!(assert_ok!(bob_session.process_incoming(enc.cipher_text)));
+        assert_eq!(
+            assert_some!(result.application_message).app_message_data,
+            b"partial"
+        );
+    }
+
+    #[test]
+    fn test_partial_commit_followed_by_bob_send_still_decrypts() {
+        let (alice_session, bob_session) = establish_sessions();
+
+        assert_ok!(alice_session.prepare_to_encrypt(None));
+        let enc = assert_ok!(alice_session.encrypt(b"step1".to_vec()));
+        assert_some!(assert_ok!(bob_session.process_incoming(enc.cipher_text)));
+
+        assert_ok!(bob_session.prepare_to_encrypt(None));
+        let enc = assert_ok!(bob_session.encrypt(b"step2".to_vec()));
+        let result = assert_some!(assert_ok!(alice_session.process_incoming(enc.cipher_text)));
+        assert_eq!(
+            assert_some!(result.application_message).app_message_data,
+            b"step2"
+        );
+    }
 
     #[test]
     #[ignore = "not yet implemented"]
     fn test_welcome_stapled_in_first_round_only() {}
 
     #[test]
-    #[ignore = "not yet implemented"]
+    #[ignore = "archive() is not yet implemented"]
     fn test_archive_round_trips_session_state() {}
 
     #[test]
-    #[ignore = "not yet implemented"]
+    #[ignore = "should_listen_on() is not yet implemented"]
     fn test_should_listen_on_returns_correct_group_and_epochs() {}
 
     #[test]
-    #[ignore = "not yet implemented"]
-    fn test_psk_export_uses_correct_label_and_context() {}
+    #[ignore = "forwarded() is not yet implemented"]
+    fn test_forwarded_decrypts_inner_payload() {}
+
+    #[test]
+    #[ignore = "send_rendezvous() is not yet implemented"]
+    fn test_send_rendezvous_returns_current_epoch_channel() {}
+
+    #[test]
+    fn test_psk_export_uses_correct_label_and_context() {
+        let alice = make_client();
+        let bob = make_client();
+        let bob_kp = make_combiner_kp(&bob);
+
+        let (group, _) = assert_ok!(super::create_group_with_member(
+            alice.classical(),
+            &bob_kp.classical,
+            None
+        ));
+
+        let s1 = assert_ok!(group.export_secret(b"exportSecret", b"derive", 32));
+        let s2 = assert_ok!(group.export_secret(b"exportSecret", b"derive", 32));
+        assert_eq!(s1.as_bytes(), s2.as_bytes());
+        assert_eq!(s1.as_bytes().len(), 32);
+
+        let other = assert_ok!(group.export_secret(b"otherLabel", b"derive", 32));
+        assert_ne!(s1.as_bytes(), other.as_bytes());
+
+        let psk_id = assert_ok!(super::export_and_register_psk(&group, &alice));
+        let expected_id = {
+            let mut v = group.current_epoch().to_le_bytes().to_vec();
+            v.extend_from_slice(group.group_id());
+            mls_rs::psk::ExternalPskId::new(v)
+        };
+        assert_eq!(psk_id, expected_id);
+    }
+
+    // --- Accessor tests ---
+
+    #[test]
+    fn test_prepare_to_encrypt_before_established_returns_error() {
+        let alice = make_client();
+        let bob = make_client();
+        let bob_kp = make_combiner_kp(&bob);
+        let session = assert_ok!(TwoMlsPqSession::initiate(alice, bob_kp));
+        assert_err!(
+            session.prepare_to_encrypt(None),
+            TwoMlsPqError::SessionNotReady
+        );
+    }
+
+    #[test]
+    fn test_prepare_to_encrypt_rotation_client_id_mismatch_returns_error() {
+        let (alice_session, _) = establish_sessions();
+        let new_alice = make_client();
+        let other = make_client();
+        assert_ok!(alice_session.stage_rotation(Arc::clone(&new_alice)));
+        assert_err!(
+            alice_session.prepare_to_encrypt(Some(other.client_id())),
+            TwoMlsPqError::SessionNotReady
+        );
+    }
+
+    #[test]
+    fn test_encrypt_without_prepare_returns_session_not_ready() {
+        let (alice_session, _) = establish_sessions();
+        assert_err!(
+            alice_session.encrypt(b"no prepare".to_vec()),
+            TwoMlsPqError::SessionNotReady
+        );
+    }
+
+    #[test]
+    fn test_receive_group_id_none_before_recv_group() {
+        let alice = make_client();
+        let bob = make_client();
+        let bob_kp = make_combiner_kp(&bob);
+        let session = assert_ok!(TwoMlsPqSession::initiate(alice, bob_kp));
+        assert!(session.receive_group_id().is_none());
+    }
+
+    #[test]
+    fn test_receive_group_id_some_after_established() {
+        let (alice_session, bob_session) = establish_sessions();
+        assert!(alice_session.receive_group_id().is_some());
+        assert!(bob_session.receive_group_id().is_some());
+    }
+
+    #[test]
+    fn test_has_receive_group_false_for_initiator_before_welcome() {
+        let alice = make_client();
+        let bob = make_client();
+        let bob_kp = make_combiner_kp(&bob);
+        let session = assert_ok!(TwoMlsPqSession::initiate(alice, bob_kp));
+        assert!(!session.has_receive_group());
+    }
+
+    #[test]
+    fn test_has_receive_group_true_for_acceptor_immediately() {
+        let alice = make_client();
+        let bob = make_client();
+        let alice_kp = make_combiner_kp(&alice);
+        let bob_kp = make_combiner_kp(&bob);
+        let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp));
+        let welcome = assert_some!(alice_session.pending_outbound());
+        let bob_session = assert_ok!(TwoMlsPqSession::accept(bob, welcome, alice_kp));
+        assert!(bob_session.has_receive_group());
+    }
+
+    #[test]
+    fn test_proposal_context_none_before_recv_group() {
+        let alice = make_client();
+        let bob = make_client();
+        let bob_kp = make_combiner_kp(&bob);
+        let session = assert_ok!(TwoMlsPqSession::initiate(alice, bob_kp));
+        assert!(session.proposal_context().is_none());
+    }
+
+    #[test]
+    fn test_proposal_context_some_after_established() {
+        let (alice_session, bob_session) = establish_sessions();
+        let alice_ctx = assert_some!(alice_session.proposal_context());
+        let bob_ctx = assert_some!(bob_session.proposal_context());
+        assert!(!alice_ctx.digest.is_empty());
+        assert!(!bob_ctx.digest.is_empty());
+    }
+
+    #[test]
+    fn test_my_agent_state_initial_is_sync() {
+        let alice = make_client();
+        let alice_id = alice.client_id();
+        let bob = make_client();
+        let bob_kp = make_combiner_kp(&bob);
+        let session = assert_ok!(TwoMlsPqSession::initiate(alice, bob_kp));
+        assert!(matches!(session.my_agent_state(), AgentState::Sync { .. }));
+        assert_eq!(session.my_agent_state().client_id(), alice_id);
+    }
+
+    #[test]
+    fn test_my_agent_state_becomes_pending_after_rotation_commit() {
+        let (alice_session, _) = establish_sessions();
+        let new_alice = make_client();
+        let new_id = new_alice.client_id();
+        assert_ok!(alice_session.stage_rotation(Arc::clone(&new_alice)));
+        assert_ok!(alice_session.prepare_to_encrypt(Some(new_id.clone())));
+        assert!(matches!(
+            alice_session.my_agent_state(),
+            AgentState::Pending { .. }
+        ));
+    }
+
+    // --- Partial commit tests ---
+
+    #[test]
+    fn test_partial_commit_surfaces_proposal_nonce() {
+        let (alice_session, bob_session) = establish_sessions();
+
+        assert_ok!(alice_session.prepare_to_encrypt(None));
+        let enc = assert_ok!(alice_session.encrypt(b"with nonce".to_vec()));
+        let result = assert_some!(assert_ok!(bob_session.process_incoming(enc.cipher_text)));
+
+        let proposal = assert_some!(result.proposal);
+        assert!(!proposal.digest.digest.is_empty());
+        assert_eq!(proposal.sender, alice_session.my_agent_state().client_id());
+    }
+
+    #[test]
+    fn test_multiple_sequential_partial_commits_stay_in_sync() {
+        let (alice_session, bob_session) = establish_sessions();
+
+        for i in 0..3u8 {
+            let msg = vec![i];
+            assert_ok!(alice_session.prepare_to_encrypt(None));
+            let enc = assert_ok!(alice_session.encrypt(msg.clone()));
+            let result = assert_some!(assert_ok!(bob_session.process_incoming(enc.cipher_text)));
+            assert_eq!(
+                assert_some!(result.application_message).app_message_data,
+                msg
+            );
+        }
+    }
+
+    #[test]
+    fn test_full_commit_after_multiple_partial_commits() {
+        let (alice_session, bob_session) = establish_sessions();
+
+        for _ in 0..2 {
+            assert_ok!(alice_session.prepare_to_encrypt(None));
+            let enc = assert_ok!(alice_session.encrypt(b"partial".to_vec()));
+            assert_some!(assert_ok!(bob_session.process_incoming(enc.cipher_text)));
+        }
+
+        assert_ok!(bob_session.prepare_to_encrypt(None));
+        let enc = assert_ok!(bob_session.encrypt(b"propose".to_vec()));
+        let result = assert_some!(assert_ok!(alice_session.process_incoming(enc.cipher_text)));
+        assert_ok!(alice_session.queue_proposal(assert_some!(result.proposal).digest));
+
+        assert_ok!(alice_session.prepare_to_encrypt(None));
+        let enc = assert_ok!(alice_session.encrypt(b"full".to_vec()));
+        let result = assert_some!(assert_ok!(bob_session.process_incoming(enc.cipher_text)));
+        assert_eq!(
+            assert_some!(result.application_message).app_message_data,
+            b"full"
+        );
+        assert_some!(result.remote_commit);
+    }
+
+    #[test]
+    fn test_bob_to_alice_full_commit_cycle() {
+        let (alice_session, bob_session) = establish_sessions();
+
+        assert_ok!(alice_session.prepare_to_encrypt(None));
+        let enc = assert_ok!(alice_session.encrypt(b"propose".to_vec()));
+        let result = assert_some!(assert_ok!(bob_session.process_incoming(enc.cipher_text)));
+
+        assert_ok!(bob_session.queue_proposal(assert_some!(result.proposal).digest));
+        assert_ok!(bob_session.prepare_to_encrypt(None));
+        let enc = assert_ok!(bob_session.encrypt(b"full".to_vec()));
+
+        let result = assert_some!(assert_ok!(alice_session.process_incoming(enc.cipher_text)));
+        assert_eq!(
+            assert_some!(result.application_message).app_message_data,
+            b"full"
+        );
+        assert_some!(result.remote_commit);
+    }
+
+    // --- Wire format tests ---
+
+    #[test]
+    fn test_decode_apq_welcome_truncated_returns_error() {
+        assert_err!(
+            super::decode_apq_welcome(&[super::APQ_TAG]),
+            TwoMlsPqError::Mls
+        );
+    }
+
+    #[test]
+    fn test_decode_bundled_truncated_returns_error() {
+        assert_err!(
+            super::decode_bundled(&[super::BUNDLED_TAG]),
+            TwoMlsPqError::Mls
+        );
+    }
+
+    #[test]
+    fn test_decode_partial_truncated_returns_error() {
+        assert_err!(
+            super::decode_partial(&[super::PARTIAL_TAG]),
+            TwoMlsPqError::Mls
+        );
+    }
+
+    #[test]
+    fn test_decode_full_bundle_truncated_returns_error() {
+        assert_err!(
+            super::decode_full_bundle(&[super::FULL_BUNDLE_TAG]),
+            TwoMlsPqError::Mls
+        );
+    }
+
+    #[test]
+    fn test_decode_full_bundle_trailing_bytes_returns_error() {
+        let mut good = super::encode_full_bundle(b"sc".to_vec(), b"rc".to_vec(), b"app".to_vec());
+        good.push(0xFF);
+        assert_err!(super::decode_full_bundle(&good), TwoMlsPqError::Mls);
+    }
+
+    #[test]
+    fn test_encode_decode_apq_welcome_roundtrip() {
+        let classical = b"classical-welcome".to_vec();
+        let pq = b"pq-welcome".to_vec();
+        let encoded = super::encode_apq_welcome(classical.clone(), pq.clone());
+        let (dec_classical, dec_pq) = assert_ok!(super::decode_apq_welcome(&encoded));
+        assert_eq!(dec_classical, classical);
+        assert_eq!(dec_pq, pq);
+    }
+
+    #[test]
+    fn test_encode_decode_bundled_roundtrip() {
+        let commit = b"commit-bytes".to_vec();
+        let app = b"app-bytes".to_vec();
+        let encoded = super::encode_bundled(commit.clone(), app.clone());
+        let (dec_commit, dec_app) = assert_ok!(super::decode_bundled(&encoded));
+        assert_eq!(dec_commit, commit);
+        assert_eq!(dec_app, app);
+    }
+
+    #[test]
+    fn test_encode_decode_full_bundle_roundtrip() {
+        let sc = b"send-commit".to_vec();
+        let rc = b"recv-commit".to_vec();
+        let app = b"app-data".to_vec();
+        let encoded = super::encode_full_bundle(sc.clone(), rc.clone(), app.clone());
+        let (dec_sc, dec_rc, dec_app) = assert_ok!(super::decode_full_bundle(&encoded));
+        assert_eq!(dec_sc, sc);
+        assert_eq!(dec_rc, rc);
+        assert_eq!(dec_app, app);
+    }
+
+    #[test]
+    fn test_process_incoming_bundled_malformed_returns_error() {
+        let (alice_session, _) = establish_sessions();
+        let fake = super::encode_bundled(b"junk".to_vec(), b"junk".to_vec());
+        assert_err!(
+            alice_session.process_incoming(fake),
+            TwoMlsPqError::DecryptionFailed
+        );
+    }
 }
