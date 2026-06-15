@@ -23,3 +23,10 @@ test:
 
 build-ios:
     bash scripts/buildIos.sh
+
+# Requires `cargo install mdbook` (and optionally mdbook-mermaid; see book/book.toml).
+book:
+    mdbook build two-mls-pq/book
+
+book-serve:
+    mdbook serve two-mls-pq/book
