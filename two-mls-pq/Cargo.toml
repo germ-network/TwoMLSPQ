@@ -55,3 +55,8 @@ required-features = ["benchmark_util"]
 harness = false
 name = "messaging"
 required-features = ["benchmark_util"]
+
+[[bench]]
+harness = false
+name = "sizes"
+required-features = ["benchmark_util"]
