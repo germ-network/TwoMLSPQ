@@ -35,7 +35,9 @@ fn main() {
     bob_s.prepare_to_encrypt(None).unwrap();
     let prop = bob_s.encrypt(b"proposal".to_vec()).unwrap();
     let res = alice_s.process_incoming(prop.cipher_text).unwrap().unwrap();
-    alice_s.queue_proposal(res.proposal.unwrap().digest).unwrap();
+    alice_s
+        .queue_proposal(res.proposal.unwrap().digest)
+        .unwrap();
     alice_s.prepare_to_encrypt(None).unwrap();
     let full = alice_s.encrypt(payload.to_vec()).unwrap().cipher_text;
     bob_s.process_incoming(full.clone()).unwrap();
