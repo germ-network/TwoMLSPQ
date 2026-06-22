@@ -8,22 +8,75 @@
 import CommProtocol
 import Foundation
 
+public protocol Archivable {
+	associatedtype Archive: Codable, Sendable
+	
+	init(archive: Archive) throws
+	var archive: Archive { get throws }
+}
+
 //abstracts the TwoMLS API surface that PersistedTwoMLS depends on,
 //so that we can sub out different implementations (classical to PQ)
 public enum AbstractTwoMLS {
 	public typealias ClientID = Data
 	public typealias GroupID = Data
+	
+	public typealias RawSuites = UInt16
+	
 	//should be 32 bytes
 	public typealias RendezvousID = Data
+	
+	public protocol Client {
+		associatedtype Invitation: AbstractTwoMLS.Invitation where Invitation.Client == Self
+		
+		init(clientId: ClientID) throws
+		
+		func makeInvitation() throws -> Invitation.Archive
+		
+		static func parseKeyPackageSuite(encoded: Data) -> RawSuites
+		
+		static var supportedSuites: [RawSuites] { get }
+		
+		//two-step reply
+		//first step, sets up a send group from a remote keyPackage
+		func reply(keyPackageMessage: Data) throws -> (
+			sendGroupArchive: Invitation.Session.Archive,
+			welcomeMessage: Data,
+			//to form the com
+			myKeyPackage: Data
+		)
+		
+		//using the output of the above to form an AppWelcome, can then package
+		//and encrypt the AppWelcome to the remote
+		func createTwoMLSGroup(
+			remoteAgentId: ClientID,
+			mySendGroupArchive: Invitation.Session.Archive,
+			//extract the leaf node HPKE key to encrypt the initial message
+			theirKeyPackageMessage: Data,
+			appWelcome: Data
+		) throws -> (
+			Invitation.Session.Archive,
+			encryptedCombinedWelcome: Data
+		)
+	}
+	
+	//object backing one keyPackage
+	public protocol Invitation: Archivable {
+		associatedtype Client: AbstractTwoMLS.Client where Client.Invitation == Self
+		associatedtype Session: AbstractTwoMLS.Session where Session.Invitation == Self
+		
+		init(clientId: ClientID) throws
+		var clientId: ClientID { get }
+		var encodedKeyPackage: Data { get }
+	}
 
-	public protocol Session {
+	public protocol Session: Archivable {
+		associatedtype Invitation: AbstractTwoMLS.Invitation where Invitation.Session == Self
+		
 		var proposalContext: TypedDigest? { get }
 		//this is an exported secret with width 32 bytes
 		var sendRendezvous: RendezvousID? { get throws }
 
-		associatedtype Archive: Codable, Sendable
-		init(archive: Archive) throws
-		var archive: Archive { get throws }
 
 		associatedtype PrepareEncryptResult: PrepareEncryptResultProtocol
 		func prepareToEncrypt(
