@@ -26,7 +26,7 @@ let package = Package(
 			name: "AbstractTwoMLS",
 			dependencies: [
 				"MLSrs",
-				.product(name: "CommProtocol", package: "autonomous-comm-protocol")
+				.product(name: "CommProtocol", package: "autonomous-comm-protocol"),
 			]
 		),
 		.binaryTarget(
