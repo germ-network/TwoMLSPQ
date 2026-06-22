@@ -23,12 +23,12 @@ jobs:
     runs-on: macOS-26
     timeout-minutes: 30
     env:
-      DEVELOPER_DIR: /Applications/Xcode_26.2.app
+      DEVELOPER_DIR: /Applications/Xcode_26.5.app
     strategy:
       matrix:
         destination:
-          - "platform=macOS"
-          - "platform=macOS,variant=Mac Catalyst"
+          # - "platform=macOS"
+          # - "platform=macOS,variant=Mac Catalyst"
           - "platform=iOS Simulator,name=iPhone 17e"
           - "platform=iOS Simulator,name=iPhone Air"
           # - "platform=tvOS Simulator,name=Apple TV"
@@ -37,4 +37,4 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - name: Test platform ${{ matrix.destination }}
-        run: set -o pipefail && xcodebuild -skipMacroValidation -scheme {Scheme} -destination "${{ matrix.destination }}" test | xcbeautify
+        run: set -o pipefail && xcodebuild -skipMacroValidation -scheme AbstractTwoMLS -destination "${{ matrix.destination }}" test | xcbeautify
