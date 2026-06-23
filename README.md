@@ -39,24 +39,29 @@ Or via the justfile:
 just bindgen
 ```
 
-## CryptoKit / ML-KEM-768 tests (macOS)
+## CryptoKit / ML-KEM-768 tests (macOS 26+)
 
-The `cryptokit` feature enables real ML-KEM-768 (FIPS 203) session tests backed by
-`mls-rs-crypto-awslc` with the `post-quantum` feature. Run on macOS:
+The `cryptokit` feature enables real ML-KEM-768 (FIPS 203) session tests, with the
+post-quantum half backed by Apple CryptoKit's native `MLKEM768` (via
+`mls-rs-crypto-cryptokit`, `post-quantum` feature); the classical half stays on
+RustCrypto. CryptoKit's ML-KEM primitives require **iOS 26 / macOS 26**, so the
+feature builds and runs only on a macOS 26+ host with the matching Xcode toolchain
+(it links a Swift bridge and is not cross-platform):
 
 ```sh
 cargo test -p two-mls-pq --features cryptokit
 ```
 
 This tests:
-- ML-KEM-768 key package generation via `AwsLcCryptoProvider`
+- ML-KEM-768 key package generation via `CryptoKitMlKemProvider`
 - Full APQ/Combiner session establishment with PQ groups using the real ML-KEM-768 cipher suite (0xFDEA)
 - Encrypt/decrypt through PQ groups
 - PSK chaining between classical and PQ group halves
 - Agent rotation through PQ groups
 
-The production iOS path (CryptoKit native `MLKEM768`) lives in the `mls-rs-crypto-cryptokit`
-fork at `mls-rs-crypto-cryptokit/src/ml_kem.rs` and requires iOS 26 / macOS 26.
+The CryptoKit ML-KEM provider lives in the `mls-rs-crypto-cryptokit` fork at
+`mls-rs-crypto-cryptokit/src/ml_kem.rs`; deterministic key derivation (needed for MLS
+TreeKEM commits) bridges to `MLKEM768.PrivateKey(seedRepresentation:)`.
 
 ## iOS XCFramework
 

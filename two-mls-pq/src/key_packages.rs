@@ -12,7 +12,7 @@ use mls_rs::{
 use mls_rs_crypto_rustcrypto::RustCryptoProvider;
 
 #[cfg(feature = "cryptokit")]
-use mls_rs_crypto_awslc::AwsLcCryptoProvider;
+use mls_rs_crypto_cryptokit::CryptoKitMlKemProvider;
 
 use crate::{ClientId, MlsCipherSuite, Result, TwoMlsPqError};
 
@@ -23,7 +23,7 @@ pub(crate) type MlsClient = Client<OurConfig>;
 #[cfg(feature = "cryptokit")]
 pub(crate) type PqConfig = WithIdentityProvider<
     BasicIdentityProvider,
-    WithCryptoProvider<AwsLcCryptoProvider, BaseConfig>,
+    WithCryptoProvider<CryptoKitMlKemProvider, BaseConfig>,
 >;
 #[cfg(feature = "cryptokit")]
 pub(crate) type PqMlsClient = Client<PqConfig>;
@@ -51,7 +51,7 @@ fn build_pq_client(
     let credential = BasicCredential::new(public_key.as_ref().to_vec());
     let signing_identity = SigningIdentity::new(credential.into_credential(), public_key);
     client_builder::ClientBuilder::new()
-        .crypto_provider(AwsLcCryptoProvider::new())
+        .crypto_provider(CryptoKitMlKemProvider)
         .identity_provider(BasicIdentityProvider::new())
         .signing_identity(signing_identity, secret_key, suite)
         .build()
