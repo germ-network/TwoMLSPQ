@@ -503,7 +503,11 @@ fileprivate struct FfiConverterString: FfiConverter {
             return String()
         }
         let bytes = UnsafeBufferPointer<UInt8>(start: value.data!, count: Int(value.len))
-        return String(bytes: bytes, encoding: String.Encoding.utf8)!
+        // Use Swift's native UTF-8 decoder; `String(bytes:encoding:.utf8)` goes
+        // through Foundation's NSString and silently strips a leading U+FEFF BOM.
+        // Invalid UTF-8 substitutes U+FFFD instead of trapping (unreachable
+        // given Rust's `String` invariant).
+        return String(decoding: bytes, as: UTF8.self)
     }
 
     public static func lower(_ value: String) -> RustBuffer {
@@ -519,7 +523,8 @@ fileprivate struct FfiConverterString: FfiConverter {
 
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> String {
         let len: Int32 = try readInt(&buf)
-        return String(bytes: try readBytes(&buf, count: Int(len)), encoding: String.Encoding.utf8)!
+        // See `lift` above for why we avoid Foundation's NSString-backed decoder here.
+        return String(decoding: try readBytes(&buf, count: Int(len)), as: UTF8.self)
     }
 
     public static func write(_ value: String, into buf: inout [UInt8]) {
@@ -558,7 +563,7 @@ public protocol MlsCipherSuiteProtocol: AnyObject, Sendable {
     
     /**
      * True if this suite is the classical component of a Combiner pair (0x0003).
-     * When a key package with this suite is paired with an XWing key package,
+     * When a key package with this suite is paired with an ML-KEM-768 key package,
      * both belong to TwoMLS as a `CombinerKeyPackage` — do not route the classical
      * half to mls-rs-uniffi-ios independently.
      */
@@ -644,6 +649,16 @@ public convenience init(value: UInt16) {
 
     
     /**
+     * MLS_128_ML_KEM_768_AES128GCM_SHA256_Ed25519 (0xFDEA, FIPS 203)
+     */
+public static func mlKem768() -> MlsCipherSuite  {
+    return try!  FfiConverterTypeMlsCipherSuite_lift(try! rustCall() {
+    uniffi_two_mls_pq_fn_constructor_mlsciphersuite_ml_kem_768($0
+    )
+})
+}
+    
+    /**
      * MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519 (0x0001)
      */
 public static func x25519Aes128() -> MlsCipherSuite  {
@@ -663,21 +678,11 @@ public static func x25519Chacha() -> MlsCipherSuite  {
 })
 }
     
-    /**
-     * MLS_128_XWING_AES128GCM_SHA256_Ed25519 (0xFE4C, draft-mahy-mls-xwing-00)
-     */
-public static func xwing() -> MlsCipherSuite  {
-    return try!  FfiConverterTypeMlsCipherSuite_lift(try! rustCall() {
-    uniffi_two_mls_pq_fn_constructor_mlsciphersuite_xwing($0
-    )
-})
-}
-    
 
     
     /**
      * True if this suite is the classical component of a Combiner pair (0x0003).
-     * When a key package with this suite is paired with an XWing key package,
+     * When a key package with this suite is paired with an ML-KEM-768 key package,
      * both belong to TwoMLS as a `CombinerKeyPackage` — do not route the classical
      * half to mls-rs-uniffi-ios independently.
      */
@@ -776,7 +781,7 @@ public protocol TwoMlsPqClientProtocol: AnyObject, Sendable {
     func clientId()  -> ClientId
     
     /**
-     * Generate a paired classical (0x0003) + PQ (0xFE4C) key package bundle
+     * Generate a paired classical (0x0003) + PQ (0xFDEA) key package bundle
      * for use in the APQ/Combiner construction.
      */
     func generateCombinerKeyPackage() throws  -> CombinerKeyPackage
@@ -870,7 +875,7 @@ open func clientId() -> ClientId  {
 }
     
     /**
-     * Generate a paired classical (0x0003) + PQ (0xFE4C) key package bundle
+     * Generate a paired classical (0x0003) + PQ (0xFDEA) key package bundle
      * for use in the APQ/Combiner construction.
      */
 open func generateCombinerKeyPackage()throws  -> CombinerKeyPackage  {
@@ -945,19 +950,25 @@ public func FfiConverterTypeTwoMlsPqClient_lower(_ value: TwoMlsPqClient) -> UIn
 
 
 
+/**
+ * A TwoMLSPQ session holding two asymmetric Combiner send groups.
+ */
 public protocol TwoMlsPqSessionProtocol: AnyObject, Sendable {
     
     func activeSessionId()  -> SessionId
     
     func archive() throws  -> Archive
     
+    /**
+     * Encrypt `app_message` using the PQ send group.
+     * Must be called after `prepare_to_encrypt`; the pending proposal hash is used as
+     * authenticated data and cleared on return.
+     * When a commit was staged (did_commit: true), the output is a bundled commit+app message.
+     */
     func encrypt(appMessage: Data) throws  -> EncryptResult
     
     /**
      * Process a message forwarded from another of the user's own devices.
-     * The transport envelope has already been decrypted by the originating device;
-     * `header_decrypted` is the inner MLS payload. Returns `None` for non-application
-     * messages (proposals, commits) forwarded in error.
      */
     func forwarded(headerDecrypted: Data) throws  -> MlsSenderMessage?
     
@@ -973,12 +984,33 @@ public protocol TwoMlsPqSessionProtocol: AnyObject, Sendable {
      */
     func pendingOutbound()  -> Data?
     
-    func prepareToEncrypt(proposing: ClientId?) throws  -> PrepareEncryptResult?
+    /**
+     * Prepare a pending proposal nonce and stage it for binding into the next outbound message.
+     * Returns `Err(SessionNotReady)` until both groups are established.
+     *
+     * - `proposing: None` with a queued remote proposal → full commit (epoch advance + PSK refresh), `did_commit: true`
+     * - `proposing: Some(new_id)` → rotation commit with new leaf credential, `did_commit: true`
+     * - Otherwise → recv self-Update only, `did_commit: false`
+     */
+    func prepareToEncrypt(proposing: ClientId?) throws  -> PrepareEncryptResult
     
+    /**
+     * Process an incoming message.
+     *
+     * - APQWelcome (0x01) → join recv groups; `Ok(None)`
+     * - Rotation commit+app (0x03) → advance send epoch then decrypt; `DecryptResult`
+     * - Partial bundle (0x05) → advance send.pq then decrypt app; `DecryptResult`
+     * - Full bundle (0x07) → epoch advance + PSK refresh then decrypt; `DecryptResult`
+     * - MLS ciphertext → decrypt on recv_group.pq; `DecryptResult`
+     */
     func processIncoming(ciphertext: Data) throws  -> DecryptResult?
     
     func proposalContext()  -> TwoMlsPqDigest?
     
+    /**
+     * Accept a remote proposal for the next epoch advance.
+     * On the next `prepare_to_encrypt(None)` call, an empty commit will be staged.
+     */
     func queueProposal(digest: TwoMlsPqDigest) throws 
     
     func receiveGroupId()  -> CombinerGroupId?
@@ -987,9 +1019,18 @@ public protocol TwoMlsPqSessionProtocol: AnyObject, Sendable {
     
     func shouldListenOn() throws  -> ListenChannels
     
+    /**
+     * Register a new agent client for the next rotation commit.
+     * Call before `prepare_to_encrypt(Some(new_client.client_id()))`.
+     */
+    func stageRotation(newClient: TwoMlsPqClient) throws 
+    
     func theirAgentState()  -> AgentState
     
 }
+/**
+ * A TwoMLSPQ session holding two asymmetric Combiner send groups.
+ */
 open class TwoMlsPqSession: TwoMlsPqSessionProtocol, @unchecked Sendable {
     fileprivate let handle: UInt64
 
@@ -1098,6 +1139,12 @@ open func archive()throws  -> Archive  {
 })
 }
     
+    /**
+     * Encrypt `app_message` using the PQ send group.
+     * Must be called after `prepare_to_encrypt`; the pending proposal hash is used as
+     * authenticated data and cleared on return.
+     * When a commit was staged (did_commit: true), the output is a bundled commit+app message.
+     */
 open func encrypt(appMessage: Data)throws  -> EncryptResult  {
     return try  FfiConverterTypeEncryptResult_lift(try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
     uniffi_two_mls_pq_fn_method_twomlspqsession_encrypt(
@@ -1109,9 +1156,6 @@ open func encrypt(appMessage: Data)throws  -> EncryptResult  {
     
     /**
      * Process a message forwarded from another of the user's own devices.
-     * The transport envelope has already been decrypted by the originating device;
-     * `header_decrypted` is the inner MLS payload. Returns `None` for non-application
-     * messages (proposals, commits) forwarded in error.
      */
 open func forwarded(headerDecrypted: Data)throws  -> MlsSenderMessage?  {
     return try  FfiConverterOptionTypeMlsSenderMessage.lift(try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
@@ -1158,8 +1202,16 @@ open func pendingOutbound() -> Data?  {
 })
 }
     
-open func prepareToEncrypt(proposing: ClientId?)throws  -> PrepareEncryptResult?  {
-    return try  FfiConverterOptionTypePrepareEncryptResult.lift(try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
+    /**
+     * Prepare a pending proposal nonce and stage it for binding into the next outbound message.
+     * Returns `Err(SessionNotReady)` until both groups are established.
+     *
+     * - `proposing: None` with a queued remote proposal → full commit (epoch advance + PSK refresh), `did_commit: true`
+     * - `proposing: Some(new_id)` → rotation commit with new leaf credential, `did_commit: true`
+     * - Otherwise → recv self-Update only, `did_commit: false`
+     */
+open func prepareToEncrypt(proposing: ClientId?)throws  -> PrepareEncryptResult  {
+    return try  FfiConverterTypePrepareEncryptResult_lift(try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
     uniffi_two_mls_pq_fn_method_twomlspqsession_prepare_to_encrypt(
             self.uniffiCloneHandle(),
         FfiConverterOptionTypeClientId.lower(proposing),$0
@@ -1167,6 +1219,15 @@ open func prepareToEncrypt(proposing: ClientId?)throws  -> PrepareEncryptResult?
 })
 }
     
+    /**
+     * Process an incoming message.
+     *
+     * - APQWelcome (0x01) → join recv groups; `Ok(None)`
+     * - Rotation commit+app (0x03) → advance send epoch then decrypt; `DecryptResult`
+     * - Partial bundle (0x05) → advance send.pq then decrypt app; `DecryptResult`
+     * - Full bundle (0x07) → epoch advance + PSK refresh then decrypt; `DecryptResult`
+     * - MLS ciphertext → decrypt on recv_group.pq; `DecryptResult`
+     */
 open func processIncoming(ciphertext: Data)throws  -> DecryptResult?  {
     return try  FfiConverterOptionTypeDecryptResult.lift(try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
     uniffi_two_mls_pq_fn_method_twomlspqsession_process_incoming(
@@ -1184,6 +1245,10 @@ open func proposalContext() -> TwoMlsPqDigest?  {
 })
 }
     
+    /**
+     * Accept a remote proposal for the next epoch advance.
+     * On the next `prepare_to_encrypt(None)` call, an empty commit will be staged.
+     */
 open func queueProposal(digest: TwoMlsPqDigest)throws   {try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
     uniffi_two_mls_pq_fn_method_twomlspqsession_queue_proposal(
             self.uniffiCloneHandle(),
@@ -1214,6 +1279,18 @@ open func shouldListenOn()throws  -> ListenChannels  {
             self.uniffiCloneHandle(),$0
     )
 })
+}
+    
+    /**
+     * Register a new agent client for the next rotation commit.
+     * Call before `prepare_to_encrypt(Some(new_client.client_id()))`.
+     */
+open func stageRotation(newClient: TwoMlsPqClient)throws   {try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
+    uniffi_two_mls_pq_fn_method_twomlspqsession_stage_rotation(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeTwoMlsPqClient_lower(newClient),$0
+    )
+}
 }
     
 open func theirAgentState() -> AgentState  {
@@ -1438,7 +1515,7 @@ public func FfiConverterTypeCombinerGroupId_lower(_ value: CombinerGroupId) -> R
 /**
  * Paired key package bundle for the APQ/Combiner construction.
  * `classical` is MLS-encoded for suite 0x0003 (X25519+ChaCha20Poly1305);
- * `pq` is MLS-encoded for suite 0xFE4C (XWing).
+ * `pq` is MLS-encoded for suite 0xFDEA (ML-KEM-768).
  */
 public struct CombinerKeyPackage: Equatable, Hashable {
     public var classical: Data
@@ -2031,14 +2108,14 @@ public func FfiConverterTypeParsedCombinerKeyPackage_lower(_ value: ParsedCombin
  */
 public struct PrepareEncryptResult: Equatable, Hashable {
     public var proposalHash: TwoMlsPqDigest
-    public var commitedRemoteClientId: ClientId?
+    public var committedRemoteClientId: ClientId?
     public var didCommit: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(proposalHash: TwoMlsPqDigest, commitedRemoteClientId: ClientId?, didCommit: Bool) {
+    public init(proposalHash: TwoMlsPqDigest, committedRemoteClientId: ClientId?, didCommit: Bool) {
         self.proposalHash = proposalHash
-        self.commitedRemoteClientId = commitedRemoteClientId
+        self.committedRemoteClientId = committedRemoteClientId
         self.didCommit = didCommit
     }
 
@@ -2059,14 +2136,14 @@ public struct FfiConverterTypePrepareEncryptResult: FfiConverterRustBuffer {
         return
             try PrepareEncryptResult(
                 proposalHash: FfiConverterTypeTwoMlsPqDigest.read(from: &buf), 
-                commitedRemoteClientId: FfiConverterOptionTypeClientId.read(from: &buf), 
+                committedRemoteClientId: FfiConverterOptionTypeClientId.read(from: &buf), 
                 didCommit: FfiConverterBool.read(from: &buf)
         )
     }
 
     public static func write(_ value: PrepareEncryptResult, into buf: inout [UInt8]) {
         FfiConverterTypeTwoMlsPqDigest.write(value.proposalHash, into: &buf)
-        FfiConverterOptionTypeClientId.write(value.commitedRemoteClientId, into: &buf)
+        FfiConverterOptionTypeClientId.write(value.committedRemoteClientId, into: &buf)
         FfiConverterBool.write(value.didCommit, into: &buf)
     }
 }
@@ -2664,30 +2741,6 @@ fileprivate struct FfiConverterOptionTypeMlsSenderMessage: FfiConverterRustBuffe
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-fileprivate struct FfiConverterOptionTypePrepareEncryptResult: FfiConverterRustBuffer {
-    typealias SwiftType = PrepareEncryptResult?
-
-    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
-        guard let value = value else {
-            writeInt(&buf, Int8(0))
-            return
-        }
-        writeInt(&buf, Int8(1))
-        FfiConverterTypePrepareEncryptResult.write(value, into: &buf)
-    }
-
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
-        switch try readInt(&buf) as Int8 {
-        case 0: return nil
-        case 1: return try FfiConverterTypePrepareEncryptResult.read(from: &buf)
-        default: throw UniffiInternalError.unexpectedOptionalTag
-        }
-    }
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
 fileprivate struct FfiConverterOptionTypeQueuedRemoteProposal: FfiConverterRustBuffer {
     typealias SwiftType = QueuedRemoteProposal?
 
@@ -2786,8 +2839,8 @@ fileprivate struct FfiConverterSequenceTypeEpochRendezvous: FfiConverterRustBuff
  * Both sides compute the same value from the same inputs regardless of who
  * initiated, allowing CommProtocol to deduplicate concurrent session initiations.
  */
-public func deriveSessionId(myId: ClientId, theirId: ClientId) -> SessionId  {
-    return try!  FfiConverterTypeSessionId_lift(try! rustCall() {
+public func deriveSessionId(myId: ClientId, theirId: ClientId)throws  -> SessionId  {
+    return try  FfiConverterTypeSessionId_lift(try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
     uniffi_two_mls_pq_fn_func_derive_session_id(
         FfiConverterTypeClientId_lower(myId),
         FfiConverterTypeClientId_lower(theirId),$0
@@ -2838,19 +2891,19 @@ private let initializationResult: InitializationResult = {
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
-    if (uniffi_two_mls_pq_checksum_func_derive_session_id() != 31607) {
+    if (uniffi_two_mls_pq_checksum_func_derive_session_id() != 62066) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_func_version() != 33499) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_func_parse_combiner_key_package() != 11987) {
+    if (uniffi_two_mls_pq_checksum_func_parse_combiner_key_package() != 43275) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_func_parse_mls_key_package() != 47333) {
+    if (uniffi_two_mls_pq_checksum_func_parse_mls_key_package() != 21071) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_mlsciphersuite_is_combiner_classical() != 36481) {
+    if (uniffi_two_mls_pq_checksum_method_mlsciphersuite_is_combiner_classical() != 42584) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_mlsciphersuite_is_supported() != 26983) {
@@ -2862,10 +2915,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_two_mls_pq_checksum_method_twomlspqclient_client_id() != 639) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqclient_generate_combiner_key_package() != 12197) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqclient_generate_combiner_key_package() != 54914) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqclient_generate_key_package() != 58983) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqclient_generate_key_package() != 11864) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_active_session_id() != 37750) {
@@ -2874,10 +2927,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_archive() != 11184) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_encrypt() != 61673) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_encrypt() != 3107) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_forwarded() != 48937) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_forwarded() != 20430) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_has_receive_group() != 35549) {
@@ -2892,16 +2945,16 @@ private let initializationResult: InitializationResult = {
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pending_outbound() != 44057) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_prepare_to_encrypt() != 22074) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_prepare_to_encrypt() != 16181) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_process_incoming() != 6305) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_process_incoming() != 41427) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_proposal_context() != 55198) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_queue_proposal() != 7064) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_queue_proposal() != 37099) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_receive_group_id() != 24855) {
@@ -2913,7 +2966,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_should_listen_on() != 14163) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_stage_rotation() != 59017) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_their_agent_state() != 37009) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_two_mls_pq_checksum_constructor_mlsciphersuite_ml_kem_768() != 8052) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_constructor_mlsciphersuite_new() != 734) {
@@ -2925,19 +2984,16 @@ private let initializationResult: InitializationResult = {
     if (uniffi_two_mls_pq_checksum_constructor_mlsciphersuite_x25519_chacha() != 46953) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_constructor_mlsciphersuite_xwing() != 17588) {
+    if (uniffi_two_mls_pq_checksum_constructor_twomlspqclient_new() != 61181) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_constructor_twomlspqclient_new() != 14414) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_two_mls_pq_checksum_constructor_twomlspqsession_accept() != 51485) {
+    if (uniffi_two_mls_pq_checksum_constructor_twomlspqsession_accept() != 19817) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_constructor_twomlspqsession_from_archive() != 15551) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_constructor_twomlspqsession_initiate() != 25513) {
+    if (uniffi_two_mls_pq_checksum_constructor_twomlspqsession_initiate() != 44812) {
         return InitializationResult.apiChecksumMismatch
     }
 
