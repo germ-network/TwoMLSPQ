@@ -12,6 +12,19 @@ just bench-pq
 # or: cargo bench -p two-mls-pq --features "benchmark_util cryptokit"
 ```
 
+## HTML reports
+
+Each run writes an interactive HTML report (criterion with the pure-Rust `plotters`
+backend — no external tools) to `target/criterion/report/index.html`: violin plots,
+per-benchmark PDF/iteration charts, and, when a previous run exists, before/after
+comparison plots. Open it after `just bench`:
+
+```sh
+open target/criterion/report/index.html   # macOS
+```
+
+`target/` is gitignored, so reports stay local.
+
 `BenchmarkId`s are labelled with the active suite (`simulated` vs `ml_kem_768`) so the
 two runs are distinguishable in reports.
 

@@ -21,6 +21,12 @@ format:
 test:
     cargo test --all-features
 
+bench:
+    cargo bench -p two-mls-pq --features benchmark_util
+
+bench-pq:
+    cargo bench -p two-mls-pq --features "benchmark_util cryptokit"
+
 build-ios:
     bash scripts/buildIos.sh
 
