@@ -14,7 +14,7 @@ let package = Package(
 		// ambiguous; isolating each wrapper in its own module resolves it.
 		.library(
 			name: "AbstractTwoMLS",
-			targets: ["AbstractTwoMLS", "TwoMLSPQ", "MLSrsClassic"]
+			targets: ["AbstractTwoMLS", "TwoMLSPQ"]
 		)
 	],
 	dependencies: [
@@ -60,7 +60,7 @@ let package = Package(
 		),
 		.testTarget(
 			name: "AbstractTwoMLSTests",
-			dependencies: ["AbstractTwoMLS"]
+			dependencies: ["AbstractTwoMLS", "MLSrsClassic"]
 		),
 	],
 	swiftLanguageModes: [.v6]
