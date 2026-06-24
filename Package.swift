@@ -49,14 +49,14 @@ let package = Package(
 		.binaryTarget(
 			name: "MLSrsLegacy",
 			url:
-				"https://github.com/germ-network/mls-rs-uniffi/releases/download/1.1.6/MLSrs.xcframework.zip",
-			checksum: "3af8bb4d322d5622c5fcf369ef467436bd38658b7cd2ee780a81bc056ee49867"
+				"https://github.com/germ-network/mls-rs-uniffi/releases/download/1.1.8/MLSrs.xcframework.zip",
+			checksum: "5ece2e77d463d573eaa4e35363c88e2d50a09a16cd57635ed572a26467482d2f"
 		),
 		.binaryTarget(
 			name: "MLSrs",
 			url:
-				"https://github.com/germ-network/TwoMLSPQ/releases/download/0.0.1/MLSrs.xcframework.zip",
-			checksum: "e6a307ac2cdc01a8207408cfae1b33ab1c064e0ae71d7d7a4e9813aed79ba0c7"
+				"https://github.com/germ-network/TwoMLSPQ/releases/download/0.0.2/MLSrs.xcframework.zip",
+			checksum: "c6e19bcb94c1f86e4f96f434844b0f3ddd459b4b5fca5da45f74b6b9143b24c3"
 		),
 		.testTarget(
 			name: "AbstractTwoMLSTests",

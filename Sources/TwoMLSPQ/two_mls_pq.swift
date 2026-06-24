@@ -503,7 +503,11 @@ fileprivate struct FfiConverterString: FfiConverter {
             return String()
         }
         let bytes = UnsafeBufferPointer<UInt8>(start: value.data!, count: Int(value.len))
-        return String(bytes: bytes, encoding: String.Encoding.utf8)!
+        // Use Swift's native UTF-8 decoder; `String(bytes:encoding:.utf8)` goes
+        // through Foundation's NSString and silently strips a leading U+FEFF BOM.
+        // Invalid UTF-8 substitutes U+FFFD instead of trapping (unreachable
+        // given Rust's `String` invariant).
+        return String(decoding: bytes, as: UTF8.self)
     }
 
     public static func lower(_ value: String) -> RustBuffer {
@@ -519,7 +523,8 @@ fileprivate struct FfiConverterString: FfiConverter {
 
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> String {
         let len: Int32 = try readInt(&buf)
-        return String(bytes: try readBytes(&buf, count: Int(len)), encoding: String.Encoding.utf8)!
+        // See `lift` above for why we avoid Foundation's NSString-backed decoder here.
+        return String(decoding: try readBytes(&buf, count: Int(len)), as: UTF8.self)
     }
 
     public static func write(_ value: String, into buf: inout [UInt8]) {
@@ -2480,7 +2485,6 @@ public enum TwoMlsPqError: Swift.Error, Equatable, Hashable, Foundation.Localize
     case InvalidKeyPackage
     case MissingWelcome
     case PskBinding
-    case PqNotAvailable
     case SessionNotEstablished
     case SessionNotReady
     case ProposalRejected
@@ -2519,12 +2523,11 @@ public struct FfiConverterTypeTwoMlsPqError: FfiConverterRustBuffer {
         case 2: return .InvalidKeyPackage
         case 3: return .MissingWelcome
         case 4: return .PskBinding
-        case 5: return .PqNotAvailable
-        case 6: return .SessionNotEstablished
-        case 7: return .SessionNotReady
-        case 8: return .ProposalRejected
-        case 9: return .DecryptionFailed
-        case 10: return .ArchiveInvalid
+        case 5: return .SessionNotEstablished
+        case 6: return .SessionNotReady
+        case 7: return .ProposalRejected
+        case 8: return .DecryptionFailed
+        case 9: return .ArchiveInvalid
 
          default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -2553,28 +2556,24 @@ public struct FfiConverterTypeTwoMlsPqError: FfiConverterRustBuffer {
             writeInt(&buf, Int32(4))
         
         
-        case .PqNotAvailable:
+        case .SessionNotEstablished:
             writeInt(&buf, Int32(5))
         
         
-        case .SessionNotEstablished:
+        case .SessionNotReady:
             writeInt(&buf, Int32(6))
         
         
-        case .SessionNotReady:
+        case .ProposalRejected:
             writeInt(&buf, Int32(7))
         
         
-        case .ProposalRejected:
+        case .DecryptionFailed:
             writeInt(&buf, Int32(8))
         
         
-        case .DecryptionFailed:
-            writeInt(&buf, Int32(9))
-        
-        
         case .ArchiveInvalid:
-            writeInt(&buf, Int32(10))
+            writeInt(&buf, Int32(9))
         
         }
     }
