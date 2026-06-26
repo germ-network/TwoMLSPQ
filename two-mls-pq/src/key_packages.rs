@@ -226,6 +226,25 @@ pub fn parse_combiner_key_package(kp: CombinerKeyPackage) -> Result<ParsedCombin
     })
 }
 
+/// Reject a peer combiner whose both halves are classical (no PQ protection).
+///
+/// No-op without `cryptokit`: there the PQ half is deliberately classical
+/// (ML-KEM is simulated), so the check would reject every session.
+#[cfg(feature = "cryptokit")]
+pub(crate) fn ensure_pq_available(their_kp: &CombinerKeyPackage) -> Result<()> {
+    let classical = parse_mls_key_package(their_kp.classical.clone())?;
+    let pq = parse_mls_key_package(their_kp.pq.clone())?;
+    if !classical.cipher_suite.is_supported() && !pq.cipher_suite.is_supported() {
+        return Err(TwoMlsPqError::PqNotAvailable);
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "cryptokit"))]
+pub(crate) fn ensure_pq_available(_their_kp: &CombinerKeyPackage) -> Result<()> {
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use mls_rs::{CipherSuiteProvider, CryptoProvider};

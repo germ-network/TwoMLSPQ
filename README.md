@@ -2,6 +2,19 @@
 
 Germ Network's implementation of 1:1 encrypted messaging sessions built on two asymmetric MLS send groups (Distributed MLS — draft-xue-distributed-mls).
 
+## Documentation
+
+The full guide — concepts, the Combiner construction, cipher suites, the session
+lifecycle, wire format, PSK binding, and the API reference — is an mdBook under
+[`two-mls-pq/book`](two-mls-pq/book/src/introduction.md). The chapters are plain Markdown,
+so you can read them directly on GitHub, or build the rendered site locally:
+
+```sh
+cargo install mdbook   # once
+just book              # build → two-mls-pq/book/book/
+just book-serve        # serve at http://localhost:3000
+```
+
 ## Structure
 
 ```
