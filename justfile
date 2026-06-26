@@ -26,6 +26,11 @@ bench:
 
 bench-pq:
     cargo bench -p two-mls-pq --features "benchmark_util cryptokit"
+bindgen:
+    cargo build --package two-mls-pq
+    cargo run --package uniffi-bindgen -- generate \
+        target/debug/libtwo_mls_pq.dylib \
+        --library --language swift --out-dir bindings
 
 build-ios:
     bash scripts/buildIos.sh
