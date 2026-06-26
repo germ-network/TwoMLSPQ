@@ -39,12 +39,12 @@ struct APIDemo {
 		//  group with
 		//local will now also send, slowly, a PQ keyPackage so that remote
 		//can stand up their own APQ group
-		let localRatchetState = localSession.currentPQInflight()
+		let localRatchetState = try localSession.currentPQInflight()
 		guard case .proposing(let localPQProposal) = localRatchetState else {
 			throw TestErrors.unexpected
 		}
 
-		let remoteRatchetState = remoteSession.currentPQInflight()
+		let remoteRatchetState = try remoteSession.currentPQInflight()
 		guard case .receivingInitial = remoteRatchetState else {
 			throw TestErrors.unexpected
 		}
@@ -57,7 +57,7 @@ struct APIDemo {
 
 		//remote state should have flipped:
 		//in this case it's actually a PQ welcome
-		guard case .committing(let remoteWelcome) = remoteSession.currentPQInflight() else {
+		guard case .committing(let remoteWelcome) = try remoteSession.currentPQInflight() else {
 			throw TestErrors.unexpected
 		}
 

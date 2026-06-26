@@ -44,7 +44,7 @@ extension AbstractTwoMLS {
 		associatedtype DecryptResult: DecryptResultProtocol
 		where DecryptResult.SenderMessage == MLSSenderMessage
 
-		func currentPQInflight() -> PQRatchetState
+		func currentPQInflight() throws -> PQRatchetState
 		func received(pqProposal: Data) throws
 		func received(pqCommit: Data) throws
 
