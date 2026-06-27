@@ -71,13 +71,15 @@ extension AbstractTwoMLS {
 		public let cipherText: Data
 		public let sender: AbstractTwoMLS.ClientID
 		public let recipient: AbstractTwoMLS.ClientID
-		public let epoch: UInt64
+		public let epochs: APQEpochs
 
 		init(_ base: TwoMLSPQ.EncryptResult) {
 			cipherText = base.cipherText
 			sender = base.sender.bytes
 			recipient = base.recipient.bytes
-			epoch = base.epoch
+			// GAP: the FFI EncryptResult reports a single epoch; the pq/classical
+			// split is not yet exported.
+			epochs = APQEpochs(pqEpoch: base.epoch, classicalEpoch: base.epoch)
 		}
 	}
 
@@ -149,7 +151,7 @@ extension AbstractTwoMLS {
 extension AbstractTwoMLS {
 
 	/// Adapter wrapping a `TwoMLSPQ.TwoMlsPqSession`.
-	public struct PQSession: AbstractTwoMLS.Session {
+	public struct PQSession: AbstractTwoMLS.PQRatchetingSession {
 		public typealias Invitation = PQInvitation
 		public typealias Archive = Data
 
@@ -227,23 +229,44 @@ extension AbstractTwoMLS {
 			return (groupId, rendezvous)
 		}
 
-		// MARK: PQ ratchet — GAP (no FFI equivalent yet)
+		// MARK: PQRatchet
 
-		public func currentPQInflight() throws -> AbstractTwoMLS.PQRatchetState {
+		// The action methods have no FFI surface yet (GAP); `isFullyEstablished`
+		// maps to the session's own established flag, and `turn`/`epochs` return
+		// placeholders.
+
+		public var turn: PQTurn {
+			// GAP: no FFI accessor for whose PQ turn it is.
+			.weInitiate
+		}
+
+		public var epochs: APQEpochs {
+			// GAP: no FFI accessor for the APQInfo epoch pair.
+			APQEpochs(pqEpoch: 0, classicalEpoch: 0)
+		}
+
+		public var isFullyEstablished: Bool {
+			base.isEstablished()
+		}
+
+		public func begin(
+			_ kind: PQOperationKind,
+			rotating: AbstractTwoMLS.ClientID?
+		) throws -> PQOutbound {
 			throw TwoMLSPQConformanceError.notImplemented(
-				"PQSession.currentPQInflight — no TwoMLSPQ FFI equivalent yet"
+				"PQRatchet.begin(\(kind)) — no TwoMLSPQ FFI equivalent yet"
 			)
 		}
 
-		public func received(pqProposal: Data) throws {
+		public func advance(after inbound: PQInbound) throws -> PQOutbound? {
 			throw TwoMLSPQConformanceError.notImplemented(
-				"PQSession.received(pqProposal:)"
+				"PQRatchet.advance — no TwoMLSPQ FFI equivalent yet"
 			)
 		}
 
-		public func received(pqCommit: Data) throws {
+		public func ingest(_ message: Data) throws -> PQInbound {
 			throw TwoMLSPQConformanceError.notImplemented(
-				"PQSession.received(pqCommit:)"
+				"PQRatchet.ingest — no TwoMLSPQ FFI equivalent yet"
 			)
 		}
 	}

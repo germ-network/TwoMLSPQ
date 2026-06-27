@@ -39,27 +39,36 @@ struct APIDemo {
 		//  group with
 		//local will now also send, slowly, a PQ keyPackage so that remote
 		//can stand up their own APQ group
-		let localRatchetState = try localSession.currentPQInflight()
-		guard case .proposing(let localPQProposal) = localRatchetState else {
+		//the PQ side-band is a separate capability from the base Session
+		guard
+			let localPQ = localSession as? any AbstractTwoMLS.PQRatchetingSession,
+			let remotePQ = remoteSession as? any AbstractTwoMLS.PQRatchetingSession
+		else {
 			throw TestErrors.unexpected
 		}
 
-		let remoteRatchetState = try remoteSession.currentPQInflight()
-		guard case .receivingInitial = remoteRatchetState else {
+		//local holds the turn and owes the PQ bootstrap of remote's send group
+		guard localPQ.turn == .weInitiate else {
+			throw TestErrors.unexpected
+		}
+		let localOutbound = try localPQ.begin(.finishBootstrap, rotating: nil)
+
+		//remote has no PQ group of its own yet
+		guard !remotePQ.isFullyEstablished else {
 			throw TestErrors.unexpected
 		}
 
 		//can round trip without blocking on PQ
 		try localSession.exchange(with: remoteSession)
 
-		//pqProposal finally arrived at remote
-		try remoteSession.received(pqProposal: localPQProposal)
-
-		//remote state should have flipped:
-		//in this case it's actually a PQ welcome
-		guard case .committing(let remoteWelcome) = try remoteSession.currentPQInflight() else {
+		//the PQ payload finally arrived at remote
+		let remoteInbound = try remotePQ.ingest(localOutbound.payload)
+		guard remoteInbound.kind == .finishBootstrap else {
 			throw TestErrors.unexpected
 		}
+
+		//remote replies, advancing the operation
+		_ = try remotePQ.advance(after: remoteInbound)
 
 		try localSession.exchange(with: remoteSession)
 	}

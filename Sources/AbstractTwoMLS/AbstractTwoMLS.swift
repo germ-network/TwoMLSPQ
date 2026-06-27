@@ -44,16 +44,6 @@ extension AbstractTwoMLS {
 		associatedtype DecryptResult: DecryptResultProtocol
 		where DecryptResult.SenderMessage == MLSSenderMessage
 
-		func currentPQInflight() throws -> PQRatchetState
-		func received(pqProposal: Data) throws
-		func received(pqCommit: Data) throws
-
-	}
-
-	public enum PQRatchetState {
-		case proposing(Data)
-		case committing(Data)
-		case receivingInitial
 	}
 
 	public protocol PrepareEncryptResultProtocol {
@@ -66,7 +56,8 @@ extension AbstractTwoMLS {
 		var cipherText: Data { get }
 		var sender: ClientID { get }
 		var recipient: ClientID { get }
-		var epoch: UInt64 { get }
+		//the APQ epoch pair (pq_epoch / t_epoch), see AbstractTwoMLS+PQRatchet.swift
+		var epochs: APQEpochs { get }
 	}
 
 	//pass the sender client identity along with the appmessage
