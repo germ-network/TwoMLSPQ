@@ -1,8 +1,10 @@
 [lib]
-crate-type = ["cdylib", "staticlib"]
+bench = false
+crate-type = ["cdylib", "staticlib", "rlib"]
 
 [package]
 authors.workspace = true
+autobenches = false
 edition.workspace = true
 license.workspace = true
 name = "two-mls-pq"
@@ -15,6 +17,9 @@ workspace = true
 
 [features]
 cryptokit = ["dep:mls-rs-crypto-cryptokit"]
+# Exposes bench fixtures and gates the `benches/*` targets; combine with `cryptokit`
+# for real ML-KEM-768 numbers.
+benchmark_util = []
 default = ["rustcrypto"]
 rustcrypto = []
 
@@ -30,3 +35,28 @@ zeroize = "1.8.2"
 uniffi = { workspace = true, features = ["build"] }
 
 [dev-dependencies]
+criterion = { version = "0.8", default-features = false, features = [
+  "cargo_bench_support",
+  "html_reports",
+  "plotters",
+] }
+
+[[bench]]
+harness = false
+name = "kp_generation"
+required-features = ["benchmark_util"]
+
+[[bench]]
+harness = false
+name = "establishment"
+required-features = ["benchmark_util"]
+
+[[bench]]
+harness = false
+name = "messaging"
+required-features = ["benchmark_util"]
+
+[[bench]]
+harness = false
+name = "sizes"
+required-features = ["benchmark_util"]

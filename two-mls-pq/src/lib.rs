@@ -1,5 +1,6 @@
 uniffi::setup_scaffolding!();
 
+mod combiner;
 pub mod key_packages;
 mod psk;
 pub mod session;
@@ -170,7 +171,8 @@ impl MlsCipherSuite {
     pub const DHKEM_X448_CHACHA: u16 = 0x0006;
     pub const DHKEM_P384_AES256: u16 = 0x0007;
     // Private range (0xF000–0xFFFF) — pending IANA assignment
-    /// MLS_128_ML_KEM_768_AES128GCM_SHA256_Ed25519 (0xFDEA, FIPS 203 / draft-mls-pq)
+    /// MLS_128_ML_KEM_768_AES128GCM_SHA256_Ed25519 (0xFDEA, FIPS 203).
+    /// Private-range value; not assigned by draft-ietf-mls-pq-ciphersuites.
     pub const ML_KEM_768: u16 = 0xFDEA;
 }
 
@@ -237,6 +239,8 @@ pub enum TwoMlsPqError {
     MissingWelcome,
     #[error("PSK binding failure")]
     PskBinding,
+    #[error("combiner key package carries no post-quantum cipher suite")]
+    PqNotAvailable,
     #[error("session not established")]
     SessionNotEstablished,
     #[error("session not ready for encryption")]

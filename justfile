@@ -21,6 +21,11 @@ format:
 test:
     cargo test --all-features
 
+bench:
+    cargo bench -p two-mls-pq --features benchmark_util
+
+bench-pq:
+    cargo bench -p two-mls-pq --features "benchmark_util cryptokit"
 bindgen:
     cargo build --package two-mls-pq
     cargo run --package uniffi-bindgen -- generate \
@@ -29,3 +34,10 @@ bindgen:
 
 build-ios:
     bash scripts/buildIos.sh
+
+# Requires `cargo install mdbook` (and optionally mdbook-mermaid; see book/book.toml).
+book:
+    mdbook build two-mls-pq/book
+
+book-serve:
+    mdbook serve two-mls-pq/book
