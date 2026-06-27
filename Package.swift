@@ -30,7 +30,6 @@ let package = Package(
 			name: "AbstractTwoMLS",
 			dependencies: [
 				"TwoMLSPQ",
-				"MLSrsClassic",
 				.product(name: "CommProtocol", package: "autonomous-comm-protocol"),
 			]
 		),
