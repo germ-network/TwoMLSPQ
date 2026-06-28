@@ -1,14 +1,19 @@
 #!/usr/bin/env bash
 #
-# Dynamic-framework build (Phase 0.3). Produces a dynamic (cdylib) xcframework so TwoMLSPQ
-# and the legacy classical lib can coexist in one app without the
-# `duplicate symbol _rust_eh_personality` link error — a dynamic lib keeps std's symbols
-# internal (verified: the cdylib exports 0 `rust_eh_personality`).
+# Dynamic framework-bundle build. Produces a dynamic (cdylib) xcframework packaged as
+# `.framework` bundles so TwoMLSPQ can coexist in one app with the legacy classical
+# static MLSrs lib. Two independent reasons both require this shape:
 #
-# Differs from buildIos.sh only in shipping the `.dylib` (cdylib) instead of the `.a`
-# (staticlib), with an @rpath install-name so the consuming app can embed it. The clang
-# module name stays `two_mls_pqFFI` (via the generated `bindings/`), so the generated Swift
-# is unchanged. Only TwoMLSPQ needs to be dynamic; the legacy framework stays static.
+#   1. dynamic (cdylib) keeps Rust std's symbols internal — avoids the
+#      `duplicate symbol _rust_eh_personality` link error (a cdylib exports 0).
+#   2. framework packaging keeps the clang `module.modulemap` INSIDE the framework
+#      (`two_mls_pqFFI.framework/Modules/`), not in the shared build `include/` dir.
+#      A `-library … -headers …` xcframework dumps `module.modulemap` into `include/`,
+#      which collides with the other uniffi xcframework:
+#      "Multiple commands produce …/include/module.modulemap".
+#
+# The framework + clang module is named `two_mls_pqFFI` (matches the generated Swift's
+# `import two_mls_pqFFI`); the xcframework wrapper is `TwoMLSPQ.xcframework`.
 #
 # Full validation = consume this xcframework from AbstractTwoMLS and build a real
 # device/archive (embedded-framework code-signing). See ROADMAP Phase 0.3/0.4.
@@ -17,11 +22,13 @@ set -euo pipefail
 CARGO="$HOME/.cargo/bin/cargo"
 RUSTUP="$HOME/.cargo/bin/rustup"
 CRATE="two-mls-pq"
-LIB_NAME="libtwo_mls_pq"          # cargo output: <LIB_NAME>.dylib
-FRAMEWORK="TwoMLSPQ"
+LIB_NAME="libtwo_mls_pq"              # cargo output: <LIB_NAME>.dylib
+MODULE="two_mls_pqFFI"               # framework + clang module name
+FRAMEWORK="TwoMLSPQ"                 # xcframework name
 BINDINGS_DIR="./bindings"
 BUILD_DIR="./buildIos"
-INSTALL_NAME="@rpath/${LIB_NAME}.dylib"
+FW_DIR="$BUILD_DIR/frameworks"
+INSTALL_NAME="@rpath/${MODULE}.framework/${MODULE}"
 
 # Real ML-KEM-768 (AWS-LC) — the PQ half the coexistence check exercises.
 BUILD_FLAGS=(--release --package "$CRATE" --no-default-features --features cryptokit)
@@ -34,21 +41,14 @@ BUILD_FLAGS=(--release --package "$CRATE" --no-default-features --features crypt
     aarch64-apple-darwin || true
 
 # Clean previous artifacts
-rm -rf "$BUILD_DIR/$FRAMEWORK.xcframework" || true
-rm -f  "$BUILD_DIR/$FRAMEWORK.xcframework.zip" || true
+rm -rf "$BUILD_DIR/$FRAMEWORK.xcframework" "$BUILD_DIR/$FRAMEWORK.xcframework.zip" "$FW_DIR" || true
+mkdir -p "$BUILD_DIR" "$FW_DIR"
 
-mkdir -p "$BUILD_DIR"
-
-# Release cdylib builds
+# Release cdylib builds (iOS device + simulator + macOS).
 "$CARGO" build "${BUILD_FLAGS[@]}" --target=aarch64-apple-ios-sim
 IPHONEOS_DEPLOYMENT_TARGET=17.0 "$CARGO" build "${BUILD_FLAGS[@]}" --target=aarch64-apple-ios
 "$CARGO" build "${BUILD_FLAGS[@]}" --target=x86_64-apple-ios  # XCode Cloud runs x86_64
-MACOS_DEPLOYMENT_TARGET=10_15   "$CARGO" build "${BUILD_FLAGS[@]}" --target=aarch64-apple-darwin
-
-# @rpath-relative install-name on every slice so the consuming app can embed + load it
-for target in aarch64-apple-ios-sim aarch64-apple-ios x86_64-apple-ios aarch64-apple-darwin; do
-    install_name_tool -id "$INSTALL_NAME" "target/$target/release/${LIB_NAME}.dylib"
-done
+MACOSX_DEPLOYMENT_TARGET=15.0   "$CARGO" build "${BUILD_FLAGS[@]}" --target=aarch64-apple-darwin
 
 # Generate Swift bindings from the device dylib
 "$CARGO" run -p uniffi-bindgen --bin uniffi-bindgen \
@@ -56,21 +56,77 @@ done
     --language swift \
     --out-dir "$BINDINGS_DIR"
 
-mv "$BINDINGS_DIR/two_mls_pqFFI.modulemap" "$BINDINGS_DIR/module.modulemap"
+# framework-scoped module map — lives inside each framework's Modules/, never include/.
+MODMAP="framework module ${MODULE} {
+    header \"${MODULE}.h\"
+    export *
+}"
 
-# Combine arm + x86_64 simulator slices (required for XCode Cloud)
+# $1 = MinimumOSVersion, $2 = platform (CFBundleSupportedPlatforms)
+make_plist() {
+cat <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleDevelopmentRegion</key><string>en</string>
+<key>CFBundleExecutable</key><string>${MODULE}</string>
+<key>CFBundleIdentifier</key><string>network.germ.${MODULE}</string>
+<key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+<key>CFBundleName</key><string>${MODULE}</string>
+<key>CFBundlePackageType</key><string>FMWK</string>
+<key>CFBundleShortVersionString</key><string>1.0</string>
+<key>CFBundleVersion</key><string>1</string>
+<key>MinimumOSVersion</key><string>${1}</string>
+<key>CFBundleSupportedPlatforms</key><array><string>${2}</string></array>
+</dict></plist>
+EOF
+}
+
+# Flat framework (iOS device / simulator).  $1 dylib  $2 dest-parent  $3 minOS  $4 platform
+flat_fw() {
+  local dylib="$1" dir="$2/${MODULE}.framework"
+  mkdir -p "$dir/Headers" "$dir/Modules"
+  cp "$dylib" "$dir/${MODULE}"
+  install_name_tool -id "$INSTALL_NAME" "$dir/${MODULE}"
+  cp "$BINDINGS_DIR/${MODULE}.h" "$dir/Headers/"
+  printf '%s\n' "$MODMAP" > "$dir/Modules/module.modulemap"
+  make_plist "$3" "$4" > "$dir/Info.plist"
+}
+
+# Versioned framework (macOS).  $1 dylib  $2 dest-parent
+versioned_fw() {
+  local dylib="$1" base="$2/${MODULE}.framework" V="$2/${MODULE}.framework/Versions/A"
+  mkdir -p "$V/Headers" "$V/Modules" "$V/Resources"
+  cp "$dylib" "$V/${MODULE}"
+  install_name_tool -id "$INSTALL_NAME" "$V/${MODULE}"
+  cp "$BINDINGS_DIR/${MODULE}.h" "$V/Headers/"
+  printf '%s\n' "$MODMAP" > "$V/Modules/module.modulemap"
+  make_plist "15.0" "MacOSX" > "$V/Resources/Info.plist"
+  ln -sf A "$base/Versions/Current"
+  ln -sf "Versions/Current/${MODULE}" "$base/${MODULE}"
+  ln -sf Versions/Current/Headers "$base/Headers"
+  ln -sf Versions/Current/Modules "$base/Modules"
+  ln -sf Versions/Current/Resources "$base/Resources"
+}
+
+# iOS device
+flat_fw "target/aarch64-apple-ios/release/${LIB_NAME}.dylib" "$FW_DIR/ios" "17.0" "iPhoneOS"
+
+# iOS simulator (lipo arm64 + x86_64 — XCode Cloud runs x86_64)
 # https://forums.developer.apple.com/forums/thread/711294?answerId=722588022#722588022
-SIM_DYLIB="$BUILD_DIR/${LIB_NAME}_sim_combined.dylib"
-lipo -create \
-    -output "$SIM_DYLIB" \
+mkdir -p "$FW_DIR/sim-build"
+lipo -create -output "$FW_DIR/sim-build/${LIB_NAME}.dylib" \
     "target/aarch64-apple-ios-sim/release/${LIB_NAME}.dylib" \
     "target/x86_64-apple-ios/release/${LIB_NAME}.dylib"
-install_name_tool -id "$INSTALL_NAME" "$SIM_DYLIB"
+flat_fw "$FW_DIR/sim-build/${LIB_NAME}.dylib" "$FW_DIR/sim" "17.0" "iPhoneSimulator"
+
+# macOS
+versioned_fw "target/aarch64-apple-darwin/release/${LIB_NAME}.dylib" "$FW_DIR/macos"
 
 xcodebuild -create-xcframework \
-    -library "$SIM_DYLIB" -headers "$BINDINGS_DIR" \
-    -library "target/aarch64-apple-ios/release/${LIB_NAME}.dylib"    -headers "$BINDINGS_DIR" \
-    -library "target/aarch64-apple-darwin/release/${LIB_NAME}.dylib" -headers "$BINDINGS_DIR" \
+    -framework "$FW_DIR/ios/${MODULE}.framework" \
+    -framework "$FW_DIR/sim/${MODULE}.framework" \
+    -framework "$FW_DIR/macos/${MODULE}.framework" \
     -output "$BUILD_DIR/$FRAMEWORK.xcframework"
 
 cd "$BUILD_DIR"
