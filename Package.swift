@@ -37,7 +37,7 @@ let package = Package(
 		// `RustBuffer` (from `two_mls_pqFFI`).
 		.target(
 			name: "TwoMLSPQ",
-			dependencies: ["MLSrs"]
+			dependencies: ["TwoMLSPQrs"]
 		),
 		// Classical implementation — UniFFI wrapper for the legacy mls-rs-uniffi-ios
 		// framework. Owns its own `RustBuffer` (from `mls_rs_uniffi_iosFFI`).
@@ -52,10 +52,17 @@ let package = Package(
 			checksum: "5ece2e77d463d573eaa4e35363c88e2d50a09a16cd57635ed572a26467482d2f"
 		),
 		.binaryTarget(
-			name: "MLSrs",
+			name: "TwoMLSPQrs",
+			// Dynamic (cdylib) framework xcframework from TwoMLSPQ
+			// scripts/buildIosDynamic.sh — dynamic lib + framework packaging lets
+			// TwoMLSPQ coexist with the legacy classical static MLSrs lib (avoids both
+			// the `_rust_eh_personality` duplicate-symbol link error and the
+			// include/module.modulemap collision).
+			// IMPORTANT: when this URL changes, re-sync Sources/TwoMLSPQ/two_mls_pq.swift
+			// from the SAME release (uniffi embeds a checksum contract verified at init).
 			url:
-				"https://github.com/germ-network/TwoMLSPQ/releases/download/0.0.2/MLSrs.xcframework.zip",
-			checksum: "c6e19bcb94c1f86e4f96f434844b0f3ddd459b4b5fca5da45f74b6b9143b24c3"
+				"https://github.com/germ-network/TwoMLSPQ/releases/download/0.0.3/TwoMLSPQ.xcframework.zip",
+			checksum: "68d71e2c03b1d0126c05381299e28b45d9a8003080f8e6d68e214f67f5210e24"
 		),
 		.testTarget(
 			name: "AbstractTwoMLSTests",

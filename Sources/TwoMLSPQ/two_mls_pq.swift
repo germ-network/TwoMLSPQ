@@ -2485,6 +2485,7 @@ public enum TwoMlsPqError: Swift.Error, Equatable, Hashable, Foundation.Localize
     case InvalidKeyPackage
     case MissingWelcome
     case PskBinding
+    case PqNotAvailable
     case SessionNotEstablished
     case SessionNotReady
     case ProposalRejected
@@ -2523,11 +2524,12 @@ public struct FfiConverterTypeTwoMlsPqError: FfiConverterRustBuffer {
         case 2: return .InvalidKeyPackage
         case 3: return .MissingWelcome
         case 4: return .PskBinding
-        case 5: return .SessionNotEstablished
-        case 6: return .SessionNotReady
-        case 7: return .ProposalRejected
-        case 8: return .DecryptionFailed
-        case 9: return .ArchiveInvalid
+        case 5: return .PqNotAvailable
+        case 6: return .SessionNotEstablished
+        case 7: return .SessionNotReady
+        case 8: return .ProposalRejected
+        case 9: return .DecryptionFailed
+        case 10: return .ArchiveInvalid
 
          default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -2556,24 +2558,28 @@ public struct FfiConverterTypeTwoMlsPqError: FfiConverterRustBuffer {
             writeInt(&buf, Int32(4))
         
         
-        case .SessionNotEstablished:
+        case .PqNotAvailable:
             writeInt(&buf, Int32(5))
         
         
-        case .SessionNotReady:
+        case .SessionNotEstablished:
             writeInt(&buf, Int32(6))
         
         
-        case .ProposalRejected:
+        case .SessionNotReady:
             writeInt(&buf, Int32(7))
         
         
-        case .DecryptionFailed:
+        case .ProposalRejected:
             writeInt(&buf, Int32(8))
         
         
-        case .ArchiveInvalid:
+        case .DecryptionFailed:
             writeInt(&buf, Int32(9))
+        
+        
+        case .ArchiveInvalid:
+            writeInt(&buf, Int32(10))
         
         }
     }
