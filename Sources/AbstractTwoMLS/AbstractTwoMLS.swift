@@ -19,8 +19,12 @@ public protocol Archivable {
 //so that we can sub out different implementations (classical to PQ)
 extension AbstractTwoMLS {
 	public protocol Session: Archivable {
-		associatedtype Invitation: AbstractTwoMLS.Invitation
-		where Invitation.Session == Self
+		// `Session` is intentionally decoupled from `Invitation`. A session is produced
+		// from an invitation, but the session never needs to name the invitation type —
+		// binding it here forced every backend's session to expose a *generic*
+		// invitation, which conflicts with app-side invitation roles (anchor/card) that
+		// wrap `Invitation` independently. The forward link remains: `Invitation` still
+		// names its `Session` (see AbstractTwoMLS+Client.swift).
 
 		var proposalContext: TypedDigest? { get }
 		//this is an exported secret with width 32 bytes

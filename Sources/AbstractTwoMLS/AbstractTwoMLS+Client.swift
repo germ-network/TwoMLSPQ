@@ -57,7 +57,7 @@ public enum AbstractTwoMLS {
 	//object backing one keyPackage
 	public protocol Invitation: Archivable {
 		associatedtype Client: AbstractTwoMLS.Client where Client.Invitation == Self
-		associatedtype Session: AbstractTwoMLS.Session where Session.Invitation == Self
+		associatedtype Session: AbstractTwoMLS.Session
 
 		init(clientId: ClientID) throws
 		var clientId: ClientID { get }
