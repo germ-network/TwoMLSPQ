@@ -70,7 +70,7 @@ cat <<EOF
 <plist version="1.0"><dict>
 <key>CFBundleDevelopmentRegion</key><string>en</string>
 <key>CFBundleExecutable</key><string>${MODULE}</string>
-<key>CFBundleIdentifier</key><string>network.germ.${MODULE}</string>
+<key>CFBundleIdentifier</key><string>network.germ.${FRAMEWORK}</string>
 <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
 <key>CFBundleName</key><string>${MODULE}</string>
 <key>CFBundlePackageType</key><string>FMWK</string>

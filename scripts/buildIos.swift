@@ -75,7 +75,7 @@ func plist(minOS: String, platform: String) -> String {
     <plist version="1.0"><dict>
     <key>CFBundleDevelopmentRegion</key><string>en</string>
     <key>CFBundleExecutable</key><string>\(module)</string>
-    <key>CFBundleIdentifier</key><string>network.germ.\(module)</string>
+    <key>CFBundleIdentifier</key><string>network.germ.\(frameworkName)</string>
     <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
     <key>CFBundleName</key><string>\(module)</string>
     <key>CFBundlePackageType</key><string>FMWK</string>
