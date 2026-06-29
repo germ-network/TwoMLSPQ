@@ -72,10 +72,31 @@ pub fn decode_apq_welcome(bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
     Ok((classical, rest.to_vec()))
 }
 
-/// Construct the PSK identifier: 8-byte LE epoch || group_id bytes.
-fn make_psk_id(epoch: u64, group_id: &[u8]) -> ExternalPskId {
+/// Trailing domain byte that distinguishes a PQ-ratchet *injected-secret* PSK id from an
+/// *exported* (apq / cross-party) PSK id. Injected ids carry this byte and are therefore always
+/// exactly one byte longer than an exported id, so the two families can never collide even at the
+/// same epoch. See `pq_ratchet` for the injection path.
+#[cfg(feature = "cryptokit")]
+pub(crate) const PSK_DOMAIN_INJECTED: u8 = 0x52;
+
+/// Raw PSK-id bytes: 8-byte little-endian epoch || group_id. The single source of truth for the
+/// id layout; all PSK ids in this crate are derived from this.
+fn psk_id_bytes(epoch: u64, group_id: &[u8]) -> Vec<u8> {
     let mut id = epoch.to_le_bytes().to_vec();
     id.extend_from_slice(group_id);
+    id
+}
+
+/// PSK identifier for an *exported* secret (apq-PSK or cross-party TwoMLS-PSK): LE epoch || group_id.
+fn make_psk_id(epoch: u64, group_id: &[u8]) -> ExternalPskId {
+    ExternalPskId::new(psk_id_bytes(epoch, group_id))
+}
+
+/// PSK identifier for a PQ-ratchet *injected* secret: LE epoch || group_id || `PSK_DOMAIN_INJECTED`.
+#[cfg(feature = "cryptokit")]
+pub(crate) fn injected_secret_psk_id(epoch: u64, group_id: &[u8]) -> ExternalPskId {
+    let mut id = psk_id_bytes(epoch, group_id);
+    id.push(PSK_DOMAIN_INJECTED);
     ExternalPskId::new(id)
 }
 

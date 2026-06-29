@@ -16,7 +16,7 @@ use mls_rs_crypto_awslc::MlKemKem;
 use mls_rs_crypto_traits::KemType;
 
 use crate::client::CombinerClient;
-use crate::group::{export_and_register_psk_pq, PqMlsGroup};
+use crate::group::{export_and_register_psk_pq, injected_secret_psk_id, PqMlsGroup};
 use crate::{CombinerError, Result};
 
 const ML_KEM_768: u16 = 0xFDEA;
@@ -58,31 +58,36 @@ pub fn decapsulate(eph: &PqEphemeral, ct: &[u8]) -> Result<Vec<u8>> {
         .map_err(|_| CombinerError::Mls)
 }
 
-/// PSK id for the injected secret S at the PQ group's current epoch. Trailing `0x52` domain-tags
-/// it so it can never collide with an `apq_psk` id (which is exported from the *next* epoch).
+/// PSK id for the injected secret S at the PQ group's current epoch. The trailing domain byte
+/// (see `group::PSK_DOMAIN_INJECTED`) keeps it disjoint from any exported `apq_psk` id, which is
+/// derived from the *next* epoch and carries no domain byte.
 fn injected_psk_id(group: &PqMlsGroup) -> ExternalPskId {
-    let mut id = group.current_epoch().to_le_bytes().to_vec();
-    id.extend_from_slice(group.group_id());
-    id.push(0x52);
-    ExternalPskId::new(id)
+    injected_secret_psk_id(group.current_epoch(), group.group_id())
 }
 
-fn register_injected_secret(
-    group: &PqMlsGroup,
-    s: &[u8],
-    client: &CombinerClient,
-) -> ExternalPskId {
-    let id = injected_psk_id(group);
-    let mut pq = client.pq().secret_store();
-    pq.insert(id.clone(), PreSharedKey::new(s.to_vec()));
-    id
+/// Holds an injected secret S registered in the PQ secret store and removes it on drop, so the
+/// per-round ML-KEM entropy is cleared on **every** exit path — including early `?` returns — not
+/// just the happy path. This is what gives the ratchet forward secrecy: a later state compromise
+/// cannot recover S. `id` is reused for the commit's `add_external_psk` proposal.
+struct InjectedSecret<'a> {
+    id: ExternalPskId,
+    client: &'a CombinerClient,
 }
 
-/// Drop the injected secret from the store once the commit has folded it into the epoch, so a
-/// later state compromise cannot recover the per-round ML-KEM entropy (forward secrecy).
-fn forget_injected_secret(id: &ExternalPskId, client: &CombinerClient) {
-    let mut pq = client.pq().secret_store();
-    pq.delete(id);
+impl<'a> InjectedSecret<'a> {
+    fn register(group: &PqMlsGroup, s: &[u8], client: &'a CombinerClient) -> Self {
+        let id = injected_psk_id(group);
+        let mut pq = client.pq().secret_store();
+        pq.insert(id.clone(), PreSharedKey::new(s.to_vec()));
+        Self { id, client }
+    }
+}
+
+impl Drop for InjectedSecret<'_> {
+    fn drop(&mut self) {
+        let mut pq = self.client.pq().secret_store();
+        pq.delete(&self.id);
+    }
 }
 
 /// Initiator (committer) — inject S into `pq_group` via a pathless PSK commit, apply it, and
@@ -93,17 +98,18 @@ pub fn inject_and_commit(
     s: &[u8],
     client: &CombinerClient,
 ) -> Result<(Vec<u8>, ExternalPskId)> {
-    let s_id = register_injected_secret(pq_group, s, client);
+    let secret = InjectedSecret::register(pq_group, s, client);
     let out = pq_group
         .commit_builder()
-        .add_external_psk(s_id.clone())
+        .add_external_psk(secret.id.clone())
         .map_err(|_| CombinerError::Mls)?
         .build()
         .map_err(|_| CombinerError::Mls)?;
     pq_group
         .apply_pending_commit()
         .map_err(|_| CombinerError::Mls)?;
-    forget_injected_secret(&s_id, client);
+    // S is now folded into the new epoch; wipe it from the store before re-exporting.
+    drop(secret);
     let apq_psk_id = export_and_register_psk_pq(pq_group, client)?;
     let bytes = out
         .commit_message
@@ -120,12 +126,13 @@ pub fn apply_injected_commit(
     pq_commit: &[u8],
     client: &CombinerClient,
 ) -> Result<ExternalPskId> {
-    let s_id = register_injected_secret(pq_group, s, client);
+    let secret = InjectedSecret::register(pq_group, s, client);
     let msg = MlsMessage::from_bytes(pq_commit).map_err(|_| CombinerError::Mls)?;
     pq_group
         .process_incoming_message(msg)
         .map_err(|_| CombinerError::Mls)?;
-    forget_injected_secret(&s_id, client);
+    // S is now folded into the new epoch; wipe it before re-exporting.
+    drop(secret);
     export_and_register_psk_pq(pq_group, client)
 }
 
