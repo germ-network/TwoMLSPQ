@@ -33,6 +33,28 @@ INSTALL_NAME="@rpath/${MODULE}.framework/${MODULE}"
 # Real ML-KEM-768 (AWS-LC) — the PQ half the coexistence check exercises.
 BUILD_FLAGS=(--release --package "$CRATE" --no-default-features --features cryptokit)
 
+# Swift build-system shim. mls-rs-crypto-cryptokit's build.rs runs a bare `swift build`
+# and then links libcryptokit-bridge.a from the legacy SwiftPM layout
+# (.build/<unversioned-triple>/<profile>/). Xcode 16.3+/Swift 6.4 changed the default
+# engine to "swiftbuild", which instead emits to .build/out/Products/<Config>/ — so the
+# link fails with `could not find native static library cryptokit-bridge`. We can't pass
+# flags into that nested invocation, so shim `swift build` to force the legacy "native"
+# engine, restoring the path build.rs expects. (native is deprecated but still present;
+# this is a stopgap until the crate's build.rs learns the new layout.)
+SHIM_DIR="$(mktemp -d)"
+trap 'rm -rf "$SHIM_DIR"' EXIT
+REAL_SWIFT="$(xcrun -f swift)"
+cat > "$SHIM_DIR/swift" <<SHIM
+#!/usr/bin/env bash
+if [ "\${1:-}" = "build" ]; then
+    shift
+    exec "$REAL_SWIFT" build --build-system native "\$@"
+fi
+exec "$REAL_SWIFT" "\$@"
+SHIM
+chmod +x "$SHIM_DIR/swift"
+export PATH="$SHIM_DIR:$PATH"
+
 # Ensure all required targets are installed
 "$RUSTUP" target add \
     aarch64-apple-ios-sim \
