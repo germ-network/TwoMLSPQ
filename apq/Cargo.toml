@@ -11,7 +11,10 @@ version = "0.1.0"
 workspace = true
 
 [features]
-cryptokit = ["dep:mls-rs-crypto-awslc"]
+# Exposes measurement fixtures (e.g. full PQ updatePath commit size) for benchmarks only;
+# never enabled in production. Combine with `cryptokit` for real ML-KEM numbers.
+benchmark_util = []
+cryptokit = ["dep:mls-rs-crypto-awslc", "dep:mls-rs-crypto-traits"]
 default = ["rustcrypto"]
 rustcrypto = []
 
@@ -19,4 +22,5 @@ rustcrypto = []
 mls-rs = { workspace = true }
 mls-rs-crypto-awslc = { workspace = true, optional = true }
 mls-rs-crypto-rustcrypto = { workspace = true }
+mls-rs-crypto-traits = { version = "0.22", git = "https://github.com/germ-network/mls-rs", rev = "76a4ce0ef4875cfca434807fd9c1329b211ee4b5", optional = true }
 thiserror = { workspace = true }

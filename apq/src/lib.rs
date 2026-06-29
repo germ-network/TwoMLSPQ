@@ -13,6 +13,8 @@
 
 mod client;
 mod group;
+#[cfg(feature = "cryptokit")]
+pub mod pq_ratchet;
 
 pub use client::{CombinerClient, MlsClient, OurConfig};
 #[cfg(feature = "cryptokit")]

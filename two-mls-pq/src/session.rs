@@ -32,6 +32,8 @@ struct SessionInner {
     pending_recv_commit_message: Option<Vec<u8>>,
     queued_proposal: Option<TwoMlsPqDigest>,
     pending_new_client: Option<Arc<TwoMlsPqClient>>,
+    #[cfg(feature = "cryptokit")]
+    pq_inflight: Option<PqInflight>,
     session_id: SessionId,
     my_state: AgentState,
     their_state: AgentState,
@@ -57,6 +59,173 @@ const FULL_BUNDLE_TAG: u8 = 0x07;
 // The acceptor staples its return APQWelcome onto its first app frame; the inner frame is an
 // ordinary tagged frame (0x05/0x07/0x03/raw). First round only — consumed after one send.
 const STAPLED_WELCOME_TAG: u8 = 0x09;
+// PQ ratchet (architecture-diagrams PR #2 §A.3), cryptokit only:
+// 0x0B carries the initiator's ML-KEM encapsulation key, 0x0D the responder's ciphertext,
+// 0x0F the bind = [pq partial-commit][classical commit][app], all length-prefixed.
+#[cfg(feature = "cryptokit")]
+const PQ_EK_TAG: u8 = 0x0B;
+#[cfg(feature = "cryptokit")]
+const PQ_CT_TAG: u8 = 0x0D;
+#[cfg(feature = "cryptokit")]
+const PQ_BIND_TAG: u8 = 0x0F;
+
+/// PQ ratchet round state carried between the messages of one exchange.
+#[cfg(feature = "cryptokit")]
+enum PqInflight {
+    /// Initiator holds the ephemeral (decapsulation key) until it receives the ciphertext.
+    Initiating(apq::pq_ratchet::PqEphemeral),
+    /// Responder holds the shared secret until it receives the stapled bind.
+    Responding(Vec<u8>),
+}
+
+#[cfg(feature = "cryptokit")]
+fn encode_pq_bind(pq_commit: Vec<u8>, classical_commit: Vec<u8>, app: Vec<u8>) -> Vec<u8> {
+    let mut out =
+        Vec::with_capacity(1 + 4 + pq_commit.len() + 4 + classical_commit.len() + 4 + app.len());
+    out.push(PQ_BIND_TAG);
+    for part in [&pq_commit, &classical_commit, &app] {
+        out.extend_from_slice(&(part.len() as u32).to_le_bytes());
+        out.extend_from_slice(part);
+    }
+    out
+}
+
+#[cfg(feature = "cryptokit")]
+fn decode_pq_bind(bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+    let (&tag, mut rest) = bytes.split_first().ok_or(TwoMlsPqError::Mls)?;
+    if tag != PQ_BIND_TAG {
+        return Err(TwoMlsPqError::Mls);
+    }
+    let (pq_commit, classical_commit, app) = {
+        let mut read_chunk = || -> Result<Vec<u8>> {
+            if rest.len() < 4 {
+                return Err(TwoMlsPqError::Mls);
+            }
+            let len = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
+            rest = &rest[4..];
+            if rest.len() < len {
+                return Err(TwoMlsPqError::Mls);
+            }
+            let chunk = rest[..len].to_vec();
+            rest = &rest[len..];
+            Ok(chunk)
+        };
+        (read_chunk()?, read_chunk()?, read_chunk()?)
+    };
+    if !rest.is_empty() {
+        return Err(TwoMlsPqError::Mls);
+    }
+    Ok((pq_commit, classical_commit, app))
+}
+
+#[cfg(feature = "cryptokit")]
+impl TwoMlsPqSession {
+    /// Initiator step 1 — generate an ML-KEM ephemeral and return the encapsulation-key message
+    /// (tag 0x0B). The decapsulation key is held until the ciphertext arrives.
+    pub fn pq_ratchet_begin(&self) -> Result<Vec<u8>> {
+        let mut inner = self.inner.lock().map_err(|_| TwoMlsPqError::Mls)?;
+        if inner.pq_inflight.is_some() {
+            return Err(TwoMlsPqError::SessionNotReady);
+        }
+        let eph = apq::pq_ratchet::generate_ephemeral()?;
+        let mut msg = vec![PQ_EK_TAG];
+        msg.extend_from_slice(&eph.encapsulation_key());
+        inner.pq_inflight = Some(PqInflight::Initiating(eph));
+        Ok(msg)
+    }
+
+    /// Responder — encapsulate a fresh secret to the initiator's EK, hold it, and return the
+    /// ciphertext message (tag 0x0D).
+    pub fn pq_ratchet_respond(&self, ek_msg: Vec<u8>) -> Result<Vec<u8>> {
+        let (&tag, ek) = ek_msg.split_first().ok_or(TwoMlsPqError::Mls)?;
+        if tag != PQ_EK_TAG {
+            return Err(TwoMlsPqError::Mls);
+        }
+        let mut inner = self.inner.lock().map_err(|_| TwoMlsPqError::Mls)?;
+        if inner.pq_inflight.is_some() {
+            return Err(TwoMlsPqError::SessionNotReady);
+        }
+        let (s, ct) = apq::pq_ratchet::encapsulate(ek)?;
+        inner.pq_inflight = Some(PqInflight::Responding(s));
+        let mut msg = vec![PQ_CT_TAG];
+        msg.extend_from_slice(&ct);
+        Ok(msg)
+    }
+
+    /// Initiator step 2 — decapsulate S, inject it into the send group's PQ half via a pathless
+    /// commit, bind the exported apq_psk into the classical half, and staple an app message.
+    /// Returns the bind frame (tag 0x0F).
+    pub fn pq_ratchet_bind(&self, ct_msg: Vec<u8>, app: Vec<u8>) -> Result<Vec<u8>> {
+        let (&tag, ct) = ct_msg.split_first().ok_or(TwoMlsPqError::Mls)?;
+        if tag != PQ_CT_TAG {
+            return Err(TwoMlsPqError::Mls);
+        }
+        let mut inner = self.inner.lock().map_err(|_| TwoMlsPqError::Mls)?;
+        let eph = match inner.pq_inflight.take() {
+            Some(PqInflight::Initiating(eph)) => eph,
+            _ => return Err(TwoMlsPqError::SessionNotReady),
+        };
+        let s = apq::pq_ratchet::decapsulate(&eph, ct)?;
+        let client = inner.client.clone();
+        let send = inner
+            .send_group
+            .as_mut()
+            .ok_or(TwoMlsPqError::SessionNotReady)?;
+        let (pq_commit, apq_psk_id) =
+            apq::pq_ratchet::inject_and_commit(&mut send.pq, &s, client.combiner())?;
+        let cl_out = send
+            .classical
+            .commit_builder()
+            .add_external_psk(apq_psk_id)
+            .map_err(|_| TwoMlsPqError::Mls)?
+            .build()
+            .map_err(|_| TwoMlsPqError::Mls)?;
+        send.classical
+            .apply_pending_commit()
+            .map_err(|_| TwoMlsPqError::Mls)?;
+        let cl_commit = cl_out
+            .commit_message
+            .to_bytes()
+            .map_err(|_| TwoMlsPqError::Mls)?;
+        let app_ct = send
+            .classical
+            .encrypt_application_message(&app, vec![])
+            .map_err(|_| TwoMlsPqError::Mls)?
+            .to_bytes()
+            .map_err(|_| TwoMlsPqError::Mls)?;
+        Ok(encode_pq_bind(pq_commit, cl_commit, app_ct))
+    }
+
+    /// Responder — apply the stapled bind: register the held secret, apply the PQ partial commit
+    /// and classical commit on the recv group, and return the decrypted app message.
+    pub fn pq_ratchet_apply(&self, bind_msg: Vec<u8>) -> Result<Vec<u8>> {
+        let (pq_commit, cl_commit, app_ct) = decode_pq_bind(&bind_msg)?;
+        let mut inner = self.inner.lock().map_err(|_| TwoMlsPqError::Mls)?;
+        let s = match inner.pq_inflight.take() {
+            Some(PqInflight::Responding(s)) => s,
+            _ => return Err(TwoMlsPqError::SessionNotReady),
+        };
+        let client = inner.client.clone();
+        let recv = inner
+            .recv_group
+            .as_mut()
+            .ok_or(TwoMlsPqError::SessionNotReady)?;
+        apq::pq_ratchet::apply_injected_commit(&mut recv.pq, &s, &pq_commit, client.combiner())?;
+        let cl = MlsMessage::from_bytes(&cl_commit).map_err(|_| TwoMlsPqError::Mls)?;
+        recv.classical
+            .process_incoming_message(cl)
+            .map_err(|_| TwoMlsPqError::Mls)?;
+        let app = MlsMessage::from_bytes(&app_ct).map_err(|_| TwoMlsPqError::Mls)?;
+        match recv
+            .classical
+            .process_incoming_message(app)
+            .map_err(|_| TwoMlsPqError::Mls)?
+        {
+            ReceivedMessage::ApplicationMessage(m) => Ok(m.data().to_vec()),
+            _ => Err(TwoMlsPqError::DecryptionFailed),
+        }
+    }
+}
 
 fn encode_stapled_welcome(welcome: &[u8], inner: Vec<u8>) -> Vec<u8> {
     let mut out = Vec::with_capacity(1 + 4 + welcome.len() + inner.len());
@@ -454,6 +623,8 @@ fn build_session(
             pending_recv_commit_message: None,
             queued_proposal: None,
             pending_new_client: None,
+            #[cfg(feature = "cryptokit")]
+            pq_inflight: None,
             session_id,
             my_state: AgentState::Sync { client_id: my_id },
             their_state: AgentState::Sync {
@@ -1108,6 +1279,138 @@ mod tests {
         assert!(
             alice_session.is_established(),
             "alice should be established"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "cryptokit")]
+    fn test_pq_ratchet_round_trip_delivers_app_message() {
+        let (alice, bob) = establish_sessions();
+        // Alice initiates a PQ ratchet on her send group; Bob responds and applies.
+        let ek = assert_ok!(alice.pq_ratchet_begin());
+        let ct = assert_ok!(bob.pq_ratchet_respond(ek));
+        let bind = assert_ok!(alice.pq_ratchet_bind(ct, b"hello-pq".to_vec()));
+        let got = assert_ok!(bob.pq_ratchet_apply(bind));
+        assert_eq!(got, b"hello-pq");
+    }
+
+    #[test]
+    #[cfg(feature = "cryptokit")]
+    fn test_pq_ratchet_turn_flips_to_responder() {
+        let (alice, bob) = establish_sessions();
+        // Round 1: Alice initiates.
+        let ek = assert_ok!(alice.pq_ratchet_begin());
+        let ct = assert_ok!(bob.pq_ratchet_respond(ek));
+        let bind = assert_ok!(alice.pq_ratchet_bind(ct, b"a1".to_vec()));
+        assert_eq!(assert_ok!(bob.pq_ratchet_apply(bind)), b"a1");
+        // Round 2: turn flips — Bob initiates on his send group, Alice applies.
+        let ek2 = assert_ok!(bob.pq_ratchet_begin());
+        let ct2 = assert_ok!(alice.pq_ratchet_respond(ek2));
+        let bind2 = assert_ok!(bob.pq_ratchet_bind(ct2, b"b1".to_vec()));
+        assert_eq!(assert_ok!(alice.pq_ratchet_apply(bind2)), b"b1");
+    }
+
+    #[test]
+    #[cfg(feature = "cryptokit")]
+    fn test_pq_ratchet_bind_without_begin_is_rejected() {
+        let (alice, _bob) = establish_sessions();
+        let mut ct = vec![super::PQ_CT_TAG];
+        ct.extend_from_slice(&[0u8; 1088]);
+        assert_err!(
+            alice.pq_ratchet_bind(ct, b"x".to_vec()),
+            TwoMlsPqError::SessionNotReady
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "cryptokit")]
+    fn test_classical_round_still_works_after_pq_ratchet() {
+        let (alice, bob) = establish_sessions();
+        let ek = assert_ok!(alice.pq_ratchet_begin());
+        let ct = assert_ok!(bob.pq_ratchet_respond(ek));
+        let bind = assert_ok!(alice.pq_ratchet_bind(ct, b"pq".to_vec()));
+        assert_eq!(assert_ok!(bob.pq_ratchet_apply(bind)), b"pq");
+
+        // The classical ratchet must continue normally after a PQ bind.
+        assert_ok!(alice.prepare_to_encrypt(None));
+        let enc = assert_ok!(alice.encrypt(b"classical-after-pq".to_vec()));
+        let result = assert_some!(assert_ok!(bob.process_incoming(enc.cipher_text)));
+        assert_eq!(
+            assert_some!(result.application_message).app_message_data,
+            b"classical-after-pq"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "cryptokit")]
+    fn test_three_sequential_pq_ratchets_alternate_and_deliver() {
+        let (alice, bob) = establish_sessions();
+        for (i, (initiator, responder)) in [(&alice, &bob), (&bob, &alice), (&alice, &bob)]
+            .iter()
+            .enumerate()
+        {
+            let payload = vec![i as u8; 8];
+            let ek = assert_ok!(initiator.pq_ratchet_begin());
+            let ct = assert_ok!(responder.pq_ratchet_respond(ek));
+            let bind = assert_ok!(initiator.pq_ratchet_bind(ct, payload.clone()));
+            assert_eq!(assert_ok!(responder.pq_ratchet_apply(bind)), payload);
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "cryptokit")]
+    fn test_pq_ratchet_respond_rejects_wrong_tag() {
+        let (_alice, bob) = establish_sessions();
+        assert_err!(
+            bob.pq_ratchet_respond(vec![0xAB, 1, 2, 3]),
+            TwoMlsPqError::Mls
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "cryptokit")]
+    fn test_pq_ratchet_apply_without_respond_is_rejected() {
+        let (alice, bob) = establish_sessions();
+        let ek = assert_ok!(alice.pq_ratchet_begin());
+        let ct = assert_ok!(bob.pq_ratchet_respond(ek));
+        let bind = assert_ok!(alice.pq_ratchet_bind(ct, b"x".to_vec()));
+        // A different session that never responded has no held secret.
+        let (_a2, b2) = establish_sessions();
+        assert_err!(b2.pq_ratchet_apply(bind), TwoMlsPqError::SessionNotReady);
+    }
+
+    #[test]
+    #[cfg(feature = "cryptokit")]
+    fn test_pq_ratchet_double_begin_is_rejected() {
+        let (alice, _bob) = establish_sessions();
+        assert_ok!(alice.pq_ratchet_begin());
+        assert_err!(alice.pq_ratchet_begin(), TwoMlsPqError::SessionNotReady);
+    }
+
+    #[test]
+    #[cfg(feature = "cryptokit")]
+    fn test_pq_ratchet_tampered_ciphertext_fails_to_apply() {
+        let (alice, bob) = establish_sessions();
+        let ek = assert_ok!(alice.pq_ratchet_begin());
+        let mut ct = assert_ok!(bob.pq_ratchet_respond(ek));
+        let last = ct.len() - 1;
+        ct[last] ^= 0xFF;
+        // Alice binds a divergent S (ML-KEM implicit rejection); Bob holds the real S → apply fails.
+        let bind = assert_ok!(alice.pq_ratchet_bind(ct, b"x".to_vec()));
+        assert_err!(bob.pq_ratchet_apply(bind), TwoMlsPqError::Mls);
+    }
+
+    #[test]
+    #[cfg(feature = "cryptokit")]
+    fn test_decode_pq_bind_rejects_truncated_and_trailing() {
+        let frame = super::encode_pq_bind(b"aa".to_vec(), b"bb".to_vec(), b"cc".to_vec());
+        assert_ok!(super::decode_pq_bind(&frame));
+        let mut trailing = frame.clone();
+        trailing.push(0xFF);
+        assert_err!(super::decode_pq_bind(&trailing), TwoMlsPqError::Mls);
+        assert_err!(
+            super::decode_pq_bind(&[super::PQ_BIND_TAG]),
+            TwoMlsPqError::Mls
         );
     }
 

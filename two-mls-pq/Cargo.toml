@@ -18,7 +18,7 @@ workspace = true
 [features]
 # Exposes bench fixtures and gates the `benches/*` targets; combine with `cryptokit`
 # for real ML-KEM-768 numbers.
-benchmark_util = []
+benchmark_util = ["apq/benchmark_util"]
 cryptokit = ["apq/cryptokit"]
 default = ["rustcrypto"]
 rustcrypto = ["apq/rustcrypto"]
