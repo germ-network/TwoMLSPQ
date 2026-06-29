@@ -1,5 +1,5 @@
 [workspace]
-members = ["two-mls-pq", "uniffi-bindgen"]
+members = ["apq", "two-mls-pq", "uniffi-bindgen"]
 resolver = "3"
 
 [workspace.package]

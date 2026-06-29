@@ -18,7 +18,8 @@ just book-serve        # serve at http://localhost:3000
 ## Structure
 
 ```
-two-mls-pq/       Core library
+apq/              APQ Combiner layer (the {classical, pq} group pair, APQ-PSK, establishment)
+two-mls-pq/       Core library (session orchestration, wire format, UniFFI surface)
 uniffi-bindgen/   UniFFI binding generator
 scripts/          iOS build tooling
 bindings/         Generated Swift output (after build)

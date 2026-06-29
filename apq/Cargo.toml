@@ -1,0 +1,22 @@
+[package]
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+name = "apq"
+publish.workspace = true
+rust-version.workspace = true
+version = "0.1.0"
+
+[lints]
+workspace = true
+
+[features]
+cryptokit = ["dep:mls-rs-crypto-awslc"]
+default = ["rustcrypto"]
+rustcrypto = []
+
+[dependencies]
+mls-rs = { workspace = true }
+mls-rs-crypto-awslc = { workspace = true, optional = true }
+mls-rs-crypto-rustcrypto = { workspace = true }
+thiserror = { workspace = true }

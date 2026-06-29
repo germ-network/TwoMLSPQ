@@ -2,11 +2,13 @@ use std::sync::{Arc, Mutex};
 
 use mls_rs::{group::ReceivedMessage, MlsMessage};
 
+use apq::{
+    create_bound_combiner_send_group, create_combiner_send_group, decode_apq_welcome,
+    export_and_register_psk, join_combiner_group, join_group_from_welcome, sender_client_id,
+    CombinerGroup, APQ_TAG,
+};
+
 use crate::{
-    combiner::{
-        create_bound_combiner_send_group, create_combiner_send_group, export_and_register_psk,
-        join_combiner_group, join_group_from_welcome, sender_client_id, CombinerGroup,
-    },
     key_packages::{
         ensure_pq_available, parse_mls_key_package, CombinerKeyPackage, TwoMlsPqClient,
     },
@@ -16,7 +18,7 @@ use crate::{
 };
 
 #[cfg(feature = "cryptokit")]
-use crate::combiner::{export_and_register_psk_pq, pq_join_group_from_welcome};
+use apq::{export_and_register_psk_pq, pq_join_group_from_welcome};
 
 struct SessionInner {
     client: Arc<TwoMlsPqClient>,
@@ -41,8 +43,7 @@ pub struct TwoMlsPqSession {
     inner: Mutex<SessionInner>,
 }
 
-// APQWelcome wire format: [0x01 tag][u32-LE classical-len][classical bytes][u32-LE pq-len][pq bytes]
-const APQ_TAG: u8 = 0x01;
+// APQWelcome wire format (0x01) + encode/decode live in the `apq` crate (imported above).
 // Rotation commit+app: [0x03 tag][u32-LE commit-len][commit][u32-LE app-len][app]
 // Used only for Phase 8 agent rotation (no PSK refresh).
 const BUNDLED_TAG: u8 = 0x03;
@@ -56,39 +57,6 @@ const FULL_BUNDLE_TAG: u8 = 0x07;
 // The acceptor staples its return APQWelcome onto its first app frame; the inner frame is an
 // ordinary tagged frame (0x05/0x07/0x03/raw). First round only — consumed after one send.
 const STAPLED_WELCOME_TAG: u8 = 0x09;
-
-pub(crate) fn encode_apq_welcome(classical: Vec<u8>, pq: Vec<u8>) -> Vec<u8> {
-    let mut out = Vec::with_capacity(1 + 4 + classical.len() + 4 + pq.len());
-    out.push(APQ_TAG);
-    out.extend_from_slice(&(classical.len() as u32).to_le_bytes());
-    out.extend_from_slice(&classical);
-    out.extend_from_slice(&(pq.len() as u32).to_le_bytes());
-    out.extend_from_slice(&pq);
-    out
-}
-
-pub(crate) fn decode_apq_welcome(bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
-    let (&tag, rest) = bytes.split_first().ok_or(TwoMlsPqError::Mls)?;
-    if tag != APQ_TAG {
-        return Err(TwoMlsPqError::Mls);
-    }
-    if rest.len() < 4 {
-        return Err(TwoMlsPqError::Mls);
-    }
-    let c_len = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
-    let rest = &rest[4..];
-    if rest.len() < c_len + 4 {
-        return Err(TwoMlsPqError::Mls);
-    }
-    let classical = rest[..c_len].to_vec();
-    let rest = &rest[c_len..];
-    let p_len = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
-    let rest = &rest[4..];
-    if rest.len() != p_len {
-        return Err(TwoMlsPqError::Mls);
-    }
-    Ok((classical, rest.to_vec()))
-}
 
 fn encode_stapled_welcome(welcome: &[u8], inner: Vec<u8>) -> Vec<u8> {
     let mut out = Vec::with_capacity(1 + 4 + welcome.len() + inner.len());
@@ -257,8 +225,6 @@ impl SessionInner {
         }
     }
 
-    // --- Phase helpers for prepare_to_encrypt ---
-
     /// Phase 8: encode a rotation commit on send_group.pq with `new_id` in authenticated_data.
     fn prepare_rotation(&mut self, new_id: ClientId) -> Result<crate::PrepareEncryptResult> {
         let new_client = self
@@ -363,7 +329,7 @@ impl SessionInner {
                 .send_group
                 .as_ref()
                 .ok_or(TwoMlsPqError::SessionNotReady)?;
-            export_and_register_psk(&send.classical, &client)?
+            export_and_register_psk(&send.classical, client.combiner())?
         };
 
         let recv_commit_output = {
@@ -511,7 +477,11 @@ impl TwoMlsPqSession {
         let their_id = their_parsed.client_id;
         let session_id = crate::derive_session_id(client.client_id(), their_id.clone())?;
 
-        let (send_group, apq_welcome) = create_combiner_send_group(&their_key_package, &client)?;
+        let (send_group, apq_welcome) = create_combiner_send_group(
+            &their_key_package.classical,
+            &their_key_package.pq,
+            client.combiner(),
+        )?;
 
         Ok(build_session(
             client,
@@ -536,9 +506,13 @@ impl TwoMlsPqSession {
         let their_id = their_parsed.client_id;
         let session_id = crate::derive_session_id(client.client_id(), their_id.clone())?;
 
-        let recv_group = join_combiner_group(&welcome, &client)?;
-        let (send_group, apq_welcome) =
-            create_bound_combiner_send_group(&their_key_package, &client, &recv_group.classical)?;
+        let recv_group = join_combiner_group(&welcome, client.combiner())?;
+        let (send_group, apq_welcome) = create_bound_combiner_send_group(
+            &their_key_package.classical,
+            &their_key_package.pq,
+            client.combiner(),
+            &recv_group.classical,
+        )?;
 
         Ok(build_session(
             client,
@@ -720,7 +694,7 @@ impl TwoMlsPqSession {
 
             // Re-derive the cross-party TwoMLS-PSK from our own send group (Group_A classical).
             if let Some(sg) = &inner.send_group {
-                export_and_register_psk(&sg.classical, &client)?;
+                export_and_register_psk(&sg.classical, client.combiner())?;
             }
 
             let (classical_welcome, pq_welcome) = decode_apq_welcome(&ciphertext)?;
@@ -730,9 +704,9 @@ impl TwoMlsPqSession {
             #[cfg(not(feature = "cryptokit"))]
             let pq = join_group_from_welcome(client.classical(), &pq_welcome)?;
             #[cfg(feature = "cryptokit")]
-            export_and_register_psk_pq(&pq, &client)?;
+            export_and_register_psk_pq(&pq, client.combiner())?;
             #[cfg(not(feature = "cryptokit"))]
-            export_and_register_psk(&pq, &client)?;
+            export_and_register_psk(&pq, client.combiner())?;
             // Join the classical group (bound with the cross-party + APQ PSKs).
             let classical = join_group_from_welcome(client.classical(), &classical_welcome)?;
 
@@ -781,7 +755,9 @@ impl TwoMlsPqSession {
                     .map_err(|_| TwoMlsPqError::DecryptionFailed)?
                 {
                     ReceivedMessage::ApplicationMessage(desc) => {
-                        let sender = sender_client_id(&recv.classical, desc.sender_index)?;
+                        let sender = ClientId {
+                            bytes: sender_client_id(&recv.classical, desc.sender_index)?,
+                        };
                         let ep = recv.classical.current_epoch();
                         let proposal = make_queued_proposal(
                             recv.classical.group_id(),
@@ -846,7 +822,7 @@ impl TwoMlsPqSession {
                     .recv_group
                     .as_ref()
                     .ok_or(TwoMlsPqError::SessionNotEstablished)?;
-                export_and_register_psk(&recv.classical, &client)?;
+                export_and_register_psk(&recv.classical, client.combiner())?;
             }
 
             // Step 3 — apply the PSK-refresh commit on send_group.classical (Group_B).
@@ -877,7 +853,9 @@ impl TwoMlsPqSession {
                     .map_err(|_| TwoMlsPqError::DecryptionFailed)?
                 {
                     ReceivedMessage::ApplicationMessage(desc) => {
-                        let sender = sender_client_id(&recv.classical, desc.sender_index)?;
+                        let sender = ClientId {
+                            bytes: sender_client_id(&recv.classical, desc.sender_index)?,
+                        };
                         let ep = recv.classical.current_epoch();
                         (desc.data().to_vec(), sender, ep)
                     }
@@ -957,7 +935,9 @@ impl TwoMlsPqSession {
                     .map_err(|_| TwoMlsPqError::DecryptionFailed)?
                 {
                     ReceivedMessage::ApplicationMessage(desc) => {
-                        let sender = sender_client_id(&recv.classical, desc.sender_index)?;
+                        let sender = ClientId {
+                            bytes: sender_client_id(&recv.classical, desc.sender_index)?,
+                        };
                         let ep = recv.classical.current_epoch();
                         (desc.data().to_vec(), sender, ep)
                     }
@@ -999,7 +979,9 @@ impl TwoMlsPqSession {
 
         match received {
             ReceivedMessage::ApplicationMessage(desc) => {
-                let sender_id = sender_client_id(&recv.classical, desc.sender_index)?;
+                let sender_id = ClientId {
+                    bytes: sender_client_id(&recv.classical, desc.sender_index)?,
+                };
                 let epoch = recv.classical.current_epoch();
                 let proposal = make_queued_proposal(
                     recv.classical.group_id(),
@@ -1494,8 +1476,6 @@ mod tests {
         );
     }
 
-    // --- Gap 1: PSK refresh on full commit ---
-
     #[test]
     fn test_full_commit_advances_send_group_epoch() {
         let (alice_session, bob_session) = establish_sessions();
@@ -1542,8 +1522,6 @@ mod tests {
             b"reply"
         );
     }
-
-    // --- Gap 2: recv-group self-Update on partial commit ---
 
     #[test]
     fn test_partial_commit_recv_advances_send_group_on_peer() {
@@ -1655,7 +1633,7 @@ mod tests {
         let bob = make_client();
         let bob_kp = make_combiner_kp(&bob);
 
-        let (group, _) = assert_ok!(crate::combiner::create_group_with_member(
+        let (group, _) = assert_ok!(apq::create_group_with_member(
             alice.classical(),
             &bob_kp.classical,
             &[]
@@ -1669,7 +1647,7 @@ mod tests {
         let other = assert_ok!(group.export_secret(b"otherLabel", b"derive", 32));
         assert_ne!(s1.as_bytes(), other.as_bytes());
 
-        let psk_id = assert_ok!(super::export_and_register_psk(&group, &alice));
+        let psk_id = assert_ok!(apq::export_and_register_psk(&group, alice.combiner()));
         let expected_id = {
             let mut v = group.current_epoch().to_le_bytes().to_vec();
             v.extend_from_slice(group.group_id());
@@ -1707,8 +1685,6 @@ mod tests {
             "APQ-PSK must be exported from the PQ group (pq -> classical), per draft §6.2"
         );
     }
-
-    // --- Accessor tests ---
 
     #[test]
     fn test_prepare_to_encrypt_before_established_returns_error() {
@@ -1821,8 +1797,6 @@ mod tests {
             AgentState::Pending { .. }
         ));
     }
-
-    // --- Partial commit tests ---
 
     #[test]
     fn test_partial_commit_surfaces_proposal_nonce() {
@@ -2040,16 +2014,6 @@ mod tests {
         assert_some!(result.remote_commit);
     }
 
-    // --- Wire format tests ---
-
-    #[test]
-    fn test_decode_apq_welcome_truncated_returns_error() {
-        assert_err!(
-            super::decode_apq_welcome(&[super::APQ_TAG]),
-            TwoMlsPqError::Mls
-        );
-    }
-
     #[test]
     fn test_decode_bundled_truncated_returns_error() {
         assert_err!(
@@ -2079,16 +2043,6 @@ mod tests {
         let mut good = super::encode_full_bundle(b"sc".to_vec(), b"rc".to_vec(), b"app".to_vec());
         good.push(0xFF);
         assert_err!(super::decode_full_bundle(&good), TwoMlsPqError::Mls);
-    }
-
-    #[test]
-    fn test_encode_decode_apq_welcome_roundtrip() {
-        let classical = b"classical-welcome".to_vec();
-        let pq = b"pq-welcome".to_vec();
-        let encoded = super::encode_apq_welcome(classical.clone(), pq.clone());
-        let (dec_classical, dec_pq) = assert_ok!(super::decode_apq_welcome(&encoded));
-        assert_eq!(dec_classical, classical);
-        assert_eq!(dec_pq, pq);
     }
 
     #[test]
