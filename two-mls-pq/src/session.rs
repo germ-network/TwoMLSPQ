@@ -19,6 +19,8 @@ use crate::{
 
 #[cfg(feature = "cryptokit")]
 use apq::{export_and_register_psk_pq, pq_join_group_from_welcome};
+#[cfg(feature = "cryptokit")]
+use zeroize::Zeroizing;
 
 struct SessionInner {
     client: Arc<TwoMlsPqClient>,
@@ -74,8 +76,40 @@ const PQ_BIND_TAG: u8 = 0x0F;
 enum PqInflight {
     /// Initiator holds the ephemeral (decapsulation key) until it receives the ciphertext.
     Initiating(apq::pq_ratchet::PqEphemeral),
-    /// Responder holds the shared secret until it receives the stapled bind.
-    Responding(Vec<u8>),
+    /// Responder holds the shared secret until it receives the stapled bind. `Zeroizing` wipes the
+    /// secret from memory on drop, whether it is consumed by the bind or abandoned.
+    Responding(Zeroizing<Vec<u8>>),
+}
+
+/// Append `part` to `out` as a u32-LE length-prefixed section.
+fn push_section(out: &mut Vec<u8>, part: &[u8]) {
+    out.extend_from_slice(&(part.len() as u32).to_le_bytes());
+    out.extend_from_slice(part);
+}
+
+/// Read exactly `N` u32-LE length-prefixed sections from `body` (the frame payload *after* the
+/// 1-byte tag), rejecting truncation and any trailing bytes. Single source of truth for the
+/// length-prefixed framing used by all bundle/commit frames, so the bounds checks live in one
+/// audited place rather than being re-derived per frame type.
+fn read_sections<const N: usize>(body: &[u8]) -> Result<[Vec<u8>; N]> {
+    let mut rest = body;
+    let mut out: [Vec<u8>; N] = std::array::from_fn(|_| Vec::new());
+    for slot in out.iter_mut() {
+        if rest.len() < 4 {
+            return Err(TwoMlsPqError::Mls);
+        }
+        let len = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
+        rest = &rest[4..];
+        if rest.len() < len {
+            return Err(TwoMlsPqError::Mls);
+        }
+        *slot = rest[..len].to_vec();
+        rest = &rest[len..];
+    }
+    if !rest.is_empty() {
+        return Err(TwoMlsPqError::Mls);
+    }
+    Ok(out)
 }
 
 #[cfg(feature = "cryptokit")]
@@ -83,38 +117,19 @@ fn encode_pq_bind(pq_commit: Vec<u8>, classical_commit: Vec<u8>, app: Vec<u8>) -
     let mut out =
         Vec::with_capacity(1 + 4 + pq_commit.len() + 4 + classical_commit.len() + 4 + app.len());
     out.push(PQ_BIND_TAG);
-    for part in [&pq_commit, &classical_commit, &app] {
-        out.extend_from_slice(&(part.len() as u32).to_le_bytes());
-        out.extend_from_slice(part);
-    }
+    push_section(&mut out, &pq_commit);
+    push_section(&mut out, &classical_commit);
+    push_section(&mut out, &app);
     out
 }
 
 #[cfg(feature = "cryptokit")]
 fn decode_pq_bind(bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
-    let (&tag, mut rest) = bytes.split_first().ok_or(TwoMlsPqError::Mls)?;
+    let (&tag, rest) = bytes.split_first().ok_or(TwoMlsPqError::Mls)?;
     if tag != PQ_BIND_TAG {
         return Err(TwoMlsPqError::Mls);
     }
-    let (pq_commit, classical_commit, app) = {
-        let mut read_chunk = || -> Result<Vec<u8>> {
-            if rest.len() < 4 {
-                return Err(TwoMlsPqError::Mls);
-            }
-            let len = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
-            rest = &rest[4..];
-            if rest.len() < len {
-                return Err(TwoMlsPqError::Mls);
-            }
-            let chunk = rest[..len].to_vec();
-            rest = &rest[len..];
-            Ok(chunk)
-        };
-        (read_chunk()?, read_chunk()?, read_chunk()?)
-    };
-    if !rest.is_empty() {
-        return Err(TwoMlsPqError::Mls);
-    }
+    let [pq_commit, classical_commit, app] = read_sections::<3>(rest)?;
     Ok((pq_commit, classical_commit, app))
 }
 
@@ -123,7 +138,7 @@ impl TwoMlsPqSession {
     /// Initiator step 1 — generate an ML-KEM ephemeral and return the encapsulation-key message
     /// (tag 0x0B). The decapsulation key is held until the ciphertext arrives.
     pub fn pq_ratchet_begin(&self) -> Result<Vec<u8>> {
-        let mut inner = self.inner.lock().map_err(|_| TwoMlsPqError::Mls)?;
+        let mut inner = self.lock();
         if inner.pq_inflight.is_some() {
             return Err(TwoMlsPqError::SessionNotReady);
         }
@@ -141,12 +156,12 @@ impl TwoMlsPqSession {
         if tag != PQ_EK_TAG {
             return Err(TwoMlsPqError::Mls);
         }
-        let mut inner = self.inner.lock().map_err(|_| TwoMlsPqError::Mls)?;
+        let mut inner = self.lock();
         if inner.pq_inflight.is_some() {
             return Err(TwoMlsPqError::SessionNotReady);
         }
         let (s, ct) = apq::pq_ratchet::encapsulate(ek)?;
-        inner.pq_inflight = Some(PqInflight::Responding(s));
+        inner.pq_inflight = Some(PqInflight::Responding(Zeroizing::new(s)));
         let mut msg = vec![PQ_CT_TAG];
         msg.extend_from_slice(&ct);
         Ok(msg)
@@ -160,12 +175,12 @@ impl TwoMlsPqSession {
         if tag != PQ_CT_TAG {
             return Err(TwoMlsPqError::Mls);
         }
-        let mut inner = self.inner.lock().map_err(|_| TwoMlsPqError::Mls)?;
+        let mut inner = self.lock();
         let eph = match inner.pq_inflight.take() {
             Some(PqInflight::Initiating(eph)) => eph,
             _ => return Err(TwoMlsPqError::SessionNotReady),
         };
-        let s = apq::pq_ratchet::decapsulate(&eph, ct)?;
+        let s = Zeroizing::new(apq::pq_ratchet::decapsulate(&eph, ct)?);
         let client = inner.client.clone();
         let send = inner
             .send_group
@@ -200,7 +215,7 @@ impl TwoMlsPqSession {
     /// and classical commit on the recv group, and return the decrypted app message.
     pub fn pq_ratchet_apply(&self, bind_msg: Vec<u8>) -> Result<Vec<u8>> {
         let (pq_commit, cl_commit, app_ct) = decode_pq_bind(&bind_msg)?;
-        let mut inner = self.inner.lock().map_err(|_| TwoMlsPqError::Mls)?;
+        let mut inner = self.lock();
         let s = match inner.pq_inflight.take() {
             Some(PqInflight::Responding(s)) => s,
             _ => return Err(TwoMlsPqError::SessionNotReady),
@@ -255,10 +270,8 @@ fn decode_stapled_welcome(bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
 fn encode_bundled(commit: Vec<u8>, app: Vec<u8>) -> Vec<u8> {
     let mut out = Vec::with_capacity(1 + 4 + commit.len() + 4 + app.len());
     out.push(BUNDLED_TAG);
-    out.extend_from_slice(&(commit.len() as u32).to_le_bytes());
-    out.extend_from_slice(&commit);
-    out.extend_from_slice(&(app.len() as u32).to_le_bytes());
-    out.extend_from_slice(&app);
+    push_section(&mut out, &commit);
+    push_section(&mut out, &app);
     out
 }
 
@@ -267,31 +280,15 @@ fn decode_bundled(bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
     if tag != BUNDLED_TAG {
         return Err(TwoMlsPqError::Mls);
     }
-    if rest.len() < 4 {
-        return Err(TwoMlsPqError::Mls);
-    }
-    let c_len = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
-    let rest = &rest[4..];
-    if rest.len() < c_len + 4 {
-        return Err(TwoMlsPqError::Mls);
-    }
-    let commit = rest[..c_len].to_vec();
-    let rest = &rest[c_len..];
-    let a_len = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
-    let rest = &rest[4..];
-    if rest.len() != a_len {
-        return Err(TwoMlsPqError::Mls);
-    }
-    Ok((commit, rest.to_vec()))
+    let [commit, app] = read_sections::<2>(rest)?;
+    Ok((commit, app))
 }
 
 fn encode_partial(recv_commit: Vec<u8>, app: Vec<u8>) -> Vec<u8> {
     let mut out = Vec::with_capacity(1 + 4 + recv_commit.len() + 4 + app.len());
     out.push(PARTIAL_TAG);
-    out.extend_from_slice(&(recv_commit.len() as u32).to_le_bytes());
-    out.extend_from_slice(&recv_commit);
-    out.extend_from_slice(&(app.len() as u32).to_le_bytes());
-    out.extend_from_slice(&app);
+    push_section(&mut out, &recv_commit);
+    push_section(&mut out, &app);
     out
 }
 
@@ -300,61 +297,26 @@ fn decode_partial(bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
     if tag != PARTIAL_TAG {
         return Err(TwoMlsPqError::Mls);
     }
-    if rest.len() < 4 {
-        return Err(TwoMlsPqError::Mls);
-    }
-    let rc_len = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
-    let rest = &rest[4..];
-    if rest.len() < rc_len + 4 {
-        return Err(TwoMlsPqError::Mls);
-    }
-    let recv_commit = rest[..rc_len].to_vec();
-    let rest = &rest[rc_len..];
-    let a_len = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
-    let rest = &rest[4..];
-    if rest.len() != a_len {
-        return Err(TwoMlsPqError::Mls);
-    }
-    Ok((recv_commit, rest.to_vec()))
+    let [recv_commit, app] = read_sections::<2>(rest)?;
+    Ok((recv_commit, app))
 }
 
 fn encode_full_bundle(send_commit: Vec<u8>, recv_commit: Vec<u8>, app: Vec<u8>) -> Vec<u8> {
     let mut out =
         Vec::with_capacity(1 + 4 + send_commit.len() + 4 + recv_commit.len() + 4 + app.len());
     out.push(FULL_BUNDLE_TAG);
-    out.extend_from_slice(&(send_commit.len() as u32).to_le_bytes());
-    out.extend_from_slice(&send_commit);
-    out.extend_from_slice(&(recv_commit.len() as u32).to_le_bytes());
-    out.extend_from_slice(&recv_commit);
-    out.extend_from_slice(&(app.len() as u32).to_le_bytes());
-    out.extend_from_slice(&app);
+    push_section(&mut out, &send_commit);
+    push_section(&mut out, &recv_commit);
+    push_section(&mut out, &app);
     out
 }
 
 fn decode_full_bundle(bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
-    let (&tag, mut rest) = bytes.split_first().ok_or(TwoMlsPqError::Mls)?;
+    let (&tag, rest) = bytes.split_first().ok_or(TwoMlsPqError::Mls)?;
     if tag != FULL_BUNDLE_TAG {
         return Err(TwoMlsPqError::Mls);
     }
-    let (send_commit, recv_commit, app) = {
-        let mut read_chunk = || -> Result<Vec<u8>> {
-            if rest.len() < 4 {
-                return Err(TwoMlsPqError::Mls);
-            }
-            let len = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
-            rest = &rest[4..];
-            if rest.len() < len {
-                return Err(TwoMlsPqError::Mls);
-            }
-            let chunk = rest[..len].to_vec();
-            rest = &rest[len..];
-            Ok(chunk)
-        };
-        (read_chunk()?, read_chunk()?, read_chunk()?)
-    };
-    if !rest.is_empty() {
-        return Err(TwoMlsPqError::Mls);
-    }
+    let [send_commit, recv_commit, app] = read_sections::<3>(rest)?;
     Ok((send_commit, recv_commit, app))
 }
 
@@ -634,6 +596,16 @@ fn build_session(
     })
 }
 
+impl TwoMlsPqSession {
+    /// Lock the session state, recovering from a poisoned mutex rather than propagating a panic.
+    /// A poisoned lock means a prior holder panicked mid-update; we surface the inner state and let
+    /// the normal `Option`/`AgentState` checks reject any half-applied operation. Used everywhere so
+    /// the lock policy is uniform and panic-free (the crate denies `unwrap`/`expect`/`panic`).
+    fn lock(&self) -> std::sync::MutexGuard<'_, SessionInner> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 #[uniffi::export]
 impl TwoMlsPqSession {
     /// Create a session as the initiating party targeting `their_key_package`.
@@ -704,52 +676,32 @@ impl TwoMlsPqSession {
     /// Welcome bytes to deliver to the remote party to complete group establishment.
     /// Returns `None` once consumed or when both groups are live.
     pub fn pending_outbound(&self) -> Option<Vec<u8>> {
-        self.inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .pending_outbound
-            .take()
+        self.lock().pending_outbound.take()
     }
 
     pub fn is_established(&self) -> bool {
-        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let inner = self.lock();
         inner.send_group.is_some() && inner.recv_group.is_some()
     }
 
     pub fn has_receive_group(&self) -> bool {
-        self.inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .recv_group
-            .is_some()
+        self.lock().recv_group.is_some()
     }
 
     pub fn active_session_id(&self) -> SessionId {
-        self.inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .session_id
-            .clone()
+        self.lock().session_id.clone()
     }
 
     pub fn my_agent_state(&self) -> AgentState {
-        self.inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .my_state
-            .clone()
+        self.lock().my_state.clone()
     }
 
     pub fn their_agent_state(&self) -> AgentState {
-        self.inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .their_state
-            .clone()
+        self.lock().their_state.clone()
     }
 
     pub fn receive_group_id(&self) -> Option<CombinerGroupId> {
-        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let inner = self.lock();
         inner.recv_group.as_ref().map(|rg| CombinerGroupId {
             classical: MlsGroupId {
                 bytes: rg.classical.group_id().to_vec(),
@@ -767,7 +719,7 @@ impl TwoMlsPqSession {
     /// - `proposing: Some(new_id)` → rotation commit with new leaf credential, `did_commit: true`
     /// - Otherwise → recv self-Update only, `did_commit: false`
     pub fn prepare_to_encrypt(&self, proposing: Option<ClientId>) -> Result<PrepareEncryptResult> {
-        let mut inner = self.inner.lock().map_err(|_| TwoMlsPqError::Mls)?;
+        let mut inner = self.lock();
         if let Some(new_id) = proposing {
             return inner.prepare_rotation(new_id);
         }
@@ -782,7 +734,7 @@ impl TwoMlsPqSession {
     /// authenticated data and cleared on return.
     /// When a commit was staged (did_commit: true), the output is a bundled commit+app message.
     pub fn encrypt(&self, app_message: Vec<u8>) -> Result<EncryptResult> {
-        let mut inner = self.inner.lock().map_err(|_| TwoMlsPqError::Mls)?;
+        let mut inner = self.lock();
 
         let proposal_hash = inner
             .pending_proposal_hash
@@ -850,6 +802,10 @@ impl TwoMlsPqSession {
     /// - Partial bundle (0x05) → advance send.pq then decrypt app; `DecryptResult`
     /// - Full bundle (0x07) → epoch advance + PSK refresh then decrypt; `DecryptResult`
     /// - MLS ciphertext → decrypt on recv_group.pq; `DecryptResult`
+    ///
+    /// PQ-ratchet frames (0x0B/0x0D/0x0F) are **not** handled here — the host must route them to
+    /// `pq_ratchet_respond`/`pq_ratchet_bind`/`pq_ratchet_apply` by their leading tag byte. Passing
+    /// one here returns `SessionNotReady` rather than attempting (and failing) MLS decryption.
     pub fn process_incoming(&self, ciphertext: Vec<u8>) -> Result<Option<DecryptResult>> {
         // Stapled welcome: process the embedded APQWelcome (joins the recv group), then the
         // inner app frame. Each sub-frame is a self-contained tagged frame.
@@ -860,7 +816,7 @@ impl TwoMlsPqSession {
         }
 
         if ciphertext.first() == Some(&APQ_TAG) {
-            let mut inner = self.inner.lock().map_err(|_| TwoMlsPqError::Mls)?;
+            let mut inner = self.lock();
             let client = inner.client.clone();
 
             // Re-derive the cross-party TwoMLS-PSK from our own send group (Group_A classical).
@@ -896,7 +852,7 @@ impl TwoMlsPqSession {
             let app_msg =
                 MlsMessage::from_bytes(&app_bytes).map_err(|_| TwoMlsPqError::DecryptionFailed)?;
 
-            let mut inner = self.inner.lock().map_err(|_| TwoMlsPqError::Mls)?;
+            let mut inner = self.lock();
 
             // Advance send_group.classical (Group_B on sender's side) — updates sender's leaf key.
             {
@@ -968,7 +924,7 @@ impl TwoMlsPqSession {
             let app_msg =
                 MlsMessage::from_bytes(&app_bytes).map_err(|_| TwoMlsPqError::DecryptionFailed)?;
 
-            let mut inner = self.inner.lock().map_err(|_| TwoMlsPqError::Mls)?;
+            let mut inner = self.lock();
             let client = inner.client.clone();
 
             // Step 1 — advance recv_group.classical (Group_A) with the sender's commit.
@@ -1060,7 +1016,7 @@ impl TwoMlsPqSession {
             let app_msg =
                 MlsMessage::from_bytes(&app_bytes).map_err(|_| TwoMlsPqError::DecryptionFailed)?;
 
-            let mut inner = self.inner.lock().map_err(|_| TwoMlsPqError::Mls)?;
+            let mut inner = self.lock();
 
             // Process commit — advances epoch in recv_group.classical.
             let (_committer_index, commit_auth_data) = {
@@ -1133,11 +1089,22 @@ impl TwoMlsPqSession {
             }));
         }
 
+        // PQ-ratchet frames (0x0B/0x0D/0x0F) are driven through the dedicated `pq_ratchet_*` API,
+        // not this method — they are a stateful KEM exchange, not a self-contained decryptable
+        // message. Reject them explicitly so a host that misroutes one gets a clear signal instead
+        // of an opaque `DecryptionFailed` from the MLS parser below. See `pq_ratchet_begin`.
+        #[cfg(feature = "cryptokit")]
+        if let Some(&b) = ciphertext.first() {
+            if b == PQ_EK_TAG || b == PQ_CT_TAG || b == PQ_BIND_TAG {
+                return Err(TwoMlsPqError::SessionNotReady);
+            }
+        }
+
         // MLS messages start with version bytes (0x00 ...) — attempt decryption.
         let msg =
             MlsMessage::from_bytes(&ciphertext).map_err(|_| TwoMlsPqError::DecryptionFailed)?;
 
-        let mut inner = self.inner.lock().map_err(|_| TwoMlsPqError::Mls)?;
+        let mut inner = self.lock();
         let recv = inner
             .recv_group
             .as_mut()
@@ -1176,7 +1143,7 @@ impl TwoMlsPqSession {
     }
 
     pub fn proposal_context(&self) -> Option<TwoMlsPqDigest> {
-        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let inner = self.lock();
         inner.recv_group.as_ref().map(|rg| TwoMlsPqDigest {
             hash_type: 0,
             digest: rg.pq.group_id().to_vec(),
@@ -1194,7 +1161,7 @@ impl TwoMlsPqSession {
     /// Accept a remote proposal for the next epoch advance.
     /// On the next `prepare_to_encrypt(None)` call, an empty commit will be staged.
     pub fn queue_proposal(&self, digest: TwoMlsPqDigest) -> Result<()> {
-        let mut inner = self.inner.lock().map_err(|_| TwoMlsPqError::Mls)?;
+        let mut inner = self.lock();
         inner.queued_proposal = Some(digest);
         Ok(())
     }
@@ -1202,7 +1169,7 @@ impl TwoMlsPqSession {
     /// Register a new agent client for the next rotation commit.
     /// Call before `prepare_to_encrypt(Some(new_client.client_id()))`.
     pub fn stage_rotation(&self, new_client: Arc<TwoMlsPqClient>) -> Result<()> {
-        let mut inner = self.inner.lock().map_err(|_| TwoMlsPqError::Mls)?;
+        let mut inner = self.lock();
         inner.pending_new_client = Some(new_client);
         Ok(())
     }
@@ -1365,6 +1332,16 @@ mod tests {
             bob.pq_ratchet_respond(vec![0xAB, 1, 2, 3]),
             TwoMlsPqError::Mls
         );
+    }
+
+    #[test]
+    #[cfg(feature = "cryptokit")]
+    fn test_pq_frame_routed_to_process_incoming_is_rejected() {
+        let (_alice, bob) = establish_sessions();
+        // A PQ-ratchet EK frame must never be silently swallowed as an MLS ciphertext.
+        let mut ek = vec![super::PQ_EK_TAG];
+        ek.extend_from_slice(&[0u8; 8]);
+        assert_err!(bob.process_incoming(ek), TwoMlsPqError::SessionNotReady);
     }
 
     #[test]

@@ -29,7 +29,7 @@ mls-rs = { workspace = true }
 mls-rs-crypto-rustcrypto = { workspace = true }
 thiserror = { workspace = true }
 uniffi = { workspace = true }
-zeroize = "1.8.2"
+zeroize = { workspace = true }
 
 [build-dependencies]
 uniffi = { workspace = true, features = ["build"] }
