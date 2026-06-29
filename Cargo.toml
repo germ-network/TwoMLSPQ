@@ -1,4 +1,5 @@
 [workspace]
+exclude = ["fuzz"]
 members = ["apq", "two-mls-pq", "uniffi-bindgen"]
 resolver = "3"
 
