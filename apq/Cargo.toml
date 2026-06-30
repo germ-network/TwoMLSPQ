@@ -22,5 +22,5 @@ rustcrypto = []
 mls-rs = { workspace = true }
 mls-rs-crypto-cryptokit = { workspace = true, optional = true }
 mls-rs-crypto-rustcrypto = { workspace = true }
-mls-rs-crypto-traits = { version = "0.22", git = "https://github.com/germ-network/mls-rs", rev = "76a4ce0ef4875cfca434807fd9c1329b211ee4b5", optional = true }
+mls-rs-crypto-traits = { version = "0.22", git = "https://github.com/germ-network/mls-rs", rev = "3743c75d32257ab48bde2875f5e8d624410147e9", optional = true }
 thiserror = { workspace = true }
