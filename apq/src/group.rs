@@ -21,6 +21,7 @@ pub type PqMlsGroup = Group<PqConfig>;
 #[cfg(not(feature = "cryptokit"))]
 pub type PqMlsGroup = MlsGroup;
 
+#[derive(Clone)]
 pub struct CombinerGroup {
     pub classical: MlsGroup,
     pub pq: PqMlsGroup,

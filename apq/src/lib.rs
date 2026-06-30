@@ -11,10 +11,12 @@
 //! primitives, and reports failures as `CombinerError` (the two-mls layer maps these onto
 //! its FFI error enum).
 
+pub mod archive;
 mod client;
 mod group;
 #[cfg(feature = "cryptokit")]
 pub mod pq_ratchet;
+pub mod storage;
 
 pub use client::{CombinerClient, MlsClient, OurConfig};
 #[cfg(feature = "cryptokit")]

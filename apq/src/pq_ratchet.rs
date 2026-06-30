@@ -14,6 +14,7 @@ use mls_rs::psk::{ExternalPskId, PreSharedKey};
 use mls_rs::{CipherSuite, MlsMessage};
 use mls_rs_crypto_awslc::MlKemKem;
 use mls_rs_crypto_traits::KemType;
+use zeroize::Zeroizing;
 
 use crate::client::CombinerClient;
 use crate::group::{export_and_register_psk_pq, injected_secret_psk_id, PqMlsGroup};
@@ -45,17 +46,19 @@ pub fn generate_ephemeral() -> Result<PqEphemeral> {
 }
 
 /// Responder — encapsulate to the initiator's EK, returning `(shared_secret S, ciphertext ct)`.
-pub fn encapsulate(ek_bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
+/// `S` is wrapped in `Zeroizing` so it is wiped from memory on drop.
+pub fn encapsulate(ek_bytes: &[u8]) -> Result<(Zeroizing<Vec<u8>>, Vec<u8>)> {
     let ek = HpkePublicKey::from(ek_bytes.to_vec());
     let res = ml_kem()?.encap(&ek).map_err(|_| CombinerError::Mls)?;
-    Ok((res.shared_secret.to_vec(), res.enc.to_vec()))
+    Ok((Zeroizing::new(res.shared_secret.to_vec()), res.enc.to_vec()))
 }
 
-/// Initiator step 2 — decapsulate the responder's `ct` with the held DK, recovering S.
-pub fn decapsulate(eph: &PqEphemeral, ct: &[u8]) -> Result<Vec<u8>> {
-    ml_kem()?
+/// Initiator step 2 — decapsulate the responder's `ct` with the held DK, recovering S (zeroizing).
+pub fn decapsulate(eph: &PqEphemeral, ct: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+    let s = ml_kem()?
         .decap(ct, &eph.dk, &eph.ek)
-        .map_err(|_| CombinerError::Mls)
+        .map_err(|_| CombinerError::Mls)?;
+    Ok(Zeroizing::new(s))
 }
 
 /// PSK id for the injected secret S at the PQ group's current epoch. The trailing domain byte

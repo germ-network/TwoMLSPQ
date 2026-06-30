@@ -135,6 +135,14 @@ fn decode_pq_bind(bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
 
 #[cfg(feature = "cryptokit")]
 impl TwoMlsPqSession {
+    #[cfg(test)]
+    fn recv_pq_epoch(&self) -> Option<u64> {
+        self.lock()
+            .recv_group
+            .as_ref()
+            .map(|g| g.pq.current_epoch())
+    }
+
     /// Initiator step 1 — generate an ML-KEM ephemeral and return the encapsulation-key message
     /// (tag 0x0B). The decapsulation key is held until the ciphertext arrives.
     pub fn pq_ratchet_begin(&self) -> Result<Vec<u8>> {
@@ -161,7 +169,7 @@ impl TwoMlsPqSession {
             return Err(TwoMlsPqError::SessionNotReady);
         }
         let (s, ct) = apq::pq_ratchet::encapsulate(ek)?;
-        inner.pq_inflight = Some(PqInflight::Responding(Zeroizing::new(s)));
+        inner.pq_inflight = Some(PqInflight::Responding(s));
         let mut msg = vec![PQ_CT_TAG];
         msg.extend_from_slice(&ct);
         Ok(msg)
@@ -180,35 +188,37 @@ impl TwoMlsPqSession {
             Some(PqInflight::Initiating(eph)) => eph,
             _ => return Err(TwoMlsPqError::SessionNotReady),
         };
-        let s = Zeroizing::new(apq::pq_ratchet::decapsulate(&eph, ct)?);
+        let s = apq::pq_ratchet::decapsulate(&eph, ct)?;
         let client = inner.client.clone();
-        let send = inner
-            .send_group
-            .as_mut()
-            .ok_or(TwoMlsPqError::SessionNotReady)?;
-        let (pq_commit, apq_psk_id) =
-            apq::pq_ratchet::inject_and_commit(&mut send.pq, &s, client.combiner())?;
-        let cl_out = send
-            .classical
-            .commit_builder()
-            .add_external_psk(apq_psk_id)
-            .map_err(|_| TwoMlsPqError::Mls)?
-            .build()
-            .map_err(|_| TwoMlsPqError::Mls)?;
-        send.classical
-            .apply_pending_commit()
-            .map_err(|_| TwoMlsPqError::Mls)?;
-        let cl_commit = cl_out
-            .commit_message
-            .to_bytes()
-            .map_err(|_| TwoMlsPqError::Mls)?;
-        let app_ct = send
-            .classical
-            .encrypt_application_message(&app, vec![])
-            .map_err(|_| TwoMlsPqError::Mls)?
-            .to_bytes()
-            .map_err(|_| TwoMlsPqError::Mls)?;
-        Ok(encode_pq_bind(pq_commit, cl_commit, app_ct))
+        inner.run_atomic(|inner| {
+            let send = inner
+                .send_group
+                .as_mut()
+                .ok_or(TwoMlsPqError::SessionNotReady)?;
+            let (pq_commit, apq_psk_id) =
+                apq::pq_ratchet::inject_and_commit(&mut send.pq, &s, client.combiner())?;
+            let cl_out = send
+                .classical
+                .commit_builder()
+                .add_external_psk(apq_psk_id)
+                .map_err(|_| TwoMlsPqError::Mls)?
+                .build()
+                .map_err(|_| TwoMlsPqError::Mls)?;
+            send.classical
+                .apply_pending_commit()
+                .map_err(|_| TwoMlsPqError::Mls)?;
+            let cl_commit = cl_out
+                .commit_message
+                .to_bytes()
+                .map_err(|_| TwoMlsPqError::Mls)?;
+            let app_ct = send
+                .classical
+                .encrypt_application_message(&app, vec![])
+                .map_err(|_| TwoMlsPqError::Mls)?
+                .to_bytes()
+                .map_err(|_| TwoMlsPqError::Mls)?;
+            Ok(encode_pq_bind(pq_commit, cl_commit, app_ct))
+        })
     }
 
     /// Responder — apply the stapled bind: register the held secret, apply the PQ partial commit
@@ -221,24 +231,31 @@ impl TwoMlsPqSession {
             _ => return Err(TwoMlsPqError::SessionNotReady),
         };
         let client = inner.client.clone();
-        let recv = inner
-            .recv_group
-            .as_mut()
-            .ok_or(TwoMlsPqError::SessionNotReady)?;
-        apq::pq_ratchet::apply_injected_commit(&mut recv.pq, &s, &pq_commit, client.combiner())?;
-        let cl = MlsMessage::from_bytes(&cl_commit).map_err(|_| TwoMlsPqError::Mls)?;
-        recv.classical
-            .process_incoming_message(cl)
-            .map_err(|_| TwoMlsPqError::Mls)?;
-        let app = MlsMessage::from_bytes(&app_ct).map_err(|_| TwoMlsPqError::Mls)?;
-        match recv
-            .classical
-            .process_incoming_message(app)
-            .map_err(|_| TwoMlsPqError::Mls)?
-        {
-            ReceivedMessage::ApplicationMessage(m) => Ok(m.data().to_vec()),
-            _ => Err(TwoMlsPqError::DecryptionFailed),
-        }
+        inner.run_atomic(|inner| {
+            let recv = inner
+                .recv_group
+                .as_mut()
+                .ok_or(TwoMlsPqError::SessionNotReady)?;
+            apq::pq_ratchet::apply_injected_commit(
+                &mut recv.pq,
+                &s,
+                &pq_commit,
+                client.combiner(),
+            )?;
+            let cl = MlsMessage::from_bytes(&cl_commit).map_err(|_| TwoMlsPqError::Mls)?;
+            recv.classical
+                .process_incoming_message(cl)
+                .map_err(|_| TwoMlsPqError::Mls)?;
+            let app = MlsMessage::from_bytes(&app_ct).map_err(|_| TwoMlsPqError::Mls)?;
+            match recv
+                .classical
+                .process_incoming_message(app)
+                .map_err(|_| TwoMlsPqError::Mls)?
+            {
+                ReceivedMessage::ApplicationMessage(m) => Ok(m.data().to_vec()),
+                _ => Err(TwoMlsPqError::DecryptionFailed),
+            }
+        })
     }
 }
 
@@ -345,6 +362,21 @@ fn make_queued_proposal(
 }
 
 impl SessionInner {
+    /// Run a multi-group commit sequence all-or-nothing. The send and recv groups are cloned up
+    /// front; if `f` fails partway (mls-rs commits are forward-only, so a half-applied sequence
+    /// cannot be unwound in place), the groups are restored to their pre-call state so the two/four
+    /// MLS halves never desync. Cheap here because a 1:1 session has only two leaves per group.
+    fn run_atomic<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        let send_backup = self.send_group.clone();
+        let recv_backup = self.recv_group.clone();
+        let result = f(self);
+        if result.is_err() {
+            self.send_group = send_backup;
+            self.recv_group = recv_backup;
+        }
+        result
+    }
+
     /// Transition `my_state` from `Pending { old, new }` to `Sync { new }`.
     /// Called when any message is successfully decrypted from the recv group,
     /// confirming the peer has processed our rotation commit.
@@ -426,7 +458,12 @@ impl SessionInner {
     /// send_group.classical, export a TwoMLS-PSK from it, and commit it into recv_group.classical
     /// so post-compromise security propagates to both message groups. No PQ exchange — the PQ
     /// secret established at setup is preserved via the APQ-PSK already in the key schedule.
+    /// Atomic across the send-group and recv-group classical commits.
     fn prepare_full_commit(&mut self) -> Result<crate::PrepareEncryptResult> {
+        self.run_atomic(Self::prepare_full_commit_inner)
+    }
+
+    fn prepare_full_commit_inner(&mut self) -> Result<crate::PrepareEncryptResult> {
         // Consume the queued proposal to enter this branch.
         let _ = self.queued_proposal.take();
         let client = self.client.clone();
@@ -667,10 +704,46 @@ impl TwoMlsPqSession {
         ))
     }
 
-    /// Restore a session from a serialised archive.
+    /// Restore a session from a sealed archive. `client` must be built from the same signing key
+    /// the session used, and `seal_key` must be the 32-byte key passed to `archive`.
     #[uniffi::constructor]
-    pub fn from_archive(_archive: Archive, _client: Arc<TwoMlsPqClient>) -> Result<Arc<Self>> {
-        Err(TwoMlsPqError::ArchiveInvalid)
+    pub fn from_archive(
+        archive: Archive,
+        client: Arc<TwoMlsPqClient>,
+        seal_key: Vec<u8>,
+    ) -> Result<Arc<Self>> {
+        let plaintext = apq::archive::open(&seal_key, &archive.bytes)
+            .map_err(|_| TwoMlsPqError::ArchiveInvalid)?;
+        let parsed = decode_archive(&plaintext)?;
+        client
+            .combiner()
+            .restore_storage(&parsed.classical_store, parsed.pq_store.as_deref())
+            .map_err(|_| TwoMlsPqError::ArchiveInvalid)?;
+
+        let send_group = match &parsed.send_ids {
+            Some((cl, pq)) => Some(load_combiner_group(client.combiner(), cl, pq)?),
+            None => None,
+        };
+        let recv_group = match &parsed.recv_ids {
+            Some((cl, pq)) => Some(load_combiner_group(client.combiner(), cl, pq)?),
+            None => None,
+        };
+
+        let their_id = parsed.their_state.client_id();
+        let session = build_session(
+            client,
+            send_group,
+            recv_group,
+            None,
+            parsed.session_id,
+            their_id,
+        );
+        {
+            let mut inner = session.lock();
+            inner.my_state = parsed.my_state;
+            inner.their_state = parsed.their_state;
+        }
+        Ok(session)
     }
 
     /// Welcome bytes to deliver to the remote party to complete group establishment.
@@ -1154,8 +1227,36 @@ impl TwoMlsPqSession {
         Err(TwoMlsPqError::SessionNotReady)
     }
 
-    pub fn archive(&self) -> Result<Archive> {
-        Err(TwoMlsPqError::ArchiveInvalid)
+    /// Seal the session's state into a portable archive under `seal_key` (32 bytes). Restore with
+    /// `from_archive`. Archive at a quiescent point: an in-flight PQ ratchet exchange is not
+    /// persisted (its ephemeral secret is dropped) and would restart after restore.
+    pub fn archive(&self, seal_key: Vec<u8>) -> Result<Archive> {
+        let mut inner = self.lock();
+        // Flush each live group's current state into the client's persistable storage before
+        // serialising it; mls-rs groups are not auto-persisted in the synchronous build.
+        if let Some(g) = inner.send_group.as_mut() {
+            g.classical
+                .write_to_storage()
+                .map_err(|_| TwoMlsPqError::ArchiveInvalid)?;
+            g.pq.write_to_storage()
+                .map_err(|_| TwoMlsPqError::ArchiveInvalid)?;
+        }
+        if let Some(g) = inner.recv_group.as_mut() {
+            g.classical
+                .write_to_storage()
+                .map_err(|_| TwoMlsPqError::ArchiveInvalid)?;
+            g.pq.write_to_storage()
+                .map_err(|_| TwoMlsPqError::ArchiveInvalid)?;
+        }
+        let (classical_store, pq_store) = inner.client.combiner().export_storage();
+        let plaintext = encode_archive(
+            &inner,
+            &classical_store,
+            pq_store.as_ref().map(|z| z.as_slice()),
+        );
+        let blob =
+            apq::archive::seal(&seal_key, &plaintext).map_err(|_| TwoMlsPqError::ArchiveInvalid)?;
+        Ok(Archive { bytes: blob })
     }
 
     /// Accept a remote proposal for the next epoch advance.
@@ -1184,6 +1285,167 @@ impl TwoMlsPqSession {
     }
 }
 
+// Archive wire format (sealed plaintext): [u8 version][session_id][my_state][their_state]
+// [send group ids?][recv group ids?][classical store][pq store?]. Group ids and the PQ store are
+// presence-tagged because a freshly-initiated session has no recv group and the rustcrypto build
+// keeps the PQ half in the classical store.
+const ARCHIVE_VERSION: u8 = 1;
+
+struct ParsedArchive {
+    session_id: SessionId,
+    my_state: AgentState,
+    their_state: AgentState,
+    send_ids: Option<(Vec<u8>, Vec<u8>)>,
+    recv_ids: Option<(Vec<u8>, Vec<u8>)>,
+    classical_store: Vec<u8>,
+    pq_store: Option<Vec<u8>>,
+}
+
+fn encode_agent_state(out: &mut Vec<u8>, state: &AgentState) {
+    match state {
+        AgentState::Sync { client_id } => {
+            out.push(0);
+            push_section(out, &client_id.bytes);
+        }
+        AgentState::Pending { old, new } => {
+            out.push(1);
+            push_section(out, &old.bytes);
+            push_section(out, &new.bytes);
+        }
+    }
+}
+
+fn encode_group_ids(out: &mut Vec<u8>, group: Option<&CombinerGroup>) {
+    match group {
+        Some(g) => {
+            out.push(1);
+            push_section(out, g.classical.group_id());
+            push_section(out, g.pq.group_id());
+        }
+        None => out.push(0),
+    }
+}
+
+fn encode_archive(
+    inner: &SessionInner,
+    classical_store: &[u8],
+    pq_store: Option<&[u8]>,
+) -> Vec<u8> {
+    let mut out = vec![ARCHIVE_VERSION];
+    push_section(&mut out, &inner.session_id.bytes);
+    encode_agent_state(&mut out, &inner.my_state);
+    encode_agent_state(&mut out, &inner.their_state);
+    encode_group_ids(&mut out, inner.send_group.as_ref());
+    encode_group_ids(&mut out, inner.recv_group.as_ref());
+    push_section(&mut out, classical_store);
+    match pq_store {
+        Some(p) => {
+            out.push(1);
+            push_section(&mut out, p);
+        }
+        None => out.push(0),
+    }
+    out
+}
+
+struct ArchiveCursor<'a> {
+    rest: &'a [u8],
+}
+
+impl<'a> ArchiveCursor<'a> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8]> {
+        if self.rest.len() < n {
+            return Err(TwoMlsPqError::ArchiveInvalid);
+        }
+        let (head, tail) = self.rest.split_at(n);
+        self.rest = tail;
+        Ok(head)
+    }
+
+    fn byte(&mut self) -> Result<u8> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn section(&mut self) -> Result<Vec<u8>> {
+        let b = self.take(4)?;
+        let len = u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize;
+        Ok(self.take(len)?.to_vec())
+    }
+
+    fn client_id(&mut self) -> Result<ClientId> {
+        Ok(ClientId {
+            bytes: self.section()?,
+        })
+    }
+
+    fn agent_state(&mut self) -> Result<AgentState> {
+        match self.byte()? {
+            0 => Ok(AgentState::Sync {
+                client_id: self.client_id()?,
+            }),
+            1 => Ok(AgentState::Pending {
+                old: self.client_id()?,
+                new: self.client_id()?,
+            }),
+            _ => Err(TwoMlsPqError::ArchiveInvalid),
+        }
+    }
+
+    fn group_ids(&mut self) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        match self.byte()? {
+            0 => Ok(None),
+            1 => Ok(Some((self.section()?, self.section()?))),
+            _ => Err(TwoMlsPqError::ArchiveInvalid),
+        }
+    }
+}
+
+fn decode_archive(plaintext: &[u8]) -> Result<ParsedArchive> {
+    let mut cur = ArchiveCursor { rest: plaintext };
+    if cur.byte()? != ARCHIVE_VERSION {
+        return Err(TwoMlsPqError::ArchiveInvalid);
+    }
+    let session_id = SessionId {
+        bytes: cur.section()?,
+    };
+    let my_state = cur.agent_state()?;
+    let their_state = cur.agent_state()?;
+    let send_ids = cur.group_ids()?;
+    let recv_ids = cur.group_ids()?;
+    let classical_store = cur.section()?;
+    let pq_store = match cur.byte()? {
+        0 => None,
+        1 => Some(cur.section()?),
+        _ => return Err(TwoMlsPqError::ArchiveInvalid),
+    };
+    if !cur.rest.is_empty() {
+        return Err(TwoMlsPqError::ArchiveInvalid);
+    }
+    Ok(ParsedArchive {
+        session_id,
+        my_state,
+        their_state,
+        send_ids,
+        recv_ids,
+        classical_store,
+        pq_store,
+    })
+}
+
+fn load_combiner_group(
+    client: &apq::CombinerClient,
+    classical_id: &[u8],
+    pq_id: &[u8],
+) -> Result<CombinerGroup> {
+    let classical = client
+        .load_classical_group(classical_id)
+        .map_err(|_| TwoMlsPqError::ArchiveInvalid)?;
+    let pq = client
+        .load_pq_group(pq_id)
+        .map_err(|_| TwoMlsPqError::ArchiveInvalid)?;
+    Ok(CombinerGroup { classical, pq })
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -1191,6 +1453,7 @@ mod tests {
     use super::TwoMlsPqSession;
     use crate::{
         assert_err, assert_ok, assert_some,
+        key_packages::TwoMlsPqClient,
         test_utils::{establish_sessions, make_client, make_combiner_kp},
         AgentState, TwoMlsPqError,
     };
@@ -1393,6 +1656,23 @@ mod tests {
 
     #[test]
     #[cfg(feature = "cryptokit")]
+    fn test_pq_ratchet_apply_failure_rolls_back_the_pq_group() {
+        let (alice, bob) = establish_sessions();
+        let ek = assert_ok!(alice.pq_ratchet_begin());
+        let ct = assert_ok!(bob.pq_ratchet_respond(ek));
+        let bind = assert_ok!(alice.pq_ratchet_bind(ct, b"x".to_vec()));
+        // Keep the valid PQ commit but corrupt the classical commit, so Bob's apply advances the
+        // PQ group and then fails on the classical half — exercising the cross-group rollback.
+        let (pq_commit, _cl, app) = super::decode_pq_bind(&bind).unwrap();
+        let corrupt = super::encode_pq_bind(pq_commit, vec![0xFF; 8], app);
+        let pq_epoch_before = bob.recv_pq_epoch();
+        assert_err!(bob.pq_ratchet_apply(corrupt), TwoMlsPqError::Mls);
+        // run_atomic restored the PQ group; it must not be left one epoch ahead of the classical.
+        assert_eq!(bob.recv_pq_epoch(), pq_epoch_before);
+    }
+
+    #[test]
+    #[cfg(feature = "cryptokit")]
     fn test_initiate_fails_when_both_suites_classical() {
         let alice = make_client();
         let bob = make_client();
@@ -1543,18 +1823,84 @@ mod tests {
     }
 
     #[test]
-    fn test_from_archive_returns_archive_invalid() {
+    fn test_from_archive_rejects_empty_blob() {
         let client = make_client();
         assert_err!(
-            TwoMlsPqSession::from_archive(crate::Archive { bytes: vec![] }, client),
+            TwoMlsPqSession::from_archive(crate::Archive { bytes: vec![] }, client, vec![0u8; 32]),
             TwoMlsPqError::ArchiveInvalid
         );
     }
 
     #[test]
-    fn test_archive_returns_archive_invalid() {
+    fn test_from_archive_rejects_wrong_seal_key() {
+        let (alice, _bob, alice_key) = establish_with_keys();
+        let archive = assert_ok!(alice.archive(vec![7u8; 32]));
+        let fresh = assert_ok!(TwoMlsPqClient::new(alice_key));
+        assert_err!(
+            TwoMlsPqSession::from_archive(archive, fresh, vec![9u8; 32]),
+            TwoMlsPqError::ArchiveInvalid
+        );
+    }
+
+    #[test]
+    fn test_archive_rejects_wrong_key_length() {
         let (alice_session, _) = establish_sessions();
-        assert_err!(alice_session.archive(), TwoMlsPqError::ArchiveInvalid);
+        assert_err!(
+            alice_session.archive(vec![0u8; 16]),
+            TwoMlsPqError::ArchiveInvalid
+        );
+    }
+
+    #[test]
+    fn test_archive_round_trips_and_session_keeps_messaging() {
+        let (alice, bob, alice_key) = establish_with_keys();
+        // Drive one round before archiving so the groups hold real conversation state.
+        round_trip(&alice, &bob, b"before archive");
+
+        let key = vec![42u8; 32];
+        let archive = assert_ok!(alice.archive(key.clone()));
+
+        // Simulate an app restart: rebuild Alice's client from the same signing key, then restore.
+        let restored_client = assert_ok!(TwoMlsPqClient::new(alice_key));
+        let alice2 = assert_ok!(TwoMlsPqSession::from_archive(archive, restored_client, key));
+        assert!(alice2.is_established());
+        assert_eq!(
+            alice2.active_session_id().bytes,
+            alice.active_session_id().bytes
+        );
+
+        // The restored session continues the conversation in both directions.
+        round_trip(&alice2, &bob, b"after restore from alice");
+        round_trip(&bob, &alice2, b"after restore to alice");
+    }
+
+    // Establish a session pair, returning Alice's signing key so her client can be rebuilt for an
+    // archive round-trip (a fresh client from the same key, as an app restart would do).
+    fn establish_with_keys() -> (Arc<TwoMlsPqSession>, Arc<TwoMlsPqSession>, Vec<u8>) {
+        let alice_key = crate::test_utils::test_signing_key();
+        let alice = assert_ok!(TwoMlsPqClient::new(alice_key.clone()));
+        let bob = make_client();
+        let alice_kp = make_combiner_kp(&alice);
+        let bob_kp = make_combiner_kp(&bob);
+
+        let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp));
+        let welcome_a = assert_some!(alice_session.pending_outbound());
+        let bob_session = assert_ok!(TwoMlsPqSession::accept(
+            Arc::clone(&bob),
+            welcome_a,
+            alice_kp
+        ));
+        let welcome_b = assert_some!(bob_session.pending_outbound());
+        assert_ok!(alice_session.process_incoming(welcome_b));
+        (alice_session, bob_session, alice_key)
+    }
+
+    fn round_trip(sender: &TwoMlsPqSession, receiver: &TwoMlsPqSession, msg: &[u8]) {
+        assert_ok!(sender.prepare_to_encrypt(None));
+        let enc = assert_ok!(sender.encrypt(msg.to_vec()));
+        let result = assert_some!(assert_ok!(receiver.process_incoming(enc.cipher_text)));
+        let app = assert_some!(result.application_message);
+        assert_eq!(app.app_message_data, msg);
     }
 
     #[test]
@@ -1890,10 +2236,6 @@ mod tests {
             b"world"
         );
     }
-
-    #[test]
-    #[ignore = "archive() is not yet implemented"]
-    fn test_archive_round_trips_session_state() {}
 
     #[test]
     #[ignore = "should_listen_on() is not yet implemented"]
