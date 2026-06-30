@@ -97,6 +97,7 @@ bash scripts/buildIos.sh
 3. Create a GitHub release from that tag and upload:
    - `buildIos/MLSrs.xcframework.zip`
    - `bindings/two_mls_pqFFI.h`
+   - `bindings/two_mls_pq.swift`
 
    Include the checksum in the release notes.
 
