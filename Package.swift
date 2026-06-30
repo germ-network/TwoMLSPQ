@@ -55,8 +55,8 @@ let package = Package(
 		.binaryTarget(
 			name: "MLSrs",
 			url:
-				"https://github.com/germ-network/TwoMLSPQ/releases/download/0.0.2/MLSrs.xcframework.zip",
-			checksum: "c6e19bcb94c1f86e4f96f434844b0f3ddd459b4b5fca5da45f74b6b9143b24c3"
+				"https://github.com/germ-network/TwoMLSPQ/releases/download/0.0.5/TwoMLSPQ.xcframework.zip",
+			checksum: "916fec43ebdb520faa767e50bbc28240b073689a7f6a76916f67d29ce18939b7"
 		),
 		.testTarget(
 			name: "AbstractTwoMLSTests",
