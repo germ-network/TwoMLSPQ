@@ -109,9 +109,9 @@ The demo app is at https://github.com/germ-network/AbstractTwoMLS.
 
 After publishing a release:
 
-1. Copy the generated header into the app:
+1. Copy the generated header and Swift binding into the app:
    ```sh
-   cp bindings/two_mls_pqFFI.h /path/to/AbstractTwoMLS/
+   cp bindings/two_mls_pqFFI.h bindings/two_mls_pq.swift /path/to/AbstractTwoMLS/
    ```
 
 2. Update `Package.swift` in the app with the new release URL and checksum:
