@@ -11,18 +11,18 @@
 
 use mls_rs::crypto::{HpkePublicKey, HpkeSecretKey};
 use mls_rs::psk::{ExternalPskId, PreSharedKey};
-use mls_rs::{CipherSuite, MlsMessage};
-use mls_rs_crypto_awslc::MlKemKem;
+use mls_rs::MlsMessage;
+use mls_rs_crypto_cryptokit::ml_kem::MlKem768Kem;
 use mls_rs_crypto_traits::KemType;
 
 use crate::client::CombinerClient;
 use crate::group::{export_and_register_psk_pq, injected_secret_psk_id, PqMlsGroup};
 use crate::{CombinerError, Result};
 
-const ML_KEM_768: u16 = 0xFDEA;
-
-fn ml_kem() -> Result<MlKemKem> {
-    MlKemKem::new(CipherSuite::from(ML_KEM_768)).ok_or(CombinerError::Mls)
+/// Apple CryptoKit's ML-KEM-768 KEM (kem id 0xFDEA). Infallible to construct — it is the only
+/// suite this type implements — so callers no longer thread a cipher suite through.
+fn ml_kem() -> MlKem768Kem {
+    MlKem768Kem::new()
 }
 
 /// Initiator-side ephemeral for one PQ ratchet round. Holds the decapsulation key; the
@@ -40,20 +40,20 @@ impl PqEphemeral {
 
 /// Initiator step 1 — generate a fresh ML-KEM-768 keypair.
 pub fn generate_ephemeral() -> Result<PqEphemeral> {
-    let (dk, ek) = ml_kem()?.generate().map_err(|_| CombinerError::Mls)?;
+    let (dk, ek) = ml_kem().generate().map_err(|_| CombinerError::Mls)?;
     Ok(PqEphemeral { dk, ek })
 }
 
 /// Responder — encapsulate to the initiator's EK, returning `(shared_secret S, ciphertext ct)`.
 pub fn encapsulate(ek_bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
     let ek = HpkePublicKey::from(ek_bytes.to_vec());
-    let res = ml_kem()?.encap(&ek).map_err(|_| CombinerError::Mls)?;
+    let res = ml_kem().encap(&ek).map_err(|_| CombinerError::Mls)?;
     Ok((res.shared_secret.to_vec(), res.enc.to_vec()))
 }
 
 /// Initiator step 2 — decapsulate the responder's `ct` with the held DK, recovering S.
 pub fn decapsulate(eph: &PqEphemeral, ct: &[u8]) -> Result<Vec<u8>> {
-    ml_kem()?
+    ml_kem()
         .decap(ct, &eph.dk, &eph.ek)
         .map_err(|_| CombinerError::Mls)
 }
@@ -147,14 +147,15 @@ pub fn full_pq_updatepath_commit_size() -> usize {
     use mls_rs::identity::basic::{BasicCredential, BasicIdentityProvider};
     use mls_rs::identity::SigningIdentity;
     use mls_rs::mls_rules::{CommitOptions, DefaultMlsRules};
-    use mls_rs::{CipherSuiteProvider, CryptoProvider, ExtensionList};
-    use mls_rs_crypto_awslc::AwsLcCryptoProvider;
+    use mls_rs::{CipherSuite, CipherSuiteProvider, CryptoProvider, ExtensionList};
+    use mls_rs_crypto_cryptokit::CryptoKitMlKemProvider;
 
+    const ML_KEM_768: u16 = 0xFDEA;
     let suite = CipherSuite::from(ML_KEM_768);
     let rules =
         DefaultMlsRules::new().with_commit_options(CommitOptions::new().with_path_required(true));
     let build = |rules: DefaultMlsRules| {
-        let cs = AwsLcCryptoProvider::new()
+        let cs = CryptoKitMlKemProvider
             .cipher_suite_provider(suite)
             .unwrap();
         let (sk, pk) = cs.signature_key_generate().unwrap();
@@ -163,7 +164,7 @@ pub fn full_pq_updatepath_commit_size() -> usize {
             pk,
         );
         ClientBuilder::new()
-            .crypto_provider(AwsLcCryptoProvider::new())
+            .crypto_provider(CryptoKitMlKemProvider)
             .identity_provider(BasicIdentityProvider::new())
             .mls_rules(rules)
             .signing_identity(signing, sk, suite)
