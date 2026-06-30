@@ -383,11 +383,8 @@ extension AbstractTwoMLS {
 		}
 
 		public init(clientId: AbstractTwoMLS.ClientID) throws {
-			// GAP: TwoMlsPqClient(signingKey:) needs the private signing key, not
-			// the public client id.
-			throw TwoMLSPQConformanceError.notImplemented(
-				"PQClient.init(clientId:) — needs the signing key"
-			)
+			//TODO: the TwoMlsPqClient api should take a clientID bytes too
+			self.init(base: try TwoMlsPqClient(signingKey: clientId))
 		}
 
 		public func makeInvitation() throws -> PQInvitation.Archive {
