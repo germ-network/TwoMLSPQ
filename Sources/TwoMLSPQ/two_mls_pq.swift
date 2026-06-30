@@ -772,6 +772,9 @@ public func FfiConverterTypeMlsCipherSuite_lower(_ value: MlsCipherSuite) -> UIn
  * Holds an agent signing key and manages MLS key packages for publication.
  * The signing key's public component is the ClientId — the Basic Credential
  * that identifies this agent as a leaf node in MLS groups.
+ *
+ * Thin UniFFI wrapper around `apq::CombinerClient`; the MLS plumbing lives in the
+ * `apq` crate.
  */
 public protocol TwoMlsPqClientProtocol: AnyObject, Sendable {
     
@@ -798,6 +801,9 @@ public protocol TwoMlsPqClientProtocol: AnyObject, Sendable {
  * Holds an agent signing key and manages MLS key packages for publication.
  * The signing key's public component is the ClientId — the Basic Credential
  * that identifies this agent as a leaf node in MLS groups.
+ *
+ * Thin UniFFI wrapper around `apq::CombinerClient`; the MLS plumbing lives in the
+ * `apq` crate.
  */
 open class TwoMlsPqClient: TwoMlsPqClientProtocol, @unchecked Sendable {
     fileprivate let handle: UInt64
@@ -1002,6 +1008,10 @@ public protocol TwoMlsPqSessionProtocol: AnyObject, Sendable {
      * - Partial bundle (0x05) → advance send.pq then decrypt app; `DecryptResult`
      * - Full bundle (0x07) → epoch advance + PSK refresh then decrypt; `DecryptResult`
      * - MLS ciphertext → decrypt on recv_group.pq; `DecryptResult`
+     *
+     * PQ-ratchet frames (0x0B/0x0D/0x0F) are **not** handled here — the host must route them to
+     * `pq_ratchet_respond`/`pq_ratchet_bind`/`pq_ratchet_apply` by their leading tag byte. Passing
+     * one here returns `SessionNotReady` rather than attempting (and failing) MLS decryption.
      */
     func processIncoming(ciphertext: Data) throws  -> DecryptResult?
     
@@ -1227,6 +1237,10 @@ open func prepareToEncrypt(proposing: ClientId?)throws  -> PrepareEncryptResult 
      * - Partial bundle (0x05) → advance send.pq then decrypt app; `DecryptResult`
      * - Full bundle (0x07) → epoch advance + PSK refresh then decrypt; `DecryptResult`
      * - MLS ciphertext → decrypt on recv_group.pq; `DecryptResult`
+     *
+     * PQ-ratchet frames (0x0B/0x0D/0x0F) are **not** handled here — the host must route them to
+     * `pq_ratchet_respond`/`pq_ratchet_bind`/`pq_ratchet_apply` by their leading tag byte. Passing
+     * one here returns `SessionNotReady` rather than attempting (and failing) MLS decryption.
      */
 open func processIncoming(ciphertext: Data)throws  -> DecryptResult?  {
     return try  FfiConverterOptionTypeDecryptResult.lift(try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
@@ -2485,6 +2499,7 @@ public enum TwoMlsPqError: Swift.Error, Equatable, Hashable, Foundation.Localize
     case InvalidKeyPackage
     case MissingWelcome
     case PskBinding
+    case PqNotAvailable
     case SessionNotEstablished
     case SessionNotReady
     case ProposalRejected
@@ -2523,11 +2538,12 @@ public struct FfiConverterTypeTwoMlsPqError: FfiConverterRustBuffer {
         case 2: return .InvalidKeyPackage
         case 3: return .MissingWelcome
         case 4: return .PskBinding
-        case 5: return .SessionNotEstablished
-        case 6: return .SessionNotReady
-        case 7: return .ProposalRejected
-        case 8: return .DecryptionFailed
-        case 9: return .ArchiveInvalid
+        case 5: return .PqNotAvailable
+        case 6: return .SessionNotEstablished
+        case 7: return .SessionNotReady
+        case 8: return .ProposalRejected
+        case 9: return .DecryptionFailed
+        case 10: return .ArchiveInvalid
 
          default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -2556,24 +2572,28 @@ public struct FfiConverterTypeTwoMlsPqError: FfiConverterRustBuffer {
             writeInt(&buf, Int32(4))
         
         
-        case .SessionNotEstablished:
+        case .PqNotAvailable:
             writeInt(&buf, Int32(5))
         
         
-        case .SessionNotReady:
+        case .SessionNotEstablished:
             writeInt(&buf, Int32(6))
         
         
-        case .ProposalRejected:
+        case .SessionNotReady:
             writeInt(&buf, Int32(7))
         
         
-        case .DecryptionFailed:
+        case .ProposalRejected:
             writeInt(&buf, Int32(8))
         
         
-        case .ArchiveInvalid:
+        case .DecryptionFailed:
             writeInt(&buf, Int32(9))
+        
+        
+        case .ArchiveInvalid:
+            writeInt(&buf, Int32(10))
         
         }
     }
@@ -2948,7 +2968,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_prepare_to_encrypt() != 16181) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_process_incoming() != 41427) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_process_incoming() != 20883) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_proposal_context() != 55198) {
