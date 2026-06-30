@@ -61,8 +61,8 @@ let package = Package(
 			// IMPORTANT: when this URL changes, re-sync Sources/TwoMLSPQ/two_mls_pq.swift
 			// from the SAME release (uniffi embeds a checksum contract verified at init).
 			url:
-				"https://github.com/germ-network/TwoMLSPQ/releases/download/0.0.4/TwoMLSPQ.xcframework.zip",
-			checksum: "5feef0f5a2cd3354d83d41387513b789ba41bac6f385894351487ef316cfbe27"
+				"https://github.com/germ-network/TwoMLSPQ/releases/download/0.0.5/TwoMLSPQ.xcframework.zip",
+			checksum: "916fec43ebdb520faa767e50bbc28240b073689a7f6a76916f67d29ce18939b7"
 		),
 		.testTarget(
 			name: "AbstractTwoMLSTests",
