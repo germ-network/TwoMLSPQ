@@ -88,7 +88,10 @@ impl TwoMlsPqClient {
     /// private data — the Invitation owns it. Publish the invitation's `combinerKeyPackage`
     /// and reconstruct the receiving side with `TwoMlsPqInvitation(archive:)`.
     pub fn generate_invitation(&self) -> Result<Vec<u8>> {
-        encode_archive(&generate_combiner_invitation(&self.inner)?, &BTreeSet::new())
+        encode_archive(
+            &generate_combiner_invitation(&self.inner)?,
+            &BTreeSet::new(),
+        )
     }
 }
 
@@ -425,8 +428,9 @@ mod tests {
         let alice_kp = make_combiner_kp(&alice);
 
         // Bob publishes an invitation instead of retaining key-package state on the client.
-        let bob_inv =
-            assert_ok!(super::TwoMlsPqInvitation::new(assert_ok!(bob.generate_invitation())));
+        let bob_inv = assert_ok!(super::TwoMlsPqInvitation::new(assert_ok!(
+            bob.generate_invitation()
+        )));
         let bob_kp = bob_inv.combiner_key_package();
 
         let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp));
@@ -451,8 +455,9 @@ mod tests {
         let bob = make_client();
         let alice_kp = make_combiner_kp(&alice);
 
-        let bob_inv =
-            assert_ok!(super::TwoMlsPqInvitation::new(assert_ok!(bob.generate_invitation())));
+        let bob_inv = assert_ok!(super::TwoMlsPqInvitation::new(assert_ok!(
+            bob.generate_invitation()
+        )));
         let bob_kp = bob_inv.combiner_key_package();
 
         let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp));
@@ -474,24 +479,26 @@ mod tests {
         use mls_rs_crypto_rustcrypto::RustCryptoProvider;
 
         let bob = make_client();
-        let bob_inv =
-            assert_ok!(super::TwoMlsPqInvitation::new(assert_ok!(bob.generate_invitation())));
+        let bob_inv = assert_ok!(super::TwoMlsPqInvitation::new(assert_ok!(
+            bob.generate_invitation()
+        )));
 
         // Seal a header to the public init key from Bob's published classical key package.
         let key_package = assert_some!(assert_ok!(mls_rs::MlsMessage::from_bytes(
             &bob_inv.combiner_key_package().classical
         ))
         .into_key_package());
-        let cs = assert_some!(
-            RustCryptoProvider::new().cipher_suite_provider(mls_rs::CipherSuite::CURVE25519_CHACHA)
-        );
+        let cs =
+            assert_some!(RustCryptoProvider::new()
+                .cipher_suite_provider(mls_rs::CipherSuite::CURVE25519_CHACHA));
 
         let info = bob_inv.client_id().bytes;
         let plaintext = b"routing-header".to_vec();
         let sealed = assert_ok!(cs.hpke_seal(&key_package.hpke_init_key, &info, None, &plaintext));
 
         // `info = None` exercises the ClientId default, which matches the seal above.
-        let opened = assert_ok!(bob_inv.hpke_open(sealed.kem_output, sealed.ciphertext, None, None));
+        let opened =
+            assert_ok!(bob_inv.hpke_open(sealed.kem_output, sealed.ciphertext, None, None));
         assert_eq!(opened, plaintext);
     }
 
@@ -505,8 +512,9 @@ mod tests {
         let bob = make_client();
         let alice_kp = make_combiner_kp(&alice);
 
-        let bob_inv =
-            assert_ok!(super::TwoMlsPqInvitation::new(assert_ok!(bob.generate_invitation())));
+        let bob_inv = assert_ok!(super::TwoMlsPqInvitation::new(assert_ok!(
+            bob.generate_invitation()
+        )));
         let bob_kp = bob_inv.combiner_key_package();
 
         let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp));
@@ -516,8 +524,9 @@ mod tests {
         assert_ok!(bob_inv.receive(welcome_a.clone(), alice_kp.clone()));
 
         // Archive + restore; the consumed set must survive so the replay is still rejected.
-        let restored =
-            assert_ok!(super::TwoMlsPqInvitation::new(assert_ok!(bob_inv.archive())));
+        let restored = assert_ok!(super::TwoMlsPqInvitation::new(
+            assert_ok!(bob_inv.archive())
+        ));
         assert_err!(
             restored.receive(welcome_a, alice_kp),
             crate::TwoMlsPqError::DuplicateWelcome
@@ -542,8 +551,9 @@ mod tests {
         let bob = make_client();
         let alice_kp = make_combiner_kp(&alice);
 
-        let bob_inv =
-            assert_ok!(super::TwoMlsPqInvitation::new(assert_ok!(bob.generate_invitation())));
+        let bob_inv = assert_ok!(super::TwoMlsPqInvitation::new(assert_ok!(
+            bob.generate_invitation()
+        )));
         let bob_kp = bob_inv.combiner_key_package();
 
         let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp));

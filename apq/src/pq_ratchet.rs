@@ -155,9 +155,7 @@ pub fn full_pq_updatepath_commit_size() -> usize {
     let rules =
         DefaultMlsRules::new().with_commit_options(CommitOptions::new().with_path_required(true));
     let build = |rules: DefaultMlsRules| {
-        let cs = CryptoKitMlKemProvider
-            .cipher_suite_provider(suite)
-            .unwrap();
+        let cs = CryptoKitMlKemProvider.cipher_suite_provider(suite).unwrap();
         let (sk, pk) = cs.signature_key_generate().unwrap();
         let signing = SigningIdentity::new(
             BasicCredential::new(pk.as_ref().to_vec()).into_credential(),
