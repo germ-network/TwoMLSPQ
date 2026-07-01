@@ -11,7 +11,9 @@ use crate::{
 #[cfg(not(feature = "cryptokit"))]
 use crate::MlsCipherSuite;
 
-pub(crate) fn test_signing_key() -> Vec<u8> {
+/// A fresh, unique ClientId for tests (random bytes, so distinct callers get distinct
+/// identities). The bytes are opaque — they are no longer a signing key.
+pub(crate) fn test_client_id() -> Vec<u8> {
     let crypto = RustCryptoProvider::new();
     let cs = assert_some!(crypto.cipher_suite_provider(mls_rs::CipherSuite::CURVE25519_CHACHA));
     let (secret, _) = assert_ok!(cs.signature_key_generate());
@@ -19,7 +21,7 @@ pub(crate) fn test_signing_key() -> Vec<u8> {
 }
 
 pub(crate) fn make_client() -> Arc<TwoMlsPqClient> {
-    assert_ok!(TwoMlsPqClient::new(test_signing_key()))
+    assert_ok!(TwoMlsPqClient::new(test_client_id()))
 }
 
 pub(crate) fn make_combiner_kp(client: &TwoMlsPqClient) -> CombinerKeyPackage {

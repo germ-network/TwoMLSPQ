@@ -5,8 +5,10 @@ use mls_rs::{group::ReceivedMessage, MlsMessage};
 use apq::{
     create_bound_combiner_send_group, create_combiner_send_group, decode_apq_welcome,
     export_and_register_psk, join_combiner_group, join_group_from_welcome, sender_client_id,
-    CombinerGroup, APQ_TAG,
+    APQ_TAG,
 };
+
+use crate::key_package_store::CombinerGroup;
 
 use crate::{
     key_packages::{

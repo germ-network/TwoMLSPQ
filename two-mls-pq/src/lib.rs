@@ -1,5 +1,7 @@
 uniffi::setup_scaffolding!();
 
+mod invitation;
+mod key_package_store;
 pub mod key_packages;
 mod psk;
 pub mod session;
@@ -252,6 +254,8 @@ pub enum TwoMlsPqError {
     DecryptionFailed,
     #[error("archive corrupt or incompatible")]
     ArchiveInvalid,
+    #[error("welcome already consumed for this remote")]
+    DuplicateWelcome,
 }
 
 /// Derive the session identifier for a pair of clients.
