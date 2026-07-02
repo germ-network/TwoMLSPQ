@@ -1285,7 +1285,7 @@ public protocol TwoMlsPqSessionProtocol: AnyObject, Sendable {
      * package, bind its exported APQ-PSK into the classical half, and return the
      * bootstrap frame (tag 0x13). Taking this turn makes the next operation ours.
      */
-    func pqBootstrapRespond(kpMsg: Data) throws  -> Data
+    func pqBootstrapRespond(kpMsg: Data) throws 
     
     /**
      * Responder — apply the stapled bind: register the held secret, apply the PQ partial commit
@@ -1304,13 +1304,20 @@ public protocol TwoMlsPqSessionProtocol: AnyObject, Sendable {
      * commit, bind the exported apq_psk into the classical half, and staple an app message.
      * Returns the bind frame (tag 0x0F).
      */
-    func pqRatchetBind(ctMsg: Data, app: Data) throws  -> Data
+    func pqRatchetBind(ctMsg: Data, app: Data) throws 
     
     /**
      * Responder — encapsulate a fresh secret to the initiator's EK, hold it, and return the
      * ciphertext message (tag 0x0D).
      */
-    func pqRatchetRespond(ekMsg: Data) throws  -> Data
+    func pqRatchetRespond(ekMsg: Data) throws 
+    
+    /**
+     * Consume the side-band frame parked by the responder-side operations
+     * (`pq_ratchet_respond` / `pq_ratchet_bind` / `pq_bootstrap_respond`). Single slot,
+     * single delivery: those operations refuse to start while a frame is waiting.
+     */
+    func pqTakePendingOutbound()  -> Data?
     
     /**
      * Prepare a pending proposal nonce and stage it for binding into the next outbound message.
@@ -1600,13 +1607,12 @@ open func pqBootstrapBegin()throws  -> Data  {
      * package, bind its exported APQ-PSK into the classical half, and return the
      * bootstrap frame (tag 0x13). Taking this turn makes the next operation ours.
      */
-open func pqBootstrapRespond(kpMsg: Data)throws  -> Data  {
-    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
+open func pqBootstrapRespond(kpMsg: Data)throws   {try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
     uniffi_two_mls_pq_fn_method_twomlspqsession_pq_bootstrap_respond(
             self.uniffiCloneHandle(),
         FfiConverterData.lower(kpMsg),$0
     )
-})
+}
 }
     
     /**
@@ -1639,25 +1645,36 @@ open func pqRatchetBegin()throws  -> Data  {
      * commit, bind the exported apq_psk into the classical half, and staple an app message.
      * Returns the bind frame (tag 0x0F).
      */
-open func pqRatchetBind(ctMsg: Data, app: Data)throws  -> Data  {
-    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
+open func pqRatchetBind(ctMsg: Data, app: Data)throws   {try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
     uniffi_two_mls_pq_fn_method_twomlspqsession_pq_ratchet_bind(
             self.uniffiCloneHandle(),
         FfiConverterData.lower(ctMsg),
         FfiConverterData.lower(app),$0
     )
-})
+}
 }
     
     /**
      * Responder — encapsulate a fresh secret to the initiator's EK, hold it, and return the
      * ciphertext message (tag 0x0D).
      */
-open func pqRatchetRespond(ekMsg: Data)throws  -> Data  {
-    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
+open func pqRatchetRespond(ekMsg: Data)throws   {try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
     uniffi_two_mls_pq_fn_method_twomlspqsession_pq_ratchet_respond(
             self.uniffiCloneHandle(),
         FfiConverterData.lower(ekMsg),$0
+    )
+}
+}
+    
+    /**
+     * Consume the side-band frame parked by the responder-side operations
+     * (`pq_ratchet_respond` / `pq_ratchet_bind` / `pq_bootstrap_respond`). Single slot,
+     * single delivery: those operations refuse to start while a frame is waiting.
+     */
+open func pqTakePendingOutbound() -> Data?  {
+    return try!  FfiConverterOptionData.lift(try! rustCall() {
+    uniffi_two_mls_pq_fn_method_twomlspqsession_pq_take_pending_outbound(
+            self.uniffiCloneHandle(),$0
     )
 })
 }
@@ -3624,7 +3641,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_bootstrap_begin() != 62410) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_bootstrap_respond() != 23702) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_bootstrap_respond() != 18544) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_ratchet_apply() != 37587) {
@@ -3633,10 +3650,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_ratchet_begin() != 20914) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_ratchet_bind() != 21555) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_ratchet_bind() != 27033) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_ratchet_respond() != 43090) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_ratchet_respond() != 47447) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_take_pending_outbound() != 34962) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_prepare_to_encrypt() != 16181) {

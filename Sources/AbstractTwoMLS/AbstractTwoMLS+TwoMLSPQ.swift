@@ -157,13 +157,9 @@ extension AbstractTwoMLS {
 
 	/// Adapter wrapping a `TwoMLSPQ.TwoMlsPqSession`.
 	public struct PQSession: AbstractTwoMLS.PQRatchetingSession {
-		public typealias Invitation = PQInvitation
 		public typealias Archive = Data
 
 		let base: TwoMLSPQ.TwoMlsPqSession
-		// Shared across value copies: parks a responder's PQ reply between ingest
-		// and the following advance.
-		let pending = PQPendingOutbound()
 
 		init(_ base: TwoMLSPQ.TwoMlsPqSession) {
 			self.base = base
@@ -240,8 +236,8 @@ extension AbstractTwoMLS {
 		// MARK: PQRatchet
 
 		// The FFI is call-per-step (begin/respond/bind/apply); the abstract surface is
-		// ingest/advance. A responder's reply produced during `ingest` is parked in the
-		// shared pending box until the following `advance` hands it back out.
+		// ingest/advance. A responder's reply produced during `ingest` is parked inside
+		// the Rust session (single slot, enforced there) until `advance` consumes it.
 
 		public var turn: PQTurn {
 			base.myPqTurn() ? .weInitiate : .theyInitiate
@@ -278,7 +274,9 @@ extension AbstractTwoMLS {
 		}
 
 		public func advance(after inbound: PQInbound) throws -> PQOutbound? {
-			pending.take()
+			base.pqTakePendingOutbound().map {
+				PQOutbound(kind: inbound.kind, payload: $0)
+			}
 		}
 
 		public func ingest(_ message: Data) throws -> PQInbound {
@@ -286,10 +284,7 @@ extension AbstractTwoMLS {
 			// bootstrap KP 0x11, bootstrap bind 0x13.
 			switch message.first {
 			case 0x11:
-				pending.park(PQOutbound(
-					kind: .finishBootstrap,
-					payload: try base.pqBootstrapRespond(kpMsg: message)
-				))
+				try base.pqBootstrapRespond(kpMsg: message)
 				return PQInbound(
 					kind: .finishBootstrap, advancedGroup: .ours,
 					newEpochs: epochs, rotatedCredential: nil)
@@ -299,18 +294,12 @@ extension AbstractTwoMLS {
 					kind: .finishBootstrap, advancedGroup: .theirs,
 					newEpochs: epochs, rotatedCredential: nil)
 			case 0x0B:
-				pending.park(PQOutbound(
-					kind: .ratchet,
-					payload: try base.pqRatchetRespond(ekMsg: message)
-				))
+				try base.pqRatchetRespond(ekMsg: message)
 				return PQInbound(
 					kind: .ratchet, advancedGroup: .theirs,
 					newEpochs: nil, rotatedCredential: nil)
 			case 0x0D:
-				pending.park(PQOutbound(
-					kind: .ratchet,
-					payload: try base.pqRatchetBind(ctMsg: message, app: Data())
-				))
+				try base.pqRatchetBind(ctMsg: message, app: Data())
 				return PQInbound(
 					kind: .ratchet, advancedGroup: .ours,
 					newEpochs: epochs, rotatedCredential: nil)
@@ -326,26 +315,6 @@ extension AbstractTwoMLS {
 		}
 	}
 
-	/// Parks a responder's reply between `ingest` and the following `advance`.
-	/// A reference type so the value-typed `PQSession` copies share it.
-	final class PQPendingOutbound: @unchecked Sendable {
-		private let lock = NSLock()
-		private var outbound: PQOutbound?
-
-		func park(_ value: PQOutbound) {
-			lock.lock()
-			outbound = value
-			lock.unlock()
-		}
-
-		func take() -> PQOutbound? {
-			lock.lock()
-			defer { lock.unlock() }
-			let value = outbound
-			outbound = nil
-			return value
-		}
-	}
 }
 
 // MARK: - Invitation (stub)
