@@ -60,9 +60,16 @@ let package = Package(
 			// include/module.modulemap collision).
 			// IMPORTANT: when this URL changes, re-sync Sources/TwoMLSPQ/two_mls_pq.swift
 			// from the SAME release (uniffi embeds a checksum contract verified at init).
+			//
+			// LOCAL DEV: swap in the sibling checkout's local build while iterating on
+			// TwoMLSPQ. After every Rust change, rebuild with `scripts/buildIosDynamic.sh`
+			// and re-sync Sources/TwoMLSPQ/two_mls_pq.swift from TwoMLSPQ/bindings/
+			// (uniffi verifies a binding↔binary checksum at init, so binary + binding
+			// MUST come from the same build). Keep that swap uncommitted.
+			// path: "../TwoMLSPQ/buildIos/TwoMLSPQ.xcframework"
 			url:
-				"https://github.com/germ-network/TwoMLSPQ/releases/download/0.0.5/TwoMLSPQ.xcframework.zip",
-			checksum: "916fec43ebdb520faa767e50bbc28240b073689a7f6a76916f67d29ce18939b7"
+				"https://github.com/germ-network/TwoMLSPQ/releases/download/0.0.6/TwoMLSPQ.xcframework.zip",
+			checksum: "9862ab98da8036dba9a4ebb9d22bf0867a5d2aac3e201ba7fc8ef02fe517ebe7"
 		),
 		.testTarget(
 			name: "AbstractTwoMLSTests",
