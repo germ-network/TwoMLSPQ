@@ -1347,8 +1347,9 @@ public protocol TwoMlsPqSessionProtocol: AnyObject, Sendable {
     func proposalContext()  -> TwoMlsPqDigest?
     
     /**
-     * Accept a remote proposal for the next epoch advance.
-     * On the next `prepare_to_encrypt(None)` call, an empty commit will be staged.
+     * Approve the peer's stapled Upd proposal (identified by its digest). The proposal
+     * message enters our send group's proposal cache, and the next
+     * `prepare_to_encrypt(None)` commits it (with a cross-party PSK refresh).
      */
     func queueProposal(digest: TwoMlsPqDigest) throws 
     
@@ -1727,8 +1728,9 @@ open func proposalContext() -> TwoMlsPqDigest?  {
 }
     
     /**
-     * Accept a remote proposal for the next epoch advance.
-     * On the next `prepare_to_encrypt(None)` call, an empty commit will be staged.
+     * Approve the peer's stapled Upd proposal (identified by its digest). The proposal
+     * message enters our send group's proposal cache, and the next
+     * `prepare_to_encrypt(None)` commits it (with a cross-party PSK refresh).
      */
 open func queueProposal(digest: TwoMlsPqDigest)throws   {try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
     uniffi_two_mls_pq_fn_method_twomlspqsession_queue_proposal(
@@ -3668,7 +3670,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_proposal_context() != 55198) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_queue_proposal() != 37099) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_queue_proposal() != 20344) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_receive_group_id() != 24855) {

@@ -67,17 +67,21 @@ extension AbstractTwoMLS {
 		public let advancedGroup: SendGroupRole
 		public let newEpochs: APQEpochs?
 		public let rotatedCredential: ClientID?  // A.4/A.5 agent handoff
+		/// The app message stapled onto an A.3 bind, decrypted while applying it.
+		public let plaintext: Data?
 
 		public init(
 			kind: PQOperationKind,
 			advancedGroup: SendGroupRole,
 			newEpochs: APQEpochs?,
-			rotatedCredential: ClientID?
+			rotatedCredential: ClientID?,
+			plaintext: Data? = nil
 		) {
 			self.kind = kind
 			self.advancedGroup = advancedGroup
 			self.newEpochs = newEpochs
 			self.rotatedCredential = rotatedCredential
+			self.plaintext = plaintext
 		}
 	}
 

@@ -304,11 +304,11 @@ extension AbstractTwoMLS {
 					kind: .ratchet, advancedGroup: .ours,
 					newEpochs: epochs, rotatedCredential: nil)
 			case 0x0F:
-				// NB: the bind's stapled app plaintext has no slot on PQInbound yet.
-				_ = try base.pqRatchetApply(bindMsg: message)
+				let plaintext = try base.pqRatchetApply(bindMsg: message)
 				return PQInbound(
 					kind: .ratchet, advancedGroup: .theirs,
-					newEpochs: epochs, rotatedCredential: nil)
+					newEpochs: epochs, rotatedCredential: nil,
+					plaintext: plaintext.isEmpty ? nil : plaintext)
 			default:
 				throw TwoMLSPQConformanceError.malformedHeaderFrame
 			}
