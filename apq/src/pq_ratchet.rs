@@ -235,7 +235,7 @@ mod tests {
         .unwrap();
         let mut bob_recv = join_combiner_group(&welcome, &bob).unwrap();
 
-        let pq_epoch_before = asg.pq.current_epoch();
+        let pq_epoch_before = asg.pq.as_ref().unwrap().current_epoch();
         let cl_epoch_before = asg.classical.current_epoch();
 
         // EK/ct exchange: Alice initiates, Bob responds, Alice recovers S.
@@ -245,7 +245,8 @@ mod tests {
         assert_eq!(s_alice, s_bob);
 
         // Alice binds: pathless PQ commit injecting S, then a classical commit importing apq_psk.
-        let (pq_commit, apq_psk_id) = inject_and_commit(&mut asg.pq, &s_alice, &alice).unwrap();
+        let (pq_commit, apq_psk_id) =
+            inject_and_commit(asg.pq.as_mut().unwrap(), &s_alice, &alice).unwrap();
         let cl_out = asg
             .classical
             .commit_builder()
@@ -258,15 +259,21 @@ mod tests {
 
         // Bob applies the stapled commits.
         let apq_psk_id_bob =
-            apply_injected_commit(&mut bob_recv.pq, &s_bob, &pq_commit, &bob).unwrap();
+            apply_injected_commit(bob_recv.pq.as_mut().unwrap(), &s_bob, &pq_commit, &bob).unwrap();
         bob_recv
             .classical
             .process_incoming_message(MlsMessage::from_bytes(&cl_commit).unwrap())
             .unwrap();
 
         // Both PQ groups advanced by exactly one epoch (the pathless inject) and agree.
-        assert_eq!(asg.pq.current_epoch(), pq_epoch_before + 1);
-        assert_eq!(bob_recv.pq.current_epoch(), pq_epoch_before + 1);
+        assert_eq!(
+            asg.pq.as_ref().unwrap().current_epoch(),
+            pq_epoch_before + 1
+        );
+        assert_eq!(
+            bob_recv.pq.as_ref().unwrap().current_epoch(),
+            pq_epoch_before + 1
+        );
         // Both classical groups advanced (the apq_psk bind) and agree.
         assert_eq!(asg.classical.current_epoch(), cl_epoch_before + 1);
         assert_eq!(bob_recv.classical.current_epoch(), cl_epoch_before + 1);
@@ -303,11 +310,11 @@ mod tests {
         .unwrap();
         let _bob_recv = join_combiner_group(&welcome, &bob).unwrap();
 
-        let s_id = injected_psk_id(&asg.pq);
+        let s_id = injected_psk_id(asg.pq.as_ref().unwrap());
         let eph = generate_ephemeral().unwrap();
         let (_s_bob, ct) = encapsulate(&eph.encapsulation_key()).unwrap();
         let s = decapsulate(&eph, &ct).unwrap();
-        inject_and_commit(&mut asg.pq, &s, &alice).unwrap();
+        inject_and_commit(asg.pq.as_mut().unwrap(), &s, &alice).unwrap();
 
         // Forward secrecy: the per-round ML-KEM secret is gone from the store after the bind.
         assert!(alice.pq().secret_store().get(&s_id).is_none());

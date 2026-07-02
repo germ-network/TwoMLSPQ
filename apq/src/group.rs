@@ -23,7 +23,9 @@ pub type PqMlsGroup<S> = MlsGroup<S>;
 
 pub struct CombinerGroup<S: KeyPackageStorage + Clone> {
     pub classical: MlsGroup<S>,
-    pub pq: PqMlsGroup<S>,
+    /// `None` while the PQ half is deferred: an acceptor's send group before the A.4
+    /// bootstrap, and the initiator's recv group mirroring it.
+    pub pq: Option<PqMlsGroup<S>>,
 }
 
 impl<S: KeyPackageStorage + Clone> CombinerGroup<S> {
@@ -192,7 +194,7 @@ pub fn join_group_from_welcome<S: KeyPackageStorage + Clone>(
 
 /// Create a PQ group, adding the member and binding each id in `psk_ids` as an external PSK.
 #[cfg(feature = "cryptokit")]
-pub(crate) fn pq_create_group_with_member<S: KeyPackageStorage + Clone>(
+pub fn pq_create_group_with_member<S: KeyPackageStorage + Clone>(
     pq_client: &PqMlsClient<S>,
     their_kp_bytes: &[u8],
     psk_ids: &[ExternalPskId],
@@ -262,7 +264,7 @@ pub fn create_combiner_send_group<S: KeyPackageStorage + Clone>(
     Ok((
         CombinerGroup {
             classical: classical_group,
-            pq: pq_group,
+            pq: Some(pq_group),
         },
         apq,
     ))
@@ -286,7 +288,30 @@ pub fn join_combiner_group<S: KeyPackageStorage + Clone>(
     #[cfg(not(feature = "cryptokit"))]
     export_and_register_psk(&pq, client)?;
     let classical = join_group_from_welcome(client.classical(), &classical_welcome)?;
-    Ok(CombinerGroup { classical, pq })
+    Ok(CombinerGroup {
+        classical,
+        pq: Some(pq),
+    })
+}
+
+/// Create the acceptor's bound send group (Group_B) with the PQ half deferred (A.4):
+/// classical only, bound to the cross-party TwoMLS-PSK from the recv group. The heavy PQ
+/// half is stood up later by the bootstrap flow, off the handshake critical path.
+pub fn create_bound_classical_send_group<S: KeyPackageStorage + Clone>(
+    classical_kp: &[u8],
+    client: &CombinerClient<S>,
+    recv_classical: &MlsGroup<S>,
+) -> Result<(CombinerGroup<S>, Vec<u8>)> {
+    let psk_cross = export_and_register_psk(recv_classical, client)?;
+    let (classical_group, classical_welcome) =
+        create_group_with_member(client.classical(), classical_kp, &[psk_cross])?;
+    Ok((
+        CombinerGroup {
+            classical: classical_group,
+            pq: None,
+        },
+        classical_welcome,
+    ))
 }
 
 /// Create the acceptor's bound Combiner send group (Group_B). The classical message group binds
@@ -317,7 +342,7 @@ pub fn create_bound_combiner_send_group<S: KeyPackageStorage + Clone>(
     Ok((
         CombinerGroup {
             classical: classical_group,
-            pq: pq_group,
+            pq: Some(pq_group),
         },
         apq,
     ))
@@ -396,7 +421,10 @@ mod tests {
             alice_send.classical.group_id(),
             bob_recv.classical.group_id()
         );
-        assert_eq!(alice_send.pq.group_id(), bob_recv.pq.group_id());
+        assert_eq!(
+            alice_send.pq.as_ref().unwrap().group_id(),
+            bob_recv.pq.as_ref().unwrap().group_id()
+        );
     }
 
     #[test]
@@ -420,7 +448,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(bob_send.classical.current_epoch(), 1);
-        assert_eq!(bob_send.pq.current_epoch(), 1);
+        assert_eq!(bob_send.pq.as_ref().unwrap().current_epoch(), 1);
     }
 
     #[test]
