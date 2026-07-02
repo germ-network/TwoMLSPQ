@@ -86,8 +86,14 @@ struct APIDemo {
 			throw TestErrors.unexpected
 		}
 
-		//remote replies, advancing the operation
-		_ = try remotePQ.advance(after: remoteInbound)
+		//remote replies, advancing the operation; local applies it, completing A.4
+		guard let remoteReply = try remotePQ.advance(after: remoteInbound) else {
+			throw TestErrors.unexpected
+		}
+		_ = try localPQ.ingest(remoteReply.payload)
+		guard localPQ.isFullyEstablished, remotePQ.isFullyEstablished else {
+			throw TestErrors.unexpected
+		}
 
 		try localSession.exchange(with: remoteSession)
 	}

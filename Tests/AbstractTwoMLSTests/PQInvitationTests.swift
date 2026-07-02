@@ -11,7 +11,8 @@ import AbstractTwoMLS
 import CommProtocol
 import Foundation
 import Testing
-import TwoMLSPQ
+
+@testable import TwoMLSPQ
 
 struct PQInvitationReceiveTests {
 

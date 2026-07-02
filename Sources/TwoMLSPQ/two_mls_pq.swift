@@ -1233,6 +1233,12 @@ public protocol TwoMlsPqSessionProtocol: AnyObject, Sendable {
     func encrypt(appMessage: Data) throws  -> EncryptResult
     
     /**
+     * The send group's APQ epoch pair (PQ side-band, classical message group).
+     * Zeros until the corresponding group exists.
+     */
+    func epochs()  -> ApqEpochs
+    
+    /**
      * Process a message forwarded from another of the user's own devices.
      */
     func forwarded(headerDecrypted: Data) throws  -> MlsSenderMessage?
@@ -1241,13 +1247,70 @@ public protocol TwoMlsPqSessionProtocol: AnyObject, Sendable {
     
     func isEstablished()  -> Bool
     
+    /**
+     * True once both directions' PQ halves are live (post-A.4 bootstrap).
+     */
+    func isFullyEstablished()  -> Bool
+    
     func myAgentState()  -> AgentState
+    
+    /**
+     * Whose move the PQ side-band is: true when this side owes the next operation.
+     * The initiator owes the A.4 bootstrap; completing an operation passes the turn.
+     */
+    func myPqTurn()  -> Bool
     
     /**
      * Welcome bytes to deliver to the remote party to complete group establishment.
      * Returns `None` once consumed or when both groups are live.
      */
     func pendingOutbound()  -> Data?
+    
+    /**
+     * A.4 initiator completion — join the peer's new PQ group (our key package's
+     * private material is retained in this client), register its APQ-PSK, and apply
+     * the classical bind on the recv group. The turn passes to the peer.
+     */
+    func pqBootstrapApply(bindMsg: Data) throws 
+    
+    /**
+     * A.4 initiator — emit this side's PQ key package (tag 0x11) so the peer can stand
+     * up its deferred send-group PQ half. The key package's private material is retained
+     * in this client, so the returned welcome can be joined by `pq_bootstrap_apply`.
+     */
+    func pqBootstrapBegin() throws  -> Data
+    
+    /**
+     * A.4 responder — stand up the deferred send-group PQ half around the peer's key
+     * package, bind its exported APQ-PSK into the classical half, and return the
+     * bootstrap frame (tag 0x13). Taking this turn makes the next operation ours.
+     */
+    func pqBootstrapRespond(kpMsg: Data) throws  -> Data
+    
+    /**
+     * Responder — apply the stapled bind: register the held secret, apply the PQ partial commit
+     * and classical commit on the recv group, and return the decrypted app message.
+     */
+    func pqRatchetApply(bindMsg: Data) throws  -> Data
+    
+    /**
+     * Initiator step 1 — generate an ML-KEM ephemeral and return the encapsulation-key message
+     * (tag 0x0B). The decapsulation key is held until the ciphertext arrives.
+     */
+    func pqRatchetBegin() throws  -> Data
+    
+    /**
+     * Initiator step 2 — decapsulate S, inject it into the send group's PQ half via a pathless
+     * commit, bind the exported apq_psk into the classical half, and staple an app message.
+     * Returns the bind frame (tag 0x0F).
+     */
+    func pqRatchetBind(ctMsg: Data, app: Data) throws  -> Data
+    
+    /**
+     * Responder — encapsulate a fresh secret to the initiator's EK, hold it, and return the
+     * ciphertext message (tag 0x0D).
+     */
+    func pqRatchetRespond(ekMsg: Data) throws  -> Data
     
     /**
      * Prepare a pending proposal nonce and stage it for binding into the next outbound message.
@@ -1424,6 +1487,18 @@ open func encrypt(appMessage: Data)throws  -> EncryptResult  {
 }
     
     /**
+     * The send group's APQ epoch pair (PQ side-band, classical message group).
+     * Zeros until the corresponding group exists.
+     */
+open func epochs() -> ApqEpochs  {
+    return try!  FfiConverterTypeApqEpochs_lift(try! rustCall() {
+    uniffi_two_mls_pq_fn_method_twomlspqsession_epochs(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
      * Process a message forwarded from another of the user's own devices.
      */
 open func forwarded(headerDecrypted: Data)throws  -> MlsSenderMessage?  {
@@ -1451,9 +1526,32 @@ open func isEstablished() -> Bool  {
 })
 }
     
+    /**
+     * True once both directions' PQ halves are live (post-A.4 bootstrap).
+     */
+open func isFullyEstablished() -> Bool  {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_two_mls_pq_fn_method_twomlspqsession_is_fully_established(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
 open func myAgentState() -> AgentState  {
     return try!  FfiConverterTypeAgentState_lift(try! rustCall() {
     uniffi_two_mls_pq_fn_method_twomlspqsession_my_agent_state(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * Whose move the PQ side-band is: true when this side owes the next operation.
+     * The initiator owes the A.4 bootstrap; completing an operation passes the turn.
+     */
+open func myPqTurn() -> Bool  {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_two_mls_pq_fn_method_twomlspqsession_my_pq_turn(
             self.uniffiCloneHandle(),$0
     )
 })
@@ -1467,6 +1565,99 @@ open func pendingOutbound() -> Data?  {
     return try!  FfiConverterOptionData.lift(try! rustCall() {
     uniffi_two_mls_pq_fn_method_twomlspqsession_pending_outbound(
             self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * A.4 initiator completion — join the peer's new PQ group (our key package's
+     * private material is retained in this client), register its APQ-PSK, and apply
+     * the classical bind on the recv group. The turn passes to the peer.
+     */
+open func pqBootstrapApply(bindMsg: Data)throws   {try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
+    uniffi_two_mls_pq_fn_method_twomlspqsession_pq_bootstrap_apply(
+            self.uniffiCloneHandle(),
+        FfiConverterData.lower(bindMsg),$0
+    )
+}
+}
+    
+    /**
+     * A.4 initiator — emit this side's PQ key package (tag 0x11) so the peer can stand
+     * up its deferred send-group PQ half. The key package's private material is retained
+     * in this client, so the returned welcome can be joined by `pq_bootstrap_apply`.
+     */
+open func pqBootstrapBegin()throws  -> Data  {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
+    uniffi_two_mls_pq_fn_method_twomlspqsession_pq_bootstrap_begin(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * A.4 responder — stand up the deferred send-group PQ half around the peer's key
+     * package, bind its exported APQ-PSK into the classical half, and return the
+     * bootstrap frame (tag 0x13). Taking this turn makes the next operation ours.
+     */
+open func pqBootstrapRespond(kpMsg: Data)throws  -> Data  {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
+    uniffi_two_mls_pq_fn_method_twomlspqsession_pq_bootstrap_respond(
+            self.uniffiCloneHandle(),
+        FfiConverterData.lower(kpMsg),$0
+    )
+})
+}
+    
+    /**
+     * Responder — apply the stapled bind: register the held secret, apply the PQ partial commit
+     * and classical commit on the recv group, and return the decrypted app message.
+     */
+open func pqRatchetApply(bindMsg: Data)throws  -> Data  {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
+    uniffi_two_mls_pq_fn_method_twomlspqsession_pq_ratchet_apply(
+            self.uniffiCloneHandle(),
+        FfiConverterData.lower(bindMsg),$0
+    )
+})
+}
+    
+    /**
+     * Initiator step 1 — generate an ML-KEM ephemeral and return the encapsulation-key message
+     * (tag 0x0B). The decapsulation key is held until the ciphertext arrives.
+     */
+open func pqRatchetBegin()throws  -> Data  {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
+    uniffi_two_mls_pq_fn_method_twomlspqsession_pq_ratchet_begin(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * Initiator step 2 — decapsulate S, inject it into the send group's PQ half via a pathless
+     * commit, bind the exported apq_psk into the classical half, and staple an app message.
+     * Returns the bind frame (tag 0x0F).
+     */
+open func pqRatchetBind(ctMsg: Data, app: Data)throws  -> Data  {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
+    uniffi_two_mls_pq_fn_method_twomlspqsession_pq_ratchet_bind(
+            self.uniffiCloneHandle(),
+        FfiConverterData.lower(ctMsg),
+        FfiConverterData.lower(app),$0
+    )
+})
+}
+    
+    /**
+     * Responder — encapsulate a fresh secret to the initiator's EK, hold it, and return the
+     * ciphertext message (tag 0x0D).
+     */
+open func pqRatchetRespond(ekMsg: Data)throws  -> Data  {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
+    uniffi_two_mls_pq_fn_method_twomlspqsession_pq_ratchet_respond(
+            self.uniffiCloneHandle(),
+        FfiConverterData.lower(ekMsg),$0
     )
 })
 }
@@ -1620,6 +1811,64 @@ public func FfiConverterTypeTwoMlsPqSession_lower(_ value: TwoMlsPqSession) -> U
 }
 
 
+
+
+/**
+ * The APQ epoch pair for the send group: the PQ side-band epoch and the classical
+ * (traditional) message epoch. Zeros until the corresponding group exists.
+ */
+public struct ApqEpochs: Equatable, Hashable {
+    public var pqEpoch: UInt64
+    public var classicalEpoch: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(pqEpoch: UInt64, classicalEpoch: UInt64) {
+        self.pqEpoch = pqEpoch
+        self.classicalEpoch = classicalEpoch
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension ApqEpochs: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeApqEpochs: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ApqEpochs {
+        return
+            try ApqEpochs(
+                pqEpoch: FfiConverterUInt64.read(from: &buf), 
+                classicalEpoch: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ApqEpochs, into buf: inout [UInt8]) {
+        FfiConverterUInt64.write(value.pqEpoch, into: &buf)
+        FfiConverterUInt64.write(value.classicalEpoch, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeApqEpochs_lift(_ buf: RustBuffer) throws -> ApqEpochs {
+    return try FfiConverterTypeApqEpochs.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeApqEpochs_lower(_ value: ApqEpochs) -> RustBuffer {
+    return FfiConverterTypeApqEpochs.lower(value)
+}
 
 
 /**
@@ -3345,6 +3594,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_encrypt() != 3107) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_epochs() != 27665) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_forwarded() != 20430) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -3354,10 +3606,37 @@ private let initializationResult: InitializationResult = {
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_is_established() != 41629) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_is_fully_established() != 13237) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_my_agent_state() != 25081) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_my_pq_turn() != 39545) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pending_outbound() != 44057) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_bootstrap_apply() != 21917) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_bootstrap_begin() != 62410) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_bootstrap_respond() != 23702) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_ratchet_apply() != 37587) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_ratchet_begin() != 20914) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_ratchet_bind() != 21555) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_ratchet_respond() != 43090) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_prepare_to_encrypt() != 16181) {

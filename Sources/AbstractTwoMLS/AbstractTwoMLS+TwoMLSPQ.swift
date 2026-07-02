@@ -161,6 +161,9 @@ extension AbstractTwoMLS {
 		public typealias Archive = Data
 
 		let base: TwoMLSPQ.TwoMlsPqSession
+		// Shared across value copies: parks a responder's PQ reply between ingest
+		// and the following advance.
+		let pending = PQPendingOutbound()
 
 		init(_ base: TwoMLSPQ.TwoMlsPqSession) {
 			self.base = base
@@ -236,43 +239,111 @@ extension AbstractTwoMLS {
 
 		// MARK: PQRatchet
 
-		// The action methods have no FFI surface yet (GAP); `isFullyEstablished`
-		// maps to the session's own established flag, and `turn`/`epochs` return
-		// placeholders.
+		// The FFI is call-per-step (begin/respond/bind/apply); the abstract surface is
+		// ingest/advance. A responder's reply produced during `ingest` is parked in the
+		// shared pending box until the following `advance` hands it back out.
 
 		public var turn: PQTurn {
-			// GAP: no FFI accessor for whose PQ turn it is.
-			.weInitiate
+			base.myPqTurn() ? .weInitiate : .theyInitiate
 		}
 
 		public var epochs: APQEpochs {
-			// GAP: no FFI accessor for the APQInfo epoch pair.
-			APQEpochs(pqEpoch: 0, classicalEpoch: 0)
+			let pair = base.epochs()
+			return APQEpochs(pqEpoch: pair.pqEpoch, classicalEpoch: pair.classicalEpoch)
 		}
 
 		public var isFullyEstablished: Bool {
-			base.isEstablished()
+			base.isFullyEstablished()
 		}
 
 		public func begin(
 			_ kind: PQOperationKind,
 			rotating: AbstractTwoMLS.ClientID?
 		) throws -> PQOutbound {
-			throw TwoMLSPQConformanceError.notImplemented(
-				"PQRatchet.begin(\(kind)) — no TwoMLSPQ FFI equivalent yet"
-			)
+			guard rotating == nil else {
+				throw TwoMLSPQConformanceError.notImplemented(
+					"PQRatchet.begin(rotating:) — A.4/A.5 credential handoff"
+				)
+			}
+			switch kind {
+			case .finishBootstrap:
+				return PQOutbound(kind: kind, payload: try base.pqBootstrapBegin())
+			case .ratchet:
+				return PQOutbound(kind: kind, payload: try base.pqRatchetBegin())
+			case .rekey:
+				throw TwoMLSPQConformanceError.notImplemented(
+					"PQRatchet.begin(.rekey) — A.5 has no FFI surface yet"
+				)
+			}
 		}
 
 		public func advance(after inbound: PQInbound) throws -> PQOutbound? {
-			throw TwoMLSPQConformanceError.notImplemented(
-				"PQRatchet.advance — no TwoMLSPQ FFI equivalent yet"
-			)
+			pending.take()
 		}
 
 		public func ingest(_ message: Data) throws -> PQInbound {
-			throw TwoMLSPQConformanceError.notImplemented(
-				"PQRatchet.ingest — no TwoMLSPQ FFI equivalent yet"
-			)
+			// PQ side-band frame tags (session.rs): EK 0x0B, CT 0x0D, bind 0x0F,
+			// bootstrap KP 0x11, bootstrap bind 0x13.
+			switch message.first {
+			case 0x11:
+				pending.park(PQOutbound(
+					kind: .finishBootstrap,
+					payload: try base.pqBootstrapRespond(kpMsg: message)
+				))
+				return PQInbound(
+					kind: .finishBootstrap, advancedGroup: .ours,
+					newEpochs: epochs, rotatedCredential: nil)
+			case 0x13:
+				try base.pqBootstrapApply(bindMsg: message)
+				return PQInbound(
+					kind: .finishBootstrap, advancedGroup: .theirs,
+					newEpochs: epochs, rotatedCredential: nil)
+			case 0x0B:
+				pending.park(PQOutbound(
+					kind: .ratchet,
+					payload: try base.pqRatchetRespond(ekMsg: message)
+				))
+				return PQInbound(
+					kind: .ratchet, advancedGroup: .theirs,
+					newEpochs: nil, rotatedCredential: nil)
+			case 0x0D:
+				pending.park(PQOutbound(
+					kind: .ratchet,
+					payload: try base.pqRatchetBind(ctMsg: message, app: Data())
+				))
+				return PQInbound(
+					kind: .ratchet, advancedGroup: .ours,
+					newEpochs: epochs, rotatedCredential: nil)
+			case 0x0F:
+				// NB: the bind's stapled app plaintext has no slot on PQInbound yet.
+				_ = try base.pqRatchetApply(bindMsg: message)
+				return PQInbound(
+					kind: .ratchet, advancedGroup: .theirs,
+					newEpochs: epochs, rotatedCredential: nil)
+			default:
+				throw TwoMLSPQConformanceError.malformedHeaderFrame
+			}
+		}
+	}
+
+	/// Parks a responder's reply between `ingest` and the following `advance`.
+	/// A reference type so the value-typed `PQSession` copies share it.
+	final class PQPendingOutbound: @unchecked Sendable {
+		private let lock = NSLock()
+		private var outbound: PQOutbound?
+
+		func park(_ value: PQOutbound) {
+			lock.lock()
+			outbound = value
+			lock.unlock()
+		}
+
+		func take() -> PQOutbound? {
+			lock.lock()
+			defer { lock.unlock() }
+			let value = outbound
+			outbound = nil
+			return value
 		}
 	}
 }
