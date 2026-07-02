@@ -2,10 +2,12 @@ use std::sync::{Arc, Mutex};
 
 use mls_rs::{group::ReceivedMessage, MlsMessage};
 
+#[cfg(not(feature = "cryptokit"))]
+use apq::create_group_with_member;
 use apq::{
-    create_bound_combiner_send_group, create_combiner_send_group, decode_apq_welcome,
-    export_and_register_psk, join_combiner_group, join_group_from_welcome, sender_client_id,
-    APQ_TAG,
+    create_bound_classical_send_group, create_combiner_send_group, decode_apq_welcome,
+    encode_apq_welcome, export_and_register_psk, join_combiner_group, join_group_from_welcome,
+    sender_client_id, APQ_TAG,
 };
 
 use crate::key_package_store::CombinerGroup;
@@ -20,7 +22,7 @@ use crate::{
 };
 
 #[cfg(feature = "cryptokit")]
-use apq::{export_and_register_psk_pq, pq_join_group_from_welcome};
+use apq::{export_and_register_psk_pq, pq_create_group_with_member, pq_join_group_from_welcome};
 #[cfg(feature = "cryptokit")]
 use zeroize::Zeroizing;
 
@@ -41,6 +43,9 @@ struct SessionInner {
     session_id: SessionId,
     my_state: AgentState,
     their_state: AgentState,
+    /// Whose move the PQ side-band is: the initiator owes the A.4 bootstrap; thereafter
+    /// completing an operation passes the turn to the peer.
+    pq_turn_mine: bool,
 }
 
 /// A TwoMLSPQ session holding two asymmetric Combiner send groups.
@@ -72,6 +77,13 @@ const PQ_EK_TAG: u8 = 0x0B;
 const PQ_CT_TAG: u8 = 0x0D;
 #[cfg(feature = "cryptokit")]
 const PQ_BIND_TAG: u8 = 0x0F;
+
+/// A.4 bootstrap: this side's PQ key package, sent so the peer can stand up its deferred
+/// send-group PQ half.
+const PQ_BOOTSTRAP_KP_TAG: u8 = 0x11;
+
+/// A.4 bootstrap reply: the new PQ group's welcome plus the classical APQ-PSK bind commit.
+const PQ_BOOTSTRAP_BIND_TAG: u8 = 0x13;
 
 /// PQ ratchet round state carried between the messages of one exchange.
 #[cfg(feature = "cryptokit")]
@@ -125,6 +137,32 @@ fn encode_pq_bind(pq_commit: Vec<u8>, classical_commit: Vec<u8>, app: Vec<u8>) -
     out
 }
 
+/// Encode the A.4 bootstrap reply: `[0x13][u32-LE welcome-len][pq_welcome][classical_commit…]`.
+fn encode_bootstrap_bind(pq_welcome: Vec<u8>, classical_commit: Vec<u8>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + 4 + pq_welcome.len() + classical_commit.len());
+    out.push(PQ_BOOTSTRAP_BIND_TAG);
+    out.extend_from_slice(&(pq_welcome.len() as u32).to_le_bytes());
+    out.extend_from_slice(&pq_welcome);
+    out.extend_from_slice(&classical_commit);
+    out
+}
+
+fn decode_bootstrap_bind(bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
+    let (&tag, rest) = bytes.split_first().ok_or(TwoMlsPqError::Mls)?;
+    if tag != PQ_BOOTSTRAP_BIND_TAG {
+        return Err(TwoMlsPqError::Mls);
+    }
+    if rest.len() < 4 {
+        return Err(TwoMlsPqError::Mls);
+    }
+    let w_len = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
+    let rest = &rest[4..];
+    if rest.len() < w_len {
+        return Err(TwoMlsPqError::Mls);
+    }
+    Ok((rest[..w_len].to_vec(), rest[w_len..].to_vec()))
+}
+
 #[cfg(feature = "cryptokit")]
 fn decode_pq_bind(bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
     let (&tag, rest) = bytes.split_first().ok_or(TwoMlsPqError::Mls)?;
@@ -136,6 +174,7 @@ fn decode_pq_bind(bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
 }
 
 #[cfg(feature = "cryptokit")]
+#[uniffi::export]
 impl TwoMlsPqSession {
     /// Initiator step 1 — generate an ML-KEM ephemeral and return the encapsulation-key message
     /// (tag 0x0B). The decapsulation key is held until the ciphertext arrives.
@@ -188,8 +227,9 @@ impl TwoMlsPqSession {
             .send_group
             .as_mut()
             .ok_or(TwoMlsPqError::SessionNotReady)?;
+        let send_pq = send.pq.as_mut().ok_or(TwoMlsPqError::SessionNotReady)?;
         let (pq_commit, apq_psk_id) =
-            apq::pq_ratchet::inject_and_commit(&mut send.pq, &s, client.combiner())?;
+            apq::pq_ratchet::inject_and_commit(send_pq, &s, client.combiner())?;
         let cl_out = send
             .classical
             .commit_builder()
@@ -210,6 +250,8 @@ impl TwoMlsPqSession {
             .map_err(|_| TwoMlsPqError::Mls)?
             .to_bytes()
             .map_err(|_| TwoMlsPqError::Mls)?;
+        // Our operation is complete once the peer applies; the turn passes.
+        inner.pq_turn_mine = false;
         Ok(encode_pq_bind(pq_commit, cl_commit, app_ct))
     }
 
@@ -227,20 +269,24 @@ impl TwoMlsPqSession {
             .recv_group
             .as_mut()
             .ok_or(TwoMlsPqError::SessionNotReady)?;
-        apq::pq_ratchet::apply_injected_commit(&mut recv.pq, &s, &pq_commit, client.combiner())?;
+        let recv_pq = recv.pq.as_mut().ok_or(TwoMlsPqError::SessionNotReady)?;
+        apq::pq_ratchet::apply_injected_commit(recv_pq, &s, &pq_commit, client.combiner())?;
         let cl = MlsMessage::from_bytes(&cl_commit).map_err(|_| TwoMlsPqError::Mls)?;
         recv.classical
             .process_incoming_message(cl)
             .map_err(|_| TwoMlsPqError::Mls)?;
         let app = MlsMessage::from_bytes(&app_ct).map_err(|_| TwoMlsPqError::Mls)?;
-        match recv
+        let out = match recv
             .classical
             .process_incoming_message(app)
             .map_err(|_| TwoMlsPqError::Mls)?
         {
             ReceivedMessage::ApplicationMessage(m) => Ok(m.data().to_vec()),
             _ => Err(TwoMlsPqError::DecryptionFailed),
-        }
+        };
+        // We finished receiving this operation; the next one is ours to start.
+        inner.pq_turn_mine = true;
+        out
     }
 }
 
@@ -574,6 +620,7 @@ fn build_session(
     pending_outbound: Option<Vec<u8>>,
     session_id: SessionId,
     their_id: ClientId,
+    initiated: bool,
 ) -> Arc<TwoMlsPqSession> {
     let my_id = client.client_id();
     Arc::new(TwoMlsPqSession {
@@ -594,6 +641,7 @@ fn build_session(
             their_state: AgentState::Sync {
                 client_id: their_id,
             },
+            pq_turn_mine: initiated,
         }),
     })
 }
@@ -635,6 +683,7 @@ impl TwoMlsPqSession {
             Some(apq_welcome),
             session_id,
             their_id,
+            true,
         ))
     }
 
@@ -652,12 +701,15 @@ impl TwoMlsPqSession {
         let session_id = crate::derive_session_id(client.client_id(), their_id.clone())?;
 
         let recv_group = join_combiner_group(&welcome, client.combiner())?;
-        let (send_group, apq_welcome) = create_bound_combiner_send_group(
+        // A.4: the send group's PQ half is deferred — classical only, bound to the
+        // cross-party PSK. The bootstrap flow stands it up off the critical path, so the
+        // return welcome carries an empty PQ slot.
+        let (send_group, classical_welcome) = create_bound_classical_send_group(
             &their_key_package.classical,
-            &their_key_package.pq,
             client.combiner(),
             &recv_group.classical,
         )?;
+        let apq_welcome = encode_apq_welcome(classical_welcome, Vec::new());
 
         Ok(build_session(
             client,
@@ -666,6 +718,7 @@ impl TwoMlsPqSession {
             Some(apq_welcome),
             session_id,
             their_id,
+            false,
         ))
     }
 
@@ -679,6 +732,148 @@ impl TwoMlsPqSession {
     /// Returns `None` once consumed or when both groups are live.
     pub fn pending_outbound(&self) -> Option<Vec<u8>> {
         self.lock().pending_outbound.take()
+    }
+
+    /// True once both directions' PQ halves are live (post-A.4 bootstrap).
+    pub fn is_fully_established(&self) -> bool {
+        let inner = self.lock();
+        matches!(
+            (&inner.send_group, &inner.recv_group),
+            (Some(s), Some(r)) if s.pq.is_some() && r.pq.is_some()
+        )
+    }
+
+    /// Whose move the PQ side-band is: true when this side owes the next operation.
+    /// The initiator owes the A.4 bootstrap; completing an operation passes the turn.
+    pub fn my_pq_turn(&self) -> bool {
+        self.lock().pq_turn_mine
+    }
+
+    /// The send group's APQ epoch pair (PQ side-band, classical message group).
+    /// Zeros until the corresponding group exists.
+    pub fn epochs(&self) -> crate::ApqEpochs {
+        let inner = self.lock();
+        let (pq_epoch, classical_epoch) = inner
+            .send_group
+            .as_ref()
+            .map(|g| {
+                (
+                    g.pq.as_ref().map(|p| p.current_epoch()).unwrap_or(0),
+                    g.classical.current_epoch(),
+                )
+            })
+            .unwrap_or((0, 0));
+        crate::ApqEpochs {
+            pq_epoch,
+            classical_epoch,
+        }
+    }
+
+    /// A.4 initiator — emit this side's PQ key package (tag 0x11) so the peer can stand
+    /// up its deferred send-group PQ half. The key package's private material is retained
+    /// in this client, so the returned welcome can be joined by `pq_bootstrap_apply`.
+    pub fn pq_bootstrap_begin(&self) -> Result<Vec<u8>> {
+        let inner = self.lock();
+        if !inner.pq_turn_mine {
+            return Err(TwoMlsPqError::SessionNotReady);
+        }
+        let ready = inner.send_group.is_some()
+            && inner
+                .recv_group
+                .as_ref()
+                .map(|g| g.pq.is_none())
+                .unwrap_or(false);
+        if !ready {
+            return Err(TwoMlsPqError::SessionNotReady);
+        }
+        #[cfg(feature = "cryptokit")]
+        let kp = inner.client.combiner().generate_pq_key_package()?;
+        #[cfg(not(feature = "cryptokit"))]
+        let kp = inner.client.combiner().generate_classical_key_package()?;
+        let mut msg = vec![PQ_BOOTSTRAP_KP_TAG];
+        msg.extend_from_slice(&kp);
+        Ok(msg)
+    }
+
+    /// A.4 responder — stand up the deferred send-group PQ half around the peer's key
+    /// package, bind its exported APQ-PSK into the classical half, and return the
+    /// bootstrap frame (tag 0x13). Taking this turn makes the next operation ours.
+    pub fn pq_bootstrap_respond(&self, kp_msg: Vec<u8>) -> Result<Vec<u8>> {
+        let (&tag, kp) = kp_msg.split_first().ok_or(TwoMlsPqError::Mls)?;
+        if tag != PQ_BOOTSTRAP_KP_TAG {
+            return Err(TwoMlsPqError::Mls);
+        }
+        let mut inner = self.lock();
+        let client = inner.client.clone();
+        let frame = {
+            let send = inner
+                .send_group
+                .as_mut()
+                .ok_or(TwoMlsPqError::SessionNotReady)?;
+            if send.pq.is_some() {
+                return Err(TwoMlsPqError::SessionNotReady);
+            }
+            #[cfg(feature = "cryptokit")]
+            let (pq_group, pq_welcome) = pq_create_group_with_member(client.pq(), kp, &[])?;
+            #[cfg(not(feature = "cryptokit"))]
+            let (pq_group, pq_welcome) = create_group_with_member(client.classical(), kp, &[])?;
+            #[cfg(feature = "cryptokit")]
+            let apq_psk = export_and_register_psk_pq(&pq_group, client.combiner())?;
+            #[cfg(not(feature = "cryptokit"))]
+            let apq_psk = export_and_register_psk(&pq_group, client.combiner())?;
+            let cl_out = send
+                .classical
+                .commit_builder()
+                .add_external_psk(apq_psk)
+                .map_err(|_| TwoMlsPqError::Mls)?
+                .build()
+                .map_err(|_| TwoMlsPqError::Mls)?;
+            send.classical
+                .apply_pending_commit()
+                .map_err(|_| TwoMlsPqError::Mls)?;
+            let cl_commit = cl_out
+                .commit_message
+                .to_bytes()
+                .map_err(|_| TwoMlsPqError::Mls)?;
+            send.pq = Some(pq_group);
+            encode_bootstrap_bind(pq_welcome, cl_commit)
+        };
+        inner.pq_turn_mine = true;
+        Ok(frame)
+    }
+
+    /// A.4 initiator completion — join the peer's new PQ group (our key package's
+    /// private material is retained in this client), register its APQ-PSK, and apply
+    /// the classical bind on the recv group. The turn passes to the peer.
+    pub fn pq_bootstrap_apply(&self, bind_msg: Vec<u8>) -> Result<()> {
+        let (pq_welcome, cl_commit) = decode_bootstrap_bind(&bind_msg)?;
+        let mut inner = self.lock();
+        let client = inner.client.clone();
+        {
+            let recv = inner
+                .recv_group
+                .as_mut()
+                .ok_or(TwoMlsPqError::SessionNotReady)?;
+            if recv.pq.is_some() {
+                return Err(TwoMlsPqError::SessionNotReady);
+            }
+            #[cfg(feature = "cryptokit")]
+            let pq = pq_join_group_from_welcome(client.pq(), &pq_welcome)?;
+            #[cfg(not(feature = "cryptokit"))]
+            let pq = join_group_from_welcome(client.classical(), &pq_welcome)?;
+            // Register the APQ-PSK before applying the classical bind that references it.
+            #[cfg(feature = "cryptokit")]
+            export_and_register_psk_pq(&pq, client.combiner())?;
+            #[cfg(not(feature = "cryptokit"))]
+            export_and_register_psk(&pq, client.combiner())?;
+            let cl = MlsMessage::from_bytes(&cl_commit).map_err(|_| TwoMlsPqError::Mls)?;
+            recv.classical
+                .process_incoming_message(cl)
+                .map_err(|_| TwoMlsPqError::Mls)?;
+            recv.pq = Some(pq);
+        }
+        inner.pq_turn_mine = false;
+        Ok(())
     }
 
     pub fn is_established(&self) -> bool {
@@ -708,8 +903,13 @@ impl TwoMlsPqSession {
             classical: MlsGroupId {
                 bytes: rg.classical.group_id().to_vec(),
             },
+            // Empty until the deferred PQ half is bootstrapped (A.4).
             pq: MlsGroupId {
-                bytes: rg.pq.group_id().to_vec(),
+                bytes: rg
+                    .pq
+                    .as_ref()
+                    .map(|pq| pq.group_id().to_vec())
+                    .unwrap_or_default(),
             },
         })
     }
@@ -827,6 +1027,16 @@ impl TwoMlsPqSession {
             }
 
             let (classical_welcome, pq_welcome) = decode_apq_welcome(&ciphertext)?;
+            // An empty PQ slot is the acceptor's deferred (A.4) return welcome: join the
+            // classical group only; the PQ half arrives with the bootstrap flow.
+            if pq_welcome.is_empty() {
+                let classical = join_group_from_welcome(client.classical(), &classical_welcome)?;
+                inner.recv_group = Some(CombinerGroup {
+                    classical,
+                    pq: None,
+                });
+                return Ok(None);
+            }
             // Join the PQ group first, then re-derive the intra-party APQ-PSK from it.
             #[cfg(feature = "cryptokit")]
             let pq = pq_join_group_from_welcome(client.pq(), &pq_welcome)?;
@@ -839,7 +1049,10 @@ impl TwoMlsPqSession {
             // Join the classical group (bound with the cross-party + APQ PSKs).
             let classical = join_group_from_welcome(client.classical(), &classical_welcome)?;
 
-            inner.recv_group = Some(CombinerGroup { classical, pq });
+            inner.recv_group = Some(CombinerGroup {
+                classical,
+                pq: Some(pq),
+            });
             return Ok(None);
         }
 
@@ -1148,7 +1361,11 @@ impl TwoMlsPqSession {
         let inner = self.lock();
         inner.recv_group.as_ref().map(|rg| TwoMlsPqDigest {
             hash_type: crate::DIGEST_SHA256,
-            digest: rg.pq.group_id().to_vec(),
+            digest: rg
+                .pq
+                .as_ref()
+                .map(|pq| pq.group_id().to_vec())
+                .unwrap_or_else(|| rg.classical.group_id().to_vec()),
         })
     }
 
@@ -1196,6 +1413,58 @@ mod tests {
         test_utils::{establish_sessions, make_client, make_combiner_kp},
         AgentState, TwoMlsPqError,
     };
+
+    #[test]
+    fn test_pq_bootstrap_completes_deferred_halves() {
+        let (alice, bob) = establish_sessions();
+
+        // Establishment is classical-complete but the acceptor's send-group PQ half
+        // (and the initiator's recv mirror) is deferred.
+        assert!(alice.is_established());
+        assert!(bob.is_established());
+        assert!(!alice.is_fully_established());
+        assert!(!bob.is_fully_established());
+        // The initiator holds the turn and owes the bootstrap.
+        assert!(alice.my_pq_turn());
+        assert!(!bob.my_pq_turn());
+
+        let kp_msg = assert_ok!(alice.pq_bootstrap_begin());
+        let bind = assert_ok!(bob.pq_bootstrap_respond(kp_msg));
+        assert_ok!(alice.pq_bootstrap_apply(bind));
+
+        assert!(alice.is_fully_established());
+        assert!(bob.is_fully_established());
+        // Completing the operation passes the turn.
+        assert!(!alice.my_pq_turn());
+        assert!(bob.my_pq_turn());
+        assert!(bob.epochs().pq_epoch > 0);
+
+        // Both directions still message after the bind commits.
+        assert_ok!(alice.prepare_to_encrypt(None));
+        let a2b = assert_ok!(alice.encrypt(b"post-bootstrap a".to_vec()));
+        let got = assert_ok!(bob.process_incoming(a2b.cipher_text));
+        assert_eq!(
+            assert_some!(assert_some!(got).application_message).app_message_data,
+            b"post-bootstrap a".to_vec()
+        );
+        assert_ok!(bob.prepare_to_encrypt(None));
+        let b2a = assert_ok!(bob.encrypt(b"post-bootstrap b".to_vec()));
+        let got = assert_ok!(alice.process_incoming(b2a.cipher_text));
+        assert_eq!(
+            assert_some!(assert_some!(got).application_message).app_message_data,
+            b"post-bootstrap b".to_vec()
+        );
+    }
+
+    #[test]
+    fn test_pq_bootstrap_begin_requires_turn() {
+        let (_alice, bob) = establish_sessions();
+        // The acceptor does not hold the turn and cannot begin the bootstrap.
+        assert_err!(
+            bob.pq_bootstrap_begin(),
+            crate::TwoMlsPqError::SessionNotReady
+        );
+    }
 
     #[test]
     fn test_initiate_stores_outbound_welcome() {
@@ -1263,10 +1532,21 @@ mod tests {
         assert_eq!(got, b"hello-pq");
     }
 
+    /// Complete the A.4 bootstrap after establishment so both directions are full
+    /// APQ — required before the deferred acceptor side can ratchet.
+    #[cfg(feature = "cryptokit")]
+    fn establish_full() -> (Arc<TwoMlsPqSession>, Arc<TwoMlsPqSession>) {
+        let (alice, bob) = establish_sessions();
+        let kp = assert_ok!(alice.pq_bootstrap_begin());
+        let bind = assert_ok!(bob.pq_bootstrap_respond(kp));
+        assert_ok!(alice.pq_bootstrap_apply(bind));
+        (alice, bob)
+    }
+
     #[test]
     #[cfg(feature = "cryptokit")]
     fn test_pq_ratchet_turn_flips_to_responder() {
-        let (alice, bob) = establish_sessions();
+        let (alice, bob) = establish_full();
         // Round 1: Alice initiates.
         let ek = assert_ok!(alice.pq_ratchet_begin());
         let ct = assert_ok!(bob.pq_ratchet_respond(ek));
@@ -1313,7 +1593,7 @@ mod tests {
     #[test]
     #[cfg(feature = "cryptokit")]
     fn test_three_sequential_pq_ratchets_alternate_and_deliver() {
-        let (alice, bob) = establish_sessions();
+        let (alice, bob) = establish_full();
         for (i, (initiator, responder)) in [(&alice, &bob), (&bob, &alice), (&alice, &bob)]
             .iter()
             .enumerate()
@@ -1953,8 +2233,9 @@ mod tests {
         let send = assert_some!(inner.send_group.as_ref());
 
         let apq_id_from_pq = {
-            let mut v = send.pq.current_epoch().to_le_bytes().to_vec();
-            v.extend_from_slice(send.pq.group_id());
+            let send_pq = send.pq.as_ref().expect("send pq");
+            let mut v = send_pq.current_epoch().to_le_bytes().to_vec();
+            v.extend_from_slice(send_pq.group_id());
             mls_rs::psk::ExternalPskId::new(v)
         };
         assert!(
@@ -2117,8 +2398,14 @@ mod tests {
         let epochs = |s: &Arc<TwoMlsPqSession>| {
             let inner = s.inner.lock().unwrap_or_else(|e| e.into_inner());
             (
-                inner.send_group.as_ref().map(|g| g.pq.current_epoch()),
-                inner.recv_group.as_ref().map(|g| g.pq.current_epoch()),
+                inner
+                    .send_group
+                    .as_ref()
+                    .and_then(|g| g.pq.as_ref().map(|p| p.current_epoch())),
+                inner
+                    .recv_group
+                    .as_ref()
+                    .and_then(|g| g.pq.as_ref().map(|p| p.current_epoch())),
                 inner
                     .recv_group
                     .as_ref()
@@ -2161,8 +2448,14 @@ mod tests {
         let epochs = |s: &Arc<TwoMlsPqSession>| {
             let inner = s.inner.lock().unwrap_or_else(|e| e.into_inner());
             (
-                inner.send_group.as_ref().map(|g| g.pq.current_epoch()),
-                inner.recv_group.as_ref().map(|g| g.pq.current_epoch()),
+                inner
+                    .send_group
+                    .as_ref()
+                    .and_then(|g| g.pq.as_ref().map(|p| p.current_epoch())),
+                inner
+                    .recv_group
+                    .as_ref()
+                    .and_then(|g| g.pq.as_ref().map(|p| p.current_epoch())),
                 inner
                     .send_group
                     .as_ref()

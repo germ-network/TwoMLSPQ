@@ -28,6 +28,14 @@ pub struct ClientId {
     pub bytes: Vec<u8>,
 }
 
+/// The APQ epoch pair for the send group: the PQ side-band epoch and the classical
+/// (traditional) message epoch. Zeros until the corresponding group exists.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ApqEpochs {
+    pub pq_epoch: u64,
+    pub classical_epoch: u64,
+}
+
 /// MLS group identifier.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct MlsGroupId {
