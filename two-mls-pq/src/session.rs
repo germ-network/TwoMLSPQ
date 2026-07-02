@@ -334,13 +334,13 @@ fn make_queued_proposal(
     }
     Some(crate::QueuedRemoteProposal {
         digest: TwoMlsPqDigest {
-            hash_type: 0,
+            hash_type: crate::DIGEST_SHA256,
             digest: authenticated_data.to_vec(),
         },
         sender: sender_id.clone(),
         proposing: sender_id.clone(),
         context: TwoMlsPqDigest {
-            hash_type: 0,
+            hash_type: crate::DIGEST_SHA256,
             digest: group_id.to_vec(),
         },
     })
@@ -412,7 +412,7 @@ impl SessionInner {
             .map_err(|_| TwoMlsPqError::Mls)?;
 
         let proposal_hash = TwoMlsPqDigest {
-            hash_type: 0,
+            hash_type: crate::DIGEST_SHA256,
             digest: nonce.as_bytes().to_vec(),
         };
         self.pending_proposal_hash = Some(proposal_hash.clone());
@@ -505,7 +505,7 @@ impl SessionInner {
             .map_err(|_| TwoMlsPqError::Mls)?;
 
         let proposal_hash = TwoMlsPqDigest {
-            hash_type: 0,
+            hash_type: crate::DIGEST_SHA256,
             digest: nonce.as_bytes().to_vec(),
         };
         self.pending_proposal_hash = Some(proposal_hash.clone());
@@ -554,7 +554,7 @@ impl SessionInner {
             .map_err(|_| TwoMlsPqError::Mls)?;
 
         let proposal_hash = TwoMlsPqDigest {
-            hash_type: 0,
+            hash_type: crate::DIGEST_SHA256,
             digest: nonce.as_bytes().to_vec(),
         };
         self.pending_proposal_hash = Some(proposal_hash.clone());
@@ -1147,7 +1147,7 @@ impl TwoMlsPqSession {
     pub fn proposal_context(&self) -> Option<TwoMlsPqDigest> {
         let inner = self.lock();
         inner.recv_group.as_ref().map(|rg| TwoMlsPqDigest {
-            hash_type: 0,
+            hash_type: crate::DIGEST_SHA256,
             digest: rg.pq.group_id().to_vec(),
         })
     }
