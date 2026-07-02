@@ -34,8 +34,11 @@ struct SessionInner {
     pending_proposal_hash: Option<TwoMlsPqDigest>,
     /// Send-group commit to bundle with the next outbound app message (rotation, or epoch advance).
     pending_commit_message: Option<Vec<u8>>,
-    /// Recv-group commit to bundle with the next outbound app message (self-Update or PSK refresh).
-    pending_recv_commit_message: Option<Vec<u8>>,
+    /// Upd(self) proposal for the peer's send group, stapled onto the next outbound frame.
+    pending_proposal_message: Option<Vec<u8>>,
+    /// The peer's stapled Upd proposal awaiting app approval (digest, proposal bytes). It
+    /// enters our send group's proposal cache only via `queue_proposal`.
+    offered_proposal: Option<(TwoMlsPqDigest, Vec<u8>)>,
     queued_proposal: Option<TwoMlsPqDigest>,
     pending_new_client: Option<Arc<TwoMlsPqClient>>,
     #[cfg(feature = "cryptokit")]
@@ -64,9 +67,8 @@ const BUNDLED_TAG: u8 = 0x03;
 // Partial commit: [0x05 tag][u32-LE recv-commit-len][recv-commit][u32-LE app-len][app]
 // Alice commits on Group_B (recv group) to refresh her HPKE leaf key, then sends app on Group_A.
 const PARTIAL_TAG: u8 = 0x05;
-// Full bundle: [0x07 tag][u32-LE send-commit-len][send-commit][u32-LE recv-commit-len][recv-commit][u32-LE app-len][app]
-// Epoch-advance commit on Group_A + PSK-refresh commit on Group_B + app on Group_A.
-const FULL_BUNDLE_TAG: u8 = 0x07;
+// 0x07 was the pre-A.2 full-bundle frame (send + recv commits); retired — the tag
+// stays reserved so old frames are rejected rather than misparsed.
 // Stapled welcome: [0x09 tag][u32-LE welcome-len][APQWelcome bytes][inner frame bytes].
 // The acceptor staples its return APQWelcome onto its first app frame; the inner frame is an
 // ordinary tagged frame (0x05/0x07/0x03/raw). First round only — consumed after one send.
@@ -331,63 +333,36 @@ fn decode_bundled(bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
     Ok((commit, app))
 }
 
-fn encode_partial(recv_commit: Vec<u8>, app: Vec<u8>) -> Vec<u8> {
-    let mut out = Vec::with_capacity(1 + 4 + recv_commit.len() + 4 + app.len());
+/// A.2 ratchet frame (0x05): own-send-group commit + Upd(self) proposal for the peer's
+/// send group + app message. An empty section is permitted (e.g. rotation-less proposal).
+fn encode_ratchet(commit: Vec<u8>, proposal: Vec<u8>, app: Vec<u8>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + 12 + commit.len() + proposal.len() + app.len());
     out.push(PARTIAL_TAG);
-    push_section(&mut out, &recv_commit);
+    push_section(&mut out, &commit);
+    push_section(&mut out, &proposal);
     push_section(&mut out, &app);
     out
 }
 
-fn decode_partial(bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
+fn decode_ratchet(bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
     let (&tag, rest) = bytes.split_first().ok_or(TwoMlsPqError::Mls)?;
     if tag != PARTIAL_TAG {
         return Err(TwoMlsPqError::Mls);
     }
-    let [recv_commit, app] = read_sections::<2>(rest)?;
-    Ok((recv_commit, app))
+    let [commit, proposal, app] = read_sections::<3>(rest)?;
+    Ok((commit, proposal, app))
 }
 
-fn encode_full_bundle(send_commit: Vec<u8>, recv_commit: Vec<u8>, app: Vec<u8>) -> Vec<u8> {
-    let mut out =
-        Vec::with_capacity(1 + 4 + send_commit.len() + 4 + recv_commit.len() + 4 + app.len());
-    out.push(FULL_BUNDLE_TAG);
-    push_section(&mut out, &send_commit);
-    push_section(&mut out, &recv_commit);
-    push_section(&mut out, &app);
-    out
-}
-
-fn decode_full_bundle(bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
-    let (&tag, rest) = bytes.split_first().ok_or(TwoMlsPqError::Mls)?;
-    if tag != FULL_BUNDLE_TAG {
-        return Err(TwoMlsPqError::Mls);
-    }
-    let [send_commit, recv_commit, app] = read_sections::<3>(rest)?;
-    Ok((send_commit, recv_commit, app))
-}
-
-/// Build a `QueuedRemoteProposal` from an application message's authenticated_data.
-/// Returns `None` when `authenticated_data` is empty (no proposal nonce).
-fn make_queued_proposal(
-    group_id: &[u8],
-    sender_id: &ClientId,
-    authenticated_data: &[u8],
-) -> Option<crate::QueuedRemoteProposal> {
-    if authenticated_data.is_empty() {
-        return None;
-    }
-    Some(crate::QueuedRemoteProposal {
-        digest: TwoMlsPqDigest {
-            hash_type: crate::DIGEST_SHA256,
-            digest: authenticated_data.to_vec(),
-        },
-        sender: sender_id.clone(),
-        proposing: sender_id.clone(),
-        context: TwoMlsPqDigest {
-            hash_type: crate::DIGEST_SHA256,
-            digest: group_id.to_vec(),
-        },
+/// SHA-256 digest of `bytes`, typed for the FFI. Identifies a stapled proposal in the
+/// app-approval handshake; both sides derive it from the proposal message bytes.
+fn sha256_digest(bytes: &[u8]) -> Result<TwoMlsPqDigest> {
+    use mls_rs::{CipherSuiteProvider, CryptoProvider};
+    let cs = mls_rs_crypto_rustcrypto::RustCryptoProvider::new()
+        .cipher_suite_provider(mls_rs::CipherSuite::CURVE25519_CHACHA)
+        .ok_or(TwoMlsPqError::Mls)?;
+    Ok(TwoMlsPqDigest {
+        hash_type: crate::DIGEST_SHA256,
+        digest: cs.hash(bytes).map_err(|_| TwoMlsPqError::Mls)?,
     })
 }
 
@@ -469,78 +444,70 @@ impl SessionInner {
         })
     }
 
-    /// Full round (queued proposal): traditional-only cross-party PSK refresh. Advance
-    /// send_group.classical, export a TwoMLS-PSK from it, and commit it into recv_group.classical
-    /// so post-compromise security propagates to both message groups. No PQ exchange — the PQ
-    /// secret established at setup is preserved via the APQ-PSK already in the key schedule.
-    fn prepare_full_commit(&mut self) -> Result<crate::PrepareEncryptResult> {
-        // Consume the queued proposal to enter this branch.
-        let _ = self.queued_proposal.take();
+    /// Routine round (A.2): commit in OUR OWN send group — only the owner commits — and
+    /// stage an Upd(self) proposal for the peer's send group to staple alongside. With an
+    /// app-approved queued proposal (already cached in the send group via `queue_proposal`),
+    /// the commit consumes it and additionally refreshes the cross-party TwoMLS-PSK
+    /// exported from the recv group (the peer derives the same PSK from its send group).
+    fn prepare_ratchet_commit(&mut self) -> Result<crate::PrepareEncryptResult> {
         let client = self.client.clone();
+        let did_commit = self.queued_proposal.take().is_some();
 
-        let send_commit_output = {
-            let send = self
-                .send_group
-                .as_mut()
-                .ok_or(TwoMlsPqError::SessionNotReady)?;
-            send.classical
-                .commit_builder()
-                .build()
-                .map_err(|_| TwoMlsPqError::Mls)?
-        };
-        {
-            let send = self
-                .send_group
-                .as_mut()
-                .ok_or(TwoMlsPqError::SessionNotReady)?;
-            send.classical
-                .apply_pending_commit()
-                .map_err(|_| TwoMlsPqError::Mls)?;
+        // Commit our send group only when consuming the peer's approved Upd (cached via
+        // `queue_proposal` in the current epoch — committing on routine rounds would
+        // invalidate the peer's epoch-bound proposal). The commit also refreshes the
+        // cross-party TwoMLS-PSK exported from the recv group.
+        if did_commit {
+            let psk_id = {
+                let recv = self
+                    .recv_group
+                    .as_ref()
+                    .ok_or(TwoMlsPqError::SessionNotReady)?;
+                export_and_register_psk(&recv.classical, client.combiner())?
+            };
+            let commit_output = {
+                let send = self
+                    .send_group
+                    .as_mut()
+                    .ok_or(TwoMlsPqError::SessionNotReady)?;
+                send.classical
+                    .commit_builder()
+                    .add_external_psk(psk_id)
+                    .map_err(|_| TwoMlsPqError::Mls)?
+                    .build()
+                    .map_err(|_| TwoMlsPqError::Mls)?
+            };
+            {
+                let send = self
+                    .send_group
+                    .as_mut()
+                    .ok_or(TwoMlsPqError::SessionNotReady)?;
+                send.classical
+                    .apply_pending_commit()
+                    .map_err(|_| TwoMlsPqError::Mls)?;
+            }
+            self.pending_commit_message = Some(
+                commit_output
+                    .commit_message
+                    .to_bytes()
+                    .map_err(|_| TwoMlsPqError::Mls)?,
+            );
         }
-        let send_commit_bytes = send_commit_output
-            .commit_message
-            .to_bytes()
-            .map_err(|_| TwoMlsPqError::Mls)?;
 
-        let psk_id = {
-            let send = self
-                .send_group
-                .as_ref()
-                .ok_or(TwoMlsPqError::SessionNotReady)?;
-            export_and_register_psk(&send.classical, client.combiner())?
-        };
-
-        let recv_commit_output = {
+        // Upd(self) into the peer's send group — a proposal only; the peer commits it.
+        let proposal_msg = {
             let recv = self
                 .recv_group
                 .as_mut()
                 .ok_or(TwoMlsPqError::SessionNotReady)?;
             recv.classical
-                .commit_builder()
-                .add_external_psk(psk_id)
-                .map_err(|_| TwoMlsPqError::Mls)?
-                .build()
+                .propose_update(Vec::new())
                 .map_err(|_| TwoMlsPqError::Mls)?
         };
-        {
-            let recv = self
-                .recv_group
-                .as_mut()
-                .ok_or(TwoMlsPqError::SessionNotReady)?;
-            recv.classical
-                .apply_pending_commit()
-                .map_err(|_| TwoMlsPqError::Mls)?;
-        }
-        let recv_commit_bytes = recv_commit_output
-            .commit_message
-            .to_bytes()
-            .map_err(|_| TwoMlsPqError::Mls)?;
-
-        self.pending_commit_message = Some(send_commit_bytes);
-        self.pending_recv_commit_message = Some(recv_commit_bytes);
+        self.pending_proposal_message =
+            Some(proposal_msg.to_bytes().map_err(|_| TwoMlsPqError::Mls)?);
 
         let their_id = self.their_state.client_id();
-
         let nonce = self
             .send_group
             .as_ref()
@@ -557,57 +524,8 @@ impl SessionInner {
 
         Ok(crate::PrepareEncryptResult {
             proposal_hash,
-            committed_remote_client_id: Some(their_id),
-            did_commit: true,
-        })
-    }
-
-    /// Routine round: traditional-only self-Update commit on recv_group.classical to refresh
-    /// the committer's HPKE leaf key. No PQ exchange — the PQ group is untouched this round.
-    fn prepare_partial_commit(&mut self) -> Result<crate::PrepareEncryptResult> {
-        let recv_commit_output = {
-            let recv = self
-                .recv_group
-                .as_mut()
-                .ok_or(TwoMlsPqError::SessionNotReady)?;
-            recv.classical
-                .commit_builder()
-                .build()
-                .map_err(|_| TwoMlsPqError::Mls)?
-        };
-        {
-            let recv = self
-                .recv_group
-                .as_mut()
-                .ok_or(TwoMlsPqError::SessionNotReady)?;
-            recv.classical
-                .apply_pending_commit()
-                .map_err(|_| TwoMlsPqError::Mls)?;
-        }
-        let recv_commit_bytes = recv_commit_output
-            .commit_message
-            .to_bytes()
-            .map_err(|_| TwoMlsPqError::Mls)?;
-        self.pending_recv_commit_message = Some(recv_commit_bytes);
-
-        let nonce = self
-            .send_group
-            .as_ref()
-            .ok_or(TwoMlsPqError::SessionNotReady)?
-            .classical
-            .export_secret(b"proposal", b"prepare", 32)
-            .map_err(|_| TwoMlsPqError::Mls)?;
-
-        let proposal_hash = TwoMlsPqDigest {
-            hash_type: crate::DIGEST_SHA256,
-            digest: nonce.as_bytes().to_vec(),
-        };
-        self.pending_proposal_hash = Some(proposal_hash.clone());
-
-        Ok(crate::PrepareEncryptResult {
-            proposal_hash,
-            committed_remote_client_id: None,
-            did_commit: false,
+            committed_remote_client_id: if did_commit { Some(their_id) } else { None },
+            did_commit,
         })
     }
 }
@@ -630,7 +548,8 @@ fn build_session(
             pending_outbound,
             pending_proposal_hash: None,
             pending_commit_message: None,
-            pending_recv_commit_message: None,
+            pending_proposal_message: None,
+            offered_proposal: None,
             queued_proposal: None,
             pending_new_client: None,
             #[cfg(feature = "cryptokit")]
@@ -912,10 +831,7 @@ impl TwoMlsPqSession {
         if let Some(new_id) = proposing {
             return inner.prepare_rotation(new_id);
         }
-        if inner.queued_proposal.is_some() {
-            return inner.prepare_full_commit();
-        }
-        inner.prepare_partial_commit()
+        inner.prepare_ratchet_commit()
     }
 
     /// Encrypt `app_message` using the PQ send group.
@@ -948,14 +864,14 @@ impl TwoMlsPqSession {
 
         let cipher_text = match (
             inner.pending_commit_message.take(),
-            inner.pending_recv_commit_message.take(),
+            inner.pending_proposal_message.take(),
         ) {
-            // Phase 7: epoch advance + PSK refresh → FULL_BUNDLE_TAG
-            (Some(send), Some(recv)) => encode_full_bundle(send, recv, app_bytes),
-            // Phase 8: rotation commit only → BUNDLED_TAG
-            (Some(send), None) => encode_bundled(send, app_bytes),
-            // Phase 6: recv self-Update only → PARTIAL_TAG
-            (None, Some(recv)) => encode_partial(recv, app_bytes),
+            // A.2 ratchet round: own-send-group commit + Upd(self) proposal for the peer.
+            (Some(commit), Some(proposal)) => encode_ratchet(commit, proposal, app_bytes),
+            // Rotation commit only (credential handoff) → BUNDLED_TAG.
+            (Some(commit), None) => encode_bundled(commit, app_bytes),
+            // Proposal without a commit should not occur; carry it with an empty commit slot.
+            (None, Some(proposal)) => encode_ratchet(Vec::new(), proposal, app_bytes),
             // bare app message (should not occur after prepare_to_encrypt, but safe fallback)
             (None, None) => app_bytes,
         };
@@ -1043,41 +959,41 @@ impl TwoMlsPqSession {
             return Ok(None);
         }
 
-        // Phase 6: partial bundle — recv-group self-Update commit + app message.
-        // The sender committed on their recv group (our send group) to refresh their HPKE leaf
-        // key. We must advance our send group epoch before reading the app message.
+        // A.2 ratchet frame: the sender committed in THEIR OWN send group (our recv
+        // group) and stapled an Upd(sender) proposal addressed to OUR send group.
+        // Apply the commit, decrypt the app message at the new epoch, and stage the
+        // proposal for app approval — it enters our send group only via `queue_proposal`.
         if ciphertext.first() == Some(&PARTIAL_TAG) {
-            let (recv_commit_bytes, app_bytes) = decode_partial(&ciphertext)?;
-
-            let recv_commit_msg = MlsMessage::from_bytes(&recv_commit_bytes)
-                .map_err(|_| TwoMlsPqError::DecryptionFailed)?;
+            let (commit_bytes, proposal_bytes, app_bytes) = decode_ratchet(&ciphertext)?;
             let app_msg =
                 MlsMessage::from_bytes(&app_bytes).map_err(|_| TwoMlsPqError::DecryptionFailed)?;
 
             let mut inner = self.lock();
+            let client = inner.client.clone();
 
-            // Advance send_group.classical (Group_B on sender's side) — updates sender's leaf key.
-            {
-                let send = inner
-                    .send_group
-                    .as_mut()
-                    .ok_or(TwoMlsPqError::SessionNotEstablished)?;
-                match send
-                    .classical
-                    .process_incoming_message(recv_commit_msg)
-                    .map_err(|_| TwoMlsPqError::DecryptionFailed)?
-                {
-                    ReceivedMessage::Commit(_) => {}
-                    _ => return Err(TwoMlsPqError::DecryptionFailed),
-                }
+            // The sender's commit may bind the cross-party TwoMLS-PSK, which we derive
+            // from our own send group at its current epoch.
+            if let Some(sg) = &inner.send_group {
+                export_and_register_psk(&sg.classical, client.combiner())?;
             }
 
-            // Decrypt app message from recv_group.classical (Group_A — sender's send group).
-            let (app_data, sender_id, epoch, proposal) = {
+            let (app_data, sender_id, epoch, group_id) = {
                 let recv = inner
                     .recv_group
                     .as_mut()
                     .ok_or(TwoMlsPqError::SessionNotEstablished)?;
+                if !commit_bytes.is_empty() {
+                    let commit_msg = MlsMessage::from_bytes(&commit_bytes)
+                        .map_err(|_| TwoMlsPqError::DecryptionFailed)?;
+                    match recv
+                        .classical
+                        .process_incoming_message(commit_msg)
+                        .map_err(|_| TwoMlsPqError::DecryptionFailed)?
+                    {
+                        ReceivedMessage::Commit(_) => {}
+                        _ => return Err(TwoMlsPqError::DecryptionFailed),
+                    }
+                }
                 match recv
                     .classical
                     .process_incoming_message(app_msg)
@@ -1088,18 +1004,41 @@ impl TwoMlsPqSession {
                             bytes: sender_client_id(&recv.classical, desc.sender_index)?,
                         };
                         let ep = recv.classical.current_epoch();
-                        let proposal = make_queued_proposal(
-                            recv.classical.group_id(),
-                            &sender,
-                            &desc.authenticated_data,
-                        );
-                        (desc.data().to_vec(), sender, ep, proposal)
+                        let gid = recv.classical.group_id().to_vec();
+                        (desc.data().to_vec(), sender, ep, gid)
                     }
                     _ => return Err(TwoMlsPqError::DecryptionFailed),
                 }
             };
 
+            // Stage the stapled Upd(sender) proposal for app approval.
+            let proposal = if proposal_bytes.is_empty() {
+                None
+            } else {
+                let digest = sha256_digest(&proposal_bytes)?;
+                inner.offered_proposal = Some((digest.clone(), proposal_bytes));
+                Some(crate::QueuedRemoteProposal {
+                    digest,
+                    sender: sender_id.clone(),
+                    proposing: sender_id.clone(),
+                    context: TwoMlsPqDigest {
+                        hash_type: crate::DIGEST_SHA256,
+                        digest: group_id,
+                    },
+                })
+            };
+
             inner.resolve_pending_rotation();
+
+            // A commit only rides a frame when it consumed our approved Upd proposal.
+            let remote_commit = if commit_bytes.is_empty() {
+                None
+            } else {
+                Some(CommitResult {
+                    new_sender: None,
+                    new_recipient: inner.my_state.client_id(),
+                })
+            };
 
             return Ok(Some(DecryptResult {
                 application_message: Some(MlsSenderMessage {
@@ -1108,104 +1047,7 @@ impl TwoMlsPqSession {
                     epoch,
                 }),
                 proposal,
-                remote_commit: None,
-            }));
-        }
-
-        // Phase 7: full bundle — send-group epoch advance + recv-group PSK refresh + app.
-        // Order: apply send commit (advances Group_A) → derive new PSK → apply recv commit
-        // (injects PSK into Group_B) → decrypt app at new Group_A epoch.
-        if ciphertext.first() == Some(&FULL_BUNDLE_TAG) {
-            let (send_commit_bytes, recv_commit_bytes, app_bytes) =
-                decode_full_bundle(&ciphertext)?;
-
-            let send_commit_msg = MlsMessage::from_bytes(&send_commit_bytes)
-                .map_err(|_| TwoMlsPqError::DecryptionFailed)?;
-            let recv_commit_msg = MlsMessage::from_bytes(&recv_commit_bytes)
-                .map_err(|_| TwoMlsPqError::DecryptionFailed)?;
-            let app_msg =
-                MlsMessage::from_bytes(&app_bytes).map_err(|_| TwoMlsPqError::DecryptionFailed)?;
-
-            let mut inner = self.lock();
-            let client = inner.client.clone();
-
-            // Step 1 — advance recv_group.classical (Group_A) with the sender's commit.
-            {
-                let recv = inner
-                    .recv_group
-                    .as_mut()
-                    .ok_or(TwoMlsPqError::SessionNotEstablished)?;
-                match recv
-                    .classical
-                    .process_incoming_message(send_commit_msg)
-                    .map_err(|_| TwoMlsPqError::DecryptionFailed)?
-                {
-                    ReceivedMessage::Commit(_) => {}
-                    _ => return Err(TwoMlsPqError::DecryptionFailed),
-                }
-            }
-
-            // Step 2 — derive the same cross-party PSK from Group_A at the new epoch and register it.
-            {
-                let recv = inner
-                    .recv_group
-                    .as_ref()
-                    .ok_or(TwoMlsPqError::SessionNotEstablished)?;
-                export_and_register_psk(&recv.classical, client.combiner())?;
-            }
-
-            // Step 3 — apply the PSK-refresh commit on send_group.classical (Group_B).
-            {
-                let send = inner
-                    .send_group
-                    .as_mut()
-                    .ok_or(TwoMlsPqError::SessionNotEstablished)?;
-                match send
-                    .classical
-                    .process_incoming_message(recv_commit_msg)
-                    .map_err(|_| TwoMlsPqError::DecryptionFailed)?
-                {
-                    ReceivedMessage::Commit(_) => {}
-                    _ => return Err(TwoMlsPqError::DecryptionFailed),
-                }
-            }
-
-            // Step 4 — decrypt the app message from recv_group.classical at the new epoch.
-            let (app_data, sender_id, epoch) = {
-                let recv = inner
-                    .recv_group
-                    .as_mut()
-                    .ok_or(TwoMlsPqError::SessionNotEstablished)?;
-                match recv
-                    .classical
-                    .process_incoming_message(app_msg)
-                    .map_err(|_| TwoMlsPqError::DecryptionFailed)?
-                {
-                    ReceivedMessage::ApplicationMessage(desc) => {
-                        let sender = ClientId {
-                            bytes: sender_client_id(&recv.classical, desc.sender_index)?,
-                        };
-                        let ep = recv.classical.current_epoch();
-                        (desc.data().to_vec(), sender, ep)
-                    }
-                    _ => return Err(TwoMlsPqError::DecryptionFailed),
-                }
-            };
-
-            let my_id = inner.my_state.client_id();
-            inner.resolve_pending_rotation();
-
-            return Ok(Some(DecryptResult {
-                application_message: Some(MlsSenderMessage {
-                    app_message_data: app_data,
-                    sender_client_id: sender_id,
-                    epoch,
-                }),
-                proposal: None,
-                remote_commit: Some(CommitResult {
-                    new_sender: None,
-                    new_recipient: my_id,
-                }),
+                remote_commit,
             }));
         }
 
@@ -1323,11 +1165,8 @@ impl TwoMlsPqSession {
                     bytes: sender_client_id(&recv.classical, desc.sender_index)?,
                 };
                 let epoch = recv.classical.current_epoch();
-                let proposal = make_queued_proposal(
-                    recv.classical.group_id(),
-                    &sender_id,
-                    &desc.authenticated_data,
-                );
+                // Proposals travel as stapled messages (A.2), not authenticated_data.
+                let proposal = None;
                 let app_data = desc.data().to_vec();
                 inner.resolve_pending_rotation();
                 Ok(Some(DecryptResult {
@@ -1364,10 +1203,32 @@ impl TwoMlsPqSession {
         Err(TwoMlsPqError::ArchiveInvalid)
     }
 
-    /// Accept a remote proposal for the next epoch advance.
-    /// On the next `prepare_to_encrypt(None)` call, an empty commit will be staged.
+    /// Approve the peer's stapled Upd proposal (identified by its digest). The proposal
+    /// message enters our send group's proposal cache, and the next
+    /// `prepare_to_encrypt(None)` commits it (with a cross-party PSK refresh).
     pub fn queue_proposal(&self, digest: TwoMlsPqDigest) -> Result<()> {
         let mut inner = self.lock();
+        let (offered, proposal_bytes) = inner
+            .offered_proposal
+            .take()
+            .ok_or(TwoMlsPqError::ProposalRejected)?;
+        if offered.digest != digest.digest {
+            inner.offered_proposal = Some((offered, proposal_bytes));
+            return Err(TwoMlsPqError::ProposalRejected);
+        }
+        let msg = MlsMessage::from_bytes(&proposal_bytes).map_err(|_| TwoMlsPqError::Mls)?;
+        let send = inner
+            .send_group
+            .as_mut()
+            .ok_or(TwoMlsPqError::SessionNotReady)?;
+        match send
+            .classical
+            .process_incoming_message(msg)
+            .map_err(|_| TwoMlsPqError::Mls)?
+        {
+            ReceivedMessage::Proposal(_) => {}
+            _ => return Err(TwoMlsPqError::Mls),
+        }
         inner.queued_proposal = Some(digest);
         Ok(())
     }
@@ -2437,9 +2298,9 @@ mod tests {
             "PQ recv group must not ratchet on a routine round"
         );
         assert_eq!(
-            cl_recv_after.map(|e| e.saturating_sub(1)),
-            cl_recv_before,
-            "routine round must advance the classical recv group by one epoch"
+            cl_recv_after, cl_recv_before,
+            "a routine round is proposal-only (A.2) — no classical commit until the peer \
+             queues and consumes our Upd"
         );
     }
 
@@ -2504,9 +2365,9 @@ mod tests {
             "full round must advance the classical send group"
         );
         assert_eq!(
-            cl_recv_1.map(|e| e.saturating_sub(1)),
-            cl_recv_0,
-            "full round must advance the classical recv group (cross-party propagation)"
+            cl_recv_1, cl_recv_0,
+            "the recv group is the peer's to commit (A.2) — cross-party PCS travels via \
+             the PSK inside our send-group commit, not a recv commit"
         );
     }
 
@@ -2601,26 +2462,18 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_partial_truncated_returns_error() {
+    fn test_decode_ratchet_truncated_returns_error() {
         assert_err!(
-            super::decode_partial(&[super::PARTIAL_TAG]),
+            super::decode_ratchet(&[super::PARTIAL_TAG]),
             TwoMlsPqError::Mls
         );
     }
 
     #[test]
-    fn test_decode_full_bundle_truncated_returns_error() {
-        assert_err!(
-            super::decode_full_bundle(&[super::FULL_BUNDLE_TAG]),
-            TwoMlsPqError::Mls
-        );
-    }
-
-    #[test]
-    fn test_decode_full_bundle_trailing_bytes_returns_error() {
-        let mut good = super::encode_full_bundle(b"sc".to_vec(), b"rc".to_vec(), b"app".to_vec());
+    fn test_decode_ratchet_trailing_bytes_returns_error() {
+        let mut good = super::encode_ratchet(b"c".to_vec(), b"p".to_vec(), b"app".to_vec());
         good.push(0xFF);
-        assert_err!(super::decode_full_bundle(&good), TwoMlsPqError::Mls);
+        assert_err!(super::decode_ratchet(&good), TwoMlsPqError::Mls);
     }
 
     #[test]
@@ -2634,14 +2487,14 @@ mod tests {
     }
 
     #[test]
-    fn test_encode_decode_full_bundle_roundtrip() {
-        let sc = b"send-commit".to_vec();
-        let rc = b"recv-commit".to_vec();
+    fn test_encode_decode_ratchet_roundtrip() {
+        let commit = b"send-commit".to_vec();
+        let proposal = b"upd-proposal".to_vec();
         let app = b"app-data".to_vec();
-        let encoded = super::encode_full_bundle(sc.clone(), rc.clone(), app.clone());
-        let (dec_sc, dec_rc, dec_app) = assert_ok!(super::decode_full_bundle(&encoded));
-        assert_eq!(dec_sc, sc);
-        assert_eq!(dec_rc, rc);
+        let encoded = super::encode_ratchet(commit.clone(), proposal.clone(), app.clone());
+        let (dec_c, dec_p, dec_app) = assert_ok!(super::decode_ratchet(&encoded));
+        assert_eq!(dec_c, commit);
+        assert_eq!(dec_p, proposal);
         assert_eq!(dec_app, app);
     }
 
