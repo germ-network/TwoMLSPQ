@@ -43,6 +43,9 @@ struct SessionInner {
     session_id: SessionId,
     my_state: AgentState,
     their_state: AgentState,
+    /// Responder-side side-band frame awaiting pickup by `pq_take_pending_outbound`.
+    /// Single slot: responder operations refuse to start while a frame is waiting.
+    pending_pq_outbound: Option<Vec<u8>>,
     /// Whose move the PQ side-band is: the initiator owes the A.4 bootstrap; thereafter
     /// completing an operation passes the turn to the peer.
     pq_turn_mine: bool,
@@ -192,31 +195,35 @@ impl TwoMlsPqSession {
 
     /// Responder — encapsulate a fresh secret to the initiator's EK, hold it, and return the
     /// ciphertext message (tag 0x0D).
-    pub fn pq_ratchet_respond(&self, ek_msg: Vec<u8>) -> Result<Vec<u8>> {
+    pub fn pq_ratchet_respond(&self, ek_msg: Vec<u8>) -> Result<()> {
         let (&tag, ek) = ek_msg.split_first().ok_or(TwoMlsPqError::Mls)?;
         if tag != PQ_EK_TAG {
             return Err(TwoMlsPqError::Mls);
         }
         let mut inner = self.lock();
-        if inner.pq_inflight.is_some() {
+        if inner.pq_inflight.is_some() || inner.pending_pq_outbound.is_some() {
             return Err(TwoMlsPqError::SessionNotReady);
         }
         let (s, ct) = apq::pq_ratchet::encapsulate(ek)?;
         inner.pq_inflight = Some(PqInflight::Responding(Zeroizing::new(s)));
         let mut msg = vec![PQ_CT_TAG];
         msg.extend_from_slice(&ct);
-        Ok(msg)
+        inner.pending_pq_outbound = Some(msg);
+        Ok(())
     }
 
     /// Initiator step 2 — decapsulate S, inject it into the send group's PQ half via a pathless
     /// commit, bind the exported apq_psk into the classical half, and staple an app message.
     /// Returns the bind frame (tag 0x0F).
-    pub fn pq_ratchet_bind(&self, ct_msg: Vec<u8>, app: Vec<u8>) -> Result<Vec<u8>> {
+    pub fn pq_ratchet_bind(&self, ct_msg: Vec<u8>, app: Vec<u8>) -> Result<()> {
         let (&tag, ct) = ct_msg.split_first().ok_or(TwoMlsPqError::Mls)?;
         if tag != PQ_CT_TAG {
             return Err(TwoMlsPqError::Mls);
         }
         let mut inner = self.lock();
+        if inner.pending_pq_outbound.is_some() {
+            return Err(TwoMlsPqError::SessionNotReady);
+        }
         let eph = match inner.pq_inflight.take() {
             Some(PqInflight::Initiating(eph)) => eph,
             _ => return Err(TwoMlsPqError::SessionNotReady),
@@ -252,7 +259,8 @@ impl TwoMlsPqSession {
             .map_err(|_| TwoMlsPqError::Mls)?;
         // Our operation is complete once the peer applies; the turn passes.
         inner.pq_turn_mine = false;
-        Ok(encode_pq_bind(pq_commit, cl_commit, app_ct))
+        inner.pending_pq_outbound = Some(encode_pq_bind(pq_commit, cl_commit, app_ct));
+        Ok(())
     }
 
     /// Responder — apply the stapled bind: register the held secret, apply the PQ partial commit
@@ -642,6 +650,7 @@ fn build_session(
                 client_id: their_id,
             },
             pq_turn_mine: initiated,
+            pending_pq_outbound: None,
         }),
     })
 }
@@ -749,6 +758,13 @@ impl TwoMlsPqSession {
         self.lock().pq_turn_mine
     }
 
+    /// Consume the side-band frame parked by the responder-side operations
+    /// (`pq_ratchet_respond` / `pq_ratchet_bind` / `pq_bootstrap_respond`). Single slot,
+    /// single delivery: those operations refuse to start while a frame is waiting.
+    pub fn pq_take_pending_outbound(&self) -> Option<Vec<u8>> {
+        self.lock().pending_pq_outbound.take()
+    }
+
     /// The send group's APQ epoch pair (PQ side-band, classical message group).
     /// Zeros until the corresponding group exists.
     pub fn epochs(&self) -> crate::ApqEpochs {
@@ -798,12 +814,15 @@ impl TwoMlsPqSession {
     /// A.4 responder — stand up the deferred send-group PQ half around the peer's key
     /// package, bind its exported APQ-PSK into the classical half, and return the
     /// bootstrap frame (tag 0x13). Taking this turn makes the next operation ours.
-    pub fn pq_bootstrap_respond(&self, kp_msg: Vec<u8>) -> Result<Vec<u8>> {
+    pub fn pq_bootstrap_respond(&self, kp_msg: Vec<u8>) -> Result<()> {
         let (&tag, kp) = kp_msg.split_first().ok_or(TwoMlsPqError::Mls)?;
         if tag != PQ_BOOTSTRAP_KP_TAG {
             return Err(TwoMlsPqError::Mls);
         }
         let mut inner = self.lock();
+        if inner.pending_pq_outbound.is_some() {
+            return Err(TwoMlsPqError::SessionNotReady);
+        }
         let client = inner.client.clone();
         let frame = {
             let send = inner
@@ -839,7 +858,8 @@ impl TwoMlsPqSession {
             encode_bootstrap_bind(pq_welcome, cl_commit)
         };
         inner.pq_turn_mine = true;
-        Ok(frame)
+        inner.pending_pq_outbound = Some(frame);
+        Ok(())
     }
 
     /// A.4 initiator completion — join the peer's new PQ group (our key package's
@@ -1429,7 +1449,8 @@ mod tests {
         assert!(!bob.my_pq_turn());
 
         let kp_msg = assert_ok!(alice.pq_bootstrap_begin());
-        let bind = assert_ok!(bob.pq_bootstrap_respond(kp_msg));
+        assert_ok!(bob.pq_bootstrap_respond(kp_msg));
+        let bind = assert_some!(bob.pq_take_pending_outbound());
         assert_ok!(alice.pq_bootstrap_apply(bind));
 
         assert!(alice.is_fully_established());
@@ -1526,8 +1547,10 @@ mod tests {
         let (alice, bob) = establish_sessions();
         // Alice initiates a PQ ratchet on her send group; Bob responds and applies.
         let ek = assert_ok!(alice.pq_ratchet_begin());
-        let ct = assert_ok!(bob.pq_ratchet_respond(ek));
-        let bind = assert_ok!(alice.pq_ratchet_bind(ct, b"hello-pq".to_vec()));
+        assert_ok!(bob.pq_ratchet_respond(ek));
+        let ct = assert_some!(bob.pq_take_pending_outbound());
+        assert_ok!(alice.pq_ratchet_bind(ct, b"hello-pq".to_vec()));
+        let bind = assert_some!(alice.pq_take_pending_outbound());
         let got = assert_ok!(bob.pq_ratchet_apply(bind));
         assert_eq!(got, b"hello-pq");
     }
@@ -1538,7 +1561,8 @@ mod tests {
     fn establish_full() -> (Arc<TwoMlsPqSession>, Arc<TwoMlsPqSession>) {
         let (alice, bob) = establish_sessions();
         let kp = assert_ok!(alice.pq_bootstrap_begin());
-        let bind = assert_ok!(bob.pq_bootstrap_respond(kp));
+        assert_ok!(bob.pq_bootstrap_respond(kp));
+        let bind = assert_some!(bob.pq_take_pending_outbound());
         assert_ok!(alice.pq_bootstrap_apply(bind));
         (alice, bob)
     }
@@ -1549,13 +1573,17 @@ mod tests {
         let (alice, bob) = establish_full();
         // Round 1: Alice initiates.
         let ek = assert_ok!(alice.pq_ratchet_begin());
-        let ct = assert_ok!(bob.pq_ratchet_respond(ek));
-        let bind = assert_ok!(alice.pq_ratchet_bind(ct, b"a1".to_vec()));
+        assert_ok!(bob.pq_ratchet_respond(ek));
+        let ct = assert_some!(bob.pq_take_pending_outbound());
+        assert_ok!(alice.pq_ratchet_bind(ct, b"a1".to_vec()));
+        let bind = assert_some!(alice.pq_take_pending_outbound());
         assert_eq!(assert_ok!(bob.pq_ratchet_apply(bind)), b"a1");
         // Round 2: turn flips — Bob initiates on his send group, Alice applies.
         let ek2 = assert_ok!(bob.pq_ratchet_begin());
-        let ct2 = assert_ok!(alice.pq_ratchet_respond(ek2));
-        let bind2 = assert_ok!(bob.pq_ratchet_bind(ct2, b"b1".to_vec()));
+        assert_ok!(alice.pq_ratchet_respond(ek2));
+        let ct2 = assert_some!(alice.pq_take_pending_outbound());
+        assert_ok!(bob.pq_ratchet_bind(ct2, b"b1".to_vec()));
+        let bind2 = assert_some!(bob.pq_take_pending_outbound());
         assert_eq!(assert_ok!(alice.pq_ratchet_apply(bind2)), b"b1");
     }
 
@@ -1576,8 +1604,10 @@ mod tests {
     fn test_classical_round_still_works_after_pq_ratchet() {
         let (alice, bob) = establish_sessions();
         let ek = assert_ok!(alice.pq_ratchet_begin());
-        let ct = assert_ok!(bob.pq_ratchet_respond(ek));
-        let bind = assert_ok!(alice.pq_ratchet_bind(ct, b"pq".to_vec()));
+        assert_ok!(bob.pq_ratchet_respond(ek));
+        let ct = assert_some!(bob.pq_take_pending_outbound());
+        assert_ok!(alice.pq_ratchet_bind(ct, b"pq".to_vec()));
+        let bind = assert_some!(alice.pq_take_pending_outbound());
         assert_eq!(assert_ok!(bob.pq_ratchet_apply(bind)), b"pq");
 
         // The classical ratchet must continue normally after a PQ bind.
@@ -1600,8 +1630,10 @@ mod tests {
         {
             let payload = vec![i as u8; 8];
             let ek = assert_ok!(initiator.pq_ratchet_begin());
-            let ct = assert_ok!(responder.pq_ratchet_respond(ek));
-            let bind = assert_ok!(initiator.pq_ratchet_bind(ct, payload.clone()));
+            assert_ok!(responder.pq_ratchet_respond(ek));
+            let ct = assert_some!(responder.pq_take_pending_outbound());
+            assert_ok!(initiator.pq_ratchet_bind(ct, payload.clone()));
+            let bind = assert_some!(initiator.pq_take_pending_outbound());
             assert_eq!(assert_ok!(responder.pq_ratchet_apply(bind)), payload);
         }
     }
@@ -1631,8 +1663,10 @@ mod tests {
     fn test_pq_ratchet_apply_without_respond_is_rejected() {
         let (alice, bob) = establish_sessions();
         let ek = assert_ok!(alice.pq_ratchet_begin());
-        let ct = assert_ok!(bob.pq_ratchet_respond(ek));
-        let bind = assert_ok!(alice.pq_ratchet_bind(ct, b"x".to_vec()));
+        assert_ok!(bob.pq_ratchet_respond(ek));
+        let ct = assert_some!(bob.pq_take_pending_outbound());
+        assert_ok!(alice.pq_ratchet_bind(ct, b"x".to_vec()));
+        let bind = assert_some!(alice.pq_take_pending_outbound());
         // A different session that never responded has no held secret.
         let (_a2, b2) = establish_sessions();
         assert_err!(b2.pq_ratchet_apply(bind), TwoMlsPqError::SessionNotReady);
@@ -1651,11 +1685,13 @@ mod tests {
     fn test_pq_ratchet_tampered_ciphertext_fails_to_apply() {
         let (alice, bob) = establish_sessions();
         let ek = assert_ok!(alice.pq_ratchet_begin());
-        let mut ct = assert_ok!(bob.pq_ratchet_respond(ek));
+        assert_ok!(bob.pq_ratchet_respond(ek));
+        let mut ct = assert_some!(bob.pq_take_pending_outbound());
         let last = ct.len() - 1;
         ct[last] ^= 0xFF;
         // Alice binds a divergent S (ML-KEM implicit rejection); Bob holds the real S → apply fails.
-        let bind = assert_ok!(alice.pq_ratchet_bind(ct, b"x".to_vec()));
+        assert_ok!(alice.pq_ratchet_bind(ct, b"x".to_vec()));
+        let bind = assert_some!(alice.pq_take_pending_outbound());
         assert_err!(bob.pq_ratchet_apply(bind), TwoMlsPqError::Mls);
     }
 
