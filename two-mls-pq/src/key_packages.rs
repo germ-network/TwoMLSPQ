@@ -205,6 +205,58 @@ pub fn decode_combiner_key_package(bytes: Vec<u8>) -> Result<CombinerKeyPackage>
     Ok(CombinerKeyPackage { classical, pq })
 }
 
+/// The two components of an HPKE one-shot seal. Kept separate (like
+/// `TwoMlsPqInvitation::hpke_open`'s inputs) so the outer wire framing stays with the
+/// caller.
+#[derive(Debug, uniffi::Record)]
+pub struct HpkeSealed {
+    pub kem_output: Vec<u8>,
+    pub ciphertext: Vec<u8>,
+}
+
+/// HPKE-seal `plaintext` to a published combiner key package's (classical) init key — the
+/// sender side of the initial routing-header pattern; the holder of the key package's
+/// invitation opens it with `TwoMlsPqInvitation::hpke_open`. `info` defaults to the key
+/// package's credential (the recipient's ClientId), matching `hpke_open`'s default.
+#[uniffi::export]
+pub fn hpke_seal_to_key_package(
+    key_package: CombinerKeyPackage,
+    plaintext: Vec<u8>,
+    info: Option<Vec<u8>>,
+    aad: Option<Vec<u8>>,
+) -> Result<HpkeSealed> {
+    use mls_rs::{CipherSuiteProvider, CryptoProvider};
+    use mls_rs_crypto_rustcrypto::RustCryptoProvider;
+
+    let kp = mls_rs::MlsMessage::from_bytes(&key_package.classical)
+        .map_err(|_| TwoMlsPqError::InvalidKeyPackage)?
+        .into_key_package()
+        .ok_or(TwoMlsPqError::InvalidKeyPackage)?;
+
+    let info = match info {
+        Some(info) => info,
+        None => kp
+            .signing_identity()
+            .credential
+            .as_basic()
+            .ok_or(TwoMlsPqError::InvalidKeyPackage)?
+            .identifier
+            .clone(),
+    };
+
+    let cs = RustCryptoProvider::new()
+        .cipher_suite_provider(mls_rs::CipherSuite::CURVE25519_CHACHA)
+        .ok_or(TwoMlsPqError::Mls)?;
+
+    let sealed = cs
+        .hpke_seal(&kp.hpke_init_key, &info, aad.as_deref(), &plaintext)
+        .map_err(|_| TwoMlsPqError::Mls)?;
+    Ok(HpkeSealed {
+        kem_output: sealed.kem_output,
+        ciphertext: sealed.ciphertext,
+    })
+}
+
 /// Reject a peer combiner whose both halves are classical (no PQ protection).
 ///
 /// No-op without `cryptokit`: there the PQ half is deliberately classical
@@ -537,6 +589,30 @@ mod tests {
         let opened =
             assert_ok!(bob_inv.hpke_open(sealed.kem_output, sealed.ciphertext, None, None));
         assert_eq!(opened, plaintext);
+    }
+
+    #[test]
+    fn test_hpke_seal_to_key_package_opens_via_invitation() {
+        use crate::test_utils::make_client;
+
+        let bob = make_client();
+        let bob_inv = assert_ok!(super::TwoMlsPqInvitation::new(assert_ok!(
+            bob.generate_invitation()
+        )));
+
+        // Sender side: seal to the published key package with the default info
+        // (the recipient's ClientId, read from the credential).
+        let sealed = assert_ok!(super::hpke_seal_to_key_package(
+            bob_inv.combiner_key_package(),
+            b"routing-header".to_vec(),
+            None,
+            None,
+        ));
+
+        // Recipient side: the invitation opens it with its captured init key.
+        let opened =
+            assert_ok!(bob_inv.hpke_open(sealed.kem_output, sealed.ciphertext, None, None));
+        assert_eq!(opened, b"routing-header".to_vec());
     }
 
     #[test]
