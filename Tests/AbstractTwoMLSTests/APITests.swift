@@ -31,21 +31,21 @@ struct APIDemo {
 		remote = try .init()
 	}
 	@Test func apiDemo() async throws {
-		let (localSession, _) = try local.client.reply(
+		let (localSession, encryptedCombinedWelcome) = try local.client.reply(
 			remoteClientId: remote.clientId,
 			encodedRemoteKpkg: remote.currentInvitation.encodedKeyPackage
 		)
 
-		//test it as a stapled message
-		let encryptResult = try localSession.encrypt(
-			appMessage: "Reply".utf8Data
+		//deliver the HPKE-sealed combined welcome to the invitation
+		//(the initiator cannot staple an app message before establishment)
+		let (remoteSession, _) = try remote.currentInvitation.receiveReply(
+			ciphertext: encryptedCombinedWelcome,
+			expecting: try local.clientId
 		)
 
-		//process in in the invitation:
-		let (remoteSession, stapledMessage) = try remote.currentInvitation.receiveReply(
-			ciphertext: encryptResult.cipherText,
-			expecting: encryptResult.sender
-		)
+		//remote's first frame staples its return welcome; local joins in-band,
+		//completing establishment before any further exchange
+		try remoteSession.send(to: localSession)
 
 		//localSesson and remoteSession should both be in a consistent state:
 		//local APQ send group, remote classical send group derived from
@@ -115,7 +115,7 @@ extension AbstractTwoMLS.Client {
 		}
 
 		//APQ: the sendWelcome should be an APQWelcome
-		let (sendGroupArchive, sendWelcome, myKeyPackage) = try reply(
+		let (sendGroup, sendWelcome, myKeyPackage) = try reply(
 			keyPackageMessage: encodedRemoteKpkg
 		)
 
@@ -124,15 +124,11 @@ extension AbstractTwoMLS.Client {
 			mySendGroupWelcome: sendWelcome,
 			myKeyPackage: myKeyPackage
 		)
-		let (localSendGroupArchive, encryptedCombinedWelcome) = try createTwoMLSGroup(
+		let (localSendGroup, encryptedCombinedWelcome) = try createTwoMLSGroup(
 			remoteAgentId: remoteClientId,
-			mySendGroupArchive: sendGroupArchive,
+			mySendGroup: sendGroup,
 			theirKeyPackageMessage: encodedRemoteKpkg,
 			appWelcome: try JSONEncoder().encode(mockAppWelcome)
-		)
-
-		let localSendGroup = try Invitation.Session(
-			archive: localSendGroupArchive
 		)
 
 		return (localSendGroup, encryptedCombinedWelcome)
@@ -163,14 +159,16 @@ extension AbstractTwoMLS.Invitation {
 			from: appWelcome
 		)
 
-		let (sessionArchive, stapledMessageBody) = try receive(
+		//the app validated the welcome; hand back the remote's key package and
+		//authenticated client id extracted from it (anchor/card unification)
+		return try receive(
 			sendGroupWelcome: decoded.mySendGroupWelcome,
+			remoteKeyPackage: decoded.myKeyPackage,
+			remoteClientId: remoteClientId,
 			combinedWelcomeDigest: appWelcomeDigest,
 			stapledMessage: stapledPrivateMessage,
 			newClientId: remoteClientId
 		)
-
-		return (try .init(archive: sessionArchive), stapledMessageBody)
 	}
 }
 
@@ -182,6 +180,7 @@ extension AbstractTwoMLS.Session {
 
 	func send(to remote: some AbstractTwoMLS.Session) throws {
 		let outgoing = UUID().uuidString.utf8Data
+		_ = try prepareToEncrypt(proposing: nil)
 		let encryptedOutgoing = try encrypt(appMessage: outgoing)
 
 		let decrypted = try remote.processIncoming(

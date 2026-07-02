@@ -32,11 +32,12 @@ public enum AbstractTwoMLS {
 		static var supportedSuites: [RawSuites] { get }
 
 		//two-step reply
-		//first step, sets up a send group from a remote keyPackage
+		//first step, sets up a send group from a remote keyPackage.
+		//Returns the live session (Archivable once session persistence lands) plus
+		//the welcome and this side's own published key package for the return group.
 		func reply(keyPackageMessage: Data) throws -> (
-			sendGroupArchive: Invitation.Session.Archive,
+			sendGroup: Invitation.Session,
 			welcomeMessage: Data,
-			//to form the com
 			myKeyPackage: Data
 		)
 
@@ -44,12 +45,12 @@ public enum AbstractTwoMLS {
 		//and encrypt the AppWelcome to the remote
 		func createTwoMLSGroup(
 			remoteAgentId: ClientID,
-			mySendGroupArchive: Invitation.Session.Archive,
+			mySendGroup: Invitation.Session,
 			//extract the leaf node HPKE key to encrypt the initial message
 			theirKeyPackageMessage: Data,
 			appWelcome: Data
 		) throws -> (
-			Invitation.Session.Archive,
+			Invitation.Session,
 			encryptedCombinedWelcome: Data
 		)
 	}
@@ -67,12 +68,22 @@ public enum AbstractTwoMLS {
 		//the invitation object recalls the used groupIds
 		func decodeHeader(ciphertext: Data) throws -> HeaderDecryptResult
 
+		//Unifies the card and anchor receive flows: after the app validates the
+		//decoded AppWelcome/AnchorWelcome, it extracts the remote's published key
+		//package and authenticated client id from it and passes them back in. The
+		//conformance binds the two — the key package's credential must match the
+		//authenticated identity. `remoteKeyPackage` is opaque to the abstraction
+		//(for the PQ combiner it encodes both halves).
+		//Returns the live session; it is Archivable, so callers persist it via
+		//`session.archive` once session persistence lands in the backend.
 		func receive(
 			sendGroupWelcome: Data,
+			remoteKeyPackage: Data,
+			remoteClientId: ClientID,
 			combinedWelcomeDigest: TypedDigest,
 			stapledMessage: Data?,
 			newClientId: AbstractTwoMLS.ClientID,
-		) throws -> (Session.Archive, plaintext: Data?)
+		) throws -> (Session, plaintext: Data?)
 	}
 
 	public enum HeaderDecryptResult {
