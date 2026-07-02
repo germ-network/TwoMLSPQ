@@ -19,13 +19,14 @@ workspace = true
 # Exposes bench fixtures and gates the `benches/*` targets; combine with `cryptokit`
 # for real ML-KEM-768 numbers.
 benchmark_util = ["apq/benchmark_util"]
-cryptokit = ["apq/cryptokit"]
+cryptokit = ["apq/cryptokit", "dep:mls-rs-crypto-cryptokit"]
 default = ["rustcrypto"]
 rustcrypto = ["apq/rustcrypto"]
 
 [dependencies]
 apq = { path = "../apq", version = "0.1.0", default-features = false }
 mls-rs = { workspace = true }
+mls-rs-crypto-cryptokit = { workspace = true, optional = true }
 mls-rs-crypto-rustcrypto = { workspace = true }
 thiserror = { workspace = true }
 uniffi = { workspace = true }

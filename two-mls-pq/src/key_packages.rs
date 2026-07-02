@@ -225,10 +225,7 @@ pub fn hpke_seal_to_key_package(
     info: Option<Vec<u8>>,
     aad: Option<Vec<u8>>,
 ) -> Result<HpkeSealed> {
-    use mls_rs::{CipherSuiteProvider, CryptoProvider};
-    use mls_rs_crypto_rustcrypto::RustCryptoProvider;
-
-    let kp = mls_rs::MlsMessage::from_bytes(&key_package.classical)
+    let kp = mls_rs::MlsMessage::from_bytes(&key_package.pq)
         .map_err(|_| TwoMlsPqError::InvalidKeyPackage)?
         .into_key_package()
         .ok_or(TwoMlsPqError::InvalidKeyPackage)?;
@@ -244,10 +241,8 @@ pub fn hpke_seal_to_key_package(
             .clone(),
     };
 
-    let cs = RustCryptoProvider::new()
-        .cipher_suite_provider(mls_rs::CipherSuite::CURVE25519_CHACHA)
-        .ok_or(TwoMlsPqError::Mls)?;
-
+    use mls_rs::CipherSuiteProvider;
+    let cs = pq_envelope_suite()?;
     let sealed = cs
         .hpke_seal(&kp.hpke_init_key, &info, aad.as_deref(), &plaintext)
         .map_err(|_| TwoMlsPqError::Mls)?;
@@ -255,6 +250,29 @@ pub fn hpke_seal_to_key_package(
         kem_output: sealed.kem_output,
         ciphertext: sealed.ciphertext,
     })
+}
+
+/// The cipher suite the initial envelope is sealed under: the PQ half's suite (spec A.1 —
+/// "encrypted to the PQ EK in KP'"; classical MLS Welcome encryption protects the group
+/// secrets regardless). Under the default build the PQ half is the classical simulation.
+#[cfg(feature = "cryptokit")]
+fn pq_envelope_suite(
+) -> Result<impl mls_rs::CipherSuiteProvider<Error = impl std::error::Error + Send + Sync + 'static>>
+{
+    use mls_rs::CryptoProvider;
+    mls_rs_crypto_cryptokit::CryptoKitMlKemProvider
+        .cipher_suite_provider(mls_rs::CipherSuite::from(0xFDEA))
+        .ok_or(TwoMlsPqError::Mls)
+}
+
+#[cfg(not(feature = "cryptokit"))]
+fn pq_envelope_suite(
+) -> Result<impl mls_rs::CipherSuiteProvider<Error = impl std::error::Error + Send + Sync + 'static>>
+{
+    use mls_rs::CryptoProvider;
+    mls_rs_crypto_rustcrypto::RustCryptoProvider::new()
+        .cipher_suite_provider(mls_rs::CipherSuite::CURVE25519_CHACHA)
+        .ok_or(TwoMlsPqError::Mls)
 }
 
 /// Reject a peer combiner whose both halves are classical (no PQ protection).
@@ -376,21 +394,19 @@ impl TwoMlsPqInvitation {
         aad: Option<Vec<u8>>,
     ) -> Result<Vec<u8>> {
         use mls_rs::crypto::HpkeCiphertext;
-        use mls_rs::{CipherSuiteProvider, CryptoProvider};
-        use mls_rs_crypto_rustcrypto::RustCryptoProvider;
+        use mls_rs::CipherSuiteProvider;
 
-        // Public init key: published in the classical key package. Matching secret: the
-        // invitation's captured classical KeyPackageData.
-        let key_package = mls_rs::MlsMessage::from_bytes(&self.invitation.classical_public)
+        // Public init key: published in the PQ key package (spec A.1: the envelope is
+        // sealed to the PQ EK in KP'). Matching secret: the invitation's captured PQ
+        // KeyPackageData.
+        let key_package = mls_rs::MlsMessage::from_bytes(&self.invitation.pq_public)
             .map_err(|_| TwoMlsPqError::InvalidKeyPackage)?
             .into_key_package()
             .ok_or(TwoMlsPqError::InvalidKeyPackage)?;
         let public = key_package.hpke_init_key;
-        let secret = &self.invitation.classical_kpd.1.init_key;
+        let secret = &self.invitation.pq_kpd.1.init_key;
 
-        let cs = RustCryptoProvider::new()
-            .cipher_suite_provider(mls_rs::CipherSuite::CURVE25519_CHACHA)
-            .ok_or(TwoMlsPqError::Mls)?;
+        let cs = pq_envelope_suite()?;
 
         let info = info.unwrap_or_else(|| self.invitation.client_id.clone());
         let ciphertext = HpkeCiphertext {
@@ -564,28 +580,22 @@ mod tests {
     #[test]
     fn test_invitation_hpke_open_round_trips() {
         use crate::test_utils::make_client;
-        use mls_rs::{CipherSuiteProvider, CryptoProvider};
-        use mls_rs_crypto_rustcrypto::RustCryptoProvider;
 
         let bob = make_client();
         let bob_inv = assert_ok!(super::TwoMlsPqInvitation::new(assert_ok!(
             bob.generate_invitation()
         )));
 
-        // Seal a header to the public init key from Bob's published classical key package.
-        let key_package = assert_some!(assert_ok!(mls_rs::MlsMessage::from_bytes(
-            &bob_inv.combiner_key_package().classical
-        ))
-        .into_key_package());
-        let cs =
-            assert_some!(RustCryptoProvider::new()
-                .cipher_suite_provider(mls_rs::CipherSuite::CURVE25519_CHACHA));
-
-        let info = bob_inv.client_id().bytes;
+        // Seal with an explicit info equal to the recipient's ClientId; opening with
+        // `info = None` must agree (the default is the ClientId on both ends).
         let plaintext = b"routing-header".to_vec();
-        let sealed = assert_ok!(cs.hpke_seal(&key_package.hpke_init_key, &info, None, &plaintext));
+        let sealed = assert_ok!(super::hpke_seal_to_key_package(
+            bob_inv.combiner_key_package(),
+            plaintext.clone(),
+            Some(bob_inv.client_id().bytes),
+            None,
+        ));
 
-        // `info = None` exercises the ClientId default, which matches the seal above.
         let opened =
             assert_ok!(bob_inv.hpke_open(sealed.kem_output, sealed.ciphertext, None, None));
         assert_eq!(opened, plaintext);
