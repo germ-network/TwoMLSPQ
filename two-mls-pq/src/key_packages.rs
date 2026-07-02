@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::invitation::{
     combiner_from_invitation, decode_archive, encode_archive, generate_combiner_invitation,
-    CombinerInvitation,
+    take_bytes, CombinerInvitation,
 };
 #[cfg(feature = "cryptokit")]
 use crate::key_package_store::PqMlsClient;
@@ -166,6 +166,43 @@ pub fn parse_combiner_key_package(kp: CombinerKeyPackage) -> Result<ParsedCombin
         classical_suite: classical.cipher_suite,
         pq_suite: pq.cipher_suite,
     })
+}
+
+/// Version tag for the opaque combiner key-package encoding.
+const COMBINER_KEY_PACKAGE_VERSION: u8 = 1;
+
+/// Encode a combiner key package pair into one opaque blob for publication. The
+/// abstraction layer above carries the pair as a single `Data`; only TwoMLSPQ reads the
+/// halves back out (see [`decode_combiner_key_package`]).
+#[uniffi::export]
+pub fn encode_combiner_key_package(key_package: CombinerKeyPackage) -> Vec<u8> {
+    // Same framing style as the APQ welcome envelope: version byte, then u32-LE
+    // length-prefixed halves. Key packages are a few KB, far below u32::MAX.
+    let mut out =
+        Vec::with_capacity(1 + 4 + key_package.classical.len() + 4 + key_package.pq.len());
+    out.push(COMBINER_KEY_PACKAGE_VERSION);
+    out.extend_from_slice(&(key_package.classical.len() as u32).to_le_bytes());
+    out.extend_from_slice(&key_package.classical);
+    out.extend_from_slice(&(key_package.pq.len() as u32).to_le_bytes());
+    out.extend_from_slice(&key_package.pq);
+    out
+}
+
+/// Decode an [`encode_combiner_key_package`] blob back into the key package pair.
+#[uniffi::export]
+pub fn decode_combiner_key_package(bytes: Vec<u8>) -> Result<CombinerKeyPackage> {
+    let (&version, mut rest) = bytes
+        .split_first()
+        .ok_or(TwoMlsPqError::InvalidKeyPackage)?;
+    if version != COMBINER_KEY_PACKAGE_VERSION {
+        return Err(TwoMlsPqError::InvalidKeyPackage);
+    }
+    let classical = take_bytes(&mut rest).map_err(|_| TwoMlsPqError::InvalidKeyPackage)?;
+    let pq = take_bytes(&mut rest).map_err(|_| TwoMlsPqError::InvalidKeyPackage)?;
+    if !rest.is_empty() {
+        return Err(TwoMlsPqError::InvalidKeyPackage);
+    }
+    Ok(CombinerKeyPackage { classical, pq })
 }
 
 /// Reject a peer combiner whose both halves are classical (no PQ protection).
@@ -538,6 +575,47 @@ mod tests {
         assert_err!(
             super::TwoMlsPqInvitation::new(vec![0xFF, 0xFF, 0xFF]),
             crate::TwoMlsPqError::ArchiveInvalid
+        );
+    }
+
+    #[test]
+    fn test_combiner_key_package_codec_round_trips() {
+        use crate::test_utils::{make_client, make_combiner_kp};
+
+        let client = make_client();
+        let kp = make_combiner_kp(&client);
+
+        let encoded = super::encode_combiner_key_package(kp.clone());
+        let decoded = assert_ok!(super::decode_combiner_key_package(encoded));
+        assert_eq!(decoded.classical, kp.classical);
+        assert_eq!(decoded.pq, kp.pq);
+    }
+
+    #[test]
+    fn test_decode_combiner_key_package_rejects_malformed() {
+        use crate::test_utils::{make_client, make_combiner_kp};
+
+        // Empty and wrong-version inputs.
+        assert_err!(
+            super::decode_combiner_key_package(vec![]),
+            crate::TwoMlsPqError::InvalidKeyPackage
+        );
+        assert_err!(
+            super::decode_combiner_key_package(vec![0xFF, 0x00, 0x00, 0x00, 0x00]),
+            crate::TwoMlsPqError::InvalidKeyPackage
+        );
+
+        // Truncated and trailing-garbage framings.
+        let encoded = super::encode_combiner_key_package(make_combiner_kp(&make_client()));
+        assert_err!(
+            super::decode_combiner_key_package(encoded[..encoded.len() - 1].to_vec()),
+            crate::TwoMlsPqError::InvalidKeyPackage
+        );
+        let mut trailing = encoded;
+        trailing.push(0x00);
+        assert_err!(
+            super::decode_combiner_key_package(trailing),
+            crate::TwoMlsPqError::InvalidKeyPackage
         );
     }
 
