@@ -92,7 +92,10 @@ impl SyntheticKeyPackageStore {
     /// Drop all stored key packages. Used on the client after captured material has been
     /// moved into an Invitation, so the client retains no key-package private data.
     pub fn purge_all(&self) {
-        self.entries.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 
     fn do_insert(&self, id: Vec<u8>, pkg: KeyPackageData) {

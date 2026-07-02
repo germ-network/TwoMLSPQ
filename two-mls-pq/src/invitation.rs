@@ -108,8 +108,9 @@ pub(crate) fn decode_archive(bytes: &[u8]) -> Result<(CombinerInvitation, BTreeS
 /// self-contained [`CombinerInvitation`]. Afterwards the client retains no key-package
 /// private data — its capture stores are purged.
 pub(crate) fn generate_combiner_invitation(client: &CombinerClient) -> Result<CombinerInvitation> {
-    let (classical_public, classical_kpd) =
-        capture(client.classical_kp_store(), || client.generate_classical_key_package())?;
+    let (classical_public, classical_kpd) = capture(client.classical_kp_store(), || {
+        client.generate_classical_key_package()
+    })?;
 
     #[cfg(feature = "cryptokit")]
     let ((pq_public, pq_kpd), pq_signing_key) = (
@@ -159,10 +160,7 @@ pub(crate) fn combiner_from_invitation(inv: &CombinerInvitation) -> Result<Combi
     let client = apq::CombinerClient::from_key_packages(
         inv.client_id.clone(),
         inv.classical_signing_key.clone(),
-        SyntheticKeyPackageStore::for_invitation([
-            inv.classical_kpd.clone(),
-            inv.pq_kpd.clone(),
-        ]),
+        SyntheticKeyPackageStore::for_invitation([inv.classical_kpd.clone(), inv.pq_kpd.clone()]),
     )?;
     Ok(client)
 }
@@ -228,7 +226,6 @@ fn take_kpd(rest: &mut &[u8]) -> Result<KeyPackageSecret> {
     let id = take_bytes(rest)?;
     let kpd_bytes = take_bytes(rest)?;
     let mut reader = kpd_bytes.as_slice();
-    let kpd =
-        KeyPackageData::mls_decode(&mut reader).map_err(|_| TwoMlsPqError::ArchiveInvalid)?;
+    let kpd = KeyPackageData::mls_decode(&mut reader).map_err(|_| TwoMlsPqError::ArchiveInvalid)?;
     Ok((id, kpd))
 }

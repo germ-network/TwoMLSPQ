@@ -7,7 +7,9 @@
 
 use mls_rs::{
     client::Client,
-    client_builder::{self, BaseConfig, WithCryptoProvider, WithIdentityProvider, WithKeyPackageRepo},
+    client_builder::{
+        self, BaseConfig, WithCryptoProvider, WithIdentityProvider, WithKeyPackageRepo,
+    },
     identity::{
         basic::{BasicCredential, BasicIdentityProvider},
         SigningIdentity,
@@ -76,8 +78,9 @@ impl<S: KeyPackageStorage + Clone> CombinerClient<S> {
             .cipher_suite_provider(suite)
             .ok_or(CombinerError::Mls)?;
 
-        let (classical_sk, classical_pk) =
-            cs.signature_key_generate().map_err(|_| CombinerError::Mls)?;
+        let (classical_sk, classical_pk) = cs
+            .signature_key_generate()
+            .map_err(|_| CombinerError::Mls)?;
         let classical_signing_key = Zeroizing::new(classical_sk.as_bytes().to_vec());
         let classical_kp_store = S::default();
         let classical = build_client(
@@ -90,7 +93,9 @@ impl<S: KeyPackageStorage + Clone> CombinerClient<S> {
 
         #[cfg(feature = "cryptokit")]
         let (pq_signing_key, pq, pq_kp_store) = {
-            let (pq_sk, pq_pk) = cs.signature_key_generate().map_err(|_| CombinerError::Mls)?;
+            let (pq_sk, pq_pk) = cs
+                .signature_key_generate()
+                .map_err(|_| CombinerError::Mls)?;
             let bytes = Zeroizing::new(pq_sk.as_bytes().to_vec());
             let store = S::default();
             let client = build_pq_client(
