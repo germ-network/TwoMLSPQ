@@ -89,15 +89,16 @@ struct LifecycleTests {
 		let remoteClassicalBefore = remoteBase.epochs().classicalEpoch
 		let inbound = try remoteSession.ingest(kp.payload)
 		#expect(inbound.kind == .finishBootstrap)
-		// Responding stands the PQ half up immediately: new PQ group at epoch 1, and
-		// the APQ-PSK bind commit advances the send classical epoch by one.
+		// Responding stands the PQ half up immediately: new PQ group at epoch 1. The
+		// classical epoch is untouched — A.4 is PQ-groups-only; the APQ-PSK binds into
+		// the classical half at the next A.3 ratchet.
 		#expect(remoteBase.isFullyEstablished())
 		#expect(remoteBase.epochs().pqEpoch == 1)
-		#expect(remoteBase.epochs().classicalEpoch == remoteClassicalBefore + 1)
+		#expect(remoteBase.epochs().classicalEpoch == remoteClassicalBefore)
 
 		let reply = try #require(try remoteSession.advance(after: inbound))
 		#expect(reply.kind == .finishBootstrap)
-		// Bootstrap bind frame tag (PQ welcome + classical bind commit).
+		// Bootstrap bind frame tag (PQ welcome only — A.4 is PQ-groups-only).
 		#expect(reply.payload.first == 0x13)
 		// The parked reply is handed out exactly once.
 		#expect(try remoteSession.advance(after: inbound) == nil)
