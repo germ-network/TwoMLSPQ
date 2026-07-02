@@ -140,30 +140,21 @@ fn encode_pq_bind(pq_commit: Vec<u8>, classical_commit: Vec<u8>, app: Vec<u8>) -
     out
 }
 
-/// Encode the A.4 bootstrap reply: `[0x13][u32-LE welcome-len][pq_welcome][classical_commit…]`.
-fn encode_bootstrap_bind(pq_welcome: Vec<u8>, classical_commit: Vec<u8>) -> Vec<u8> {
-    let mut out = Vec::with_capacity(1 + 4 + pq_welcome.len() + classical_commit.len());
+/// Encode the A.4 bootstrap reply: `[0x13][pq_welcome…]`. PQ-groups-only per the spec —
+/// no classical commit rides along; ASG-PQ binds into ASG-cl at the next A.3 ratchet.
+fn encode_bootstrap_bind(pq_welcome: Vec<u8>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + pq_welcome.len());
     out.push(PQ_BOOTSTRAP_BIND_TAG);
-    out.extend_from_slice(&(pq_welcome.len() as u32).to_le_bytes());
     out.extend_from_slice(&pq_welcome);
-    out.extend_from_slice(&classical_commit);
     out
 }
 
-fn decode_bootstrap_bind(bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
+fn decode_bootstrap_bind(bytes: &[u8]) -> Result<Vec<u8>> {
     let (&tag, rest) = bytes.split_first().ok_or(TwoMlsPqError::Mls)?;
     if tag != PQ_BOOTSTRAP_BIND_TAG {
         return Err(TwoMlsPqError::Mls);
     }
-    if rest.len() < 4 {
-        return Err(TwoMlsPqError::Mls);
-    }
-    let w_len = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
-    let rest = &rest[4..];
-    if rest.len() < w_len {
-        return Err(TwoMlsPqError::Mls);
-    }
-    Ok((rest[..w_len].to_vec(), rest[w_len..].to_vec()))
+    Ok(rest.to_vec())
 }
 
 #[cfg(feature = "cryptokit")]
@@ -836,26 +827,11 @@ impl TwoMlsPqSession {
             let (pq_group, pq_welcome) = pq_create_group_with_member(client.pq(), kp, &[])?;
             #[cfg(not(feature = "cryptokit"))]
             let (pq_group, pq_welcome) = create_group_with_member(client.classical(), kp, &[])?;
-            #[cfg(feature = "cryptokit")]
-            let apq_psk = export_and_register_psk_pq(&pq_group, client.combiner())?;
-            #[cfg(not(feature = "cryptokit"))]
-            let apq_psk = export_and_register_psk(&pq_group, client.combiner())?;
-            let cl_out = send
-                .classical
-                .commit_builder()
-                .add_external_psk(apq_psk)
-                .map_err(|_| TwoMlsPqError::Mls)?
-                .build()
-                .map_err(|_| TwoMlsPqError::Mls)?;
-            send.classical
-                .apply_pending_commit()
-                .map_err(|_| TwoMlsPqError::Mls)?;
-            let cl_commit = cl_out
-                .commit_message
-                .to_bytes()
-                .map_err(|_| TwoMlsPqError::Mls)?;
+            // PQ-groups-only (spec A.4): no classical bind here. The new PQ half's
+            // secrecy reaches ASG-cl at the next A.3 ratchet; until then ASG-cl keeps
+            // the PQ-derived security chained in at establishment.
             send.pq = Some(pq_group);
-            encode_bootstrap_bind(pq_welcome, cl_commit)
+            encode_bootstrap_bind(pq_welcome)
         };
         inner.pq_turn_mine = true;
         inner.pending_pq_outbound = Some(frame);
@@ -866,7 +842,7 @@ impl TwoMlsPqSession {
     /// private material is retained in this client), register its APQ-PSK, and apply
     /// the classical bind on the recv group. The turn passes to the peer.
     pub fn pq_bootstrap_apply(&self, bind_msg: Vec<u8>) -> Result<()> {
-        let (pq_welcome, cl_commit) = decode_bootstrap_bind(&bind_msg)?;
+        let pq_welcome = decode_bootstrap_bind(&bind_msg)?;
         let mut inner = self.lock();
         let client = inner.client.clone();
         {
@@ -881,15 +857,6 @@ impl TwoMlsPqSession {
             let pq = pq_join_group_from_welcome(client.pq(), &pq_welcome)?;
             #[cfg(not(feature = "cryptokit"))]
             let pq = join_group_from_welcome(client.classical(), &pq_welcome)?;
-            // Register the APQ-PSK before applying the classical bind that references it.
-            #[cfg(feature = "cryptokit")]
-            export_and_register_psk_pq(&pq, client.combiner())?;
-            #[cfg(not(feature = "cryptokit"))]
-            export_and_register_psk(&pq, client.combiner())?;
-            let cl = MlsMessage::from_bytes(&cl_commit).map_err(|_| TwoMlsPqError::Mls)?;
-            recv.classical
-                .process_incoming_message(cl)
-                .map_err(|_| TwoMlsPqError::Mls)?;
             recv.pq = Some(pq);
         }
         inner.pq_turn_mine = false;
