@@ -11,6 +11,15 @@
 //! primitives, and reports failures as `CombinerError` (the two-mls layer maps these onto
 //! its FFI error enum).
 
+// The `cryptokit` feature's PQ provider is Apple CryptoKit (`mls-rs-crypto-cryptokit`),
+// which is gated to Apple platforms and compiles to nothing elsewhere. Enabling the feature
+// off-Apple can't work, so fail loudly here instead of with an opaque unresolved-import error.
+#[cfg(all(
+    feature = "cryptokit",
+    not(any(target_os = "macos", target_os = "ios"))
+))]
+compile_error!("the `cryptokit` feature requires a macOS or iOS target");
+
 mod client;
 mod group;
 
