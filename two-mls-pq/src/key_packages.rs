@@ -1,81 +1,30 @@
 use std::sync::Arc;
 
-use mls_rs::{
-    client::Client,
-    client_builder::{self, BaseConfig, WithCryptoProvider, WithIdentityProvider},
-    identity::{
-        basic::{BasicCredential, BasicIdentityProvider},
-        SigningIdentity,
-    },
-    CipherSuiteProvider, CryptoProvider, ExtensionList,
-};
-use mls_rs_crypto_rustcrypto::RustCryptoProvider;
-
-#[cfg(feature = "cryptokit")]
-use mls_rs_crypto_cryptokit::CryptoKitMlKemProvider;
-
 use crate::{ClientId, MlsCipherSuite, Result, TwoMlsPqError};
-
-pub(crate) type OurConfig =
-    WithIdentityProvider<BasicIdentityProvider, WithCryptoProvider<RustCryptoProvider, BaseConfig>>;
-pub(crate) type MlsClient = Client<OurConfig>;
-
-#[cfg(feature = "cryptokit")]
-pub(crate) type PqConfig = WithIdentityProvider<
-    BasicIdentityProvider,
-    WithCryptoProvider<CryptoKitMlKemProvider, BaseConfig>,
->;
-#[cfg(feature = "cryptokit")]
-pub(crate) type PqMlsClient = Client<PqConfig>;
-
-fn build_client(
-    secret_key: mls_rs::crypto::SignatureSecretKey,
-    public_key: mls_rs::crypto::SignaturePublicKey,
-    suite: mls_rs::CipherSuite,
-) -> MlsClient {
-    let credential = BasicCredential::new(public_key.as_ref().to_vec());
-    let signing_identity = SigningIdentity::new(credential.into_credential(), public_key);
-    client_builder::ClientBuilder::new()
-        .crypto_provider(RustCryptoProvider::new())
-        .identity_provider(BasicIdentityProvider::new())
-        .signing_identity(signing_identity, secret_key, suite)
-        .build()
-}
-
-#[cfg(feature = "cryptokit")]
-fn build_pq_client(
-    secret_key: mls_rs::crypto::SignatureSecretKey,
-    public_key: mls_rs::crypto::SignaturePublicKey,
-    suite: mls_rs::CipherSuite,
-) -> PqMlsClient {
-    let credential = BasicCredential::new(public_key.as_ref().to_vec());
-    let signing_identity = SigningIdentity::new(credential.into_credential(), public_key);
-    client_builder::ClientBuilder::new()
-        .crypto_provider(CryptoKitMlKemProvider)
-        .identity_provider(BasicIdentityProvider::new())
-        .signing_identity(signing_identity, secret_key, suite)
-        .build()
-}
 
 /// Holds an agent signing key and manages MLS key packages for publication.
 /// The signing key's public component is the ClientId — the Basic Credential
 /// that identifies this agent as a leaf node in MLS groups.
+///
+/// Thin UniFFI wrapper around `apq::CombinerClient`; the MLS plumbing lives in the
+/// `apq` crate.
 #[derive(uniffi::Object)]
 pub struct TwoMlsPqClient {
-    client_id: ClientId,
-    classical: MlsClient,
-    #[cfg(feature = "cryptokit")]
-    pq: PqMlsClient,
+    inner: apq::CombinerClient,
 }
 
 impl TwoMlsPqClient {
-    pub(crate) fn classical(&self) -> &MlsClient {
-        &self.classical
+    pub(crate) fn combiner(&self) -> &apq::CombinerClient {
+        &self.inner
+    }
+
+    pub(crate) fn classical(&self) -> &apq::MlsClient {
+        self.inner.classical()
     }
 
     #[cfg(feature = "cryptokit")]
-    pub(crate) fn pq(&self) -> &PqMlsClient {
-        &self.pq
+    pub(crate) fn pq(&self) -> &apq::PqMlsClient {
+        self.inner.pq()
     }
 }
 
@@ -84,40 +33,15 @@ impl TwoMlsPqClient {
     /// Create a TwoMlsPqClient from an existing agent signing key.
     #[uniffi::constructor]
     pub fn new(signing_key: Vec<u8>) -> Result<Arc<Self>> {
-        let crypto = RustCryptoProvider::new();
-        let suite = mls_rs::CipherSuite::CURVE25519_CHACHA;
-        let cs = crypto
-            .cipher_suite_provider(suite)
-            .ok_or(TwoMlsPqError::Mls)?;
-
-        let secret_key = mls_rs::crypto::SignatureSecretKey::new(signing_key.clone());
-        let public_key = cs
-            .signature_key_derive_public(&secret_key)
-            .map_err(|_| TwoMlsPqError::Mls)?;
-
-        let client_id = ClientId {
-            bytes: public_key.as_ref().to_vec(),
-        };
-        let classical = build_client(secret_key, public_key.clone(), suite);
-
-        #[cfg(feature = "cryptokit")]
-        let pq = build_pq_client(
-            mls_rs::crypto::SignatureSecretKey::new(signing_key),
-            public_key,
-            mls_rs::CipherSuite::from(MlsCipherSuite::ML_KEM_768),
-        );
-
-        Ok(Arc::new(Self {
-            client_id,
-            classical,
-            #[cfg(feature = "cryptokit")]
-            pq,
-        }))
+        let inner = apq::CombinerClient::new(signing_key)?;
+        Ok(Arc::new(Self { inner }))
     }
 
     /// The ClientId (public signing key) for this agent.
     pub fn client_id(&self) -> ClientId {
-        self.client_id.clone()
+        ClientId {
+            bytes: self.inner.client_id().to_vec(),
+        }
     }
 
     /// Generate a fresh KeyPackage for the given cipher suite.
@@ -126,20 +50,10 @@ impl TwoMlsPqClient {
     pub fn generate_key_package(&self, suite: Arc<MlsCipherSuite>) -> Result<Vec<u8>> {
         match suite.value() {
             MlsCipherSuite::DHKEM_X25519_CHACHA => {
-                let msg = self
-                    .classical
-                    .generate_key_package_message(ExtensionList::new(), ExtensionList::new(), None)
-                    .map_err(|_| TwoMlsPqError::Mls)?;
-                msg.to_bytes().map_err(|_| TwoMlsPqError::Mls)
+                Ok(self.inner.generate_classical_key_package()?)
             }
             #[cfg(feature = "cryptokit")]
-            MlsCipherSuite::ML_KEM_768 => {
-                let msg = self
-                    .pq
-                    .generate_key_package_message(ExtensionList::new(), ExtensionList::new(), None)
-                    .map_err(|_| TwoMlsPqError::Mls)?;
-                msg.to_bytes().map_err(|_| TwoMlsPqError::Mls)
-            }
+            MlsCipherSuite::ML_KEM_768 => Ok(self.inner.generate_pq_key_package()?),
             _ => Err(TwoMlsPqError::Mls),
         }
     }

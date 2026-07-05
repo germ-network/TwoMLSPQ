@@ -1,21 +1,13 @@
 uniffi::setup_scaffolding!();
 
-// The `cryptokit` feature's PQ provider is Apple CryptoKit (`mls-rs-crypto-cryptokit`),
-// which is gated to Apple platforms and compiles to nothing elsewhere. Enabling the feature
-// off-Apple can't work, so fail loudly here instead of with an opaque unresolved-import error.
-#[cfg(all(
-    feature = "cryptokit",
-    not(any(target_os = "macos", target_os = "ios"))
-))]
-compile_error!("the `cryptokit` feature requires a macOS or iOS target");
-
-mod combiner;
 pub mod key_packages;
 mod psk;
 pub mod session;
 #[cfg(test)]
 #[macro_use]
 mod test_macros;
+#[cfg(test)]
+mod demo;
 #[cfg(test)]
 mod test_utils;
 
@@ -290,6 +282,17 @@ pub fn derive_session_id(my_id: ClientId, their_id: ClientId) -> Result<SessionI
 impl From<mls_rs::error::MlsError> for TwoMlsPqError {
     fn from(_: mls_rs::error::MlsError) -> Self {
         TwoMlsPqError::Mls
+    }
+}
+
+impl From<apq::CombinerError> for TwoMlsPqError {
+    fn from(e: apq::CombinerError) -> Self {
+        match e {
+            apq::CombinerError::Mls => TwoMlsPqError::Mls,
+            apq::CombinerError::InvalidKeyPackage => TwoMlsPqError::InvalidKeyPackage,
+            apq::CombinerError::MissingWelcome => TwoMlsPqError::MissingWelcome,
+            apq::CombinerError::DecryptionFailed => TwoMlsPqError::DecryptionFailed,
+        }
     }
 }
 
