@@ -48,8 +48,11 @@ jobs:
       - name: Check Rust formatting
         run: cargo fmt --all -- --check
 
+      # `cryptokit` is Apple-only (mls-rs-crypto-cryptokit) and cannot build on Linux.
+      # Lint everything except cryptokit: `--features benchmark_util` keeps the default
+      # `rustcrypto` plus the bench targets while leaving `cryptokit` off.
       - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets --features benchmark_util -- -D warnings
 
       - name: Clippy (default features / rustcrypto, no cryptokit)
         run: cargo clippy --all-targets --no-default-features --features rustcrypto -- -D warnings
@@ -85,8 +88,10 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml') }}
 
+      # `cryptokit` is Apple-only; on Linux run everything else (default `rustcrypto`
+      # plus the bench fixtures). The macOS runner covers the real ML-KEM-768 path.
       - name: Test
-        run: cargo test --all-features
+        run: cargo test --features benchmark_util
 
       - name: Test (default features / rustcrypto, no cryptokit)
         run: cargo test --no-default-features --features rustcrypto

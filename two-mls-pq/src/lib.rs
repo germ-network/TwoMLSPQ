@@ -1,5 +1,7 @@
 uniffi::setup_scaffolding!();
 
+mod invitation;
+mod key_package_store;
 pub mod key_packages;
 mod psk;
 pub mod session;
@@ -24,6 +26,14 @@ pub fn version() -> String {
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct ClientId {
     pub bytes: Vec<u8>,
+}
+
+/// The APQ epoch pair for the send group: the PQ side-band epoch and the classical
+/// (traditional) message epoch. Zeros until the corresponding group exists.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ApqEpochs {
+    pub pq_epoch: u64,
+    pub classical_epoch: u64,
 }
 
 /// MLS group identifier.
@@ -54,10 +64,15 @@ pub struct RendezvousId {
     pub bytes: Vec<u8>,
 }
 
+/// Digest-type wire value for SHA-256-width (32-byte) digests, matching CommProtocol's
+/// `DigestTypes.sha256`. All digests this library emits are 32-byte values.
+pub(crate) const DIGEST_SHA256: u8 = 1;
+
 /// Content-typed hash digest. Used by the app layer to identify and accept
 /// MLS proposals before signalling back to the encryption layer.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct TwoMlsPqDigest {
+    /// Digest-type wire value, aligned with CommProtocol's `DigestTypes` (sha256 = 1).
     pub hash_type: u8,
     pub digest: Vec<u8>,
 }
@@ -252,6 +267,8 @@ pub enum TwoMlsPqError {
     DecryptionFailed,
     #[error("archive corrupt or incompatible")]
     ArchiveInvalid,
+    #[error("welcome already consumed for this remote")]
+    DuplicateWelcome,
 }
 
 /// Derive the session identifier for a pair of clients.

@@ -11,7 +11,7 @@
 
 use mls_rs::crypto::{HpkePublicKey, HpkeSecretKey};
 use mls_rs::psk::{ExternalPskId, PreSharedKey};
-use mls_rs::MlsMessage;
+use mls_rs::{KeyPackageStorage, MlsMessage};
 use mls_rs_crypto_cryptokit::ml_kem::MlKem768Kem;
 use mls_rs_crypto_traits::KemType;
 
@@ -61,7 +61,7 @@ pub fn decapsulate(eph: &PqEphemeral, ct: &[u8]) -> Result<Vec<u8>> {
 /// PSK id for the injected secret S at the PQ group's current epoch. The trailing domain byte
 /// (see `group::PSK_DOMAIN_INJECTED`) keeps it disjoint from any exported `apq_psk` id, which is
 /// derived from the *next* epoch and carries no domain byte.
-fn injected_psk_id(group: &PqMlsGroup) -> ExternalPskId {
+fn injected_psk_id<S: KeyPackageStorage + Clone>(group: &PqMlsGroup<S>) -> ExternalPskId {
     injected_secret_psk_id(group.current_epoch(), group.group_id())
 }
 
@@ -69,13 +69,13 @@ fn injected_psk_id(group: &PqMlsGroup) -> ExternalPskId {
 /// per-round ML-KEM entropy is cleared on **every** exit path — including early `?` returns — not
 /// just the happy path. This is what gives the ratchet forward secrecy: a later state compromise
 /// cannot recover S. `id` is reused for the commit's `add_external_psk` proposal.
-struct InjectedSecret<'a> {
+struct InjectedSecret<'a, S: KeyPackageStorage + Clone> {
     id: ExternalPskId,
-    client: &'a CombinerClient,
+    client: &'a CombinerClient<S>,
 }
 
-impl<'a> InjectedSecret<'a> {
-    fn register(group: &PqMlsGroup, s: &[u8], client: &'a CombinerClient) -> Self {
+impl<'a, S: KeyPackageStorage + Clone> InjectedSecret<'a, S> {
+    fn register(group: &PqMlsGroup<S>, s: &[u8], client: &'a CombinerClient<S>) -> Self {
         let id = injected_psk_id(group);
         let mut pq = client.pq().secret_store();
         pq.insert(id.clone(), PreSharedKey::new(s.to_vec()));
@@ -83,7 +83,7 @@ impl<'a> InjectedSecret<'a> {
     }
 }
 
-impl Drop for InjectedSecret<'_> {
+impl<S: KeyPackageStorage + Clone> Drop for InjectedSecret<'_, S> {
     fn drop(&mut self) {
         let mut pq = self.client.pq().secret_store();
         pq.delete(&self.id);
@@ -93,10 +93,10 @@ impl Drop for InjectedSecret<'_> {
 /// Initiator (committer) — inject S into `pq_group` via a pathless PSK commit, apply it, and
 /// re-export the `apq_psk` from the new PQ epoch (registered for the classical bind).
 /// Returns `(pq_commit_bytes, apq_psk_id)`.
-pub fn inject_and_commit(
-    pq_group: &mut PqMlsGroup,
+pub fn inject_and_commit<S: KeyPackageStorage + Clone>(
+    pq_group: &mut PqMlsGroup<S>,
     s: &[u8],
-    client: &CombinerClient,
+    client: &CombinerClient<S>,
 ) -> Result<(Vec<u8>, ExternalPskId)> {
     let secret = InjectedSecret::register(pq_group, s, client);
     let out = pq_group
@@ -120,11 +120,11 @@ pub fn inject_and_commit(
 
 /// Responder (applier) — register S (held since `encapsulate`), apply the initiator's pathless PQ
 /// commit, and re-export the same `apq_psk` from the new PQ epoch.
-pub fn apply_injected_commit(
-    pq_group: &mut PqMlsGroup,
+pub fn apply_injected_commit<S: KeyPackageStorage + Clone>(
+    pq_group: &mut PqMlsGroup<S>,
     s: &[u8],
     pq_commit: &[u8],
-    client: &CombinerClient,
+    client: &CombinerClient<S>,
 ) -> Result<ExternalPskId> {
     let secret = InjectedSecret::register(pq_group, s, client);
     let msg = MlsMessage::from_bytes(pq_commit).map_err(|_| CombinerError::Mls)?;
@@ -155,9 +155,7 @@ pub fn full_pq_updatepath_commit_size() -> usize {
     let rules =
         DefaultMlsRules::new().with_commit_options(CommitOptions::new().with_path_required(true));
     let build = |rules: DefaultMlsRules| {
-        let cs = CryptoKitMlKemProvider
-            .cipher_suite_provider(suite)
-            .unwrap();
+        let cs = CryptoKitMlKemProvider.cipher_suite_provider(suite).unwrap();
         let (sk, pk) = cs.signature_key_generate().unwrap();
         let signing = SigningIdentity::new(
             BasicCredential::new(pk.as_ref().to_vec()).into_credential(),
@@ -196,16 +194,18 @@ mod tests {
     use super::*;
     use crate::group::{create_combiner_send_group, join_combiner_group};
     use crate::CombinerClient;
+    use mls_rs::storage_provider::in_memory::InMemoryKeyPackageStorage;
     use mls_rs::{CipherSuiteProvider, CryptoProvider};
     use mls_rs_crypto_rustcrypto::RustCryptoProvider;
 
-    fn client() -> CombinerClient {
+    fn client() -> CombinerClient<InMemoryKeyPackageStorage> {
+        // A fresh, unique ClientId for tests (opaque random bytes, not a signing key).
         let crypto = RustCryptoProvider::new();
         let cs = crypto
             .cipher_suite_provider(mls_rs::CipherSuite::CURVE25519_CHACHA)
             .unwrap();
-        let (secret, _) = cs.signature_key_generate().unwrap();
-        CombinerClient::new(secret.as_bytes().to_vec()).unwrap()
+        let (client_id, _) = cs.signature_key_generate().unwrap();
+        CombinerClient::new(client_id.as_bytes().to_vec()).unwrap()
     }
 
     #[test]
@@ -235,7 +235,7 @@ mod tests {
         .unwrap();
         let mut bob_recv = join_combiner_group(&welcome, &bob).unwrap();
 
-        let pq_epoch_before = asg.pq.current_epoch();
+        let pq_epoch_before = asg.pq.as_ref().unwrap().current_epoch();
         let cl_epoch_before = asg.classical.current_epoch();
 
         // EK/ct exchange: Alice initiates, Bob responds, Alice recovers S.
@@ -245,7 +245,8 @@ mod tests {
         assert_eq!(s_alice, s_bob);
 
         // Alice binds: pathless PQ commit injecting S, then a classical commit importing apq_psk.
-        let (pq_commit, apq_psk_id) = inject_and_commit(&mut asg.pq, &s_alice, &alice).unwrap();
+        let (pq_commit, apq_psk_id) =
+            inject_and_commit(asg.pq.as_mut().unwrap(), &s_alice, &alice).unwrap();
         let cl_out = asg
             .classical
             .commit_builder()
@@ -258,15 +259,21 @@ mod tests {
 
         // Bob applies the stapled commits.
         let apq_psk_id_bob =
-            apply_injected_commit(&mut bob_recv.pq, &s_bob, &pq_commit, &bob).unwrap();
+            apply_injected_commit(bob_recv.pq.as_mut().unwrap(), &s_bob, &pq_commit, &bob).unwrap();
         bob_recv
             .classical
             .process_incoming_message(MlsMessage::from_bytes(&cl_commit).unwrap())
             .unwrap();
 
         // Both PQ groups advanced by exactly one epoch (the pathless inject) and agree.
-        assert_eq!(asg.pq.current_epoch(), pq_epoch_before + 1);
-        assert_eq!(bob_recv.pq.current_epoch(), pq_epoch_before + 1);
+        assert_eq!(
+            asg.pq.as_ref().unwrap().current_epoch(),
+            pq_epoch_before + 1
+        );
+        assert_eq!(
+            bob_recv.pq.as_ref().unwrap().current_epoch(),
+            pq_epoch_before + 1
+        );
         // Both classical groups advanced (the apq_psk bind) and agree.
         assert_eq!(asg.classical.current_epoch(), cl_epoch_before + 1);
         assert_eq!(bob_recv.classical.current_epoch(), cl_epoch_before + 1);
@@ -303,11 +310,11 @@ mod tests {
         .unwrap();
         let _bob_recv = join_combiner_group(&welcome, &bob).unwrap();
 
-        let s_id = injected_psk_id(&asg.pq);
+        let s_id = injected_psk_id(asg.pq.as_ref().unwrap());
         let eph = generate_ephemeral().unwrap();
         let (_s_bob, ct) = encapsulate(&eph.encapsulation_key()).unwrap();
         let s = decapsulate(&eph, &ct).unwrap();
-        inject_and_commit(&mut asg.pq, &s, &alice).unwrap();
+        inject_and_commit(asg.pq.as_mut().unwrap(), &s, &alice).unwrap();
 
         // Forward secrecy: the per-round ML-KEM secret is gone from the store after the bind.
         assert!(alice.pq().secret_store().get(&s_id).is_none());
