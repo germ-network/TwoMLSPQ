@@ -44,6 +44,17 @@ struct LifecycleTests {
 		// …which travels as a v1 header frame.
 		#expect(encryptedCombinedWelcome.first == 1)
 
+		// Routing: listening works from birth — addresses derive from our send
+		// group's classical half, one per epoch. Nowhere to post yet: the post
+		// address is the recv group's exporter, and there is no recv group.
+		let localListenAtBirth = try localBase.shouldListenOn()
+		#expect(!localListenAtBirth.sendGroup.classical.bytes.isEmpty)
+		#expect(!localListenAtBirth.sendGroup.pq.bytes.isEmpty)
+		#expect(localListenAtBirth.rendezvousByEpoch.count == 1)
+		#expect(localListenAtBirth.rendezvousByEpoch.first?.epoch == 1)
+		#expect(localListenAtBirth.rendezvousByEpoch.first?.rendezvousId.bytes.count == 32)
+		#expect(try localBase.sendRendezvous() == nil)
+
 		// -- Step 2: the invitation receives — recv group up, send group classical-only.
 		let (remoteSession, stapled) = try remote.currentInvitation.receiveReply(
 			ciphertext: encryptedCombinedWelcome,
@@ -66,6 +77,21 @@ struct LifecycleTests {
 		#expect(localBase.myAgentState() == remoteBase.theirAgentState())
 		#expect(remoteBase.myAgentState() == localBase.theirAgentState())
 
+		// Routing: remote can post immediately — its post address is the recv
+		// group's current exporter, which is the same MLS group as the initiator's
+		// send group, so it appears verbatim in the initiator's listen set.
+		let remotePost = try #require(try remoteBase.sendRendezvous())
+		#expect(remotePost.bytes.count == 32)
+		#expect(
+			localListenAtBirth.rendezvousByEpoch
+				.contains { $0.rendezvousId.bytes == remotePost.bytes })
+		// Remote listens on its own send group: classical id only — the PQ half
+		// is the deferred A.4 slot.
+		let remoteListenAtBirth = try remoteBase.shouldListenOn()
+		#expect(!remoteListenAtBirth.sendGroup.classical.bytes.isEmpty)
+		#expect(remoteListenAtBirth.sendGroup.pq.bytes.isEmpty)
+		#expect(remoteListenAtBirth.rendezvousByEpoch.first?.epoch == 1)
+
 		// -- Step 3: remote's first frame staples the return welcome; local joins in-band.
 		try remoteSession.send(to: localSession)
 		#expect(localBase.isEstablished())
@@ -75,8 +101,31 @@ struct LifecycleTests {
 		#expect(!localRecv.classical.bytes.isEmpty)
 		#expect(localRecv.pq.bytes.isEmpty)
 
+		// Routing: the stapled join gave local its recv group — somewhere to post.
+		let localPost = try #require(try localBase.sendRendezvous())
+		#expect(
+			try remoteBase.shouldListenOn().rendezvousByEpoch
+				.contains { $0.rendezvousId.bytes == localPost.bytes })
+
 		// -- Step 4: classical exchanges proceed while the PQ bootstrap is pending.
 		try localSession.exchange(with: remoteSession)
+
+		// Routing: each A.2 send commits in the sender's send group, advancing its
+		// classical epoch; the listen map covers the new epoch and retains the old
+		// ones so in-flight traffic posted at a prior epoch's address still lands.
+		let localListenAfterExchange = try localBase.shouldListenOn()
+		#expect(
+			localListenAfterExchange.rendezvousByEpoch.count
+				> localListenAtBirth.rendezvousByEpoch.count)
+		#expect(
+			localListenAfterExchange.rendezvousByEpoch.map(\.epoch).max()
+				== localBase.epochs().classicalEpoch)
+		#expect(
+			localListenAfterExchange.rendezvousByEpoch.map(\.epoch).min()
+				== 1)
+		// Addresses stay matched in both directions as epochs move.
+		#expect(try postAddressMatches(poster: localBase, listener: remoteBase))
+		#expect(try postAddressMatches(poster: remoteBase, listener: localBase))
 
 		// -- Step 5: A.4 bootstrap. Local owes it (holds the turn).
 		#expect(localSession.turn == .weInitiate)
@@ -87,6 +136,7 @@ struct LifecycleTests {
 		#expect(kp.payload.first == 0x11)
 
 		let remoteClassicalBefore = remoteBase.epochs().classicalEpoch
+		let remoteListenBeforeBootstrap = try remoteBase.shouldListenOn()
 		let inbound = try remoteSession.ingest(kp.payload)
 		#expect(inbound.kind == .finishBootstrap)
 		// Responding stands the PQ half up immediately: new PQ group at epoch 1. The
@@ -95,6 +145,14 @@ struct LifecycleTests {
 		#expect(remoteBase.isFullyEstablished())
 		#expect(remoteBase.epochs().pqEpoch == 1)
 		#expect(remoteBase.epochs().classicalEpoch == remoteClassicalBefore)
+
+		// Routing: A.4 is PQ-groups-only — no classical commit, so no new listen
+		// addresses — but the send group now advertises its PQ half's id.
+		let remoteListenAfterBootstrap = try remoteBase.shouldListenOn()
+		#expect(
+			remoteListenAfterBootstrap.rendezvousByEpoch.count
+				== remoteListenBeforeBootstrap.rendezvousByEpoch.count)
+		#expect(!remoteListenAfterBootstrap.sendGroup.pq.bytes.isEmpty)
 
 		let reply = try #require(try remoteSession.advance(after: inbound))
 		#expect(reply.kind == .finishBootstrap)
@@ -115,5 +173,20 @@ struct LifecycleTests {
 
 		// -- Step 6: exchanges still flow fully established.
 		try localSession.exchange(with: remoteSession)
+
+		// Routing: still matched after the post-bootstrap exchange rounds.
+		#expect(try postAddressMatches(poster: localBase, listener: remoteBase))
+		#expect(try postAddressMatches(poster: remoteBase, listener: localBase))
+	}
+
+	/// The poster's post address is its recv group's current exporter; the recv
+	/// group *is* the listener's send group, so that address must appear in the
+	/// listener's per-epoch listen set.
+	private func postAddressMatches(
+		poster: TwoMlsPqSession, listener: TwoMlsPqSession
+	) throws -> Bool {
+		guard let post = try poster.sendRendezvous() else { return false }
+		return try listener.shouldListenOn().rendezvousByEpoch
+			.contains { $0.rendezvousId.bytes == post.bytes }
 	}
 }

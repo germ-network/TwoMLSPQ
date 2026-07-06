@@ -224,8 +224,11 @@ extension AbstractTwoMLS {
 		) {
 			let channels = try base.shouldListenOn()
 			// CombinerGroupId carries both halves; the abstraction wants a single
-			// GroupID — use the PQ half, which is the primary send group.
-			let groupId = channels.sendGroup.pq.bytes
+			// GroupID. Use the classical half: it exists from group creation for
+			// both roles, whereas the acceptor's PQ half is empty until the A.4
+			// bootstrap — keying app listen-state off it would hand the app an
+			// empty id that then changes mid-session.
+			let groupId = channels.sendGroup.classical.bytes
 			let rendezvous = Dictionary(
 				channels.rendezvousByEpoch.map { ($0.epoch, $0.rendezvousId.bytes) },
 				uniquingKeysWith: { first, _ in first }

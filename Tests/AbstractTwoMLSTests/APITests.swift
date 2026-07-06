@@ -36,6 +36,16 @@ struct APIDemo {
 			encodedRemoteKpkg: remote.currentInvitation.encodedKeyPackage
 		)
 
+		//the session tells the transport where to listen: one address per epoch
+		//of our send group. Listening works from birth; there is nowhere to
+		//*post* until the peer's return welcome stands up our recv group
+		let (_, listenAtBirth) = try localSession.shouldListenOn()
+		guard try localSession.sendRendezvous == nil,
+			listenAtBirth.count == 1
+		else {
+			throw TestErrors.unexpected
+		}
+
 		//deliver the HPKE-sealed combined welcome to the invitation
 		//(the initiator cannot staple an app message before establishment)
 		let (remoteSession, _) = try remote.currentInvitation.receiveReply(
@@ -46,6 +56,20 @@ struct APIDemo {
 		//remote's first frame staples its return welcome; local joins in-band,
 		//completing establishment before any further exchange
 		try remoteSession.send(to: localSession)
+
+		//established both ways, routing is symmetric: my post address is my recv
+		//group's exporter — the same MLS group as the peer's send group — so each
+		//side's post address appears in the other side's listen set
+		let (localGroupId, localListen) = try localSession.shouldListenOn()
+		let (remoteGroupId, remoteListen) = try remoteSession.shouldListenOn()
+		guard !localGroupId.isEmpty, !remoteGroupId.isEmpty,
+			let localPost = try localSession.sendRendezvous,
+			let remotePost = try remoteSession.sendRendezvous,
+			remoteListen.values.contains(localPost),
+			localListen.values.contains(remotePost)
+		else {
+			throw TestErrors.unexpected
+		}
 
 		//localSesson and remoteSession should both be in a consistent state:
 		//local APQ send group, remote classical send group derived from
@@ -96,6 +120,16 @@ struct APIDemo {
 		}
 
 		try localSession.exchange(with: remoteSession)
+
+		//epochs advanced with the exchanges: the listen map grew (older epochs
+		//retained for in-flight traffic) and the post addresses stayed matched
+		let (_, localListenLater) = try localSession.shouldListenOn()
+		guard localListenLater.count > localListen.count,
+			let remotePostLater = try remoteSession.sendRendezvous,
+			localListenLater.values.contains(remotePostLater)
+		else {
+			throw TestErrors.unexpected
+		}
 	}
 }
 
