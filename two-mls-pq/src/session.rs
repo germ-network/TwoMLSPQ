@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use mls_rs::{group::ReceivedMessage, MlsMessage};
+use mls_rs::{group::ReceivedMessage, GroupStateStorage, MlsMessage};
 
 #[cfg(not(feature = "cryptokit"))]
 use apq::create_group_with_member;
@@ -56,8 +56,9 @@ struct SessionInner {
     /// Per-epoch listen addresses derived from the send group's classical half
     /// (`exportSecret("rendezvous", "TwoMLS", 32)` — the classical backend's convention).
     /// Exporters are only derivable at the current epoch, so each value is captured when
-    /// its epoch is live and retained: traffic posted at a prior epoch's address must
-    /// still land. Keyed by classical epoch.
+    /// its epoch is live: traffic posted at a prior epoch's address must still land.
+    /// Keyed by classical epoch; the window follows mls-rs's own epoch retention (see
+    /// `record_listen_rendezvous`) — current epoch + the prior epochs mls-rs retains.
     listen_rendezvous: BTreeMap<u64, Vec<u8>>,
 }
 
@@ -387,8 +388,13 @@ impl SessionInner {
     /// Idempotent per epoch. Called wherever that epoch can advance — group creation,
     /// the A.2/rotation commits in `prepare_to_encrypt`, the A.3 bind — and from
     /// `should_listen_on` as a backstop.
+    ///
+    /// The listen window follows mls-rs's own epoch retention rather than a second,
+    /// invented knob: on each new epoch the group is flushed (`write_to_storage`,
+    /// which applies mls-rs's `max_epoch_retention` trim) and addresses whose epoch
+    /// the injected group-state storage no longer retains are dropped with it.
     fn record_listen_rendezvous(&mut self) -> Result<()> {
-        let Some(send) = self.send_group.as_ref() else {
+        let Some(send) = self.send_group.as_mut() else {
             return Ok(());
         };
         let group = send.message_group();
@@ -401,6 +407,16 @@ impl SessionInner {
             .map_err(|_| TwoMlsPqError::Mls)?;
         self.listen_rendezvous
             .insert(epoch, secret.as_bytes().to_vec());
+
+        send.message_group_mut()
+            .write_to_storage()
+            .map_err(|_| TwoMlsPqError::Mls)?;
+        let group_id = send.message_group().group_id().to_vec();
+        // Read the storage handle we injected at client construction (clones share
+        // one map), not one pulled back off the session's group objects.
+        let storage = self.client.combiner().classical_group_storage();
+        self.listen_rendezvous
+            .retain(|&e, _| e == epoch || matches!(storage.epoch(&group_id, e), Ok(Some(_))));
         Ok(())
     }
 
@@ -1511,6 +1527,41 @@ mod tests {
             .rendezvous_by_epoch
             .iter()
             .any(|e| e.rendezvous_id.bytes == alice_post.bytes));
+    }
+
+    /// One approved A.2 round: `peer` staples an Upd(self); `committer` approves it and
+    /// its next send commits — advancing the committer's send-group classical epoch.
+    fn approved_commit_round(committer: &Arc<TwoMlsPqSession>, peer: &Arc<TwoMlsPqSession>) {
+        assert_ok!(peer.prepare_to_encrypt(None));
+        let upd = assert_ok!(peer.encrypt(b"upd".to_vec()));
+        let got = assert_some!(assert_ok!(committer.process_incoming(upd.cipher_text)));
+        let offered = assert_some!(got.proposal);
+        assert_ok!(committer.queue_proposal(offered.digest));
+        let prepared = assert_ok!(committer.prepare_to_encrypt(None));
+        assert!(prepared.did_commit);
+        let frame = assert_ok!(committer.encrypt(b"commit".to_vec()));
+        assert_some!(assert_ok!(peer.process_incoming(frame.cipher_text)));
+    }
+
+    #[test]
+    fn test_listen_window_follows_mls_rs_epoch_retention() {
+        let (alice, bob) = establish_sessions();
+        // Five committed rounds: alice's send group moves from epoch 1 to epoch 6.
+        for _ in 0..5 {
+            approved_commit_round(&alice, &bob);
+        }
+        let listen = assert_ok!(alice.should_listen_on());
+        let epochs: Vec<u64> = listen.rendezvous_by_epoch.iter().map(|e| e.epoch).collect();
+        // The window is NOT all six epochs — it follows the injected group-state
+        // storage's retention: current + mls-rs's retained prior epochs (mls-rs
+        // in-memory default max_epoch_retention = 3).
+        assert_eq!(epochs, vec![3, 4, 5, 6]);
+        // Bob's post address still lands inside the retained window.
+        let post = assert_some!(assert_ok!(bob.send_rendezvous()));
+        assert!(listen
+            .rendezvous_by_epoch
+            .iter()
+            .any(|e| e.rendezvous_id.bytes == post.bytes));
     }
 
     #[test]
