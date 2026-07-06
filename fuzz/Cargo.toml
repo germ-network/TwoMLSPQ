@@ -1,0 +1,27 @@
+[package]
+edition = "2021"
+name = "two-mls-pq-fuzz"
+publish = false
+version = "0.0.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Standalone workspace: cargo-fuzz builds this crate with sanitizer flags out-of-band, so it is
+# excluded from the parent workspace (see ../Cargo.toml `exclude`). Because it is its own workspace
+# root it does not inherit the parent's [patch.crates-io], so the mls-rs fork pin is mirrored below.
+[workspace]
+
+[dependencies]
+apq = { path = "../apq", default-features = false, features = ["rustcrypto"] }
+libfuzzer-sys = "0.4"
+
+[patch.crates-io]
+mls-rs = { git = "https://github.com/germ-network/mls-rs", rev = "76a4ce0ef4875cfca434807fd9c1329b211ee4b5" }
+
+[[bin]]
+bench = false
+doc = false
+name = "apq_welcome_decode"
+path = "fuzz_targets/apq_welcome_decode.rs"
+test = false
