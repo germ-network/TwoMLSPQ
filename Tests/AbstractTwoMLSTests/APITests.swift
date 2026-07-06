@@ -121,12 +121,30 @@ struct APIDemo {
 
 		try localSession.exchange(with: remoteSession)
 
-		//epochs advanced with the exchanges: the listen map grew (older epochs
-		//retained for in-flight traffic) and the post addresses stayed matched
+		//routing follows the ratchet: when the peer's stapled Upd(self) is
+		//approved (queueProposal) the next send commits it, advancing our send
+		//group's epoch and minting a new listen address; the peer's post address
+		//migrates onto it, and older epochs stay listed for in-flight traffic
+		_ = try remoteSession.prepareToEncrypt(proposing: nil)
+		let updFrame = try remoteSession.encrypt(appMessage: Data("upd".utf8))
+		guard
+			let updDecrypted = try localSession.processIncoming(
+				ciphertext: updFrame.cipherText),
+			let offered = updDecrypted.proposal
+		else {
+			throw TestErrors.unexpected
+		}
+		try localSession.queueProposal(digest: offered.digest)
+		_ = try localSession.prepareToEncrypt(proposing: nil)
+		let commitFrame = try localSession.encrypt(appMessage: Data("commit".utf8))
+		_ = try remoteSession.processIncoming(ciphertext: commitFrame.cipherText)
+
 		let (_, localListenLater) = try localSession.shouldListenOn()
-		guard localListenLater.count > localListen.count,
+		guard localListenLater.count == localListen.count + 1,
 			let remotePostLater = try remoteSession.sendRendezvous,
-			localListenLater.values.contains(remotePostLater)
+			remotePostLater != remotePost,
+			localListenLater.values.contains(remotePostLater),
+			localListenLater.values.contains(remotePost)
 		else {
 			throw TestErrors.unexpected
 		}

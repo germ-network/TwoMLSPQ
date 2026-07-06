@@ -1355,8 +1355,21 @@ public protocol TwoMlsPqSessionProtocol: AnyObject, Sendable {
     
     func receiveGroupId()  -> CombinerGroupId?
     
+    /**
+     * Where to post outbound frames: the recv group's classical-half exporter at its
+     * current epoch. The recv group *is* the peer's send group, so this value appears
+     * in the peer's `should_listen_on` set. `None` until the recv group exists (the
+     * initiator pre-return-welcome delivers via the invitation channel instead).
+     */
     func sendRendezvous() throws  -> RendezvousId?
     
+    /**
+     * The combiner group ids and per-epoch rendezvous addresses the transport should
+     * listen on. Addresses derive from the send group's classical half, one per
+     * classical epoch, retained across epochs so traffic posted at a prior epoch's
+     * address still lands. The peer derives its post address from its recv group —
+     * the same MLS group — so the values align by construction.
+     */
     func shouldListenOn() throws  -> ListenChannels
     
     /**
@@ -1748,6 +1761,12 @@ open func receiveGroupId() -> CombinerGroupId?  {
 })
 }
     
+    /**
+     * Where to post outbound frames: the recv group's classical-half exporter at its
+     * current epoch. The recv group *is* the peer's send group, so this value appears
+     * in the peer's `should_listen_on` set. `None` until the recv group exists (the
+     * initiator pre-return-welcome delivers via the invitation channel instead).
+     */
 open func sendRendezvous()throws  -> RendezvousId?  {
     return try  FfiConverterOptionTypeRendezvousId.lift(try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
     uniffi_two_mls_pq_fn_method_twomlspqsession_send_rendezvous(
@@ -1756,6 +1775,13 @@ open func sendRendezvous()throws  -> RendezvousId?  {
 })
 }
     
+    /**
+     * The combiner group ids and per-epoch rendezvous addresses the transport should
+     * listen on. Addresses derive from the send group's classical half, one per
+     * classical epoch, retained across epochs so traffic posted at a prior epoch's
+     * address still lands. The peer derives its post address from its recv group —
+     * the same MLS group — so the values align by construction.
+     */
 open func shouldListenOn()throws  -> ListenChannels  {
     return try  FfiConverterTypeListenChannels_lift(try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
     uniffi_two_mls_pq_fn_method_twomlspqsession_should_listen_on(
@@ -3676,10 +3702,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_receive_group_id() != 24855) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_send_rendezvous() != 16968) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_send_rendezvous() != 48394) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_should_listen_on() != 14163) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_should_listen_on() != 52215) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_stage_rotation() != 59017) {

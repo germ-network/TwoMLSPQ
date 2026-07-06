@@ -110,20 +110,41 @@ struct LifecycleTests {
 		// -- Step 4: classical exchanges proceed while the PQ bootstrap is pending.
 		try localSession.exchange(with: remoteSession)
 
-		// Routing: each A.2 send commits in the sender's send group, advancing its
-		// classical epoch; the listen map covers the new epoch and retains the old
-		// ones so in-flight traffic posted at a prior epoch's address still lands.
-		let localListenAfterExchange = try localBase.shouldListenOn()
+		// Routing: routine rounds don't commit (A.2 commits only when consuming an
+		// approved Upd), so no epochs moved and no new addresses were minted.
+		#expect(try localBase.shouldListenOn().rendezvousByEpoch.count == 1)
+		#expect(try remoteBase.shouldListenOn().rendezvousByEpoch.count == 1)
+
+		// -- Step 4b: a full A.2 round. Remote's stapled Upd(self) is approved and
+		// local's next send commits it: local's send group advances to classical
+		// epoch 2, minting a new listen address while retaining epoch 1's.
+		let remotePostBeforeCommit = try #require(try remoteBase.sendRendezvous())
+		_ = try remoteSession.prepareToEncrypt(proposing: nil)
+		let updFrame = try remoteSession.encrypt(appMessage: Data("upd".utf8))
+		let updDecrypted = try #require(
+			try localSession.processIncoming(ciphertext: updFrame.cipherText))
+		let offered = try #require(updDecrypted.proposal)
+		try localSession.queueProposal(digest: offered.digest)
+
+		let prepared = try #require(try localSession.prepareToEncrypt(proposing: nil))
+		#expect(prepared.didCommit)
+		let commitFrame = try localSession.encrypt(appMessage: Data("commit".utf8))
+		#expect(localBase.epochs().classicalEpoch == 2)
+		let localListenAfterCommit = try localBase.shouldListenOn()
+		#expect(localListenAfterCommit.rendezvousByEpoch.map(\.epoch).sorted() == [1, 2])
+
+		// Remote applies the commit: its post address migrates to the new epoch's
+		// channel — present in local's listen set — and the old address stays listed
+		// so in-flight traffic posted before the migration still lands.
+		_ = try remoteSession.processIncoming(ciphertext: commitFrame.cipherText)
+		let remotePostAfterCommit = try #require(try remoteBase.sendRendezvous())
+		#expect(remotePostAfterCommit.bytes != remotePostBeforeCommit.bytes)
 		#expect(
-			localListenAfterExchange.rendezvousByEpoch.count
-				> localListenAtBirth.rendezvousByEpoch.count)
+			localListenAfterCommit.rendezvousByEpoch
+				.first { $0.epoch == 2 }?.rendezvousId.bytes == remotePostAfterCommit.bytes)
 		#expect(
-			localListenAfterExchange.rendezvousByEpoch.map(\.epoch).max()
-				== localBase.epochs().classicalEpoch)
-		#expect(
-			localListenAfterExchange.rendezvousByEpoch.map(\.epoch).min()
-				== 1)
-		// Addresses stay matched in both directions as epochs move.
+			localListenAfterCommit.rendezvousByEpoch
+				.first { $0.epoch == 1 }?.rendezvousId.bytes == remotePostBeforeCommit.bytes)
 		#expect(try postAddressMatches(poster: localBase, listener: remoteBase))
 		#expect(try postAddressMatches(poster: remoteBase, listener: localBase))
 
