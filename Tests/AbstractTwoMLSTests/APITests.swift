@@ -310,6 +310,82 @@ struct RotationDemo {
 	}
 }
 
+//Increment C: forward routing. A transport re-delivery of the initial sealed frame
+//decodes as .forward to the already-spawned session instead of a fresh AppWelcome;
+//the owning session acknowledges the replay via forwarded(headerDecrypted:) — for the
+//PQ backend a replay never carries an undelivered payload (the initiator cannot
+//staple a private message pre-establishment), so the acknowledgment is nil.
+struct ForwardRoutingDemo {
+	let local: ClientWrapper<AbstractTwoMLS.PQClient>
+	let remote: ClientWrapper<AbstractTwoMLS.PQClient>
+
+	init() throws {
+		local = try .init()
+		remote = try .init()
+	}
+
+	@Test func replayedInitialFrameForwardsToSpawnedSession() async throws {
+		let (localSession, encryptedCombinedWelcome) = try local.client.reply(
+			remoteClientId: remote.clientId,
+			encodedRemoteKpkg: remote.currentInvitation.encodedKeyPackage
+		)
+
+		//before the welcome is accepted, the frame decodes as a fresh AppWelcome
+		guard
+			case .appWelcome = try remote.currentInvitation.decodeHeader(
+				ciphertext: encryptedCombinedWelcome)
+		else { throw TestErrors.unexpected }
+
+		let (remoteSession, _) = try remote.currentInvitation.receiveReply(
+			ciphertext: encryptedCombinedWelcome,
+			expecting: try local.clientId
+		)
+
+		//a transport re-delivery of the same frame now routes to the spawned
+		//session; the payload is the header-decrypted frame for `forwarded`
+		guard
+			case .forward(let groupId, let mlsMessageData) =
+				try remote.currentInvitation.decodeHeader(
+					ciphertext: encryptedCombinedWelcome)
+		else { throw TestErrors.unexpected }
+		guard groupId.identifier.count == 32, !mlsMessageData.isEmpty else {
+			throw TestErrors.unexpected
+		}
+
+		//the spawned session acknowledges the replay — nothing new inside
+		guard try remoteSession.forwarded(headerDecrypted: mlsMessageData) == nil else {
+			throw TestErrors.unexpected
+		}
+		//a mis-routed forward is refused (the initiator session has no spawn token)
+		guard (try? localSession.forwarded(headerDecrypted: mlsMessageData)) == nil else {
+			throw TestErrors.unexpected
+		}
+
+		//forwarding survives invitation archive/restore
+		let restored = try AbstractTwoMLS.PQInvitation(
+			archive: try remote.currentInvitation.archive
+		)
+		guard
+			case .forward = try restored.decodeHeader(
+				ciphertext: encryptedCombinedWelcome)
+		else { throw TestErrors.unexpected }
+
+		//a fresh frame from a different initiator still decodes as an AppWelcome
+		let third = try ClientWrapper<AbstractTwoMLS.PQClient>()
+		let (_, freshWelcome) = try third.client.reply(
+			remoteClientId: remote.clientId,
+			encodedRemoteKpkg: remote.currentInvitation.encodedKeyPackage
+		)
+		guard
+			case .appWelcome = try remote.currentInvitation.decodeHeader(
+				ciphertext: freshWelcome)
+		else { throw TestErrors.unexpected }
+
+		//and the spawned session still messages normally after the replay
+		try localSession.exchange(with: remoteSession)
+	}
+}
+
 struct MockAppWelcome: Codable, Sendable {
 	let mySendGroupWelcome: Data
 	let myKeyPackage: Data
