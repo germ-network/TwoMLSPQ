@@ -159,6 +159,27 @@ struct APIDemo {
 		else {
 			throw TestErrors.unexpected
 		}
+
+		//A.5 rekey: updatePath commits run on the PQ groups alone, so the
+		//classical ratchet is never blocked behind a large ML-KEM updatePath.
+		//remote holds the turn (local's bootstrap completion passed it)
+		guard remotePQ.turn == .weInitiate else { throw TestErrors.unexpected }
+		let rekey = try remotePQ.begin(.rekey, rotating: nil)
+		let rekeyIn1 = try localPQ.ingest(rekey.payload)
+		guard let rekeyReply = try localPQ.advance(after: rekeyIn1) else {
+			throw TestErrors.unexpected
+		}
+		let rekeyIn2 = try remotePQ.ingest(rekeyReply.payload)
+		guard let rekeyFinal = try remotePQ.advance(after: rekeyIn2) else {
+			throw TestErrors.unexpected
+		}
+		_ = try localPQ.ingest(rekeyFinal.payload)
+		guard localPQ.epochs.pqEpoch == 2, remotePQ.epochs.pqEpoch == 2 else {
+			throw TestErrors.unexpected
+		}
+
+		//and the session still messages both ways on the rekeyed groups
+		try localSession.exchange(with: remoteSession)
 	}
 }
 

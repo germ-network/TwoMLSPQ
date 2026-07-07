@@ -210,6 +210,60 @@ struct LifecycleTests {
 		// Routing: still matched after the post-bootstrap exchange rounds.
 		#expect(try postAddressMatches(poster: localBase, listener: remoteBase))
 		#expect(try postAddressMatches(poster: remoteBase, listener: localBase))
+
+		// -- Step 7: A.5 rekey — PQ-group updatePath commits, isolated from the
+		// classical ratchet. Remote holds the turn (local's A.4 completion passed it).
+		#expect(remoteSession.turn == .weInitiate)
+		let rekeyUpd = try remoteSession.begin(.rekey, rotating: nil)
+		#expect(rekeyUpd.kind == .rekey)
+		// Rekey Upd' proposal frame tag.
+		#expect(rekeyUpd.payload.first == 0x15)
+		// The proposal alone moves no epochs on the initiator's side.
+		#expect(remoteBase.epochs().pqEpoch == 1)
+
+		// Local responds: commits Upd'(remote) on its own send-PQ with an updatePath
+		// and the cross-injected PSK — pq epoch advances, classical is untouched,
+		// and no listen addresses are minted (PQ-only commits, like A.4).
+		let localClassicalBeforeRekey = localBase.epochs().classicalEpoch
+		let localListenBeforeRekey = try localBase.shouldListenOn().rendezvousByEpoch.count
+		let rekeyInbound1 = try localSession.ingest(rekeyUpd.payload)
+		#expect(rekeyInbound1.kind == .rekey)
+		#expect(localBase.epochs().pqEpoch == 2)
+		#expect(localBase.epochs().classicalEpoch == localClassicalBeforeRekey)
+		#expect(
+			try localBase.shouldListenOn().rendezvousByEpoch.count
+				== localListenBeforeRekey)
+
+		// Local's parked reply carries its Commit' plus the counter-Upd'(local).
+		let rekeyReply = try #require(try localSession.advance(after: rekeyInbound1))
+		#expect(rekeyReply.kind == .rekey)
+		// Rekey Commit' frame tag.
+		#expect(rekeyReply.payload.first == 0x17)
+		#expect(try localSession.advance(after: rekeyInbound1) == nil)
+
+		// Remote applies local's Commit' to its recv mirror and commits the
+		// counter-Upd' on its own send-PQ: its pq epoch advances too.
+		let rekeyInbound2 = try remoteSession.ingest(rekeyReply.payload)
+		#expect(rekeyInbound2.kind == .rekey)
+		#expect(remoteBase.epochs().pqEpoch == 2)
+		let rekeyFinal = try #require(try remoteSession.advance(after: rekeyInbound2))
+		#expect(rekeyFinal.payload.first == 0x17)
+
+		// Local applies the final Commit'; the operation completes and the turn
+		// passes back to local.
+		let rekeyInbound3 = try localSession.ingest(rekeyFinal.payload)
+		#expect(rekeyInbound3.kind == .rekey)
+		#expect(try localSession.advance(after: rekeyInbound3) == nil)
+		#expect(localSession.turn == .weInitiate)
+		#expect(remoteSession.turn == .theyInitiate)
+
+		// -- Step 8: exchanges still flow on the rekeyed groups, and the next
+		// send reports the bumped pq epoch.
+		try localSession.exchange(with: remoteSession)
+		_ = try remoteSession.prepareToEncrypt(proposing: nil)
+		let postRekeyFrame = try remoteSession.encrypt(appMessage: Data("post-rekey".utf8))
+		#expect(postRekeyFrame.epochs.pqEpoch == 2)
+		_ = try localSession.processIncoming(ciphertext: postRekeyFrame.cipherText)
 	}
 
 	/// The poster's post address is its recv group's current exporter; the recv
