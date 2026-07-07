@@ -219,6 +219,27 @@ impl<S: KeyPackageStorage + Clone> CombinerClient<S> {
         self.pq_signing_key.as_slice()
     }
 
+    /// The PQ half's signature keypair (secret from storage, public re-derived the same
+    /// way `from_key_packages` does). Used to hand a PQ group's leaf to this agent
+    /// during an A.5 rekey credential rotation.
+    #[cfg(feature = "cryptokit")]
+    pub fn pq_signature_keypair(
+        &self,
+    ) -> Result<(
+        mls_rs::crypto::SignatureSecretKey,
+        mls_rs::crypto::SignaturePublicKey,
+    )> {
+        let crypto = RustCryptoProvider::new();
+        let cs = crypto
+            .cipher_suite_provider(mls_rs::CipherSuite::CURVE25519_CHACHA)
+            .ok_or(CombinerError::Mls)?;
+        let sk = mls_rs::crypto::SignatureSecretKey::new(self.pq_signing_key.to_vec());
+        let pk = cs
+            .signature_key_derive_public(&sk)
+            .map_err(|_| CombinerError::Mls)?;
+        Ok((sk, pk))
+    }
+
     /// The injected classical group-state storage handle. Clones share one map with
     /// the storage inside the classical client, so probing `epoch(group_id, e)` here
     /// reflects exactly which prior epochs mls-rs still retains after its

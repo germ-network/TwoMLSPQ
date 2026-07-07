@@ -1,8 +1,12 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
+#[cfg(feature = "cryptokit")]
+use mls_rs::identity::SigningIdentity;
 use mls_rs::{
-    group::ReceivedMessage, storage_provider::in_memory::InMemoryGroupStateStorage,
+    group::ReceivedMessage,
+    psk::{ExternalPskId, PreSharedKey},
+    storage_provider::in_memory::{InMemoryGroupStateStorage, InMemoryPreSharedKeyStorage},
     GroupStateStorage, MlsMessage,
 };
 
@@ -10,8 +14,8 @@ use mls_rs::{
 use apq::create_group_with_member;
 use apq::{
     create_bound_classical_send_group, create_combiner_send_group, decode_apq_welcome,
-    encode_apq_welcome, export_and_register_psk, join_combiner_group, join_group_from_welcome,
-    sender_client_id, APQ_TAG,
+    encode_apq_welcome, export_psk, join_combiner_group, join_group_from_welcome, sender_client_id,
+    APQ_TAG,
 };
 
 use crate::key_package_store::CombinerGroup;
@@ -26,7 +30,7 @@ use crate::{
 };
 
 #[cfg(feature = "cryptokit")]
-use apq::{export_and_register_psk_pq, pq_create_group_with_member, pq_join_group_from_welcome};
+use apq::{export_psk_pq, pq_create_group_with_member, pq_join_group_from_welcome};
 #[cfg(feature = "cryptokit")]
 use zeroize::Zeroizing;
 
@@ -71,6 +75,14 @@ struct SessionInner {
     /// with — probing the new client's handle would prune every prior epoch's listen
     /// address right after rotation.
     send_group_storage: InMemoryGroupStateStorage,
+    /// Every PSK store backing one of this session's group configs: the constructing
+    /// client's stores, plus the stores of any later client that joins or stands up a
+    /// group half (the A.4 bootstrap and the return-welcome join run on the CURRENT
+    /// agent, which a Phase 8 rotation may have replaced since construction). External
+    /// PSKs are registered into ALL of these (`register_psk`): an mls-rs group resolves
+    /// PSKs from the store of the client that created it, so registering only through
+    /// `self.client` would strand every group created before the latest rotation.
+    psk_stores: Vec<InMemoryPreSharedKeyStorage>,
 }
 
 /// A TwoMLSPQ session holding two asymmetric Combiner send groups.
@@ -137,8 +149,10 @@ enum PqInflight {
     /// Responder holds the shared secret until it receives the stapled bind. `Zeroizing` wipes the
     /// secret from memory on drop, whether it is consumed by the bind or abandoned.
     Responding(Zeroizing<Vec<u8>>),
-    /// A.5 initiator awaiting the responder's Commit' (+ counter-Upd').
-    RekeyInitiated,
+    /// A.5 initiator awaiting the responder's Commit' (+ counter-Upd'). `rotating`
+    /// carries the credential-handoff ClientId from `pq_rekey_begin` so the final
+    /// commit also hands our own send-PQ leaf to the new agent's signing key.
+    RekeyInitiated { rotating: Option<ClientId> },
     /// A.5 responder awaiting the initiator's final Commit'.
     RekeyResponded,
 }
@@ -285,14 +299,13 @@ impl TwoMlsPqSession {
             _ => return Err(TwoMlsPqError::SessionNotReady),
         };
         let s = Zeroizing::new(apq::pq_ratchet::decapsulate(&eph, ct)?);
-        let client = inner.client.clone();
+        let stores = inner.psk_stores.clone();
         let send = inner
             .send_group
             .as_mut()
             .ok_or(TwoMlsPqError::SessionNotReady)?;
         let send_pq = send.pq.as_mut().ok_or(TwoMlsPqError::SessionNotReady)?;
-        let (pq_commit, apq_psk_id) =
-            apq::pq_ratchet::inject_and_commit(send_pq, &s, client.combiner())?;
+        let (pq_commit, apq_psk_id) = apq::pq_ratchet::inject_and_commit(send_pq, &s, &stores)?;
         let cl_out = send
             .classical
             .commit_builder()
@@ -331,13 +344,13 @@ impl TwoMlsPqSession {
             Some(PqInflight::Responding(s)) => s,
             _ => return Err(TwoMlsPqError::SessionNotReady),
         };
-        let client = inner.client.clone();
+        let stores = inner.psk_stores.clone();
         let recv = inner
             .recv_group
             .as_mut()
             .ok_or(TwoMlsPqError::SessionNotReady)?;
         let recv_pq = recv.pq.as_mut().ok_or(TwoMlsPqError::SessionNotReady)?;
-        apq::pq_ratchet::apply_injected_commit(recv_pq, &s, &pq_commit, client.combiner())?;
+        apq::pq_ratchet::apply_injected_commit(recv_pq, &s, &pq_commit, &stores)?;
         let cl = MlsMessage::from_bytes(&cl_commit).map_err(|_| TwoMlsPqError::Mls)?;
         recv.classical
             .process_incoming_message(cl)
@@ -360,7 +373,15 @@ impl TwoMlsPqSession {
     /// return the 0x15 frame. Requires both PQ halves live (post-A.4 only), the turn, and
     /// no other side-band operation in flight. Proposal only: no epochs move until the
     /// responder commits.
-    pub fn pq_rekey_begin(&self) -> Result<Vec<u8>> {
+    ///
+    /// `rotating` is the A.5 credential handoff: it must name the session's CURRENT
+    /// agent (a Phase 8 rotation has already swapped `self.client` to it), and the Upd'
+    /// then moves our leaf's signing key to that agent, announcing its ClientId in the
+    /// proposal's authenticated_data — the same announcement convention as the Phase 8
+    /// classical rotation commit. The leaf's credential BYTES stay what they were:
+    /// `BasicIdentityProvider` requires a stable identity across leaf updates, so agent
+    /// identity travels at the announcement level, not in the Basic Credential.
+    pub fn pq_rekey_begin(&self, rotating: Option<ClientId>) -> Result<Vec<u8>> {
         let mut inner = self.lock();
         if !inner.pq_turn_mine || inner.pending_pq_outbound.is_some() || inner.pq_inflight.is_some()
         {
@@ -374,17 +395,42 @@ impl TwoMlsPqSession {
         {
             return Err(TwoMlsPqError::SessionNotReady);
         }
+        let handoff = match &rotating {
+            Some(new_id) => {
+                if inner.client.client_id() != *new_id {
+                    return Err(TwoMlsPqError::SessionNotReady);
+                }
+                let (new_signer, new_public) = inner.client.combiner().pq_signature_keypair()?;
+                Some((new_signer, new_public, new_id.bytes.clone()))
+            }
+            None => None,
+        };
         let recv_pq = inner
             .recv_group
             .as_mut()
             .and_then(|g| g.pq.as_mut())
             .ok_or(TwoMlsPqError::SessionNotReady)?;
-        let proposal = recv_pq
-            .propose_update(Vec::new())
-            .map_err(|_| TwoMlsPqError::Mls)?;
+        let proposal = match handoff {
+            Some((new_signer, new_public, announced_id)) => {
+                let identity = SigningIdentity::new(
+                    recv_pq
+                        .current_member_signing_identity()
+                        .map_err(|_| TwoMlsPqError::Mls)?
+                        .credential
+                        .clone(),
+                    new_public,
+                );
+                recv_pq
+                    .propose_update_with_identity(new_signer, identity, announced_id)
+                    .map_err(|_| TwoMlsPqError::Mls)?
+            }
+            None => recv_pq
+                .propose_update(Vec::new())
+                .map_err(|_| TwoMlsPqError::Mls)?,
+        };
         let mut msg = vec![PQ_REKEY_UPD_TAG];
         msg.extend_from_slice(&proposal.to_bytes().map_err(|_| TwoMlsPqError::Mls)?);
-        inner.pq_inflight = Some(PqInflight::RekeyInitiated);
+        inner.pq_inflight = Some(PqInflight::RekeyInitiated { rotating });
         Ok(msg)
     }
 
@@ -392,7 +438,14 @@ impl TwoMlsPqSession {
     /// and a PSK exported from our recv-PQ mirror (the initiator derives the same PSK from
     /// its send-PQ), then park the `[Commit'][counter-Upd'(self)]` frame (0x17) for pickup
     /// via `pq_take_pending_outbound`.
-    pub fn pq_rekey_respond(&self, upd_msg: Vec<u8>) -> Result<()> {
+    ///
+    /// Returns the ClientId the initiator announced in the Upd's authenticated_data when
+    /// this rekey carries an A.5 credential handoff (see `pq_rekey_begin`), else `None`.
+    /// By the time this returns, the initiator's leaf in our send-PQ has already moved
+    /// to the new agent's signing key. The classical Phase 8 commit remains the
+    /// authoritative identity-rotation channel — this reports the PQ half catching up
+    /// and does not touch the session's agent state.
+    pub fn pq_rekey_respond(&self, upd_msg: Vec<u8>) -> Result<Option<ClientId>> {
         let (&tag, proposal_bytes) = upd_msg.split_first().ok_or(TwoMlsPqError::Mls)?;
         if tag != PQ_REKEY_UPD_TAG {
             return Err(TwoMlsPqError::Mls);
@@ -403,7 +456,6 @@ impl TwoMlsPqSession {
         if inner.pending_pq_outbound.is_some() || inner.pq_inflight.is_some() {
             return Err(TwoMlsPqError::SessionNotReady);
         }
-        let client = inner.client.clone();
         // Cross-PSK from our recv-PQ mirror (§A.5: "Export PSK from [ASG-PQ]") — the
         // initiator registers the same value from its own send-PQ at this epoch.
         let psk_id = {
@@ -412,8 +464,11 @@ impl TwoMlsPqSession {
                 .as_ref()
                 .and_then(|g| g.pq.as_ref())
                 .ok_or(TwoMlsPqError::SessionNotReady)?;
-            export_and_register_psk_pq(recv_pq, client.combiner())?
+            let (psk_id, psk) = export_psk_pq(recv_pq)?;
+            inner.register_psk(&psk_id, &psk);
+            psk_id
         };
+        let rotated;
         let commit_bytes = {
             let send_pq = inner
                 .send_group
@@ -424,7 +479,11 @@ impl TwoMlsPqSession {
                 .process_incoming_message(proposal_msg)
                 .map_err(|_| TwoMlsPqError::Mls)?
             {
-                ReceivedMessage::Proposal(_) => {}
+                ReceivedMessage::Proposal(desc) => {
+                    rotated = (!desc.authenticated_data.is_empty()).then(|| ClientId {
+                        bytes: desc.authenticated_data.clone(),
+                    });
+                }
                 _ => return Err(TwoMlsPqError::Mls),
             }
             let out = send_pq
@@ -455,7 +514,7 @@ impl TwoMlsPqSession {
         };
         inner.pq_inflight = Some(PqInflight::RekeyResponded);
         inner.pending_pq_outbound = Some(encode_pq_rekey_commit(commit_bytes, counter));
-        Ok(())
+        Ok(rotated)
     }
 
     /// Apply an A.5 rekey Commit' (0x17). As the initiator mid-operation (frame carries
@@ -470,7 +529,7 @@ impl TwoMlsPqSession {
         // Reject unsolicited commits before parsing or registering anything.
         if !matches!(
             inner.pq_inflight,
-            Some(PqInflight::RekeyInitiated) | Some(PqInflight::RekeyResponded)
+            Some(PqInflight::RekeyInitiated { .. }) | Some(PqInflight::RekeyResponded)
         ) {
             return Err(TwoMlsPqError::SessionNotReady);
         }
@@ -484,10 +543,11 @@ impl TwoMlsPqSession {
                 .as_ref()
                 .and_then(|g| g.pq.as_ref())
                 .ok_or(TwoMlsPqError::SessionNotReady)?;
-            export_and_register_psk_pq(send_pq, client.combiner())?;
+            let (psk_id, psk) = export_psk_pq(send_pq)?;
+            inner.register_psk(&psk_id, &psk);
         }
         match inner.pq_inflight.take() {
-            Some(PqInflight::RekeyInitiated) => {
+            Some(PqInflight::RekeyInitiated { rotating }) => {
                 if counter_bytes.is_empty() {
                     return Err(TwoMlsPqError::SessionNotReady);
                 }
@@ -495,7 +555,7 @@ impl TwoMlsPqSession {
                     MlsMessage::from_bytes(&counter_bytes).map_err(|_| TwoMlsPqError::Mls)?;
                 // Apply the responder's Commit' to our recv mirror, then export the
                 // cross-PSK from its NEW epoch (§A.5: "Export PSK from [BSG-PQ]").
-                let psk_id = {
+                let (psk_id, psk) = {
                     let recv_pq = inner
                         .recv_group
                         .as_mut()
@@ -508,9 +568,23 @@ impl TwoMlsPqSession {
                         ReceivedMessage::Commit(_) => {}
                         _ => return Err(TwoMlsPqError::Mls),
                     }
-                    export_and_register_psk_pq(&*recv_pq, client.combiner())?
+                    export_psk_pq(&*recv_pq)?
                 };
-                // Commit the counter-Upd' on our own send-PQ.
+                inner.register_psk(&psk_id, &psk);
+                // Commit the counter-Upd' on our own send-PQ. If this rekey carries a
+                // credential handoff, the commit's updatePath also moves OUR committer
+                // leaf to the new agent's signing key (the Upd' in `pq_rekey_begin`
+                // covered our leaf in the peer's send-PQ; this covers the other group).
+                let handoff = match &rotating {
+                    Some(new_id) => {
+                        // The session client must not have changed mid-operation.
+                        if client.client_id() != *new_id {
+                            return Err(TwoMlsPqError::SessionNotReady);
+                        }
+                        Some(client.combiner().pq_signature_keypair()?)
+                    }
+                    None => None,
+                };
                 let commit2 = {
                     let send_pq = inner
                         .send_group
@@ -524,12 +598,28 @@ impl TwoMlsPqSession {
                         ReceivedMessage::Proposal(_) => {}
                         _ => return Err(TwoMlsPqError::Mls),
                     }
-                    let out = send_pq
+                    let handoff = match handoff {
+                        Some((new_signer, new_public)) => {
+                            let identity = SigningIdentity::new(
+                                send_pq
+                                    .current_member_signing_identity()
+                                    .map_err(|_| TwoMlsPqError::Mls)?
+                                    .credential
+                                    .clone(),
+                                new_public,
+                            );
+                            Some((new_signer, identity))
+                        }
+                        None => None,
+                    };
+                    let mut builder = send_pq
                         .commit_builder()
                         .add_external_psk(psk_id)
-                        .map_err(|_| TwoMlsPqError::Mls)?
-                        .build()
                         .map_err(|_| TwoMlsPqError::Mls)?;
+                    if let Some((new_signer, identity)) = handoff {
+                        builder = builder.set_new_signing_identity(new_signer, identity);
+                    }
+                    let out = builder.build().map_err(|_| TwoMlsPqError::Mls)?;
                     send_pq
                         .apply_pending_commit()
                         .map_err(|_| TwoMlsPqError::Mls)?;
@@ -656,6 +746,22 @@ fn apq_epochs(group: &CombinerGroup) -> crate::ApqEpochs {
 }
 
 impl SessionInner {
+    /// Register an exported PSK into every store this session's groups resolve from.
+    fn register_psk(&self, psk_id: &ExternalPskId, psk: &PreSharedKey) {
+        for store in &self.psk_stores {
+            store.clone().insert(psk_id.clone(), psk.clone());
+        }
+    }
+
+    /// Track `client`'s PSK stores so future `register_psk` calls reach any group half
+    /// this client creates or joins for the session (A.4 bootstrap, return-welcome join).
+    fn track_psk_stores(&mut self, client: &TwoMlsPqClient) {
+        self.psk_stores
+            .push(client.combiner().classical().secret_store());
+        #[cfg(feature = "cryptokit")]
+        self.psk_stores.push(client.combiner().pq().secret_store());
+    }
+
     /// Capture the send group's classical-half rendezvous exporter at its current epoch.
     /// Idempotent per epoch. Called wherever that epoch can advance — group creation,
     /// the A.2/rotation commits in `prepare_to_encrypt`, the A.3 bind — and from
@@ -777,7 +883,6 @@ impl SessionInner {
     /// the commit consumes it and additionally refreshes the cross-party TwoMLS-PSK
     /// exported from the recv group (the peer derives the same PSK from its send group).
     fn prepare_ratchet_commit(&mut self) -> Result<crate::PrepareEncryptResult> {
-        let client = self.client.clone();
         let did_commit = self.queued_proposal.take().is_some();
 
         // Commit our send group only when consuming the peer's approved Upd (cached via
@@ -790,7 +895,9 @@ impl SessionInner {
                     .recv_group
                     .as_ref()
                     .ok_or(TwoMlsPqError::SessionNotReady)?;
-                export_and_register_psk(&recv.classical, client.combiner())?
+                let (psk_id, psk) = export_psk(&recv.classical)?;
+                self.register_psk(&psk_id, &psk);
+                psk_id
             };
             let commit_output = {
                 let send = self
@@ -868,6 +975,13 @@ fn build_session(
 ) -> Arc<TwoMlsPqSession> {
     let my_id = client.client_id();
     let send_group_storage = client.combiner().classical_group_storage().clone();
+    #[cfg(feature = "cryptokit")]
+    let psk_stores = vec![
+        client.combiner().classical().secret_store(),
+        client.combiner().pq().secret_store(),
+    ];
+    #[cfg(not(feature = "cryptokit"))]
+    let psk_stores = vec![client.combiner().classical().secret_store()];
     Arc::new(TwoMlsPqSession {
         inner: Mutex::new(SessionInner {
             client,
@@ -891,6 +1005,7 @@ fn build_session(
             pending_pq_outbound: None,
             listen_rendezvous: BTreeMap::new(),
             send_group_storage,
+            psk_stores,
         }),
     })
 }
@@ -1026,10 +1141,19 @@ impl TwoMlsPqSession {
     /// A.4 initiator — emit this side's PQ key package (tag 0x11) so the peer can stand
     /// up its deferred send-group PQ half. The key package's private material is retained
     /// in this client, so the returned welcome can be joined by `pq_bootstrap_apply`.
-    pub fn pq_bootstrap_begin(&self) -> Result<Vec<u8>> {
+    ///
+    /// `rotating` must name the session's CURRENT agent (like `pq_rekey_begin`); the KP'
+    /// below is generated by that client, so the new leaf carries its credential without
+    /// further work — the check is all a bootstrap-time handoff needs.
+    pub fn pq_bootstrap_begin(&self, rotating: Option<ClientId>) -> Result<Vec<u8>> {
         let inner = self.lock();
         if !inner.pq_turn_mine {
             return Err(TwoMlsPqError::SessionNotReady);
+        }
+        if let Some(new_id) = rotating {
+            if inner.client.client_id() != new_id {
+                return Err(TwoMlsPqError::SessionNotReady);
+            }
         }
         let ready = inner.send_group.is_some()
             && inner
@@ -1062,6 +1186,9 @@ impl TwoMlsPqSession {
             return Err(TwoMlsPqError::SessionNotReady);
         }
         let client = inner.client.clone();
+        // The new PQ half resolves PSKs from the CURRENT client's stores (A.4 runs on
+        // the agent a Phase 8 rotation may have installed) — track them.
+        inner.track_psk_stores(&client);
         let frame = {
             let send = inner
                 .send_group
@@ -1092,6 +1219,8 @@ impl TwoMlsPqSession {
         let pq_welcome = decode_bootstrap_bind(&bind_msg)?;
         let mut inner = self.lock();
         let client = inner.client.clone();
+        // The joined PQ half resolves PSKs from the CURRENT client's stores — track them.
+        inner.track_psk_stores(&client);
         {
             let recv = inner
                 .recv_group
@@ -1259,10 +1388,14 @@ impl TwoMlsPqSession {
         if ciphertext.first() == Some(&APQ_TAG) {
             let mut inner = self.lock();
             let client = inner.client.clone();
+            // The joins below resolve PSKs from the CURRENT client's stores (a Phase 8
+            // rotation may have replaced the constructing client) — track them first.
+            inner.track_psk_stores(&client);
 
             // Re-derive the cross-party TwoMLS-PSK from our own send group (Group_A classical).
             if let Some(sg) = &inner.send_group {
-                export_and_register_psk(&sg.classical, client.combiner())?;
+                let (psk_id, psk) = export_psk(&sg.classical)?;
+                inner.register_psk(&psk_id, &psk);
             }
 
             let (classical_welcome, pq_welcome) = decode_apq_welcome(&ciphertext)?;
@@ -1282,9 +1415,10 @@ impl TwoMlsPqSession {
             #[cfg(not(feature = "cryptokit"))]
             let pq = join_group_from_welcome(client.classical(), &pq_welcome)?;
             #[cfg(feature = "cryptokit")]
-            export_and_register_psk_pq(&pq, client.combiner())?;
+            let (psk_id, psk) = export_psk_pq(&pq)?;
             #[cfg(not(feature = "cryptokit"))]
-            export_and_register_psk(&pq, client.combiner())?;
+            let (psk_id, psk) = export_psk(&pq)?;
+            inner.register_psk(&psk_id, &psk);
             // Join the classical group (bound with the cross-party + APQ PSKs).
             let classical = join_group_from_welcome(client.classical(), &classical_welcome)?;
 
@@ -1305,12 +1439,12 @@ impl TwoMlsPqSession {
                 MlsMessage::from_bytes(&app_bytes).map_err(|_| TwoMlsPqError::DecryptionFailed)?;
 
             let mut inner = self.lock();
-            let client = inner.client.clone();
 
             // The sender's commit may bind the cross-party TwoMLS-PSK, which we derive
             // from our own send group at its current epoch.
             if let Some(sg) = &inner.send_group {
-                export_and_register_psk(&sg.classical, client.combiner())?;
+                let (psk_id, psk) = export_psk(&sg.classical)?;
+                inner.register_psk(&psk_id, &psk);
             }
 
             let (app_data, sender_id, epoch, group_id) = {
@@ -1663,7 +1797,7 @@ mod tests {
         assert!(alice.my_pq_turn());
         assert!(!bob.my_pq_turn());
 
-        let kp_msg = assert_ok!(alice.pq_bootstrap_begin());
+        let kp_msg = assert_ok!(alice.pq_bootstrap_begin(None));
         assert_ok!(bob.pq_bootstrap_respond(kp_msg));
         let bind = assert_some!(bob.pq_take_pending_outbound());
         assert_ok!(alice.pq_bootstrap_apply(bind));
@@ -1697,7 +1831,7 @@ mod tests {
         let (_alice, bob) = establish_sessions();
         // The acceptor does not hold the turn and cannot begin the bootstrap.
         assert_err!(
-            bob.pq_bootstrap_begin(),
+            bob.pq_bootstrap_begin(None),
             crate::TwoMlsPqError::SessionNotReady
         );
     }
@@ -1989,9 +2123,10 @@ mod tests {
     /// responder applies the final commit (turn flipped to the responder).
     #[cfg(feature = "cryptokit")]
     fn rekey_round(initiator: &Arc<TwoMlsPqSession>, responder: &Arc<TwoMlsPqSession>) {
-        let upd = assert_ok!(initiator.pq_rekey_begin());
+        let upd = assert_ok!(initiator.pq_rekey_begin(None));
         assert_eq!(upd.first(), Some(&super::PQ_REKEY_UPD_TAG));
-        assert_ok!(responder.pq_rekey_respond(upd));
+        // A rotation-less rekey announces no credential.
+        assert!(assert_ok!(responder.pq_rekey_respond(upd)).is_none());
         let reply = assert_some!(responder.pq_take_pending_outbound());
         assert!(assert_ok!(initiator.pq_rekey_apply(reply)));
         let fin = assert_some!(initiator.pq_take_pending_outbound());
@@ -2065,7 +2200,7 @@ mod tests {
         // Pre-A.4 the acceptor's send-PQ (and the initiator's recv mirror) is missing.
         let (alice, _bob) = establish_sessions();
         assert!(alice.my_pq_turn());
-        assert_err!(alice.pq_rekey_begin(), TwoMlsPqError::SessionNotReady);
+        assert_err!(alice.pq_rekey_begin(None), TwoMlsPqError::SessionNotReady);
     }
 
     #[test]
@@ -2073,13 +2208,179 @@ mod tests {
     fn test_pq_rekey_requires_turn_and_rejects_unsolicited() {
         let (alice, bob) = establish_full();
         // Alice's bootstrap completion passed the turn to Bob.
-        assert_err!(alice.pq_rekey_begin(), TwoMlsPqError::SessionNotReady);
+        assert_err!(alice.pq_rekey_begin(None), TwoMlsPqError::SessionNotReady);
         // An unsolicited final commit (no rekey in flight) is rejected.
         let bogus = super::encode_pq_rekey_commit(vec![0u8; 8], Vec::new());
         assert_err!(bob.pq_rekey_apply(bogus), TwoMlsPqError::SessionNotReady);
         // A second begin while one is in flight is rejected (single slot).
-        let _upd = assert_ok!(bob.pq_rekey_begin());
-        assert_err!(bob.pq_rekey_begin(), TwoMlsPqError::SessionNotReady);
+        let _upd = assert_ok!(bob.pq_rekey_begin(None));
+        assert_err!(bob.pq_rekey_begin(None), TwoMlsPqError::SessionNotReady);
+    }
+
+    /// The session's own leaf signature public keys in (send-PQ, recv-PQ) — the two
+    /// leaves an A.5 credential handoff must move to the new agent.
+    #[cfg(feature = "cryptokit")]
+    fn own_pq_leaf_signature_keys(session: &Arc<TwoMlsPqSession>) -> (Vec<u8>, Vec<u8>) {
+        let inner = session.lock();
+        let send = inner
+            .send_group
+            .as_ref()
+            .and_then(|g| g.pq.as_ref())
+            .expect("send-PQ live")
+            .current_member_signing_identity()
+            .expect("send-PQ leaf")
+            .signature_key
+            .as_bytes()
+            .to_vec();
+        let recv = inner
+            .recv_group
+            .as_ref()
+            .and_then(|g| g.pq.as_ref())
+            .expect("recv-PQ live")
+            .current_member_signing_identity()
+            .expect("recv-PQ leaf")
+            .signature_key
+            .as_bytes()
+            .to_vec();
+        (send, recv)
+    }
+
+    #[test]
+    #[cfg(feature = "cryptokit")]
+    fn test_pq_rekey_rotation_hands_pq_leaves_to_new_agent() {
+        let (alice, bob) = establish_full();
+
+        // Phase 8 first: the classical rotation swaps the session client to the new
+        // agent and announces the ClientId to the peer.
+        let new_bob = make_client();
+        let new_bob_id = new_bob.client_id();
+        assert_ok!(bob.stage_rotation(Arc::clone(&new_bob)));
+        assert!(assert_ok!(bob.prepare_to_encrypt(Some(new_bob_id.clone()))).did_commit);
+        let enc = assert_ok!(bob.encrypt(b"rotate".to_vec()));
+        assert_some!(assert_ok!(alice.process_incoming(enc.cipher_text)));
+
+        // The PQ leaves still sign as the old agent until the A.5 handoff.
+        let (_, new_public) = assert_ok!(new_bob.combiner().pq_signature_keypair());
+        let new_key = new_public.as_bytes().to_vec();
+        let before = own_pq_leaf_signature_keys(&bob);
+        assert_ne!(before.0, new_key);
+        assert_ne!(before.1, new_key);
+
+        // A.5 with the credential handoff; the responder learns the announced id.
+        let upd = assert_ok!(bob.pq_rekey_begin(Some(new_bob_id.clone())));
+        assert_eq!(
+            assert_some!(assert_ok!(alice.pq_rekey_respond(upd))),
+            new_bob_id
+        );
+        let reply = assert_some!(alice.pq_take_pending_outbound());
+        assert!(assert_ok!(bob.pq_rekey_apply(reply)));
+        let fin = assert_some!(bob.pq_take_pending_outbound());
+        assert!(!assert_ok!(alice.pq_rekey_apply(fin)));
+
+        // Both of Bob's PQ leaves now sign with the new agent's key.
+        let after = own_pq_leaf_signature_keys(&bob);
+        assert_eq!(after.0, new_key);
+        assert_eq!(after.1, new_key);
+
+        // The rekeyed, rotated groups keep working: messaging flows and the next
+        // rekey round (Alice's turn) proceeds — the new signer owns the leaves.
+        assert_ok!(bob.prepare_to_encrypt(None));
+        let msg = assert_ok!(bob.encrypt(b"post-handoff".to_vec()));
+        let got = assert_ok!(alice.process_incoming(msg.cipher_text));
+        assert_eq!(
+            assert_some!(assert_some!(got).application_message).app_message_data,
+            b"post-handoff".to_vec()
+        );
+        rekey_round(&alice, &bob);
+    }
+
+    /// Phase 8 swaps the session client, but the existing groups keep resolving
+    /// external PSKs from the stores of the clients that created them. Every
+    /// PSK-carrying flow must still work after a rotation — this pins the
+    /// psk_stores registry (a plain rekey, an A.3 ratchet, and a full classical
+    /// commit round, all post-rotation, no credential handoff involved).
+    #[test]
+    #[cfg(feature = "cryptokit")]
+    fn test_psk_flows_survive_rotation_without_handoff() {
+        let (alice, bob) = establish_full();
+
+        let new_bob = make_client();
+        assert_ok!(bob.stage_rotation(Arc::clone(&new_bob)));
+        assert_ok!(bob.prepare_to_encrypt(Some(new_bob.client_id())));
+        let enc = assert_ok!(bob.encrypt(b"rotate".to_vec()));
+        assert_some!(assert_ok!(alice.process_incoming(enc.cipher_text)));
+
+        // A.5 plain rekey, initiated by the rotated side (Bob holds the turn).
+        rekey_round(&bob, &alice);
+
+        // A.3 ratchet with the rotated side responding (Alice's turn now).
+        let ek = assert_ok!(alice.pq_ratchet_begin());
+        assert_ok!(bob.pq_ratchet_respond(ek));
+        let ct = assert_some!(bob.pq_take_pending_outbound());
+        assert_ok!(alice.pq_ratchet_bind(ct, b"post-rotation-ratchet".to_vec()));
+        let bind = assert_some!(alice.pq_take_pending_outbound());
+        assert_eq!(
+            assert_ok!(bob.pq_ratchet_apply(bind)),
+            b"post-rotation-ratchet"
+        );
+
+        // Full classical commit round from the rotated side: Alice staples an Upd
+        // that Bob approves and commits with a cross-party PSK refresh.
+        assert_ok!(alice.prepare_to_encrypt(None));
+        let a2b = assert_ok!(alice.encrypt(b"staple".to_vec()));
+        let got = assert_some!(assert_ok!(bob.process_incoming(a2b.cipher_text)));
+        let offered = assert_some!(got.proposal);
+        assert_ok!(bob.queue_proposal(offered.digest));
+        assert!(assert_ok!(bob.prepare_to_encrypt(None)).did_commit);
+        let b2a = assert_ok!(bob.encrypt(b"full-commit".to_vec()));
+        assert_eq!(
+            assert_some!(
+                assert_some!(assert_ok!(alice.process_incoming(b2a.cipher_text)))
+                    .application_message
+            )
+            .app_message_data,
+            b"full-commit"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "cryptokit")]
+    fn test_pq_rekey_begin_rotating_requires_current_agent() {
+        let (_alice, bob) = establish_full();
+        // Bob holds the turn, but no Phase 8 rotation has run: a handoff to an
+        // arbitrary agent is refused, and the slot stays free for a plain rekey.
+        let stranger = make_client();
+        assert_err!(
+            bob.pq_rekey_begin(Some(stranger.client_id())),
+            TwoMlsPqError::SessionNotReady
+        );
+        assert_ok!(bob.pq_rekey_begin(None));
+    }
+
+    #[test]
+    #[cfg(feature = "cryptokit")]
+    fn test_pq_bootstrap_begin_rotating_requires_current_agent() {
+        let (alice, bob) = establish_sessions();
+        let stranger = make_client();
+        assert_err!(
+            alice.pq_bootstrap_begin(Some(stranger.client_id())),
+            TwoMlsPqError::SessionNotReady
+        );
+
+        // After a Phase 8 rotation the bootstrap accepts the handoff id, and the
+        // KP' it emits — generated by the new agent — completes A.4 as usual.
+        let new_alice = make_client();
+        let new_alice_id = new_alice.client_id();
+        assert_ok!(alice.stage_rotation(Arc::clone(&new_alice)));
+        assert_ok!(alice.prepare_to_encrypt(Some(new_alice_id.clone())));
+        let enc = assert_ok!(alice.encrypt(b"rotate".to_vec()));
+        assert_some!(assert_ok!(bob.process_incoming(enc.cipher_text)));
+
+        let kp = assert_ok!(alice.pq_bootstrap_begin(Some(new_alice_id)));
+        assert_ok!(bob.pq_bootstrap_respond(kp));
+        let bind = assert_some!(bob.pq_take_pending_outbound());
+        assert_ok!(alice.pq_bootstrap_apply(bind));
+        assert!(bob.my_pq_turn());
     }
 
     #[test]
@@ -2089,7 +2390,7 @@ mod tests {
         let bob_before = assert_ok!(bob.should_listen_on());
         assert!(bob_before.send_group.pq.bytes.is_empty());
 
-        let kp = assert_ok!(alice.pq_bootstrap_begin());
+        let kp = assert_ok!(alice.pq_bootstrap_begin(None));
         assert_ok!(bob.pq_bootstrap_respond(kp));
         let bind = assert_some!(bob.pq_take_pending_outbound());
         assert_ok!(alice.pq_bootstrap_apply(bind));
@@ -2123,7 +2424,7 @@ mod tests {
     #[cfg(feature = "cryptokit")]
     fn establish_full() -> (Arc<TwoMlsPqSession>, Arc<TwoMlsPqSession>) {
         let (alice, bob) = establish_sessions();
-        let kp = assert_ok!(alice.pq_bootstrap_begin());
+        let kp = assert_ok!(alice.pq_bootstrap_begin(None));
         assert_ok!(bob.pq_bootstrap_respond(kp));
         let bind = assert_some!(bob.pq_take_pending_outbound());
         assert_ok!(alice.pq_bootstrap_apply(bind));
