@@ -121,6 +121,10 @@ struct LifecycleTests {
 		let remotePostBeforeCommit = try #require(try remoteBase.sendRendezvous())
 		_ = try remoteSession.prepareToEncrypt(proposing: nil)
 		let updFrame = try remoteSession.encrypt(appMessage: Data("upd".utf8))
+
+		// The encrypt result reports the true APQ pair, not a duplicated single
+		// epoch: remote's send group is classical-only pre-A.4, so pqEpoch is 0.
+		#expect(updFrame.epochs == AbstractTwoMLS.APQEpochs(pqEpoch: 0, classicalEpoch: 1))
 		let updDecrypted = try #require(
 			try localSession.processIncoming(ciphertext: updFrame.cipherText))
 		let offered = try #require(updDecrypted.proposal)
@@ -130,6 +134,14 @@ struct LifecycleTests {
 		#expect(prepared.didCommit)
 		let commitFrame = try localSession.encrypt(appMessage: Data("commit".utf8))
 		#expect(localBase.epochs().classicalEpoch == 2)
+
+		// The initiator's send group is a full APQ pair from birth: pq stays 1
+		// while the commit advanced classical to 2 — and the encrypt result
+		// matches the session's own epoch view at send time.
+		#expect(commitFrame.epochs == AbstractTwoMLS.APQEpochs(pqEpoch: 1, classicalEpoch: 2))
+		#expect(commitFrame.epochs.pqEpoch == localBase.epochs().pqEpoch)
+		#expect(commitFrame.epochs.classicalEpoch == localBase.epochs().classicalEpoch)
+
 		let localListenAfterCommit = try localBase.shouldListenOn()
 		#expect(localListenAfterCommit.rendezvousByEpoch.map(\.epoch).sorted() == [1, 2])
 

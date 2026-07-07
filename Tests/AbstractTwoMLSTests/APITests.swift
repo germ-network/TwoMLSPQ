@@ -148,6 +148,17 @@ struct APIDemo {
 		else {
 			throw TestErrors.unexpected
 		}
+
+		//the encrypt result reports the APQ epoch pair (pq side-band / classical
+		//message group) — the initiator's full pair after its commit — and the
+		//commit's classical epoch keys the listen address the commit minted
+		guard
+			commitFrame.epochs
+				== AbstractTwoMLS.APQEpochs(pqEpoch: 1, classicalEpoch: 2),
+			localListenLater[commitFrame.epochs.classicalEpoch] == remotePostLater
+		else {
+			throw TestErrors.unexpected
+		}
 	}
 }
 
