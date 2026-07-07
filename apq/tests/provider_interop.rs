@@ -6,11 +6,12 @@
 //!      portable provider CI uses on Linux.
 //!   2. The same provider covers the classical half (CURVE25519_CHACHA), so one provider
 //!      selection serves both halves.
-//!   3. (Apple targets) CryptoKit and awslc agree on the ML-KEM-768 wire: raw KEM
-//!      encap/decap crosses providers, a group with one member on each provider works,
-//!      the archive blob format survives the provider swap, and the HPKE envelope (the
-//!      A.1 initial routing header, sealed to the PQ key package's init key) opens
-//!      across providers in both directions.
+//!   3. (Apple targets) CryptoKit and awslc agree on the whole wire: raw KEM
+//!      encap/decap, mixed-provider MLS groups, archive blobs, the HPKE envelope (the
+//!      A.1 initial routing header), full APQ combiner sessions instantiated once per
+//!      provider from the generic `CombinerClient` — establishment, APQ-PSK bind, app
+//!      messaging — and an A.3 PQ ratchet round, all crossing providers in both
+//!      directions with no multi-process harness.
 
 // Test-only crate: helper fns aren't `#[test]` items, so the workspace's unwrap/panic
 // denies would fire despite clippy.toml's allow-unwrap-in-tests.
@@ -113,6 +114,10 @@ fn awslc_classical_group_end_to_end() {
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 mod cryptokit_interop {
     use super::*;
+    use apq::{
+        create_combiner_send_group, join_combiner_group, pq_ratchet, CombinerClient, CryptoConfig,
+    };
+    use mls_rs::storage_provider::in_memory::InMemoryKeyPackageStorage;
     use mls_rs_crypto_awslc::MlKemKem;
     use mls_rs_crypto_cryptokit::ml_kem::MlKem768Kem;
     use mls_rs_crypto_cryptokit::{CryptoKitMlKemProvider, CryptoKitProvider};
@@ -120,6 +125,31 @@ mod cryptokit_interop {
 
     fn awslc_kem() -> MlKemKem {
         MlKemKem::new(ML_KEM_768).unwrap()
+    }
+
+    // Because `CombinerClient` is generic over its providers, ONE binary instantiates
+    // both provider stacks and runs full combiner sessions between them — no
+    // multi-process harness. This is the same generic client `two-mls-pq` pins to a
+    // single provider per build.
+    type AwsCombiner =
+        CombinerClient<InMemoryKeyPackageStorage, AwsLcCryptoProvider, AwsLcCryptoProvider>;
+    type CkCombiner =
+        CombinerClient<InMemoryKeyPackageStorage, CryptoKitProvider, CryptoKitMlKemProvider>;
+
+    fn aws_combiner(id: &[u8]) -> AwsCombiner {
+        CombinerClient::new(id.to_vec(), CryptoConfig::default()).unwrap()
+    }
+
+    fn ck_combiner(id: &[u8]) -> CkCombiner {
+        CombinerClient::new(
+            id.to_vec(),
+            CryptoConfig {
+                classical: CryptoKitProvider::default(),
+                pq: CryptoKitMlKemProvider,
+                mode: Default::default(),
+            },
+        )
+        .unwrap()
     }
 
     /// Raw ML-KEM-768 encap/decap crosses providers in both directions, i.e.
@@ -149,6 +179,100 @@ mod cryptokit_interop {
         let cryptokit = build_client(CryptoKitMlKemProvider, ML_KEM_768, b"cryptokit");
         group_round_trip(&awslc, &cryptokit);
         group_round_trip(&cryptokit, &awslc);
+    }
+
+    /// A full APQ combiner session across providers, initiated from each side: the
+    /// two-welcome establishment, the APQ-PSK bind (whose exporter-derived PSK must
+    /// agree bit-for-bit across providers or the classical join fails), and app
+    /// messaging both ways.
+    #[test]
+    fn combiner_establishment_crosses_providers() {
+        // awslc initiates to a CryptoKit acceptor…
+        let alice = aws_combiner(b"alice-awslc");
+        let bob = ck_combiner(b"bob-cryptokit");
+        let (mut a_send, welcome) = create_combiner_send_group(
+            &bob.generate_classical_key_package().unwrap(),
+            &bob.generate_pq_key_package().unwrap(),
+            &alice,
+        )
+        .unwrap();
+        let mut b_recv = join_combiner_group(&welcome, &bob).unwrap();
+        send_and_check(&mut a_send.classical, &mut b_recv.classical, b"aws->ck");
+        send_and_check(&mut b_recv.classical, &mut a_send.classical, b"ck->aws");
+
+        // …and CryptoKit initiates to an awslc acceptor.
+        let carol = ck_combiner(b"carol-cryptokit");
+        let dave = aws_combiner(b"dave-awslc");
+        let (mut c_send, welcome) = create_combiner_send_group(
+            &dave.generate_classical_key_package().unwrap(),
+            &dave.generate_pq_key_package().unwrap(),
+            &carol,
+        )
+        .unwrap();
+        let mut d_recv = join_combiner_group(&welcome, &dave).unwrap();
+        send_and_check(&mut c_send.classical, &mut d_recv.classical, b"ck->aws");
+        send_and_check(&mut d_recv.classical, &mut c_send.classical, b"aws->ck");
+    }
+
+    /// A full A.3 PQ ratchet round on a cross-provider session: each side runs its own
+    /// provider's ML-KEM for the EK/ct exchange, then the pathless PQ commit and the
+    /// classical apq-PSK bind cross providers. Messaging must still flow in the
+    /// PQ-refreshed epoch.
+    #[test]
+    fn pq_ratchet_crosses_providers() {
+        let alice = aws_combiner(b"alice-awslc");
+        let bob = ck_combiner(b"bob-cryptokit");
+        let (mut a_send, welcome) = create_combiner_send_group(
+            &bob.generate_classical_key_package().unwrap(),
+            &bob.generate_pq_key_package().unwrap(),
+            &alice,
+        )
+        .unwrap();
+        let mut b_recv = join_combiner_group(&welcome, &bob).unwrap();
+
+        // EK/ct exchange, each side on its own provider's KEM.
+        let eph = pq_ratchet::generate_ephemeral(&awslc_kem()).unwrap();
+        let (s_bob, ct) =
+            pq_ratchet::encapsulate(&MlKem768Kem::new(), &eph.encapsulation_key()).unwrap();
+        let s_alice = pq_ratchet::decapsulate(&awslc_kem(), &eph, &ct).unwrap();
+        assert_eq!(s_alice, s_bob);
+
+        // Alice (awslc) binds: pathless PQ commit + classical apq-PSK commit.
+        let a_stores = [alice.pq().secret_store(), alice.classical().secret_store()];
+        let (pq_commit, apq_psk_id) =
+            pq_ratchet::inject_and_commit(a_send.pq.as_mut().unwrap(), &s_alice, &a_stores)
+                .unwrap();
+        let cl_out = a_send
+            .classical
+            .commit_builder()
+            .add_external_psk(apq_psk_id)
+            .unwrap()
+            .build()
+            .unwrap();
+        a_send.classical.apply_pending_commit().unwrap();
+
+        // Bob (CryptoKit) applies both commits.
+        let b_stores = [bob.pq().secret_store(), bob.classical().secret_store()];
+        pq_ratchet::apply_injected_commit(
+            b_recv.pq.as_mut().unwrap(),
+            &s_bob,
+            &pq_commit,
+            &b_stores,
+        )
+        .unwrap();
+        let cl = MlsMessage::from_bytes(&cl_out.commit_message.to_bytes().unwrap()).unwrap();
+        b_recv.classical.process_incoming_message(cl).unwrap();
+
+        send_and_check(
+            &mut a_send.classical,
+            &mut b_recv.classical,
+            b"post-ratchet",
+        );
+        send_and_check(
+            &mut b_recv.classical,
+            &mut a_send.classical,
+            b"post-ratchet-2",
+        );
     }
 
     /// The HPKE envelope crosses providers in both directions — the mixed-deployment

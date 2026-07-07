@@ -214,12 +214,20 @@ jobs:
       - name: Test (cryptokit)
         run: cargo test -p two-mls-pq --features cryptokit
 
+      # Both provider flags in one build: providers.rs resolves the dual-feature build to
+      # CryptoKit (the precedence a dev's --all-features hits), and the tests must still
+      # pass under it — not merely compile.
+      - name: Test (dual-provider build, cryptokit precedence)
+        run: cargo test -p two-mls-pq --features cryptokit,awslc
+
       - name: Test (apq)
         run: cargo test -p apq --lib
 
       # CryptoKit ↔ awslc interop as its own gate: raw ML-KEM encap/decap, mixed-provider
-      # MLS groups, archive blobs, and the HPKE envelope, each crossing providers in both
-      # directions. This is what keeps a Linux/awslc peer wire-compatible with an
-      # Apple/CryptoKit peer.
+      # MLS groups, archive blobs, the HPKE envelope, and — since the generic
+      # CombinerClient lets one binary instantiate both provider stacks, no harness —
+      # full cross-provider combiner sessions (establishment, APQ-PSK bind, messaging)
+      # plus an A.3 PQ ratchet round, all in both directions. This is what keeps a
+      # Linux/awslc peer wire-compatible with an Apple/CryptoKit peer.
       - name: Cross-provider interop (cryptokit <-> awslc)
         run: cargo test -p apq --test provider_interop
