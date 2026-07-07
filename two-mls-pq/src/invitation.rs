@@ -7,13 +7,14 @@
 use std::collections::BTreeSet;
 
 use mls_rs::mls_rs_codec::{MlsDecode, MlsEncode};
-use mls_rs::storage_provider::KeyPackageData;
 use zeroize::Zeroizing;
 
 use crate::key_package_store::{CombinerClient, KeyPackageSecret, SyntheticKeyPackageStore};
 use crate::{Result, TwoMlsPqError};
 
-const INVITATION_VERSION: u8 = 1;
+// v2: field framing moved from bespoke u32-LE length prefixes to `mls_rs_codec`; v1 archives
+// are rejected as `ArchiveInvalid`.
+const INVITATION_VERSION: u8 = 2;
 
 // Tags whether the PQ half is real ML-KEM (`cryptokit`) or a classical simulation (default
 // build). Baked into the archive so a mismatched build fails loudly at decode rather than
@@ -23,85 +24,97 @@ const PQ_MODE: u8 = 1;
 #[cfg(not(feature = "cryptokit"))]
 const PQ_MODE: u8 = 0;
 
-/// A self-contained combiner invitation. The two halves' signing keys and key packages are
-/// always present; under the default build (no real PQ) the PQ half mirrors the classical
-/// one, so the archive shape is uniform across builds (distinguished by `PQ_MODE`).
-pub(crate) struct CombinerInvitation {
-    pub client_id: Vec<u8>,
-    pub classical_signing_key: Zeroizing<Vec<u8>>,
-    pub pq_signing_key: Zeroizing<Vec<u8>>,
-    /// MLS-encoded (published) key package message for each half.
-    pub classical_public: Vec<u8>,
-    pub pq_public: Vec<u8>,
-    /// Captured private key-package material for each half: (storage id, KeyPackageData).
-    pub classical_kpd: KeyPackageSecret,
-    pub pq_kpd: KeyPackageSecret,
+// In its own module because the derive-generated impls reference the std `Result`, which the
+// crate-local `Result` alias imported above would shadow.
+mod wire {
+    use mls_rs::mls_rs_codec::{self, MlsDecode, MlsEncode, MlsSize};
+    use zeroize::Zeroizing;
+
+    use crate::key_package_store::KeyPackageSecret;
+
+    /// A self-contained combiner invitation. The two halves' signing keys and key packages are
+    /// always present; under the default build (no real PQ) the PQ half mirrors the classical
+    /// one, so the archive shape is uniform across builds (distinguished by `PQ_MODE`).
+    ///
+    /// The derived codec embeds each `KeyPackageData` via its own canonical MLS encoding — no
+    /// field-by-field surgery, so it stays correct if mls-rs evolves the (non_exhaustive) struct.
+    #[derive(MlsSize, MlsEncode, MlsDecode)]
+    pub(crate) struct CombinerInvitation {
+        #[mls_codec(with = "mls_rs_codec::byte_vec")]
+        pub client_id: Vec<u8>,
+        #[mls_codec(with = "mls_rs_codec::byte_vec")]
+        pub classical_signing_key: Zeroizing<Vec<u8>>,
+        #[mls_codec(with = "mls_rs_codec::byte_vec")]
+        pub pq_signing_key: Zeroizing<Vec<u8>>,
+        /// MLS-encoded (published) key package message for each half.
+        #[mls_codec(with = "mls_rs_codec::byte_vec")]
+        pub classical_public: Vec<u8>,
+        #[mls_codec(with = "mls_rs_codec::byte_vec")]
+        pub pq_public: Vec<u8>,
+        /// Captured private key-package material for each half: (storage id, KeyPackageData).
+        pub classical_kpd: KeyPackageSecret,
+        pub pq_kpd: KeyPackageSecret,
+    }
+
+    /// The persisted form of a `TwoMlsPqInvitation`: the framed invitation blob (kept framed
+    /// so the version/PQ-mode header stays where `CombinerInvitation::decode` expects it)
+    /// followed by the consumed-remote ids.
+    #[derive(MlsSize, MlsEncode, MlsDecode)]
+    pub(super) struct InvitationArchive {
+        #[mls_codec(with = "mls_rs_codec::byte_vec")]
+        pub(super) invitation: Vec<u8>,
+        pub(super) consumed: Vec<Vec<u8>>,
+    }
 }
 
+pub(crate) use wire::CombinerInvitation;
+use wire::InvitationArchive;
+
 impl CombinerInvitation {
-    /// Encode to an opaque, versioned, length-prefixed blob.
+    /// Encode to an opaque blob: `[version][pq_mode]` header, then the MLS-codec fields.
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut out = vec![INVITATION_VERSION, PQ_MODE];
-        put_bytes(&mut out, &self.client_id)?;
-        put_bytes(&mut out, &self.classical_signing_key)?;
-        put_bytes(&mut out, &self.pq_signing_key)?;
-        put_bytes(&mut out, &self.classical_public)?;
-        put_bytes(&mut out, &self.pq_public)?;
-        put_kpd(&mut out, &self.classical_kpd)?;
-        put_kpd(&mut out, &self.pq_kpd)?;
+        self.mls_encode(&mut out)
+            .map_err(|_| TwoMlsPqError::ArchiveInvalid)?;
         Ok(out)
     }
 
     /// Decode a blob produced by [`encode`](Self::encode). Rejects a wrong version or a
     /// PQ-mode mismatch (an archive from the other build).
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        let mut rest = bytes;
-        if take_u8(&mut rest)? != INVITATION_VERSION || take_u8(&mut rest)? != PQ_MODE {
-            return Err(TwoMlsPqError::ArchiveInvalid);
-        }
-        let client_id = take_bytes(&mut rest)?;
-        let classical_signing_key = Zeroizing::new(take_bytes(&mut rest)?);
-        let pq_signing_key = Zeroizing::new(take_bytes(&mut rest)?);
-        let classical_public = take_bytes(&mut rest)?;
-        let pq_public = take_bytes(&mut rest)?;
-        let classical_kpd = take_kpd(&mut rest)?;
-        let pq_kpd = take_kpd(&mut rest)?;
-        Ok(Self {
-            client_id,
-            classical_signing_key,
-            pq_signing_key,
-            classical_public,
-            pq_public,
-            classical_kpd,
-            pq_kpd,
-        })
+        let mut rest = match bytes {
+            [INVITATION_VERSION, PQ_MODE, rest @ ..] => rest,
+            _ => return Err(TwoMlsPqError::ArchiveInvalid),
+        };
+        Self::mls_decode(&mut rest).map_err(|_| TwoMlsPqError::ArchiveInvalid)
     }
 }
 
-/// The single encoder for a `TwoMlsPqInvitation`'s persisted form: the framed invitation
-/// blob followed by the consumed-remote ids. `BTreeSet` gives a deterministic byte order.
-/// Used by both `generate_invitation` (empty set) and `archive`; `decode_archive` is the
-/// sole reader, so the layout lives in exactly one place.
+/// The single encoder for a `TwoMlsPqInvitation`'s persisted form ([`InvitationArchive`]).
+/// `BTreeSet` iteration gives a deterministic byte order. Used by both `generate_invitation`
+/// (empty set) and `archive`; `decode_archive` is the sole reader, so the layout lives in
+/// exactly one place.
 pub(crate) fn encode_archive(
     invitation: &CombinerInvitation,
     consumed: &BTreeSet<Vec<u8>>,
 ) -> Result<Vec<u8>> {
-    let mut out = Vec::new();
-    put_bytes(&mut out, &invitation.encode()?)?;
-    for id in consumed {
-        put_bytes(&mut out, id)?;
+    InvitationArchive {
+        invitation: invitation.encode()?,
+        consumed: consumed.iter().cloned().collect(),
     }
-    Ok(out)
+    .mls_encode_to_vec()
+    .map_err(|_| TwoMlsPqError::ArchiveInvalid)
 }
 
 pub(crate) fn decode_archive(bytes: &[u8]) -> Result<(CombinerInvitation, BTreeSet<Vec<u8>>)> {
     let mut rest = bytes;
-    let invitation = CombinerInvitation::decode(&take_bytes(&mut rest)?)?;
-    let mut consumed = BTreeSet::new();
-    while !rest.is_empty() {
-        consumed.insert(take_bytes(&mut rest)?);
+    let archive =
+        InvitationArchive::mls_decode(&mut rest).map_err(|_| TwoMlsPqError::ArchiveInvalid)?;
+    if !rest.is_empty() {
+        return Err(TwoMlsPqError::ArchiveInvalid);
     }
-    Ok((invitation, consumed))
+    let invitation = CombinerInvitation::decode(&archive.invitation)?;
+    Ok((invitation, archive.consumed.into_iter().collect()))
 }
 
 /// Generate a combiner key package on `client` and capture its private material into a
@@ -182,50 +195,4 @@ fn single_captured(captured: Vec<KeyPackageSecret>) -> Result<KeyPackageSecret> 
         (Some(secret), None) => Ok(secret),
         _ => Err(TwoMlsPqError::Mls),
     }
-}
-
-pub(crate) fn put_bytes(out: &mut Vec<u8>, v: &[u8]) -> Result<()> {
-    let len = u32::try_from(v.len()).map_err(|_| TwoMlsPqError::ArchiveInvalid)?;
-    out.extend_from_slice(&len.to_le_bytes());
-    out.extend_from_slice(v);
-    Ok(())
-}
-
-pub(crate) fn take_bytes(rest: &mut &[u8]) -> Result<Vec<u8>> {
-    if rest.len() < 4 {
-        return Err(TwoMlsPqError::ArchiveInvalid);
-    }
-    let len = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
-    *rest = &rest[4..];
-    if rest.len() < len {
-        return Err(TwoMlsPqError::ArchiveInvalid);
-    }
-    let v = rest[..len].to_vec();
-    *rest = &rest[len..];
-    Ok(v)
-}
-
-fn take_u8(rest: &mut &[u8]) -> Result<u8> {
-    let (&b, tail) = rest.split_first().ok_or(TwoMlsPqError::ArchiveInvalid)?;
-    *rest = tail;
-    Ok(b)
-}
-
-// KeyPackageData is (de)serialized via its own canonical MLS codec — no field-by-field
-// surgery, so it stays correct if mls-rs evolves the (non_exhaustive) struct.
-fn put_kpd(out: &mut Vec<u8>, (id, kpd): &KeyPackageSecret) -> Result<()> {
-    put_bytes(out, id)?;
-    put_bytes(
-        out,
-        &kpd.mls_encode_to_vec()
-            .map_err(|_| TwoMlsPqError::ArchiveInvalid)?,
-    )
-}
-
-fn take_kpd(rest: &mut &[u8]) -> Result<KeyPackageSecret> {
-    let id = take_bytes(rest)?;
-    let kpd_bytes = take_bytes(rest)?;
-    let mut reader = kpd_bytes.as_slice();
-    let kpd = KeyPackageData::mls_decode(&mut reader).map_err(|_| TwoMlsPqError::ArchiveInvalid)?;
-    Ok((id, kpd))
 }

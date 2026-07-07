@@ -4,7 +4,7 @@ use mls_rs::{CipherSuiteProvider, CryptoProvider};
 use mls_rs_crypto_rustcrypto::RustCryptoProvider;
 
 use crate::{
-    key_packages::{CombinerKeyPackage, TwoMlsPqClient},
+    key_packages::{CombinerKeyPackage, TwoMlsPqIdentity},
     session::TwoMlsPqSession,
 };
 
@@ -20,11 +20,11 @@ pub(crate) fn test_client_id() -> Vec<u8> {
     secret.as_bytes().to_vec()
 }
 
-pub(crate) fn make_client() -> Arc<TwoMlsPqClient> {
-    assert_ok!(TwoMlsPqClient::new(test_client_id()))
+pub(crate) fn make_client() -> Arc<TwoMlsPqIdentity> {
+    assert_ok!(TwoMlsPqIdentity::new(test_client_id()))
 }
 
-pub(crate) fn make_combiner_kp(client: &TwoMlsPqClient) -> CombinerKeyPackage {
+pub(crate) fn make_combiner_kp(client: &TwoMlsPqIdentity) -> CombinerKeyPackage {
     #[cfg(feature = "cryptokit")]
     return assert_ok!(client.generate_combiner_key_package());
     #[cfg(not(feature = "cryptokit"))]

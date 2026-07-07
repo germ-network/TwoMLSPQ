@@ -20,10 +20,12 @@
 ))]
 compile_error!("the `cryptokit` feature requires a macOS or iOS target");
 
+pub mod archive;
 mod client;
 mod group;
 #[cfg(feature = "cryptokit")]
 pub mod pq_ratchet;
+pub mod storage;
 
 pub use client::{CombinerClient, MlsClient, OurConfig};
 #[cfg(feature = "cryptokit")]
@@ -32,8 +34,9 @@ pub use client::{PqConfig, PqMlsClient};
 pub use group::{
     create_bound_classical_send_group, create_bound_combiner_send_group,
     create_combiner_send_group, create_group_with_member, decode_apq_welcome, encode_apq_welcome,
-    export_and_register_psk, join_combiner_group, join_group_from_welcome, sender_client_id,
-    CombinerGroup, MlsGroup, PqMlsGroup, APQ_TAG,
+    export_and_register_psk, export_psk, forget_psk, join_combiner_group, join_group_from_welcome,
+    load_combiner_group, register_psk, sender_client_id, CombinerGroup, CombinerGroupState,
+    MlsGroup, PqMlsGroup, APQ_TAG,
 };
 #[cfg(feature = "cryptokit")]
 pub use group::{
@@ -52,6 +55,12 @@ pub enum CombinerError {
     MissingWelcome,
     #[error("decryption failed")]
     DecryptionFailed,
+    /// A persistence blob (session archive or group-state snapshot) is structurally invalid:
+    /// wrong version, truncation, trailing bytes, or a violated storage invariant. Distinct
+    /// from [`DecryptionFailed`](Self::DecryptionFailed), which is an authentication failure
+    /// of a sealed blob (wrong key or tampered ciphertext).
+    #[error("invalid archive")]
+    ArchiveInvalid,
 }
 
 pub type Result<T> = std::result::Result<T, CombinerError>;
