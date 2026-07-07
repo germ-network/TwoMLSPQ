@@ -2259,21 +2259,23 @@ public func FfiConverterTypeDecryptResult_lower(_ value: DecryptResult) -> RustB
 
 
 /**
- * Returned by `encrypt`.
+ * Returned by `encrypt`. `epochs` is the send group's APQ pair at send time —
+ * the PQ side-band epoch (0 while that half is deferred) and the classical
+ * message epoch the ciphertext was produced in.
  */
 public struct EncryptResult: Equatable, Hashable {
     public var cipherText: Data
     public var sender: ClientId
     public var recipient: ClientId
-    public var epoch: UInt64
+    public var epochs: ApqEpochs
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(cipherText: Data, sender: ClientId, recipient: ClientId, epoch: UInt64) {
+    public init(cipherText: Data, sender: ClientId, recipient: ClientId, epochs: ApqEpochs) {
         self.cipherText = cipherText
         self.sender = sender
         self.recipient = recipient
-        self.epoch = epoch
+        self.epochs = epochs
     }
 
     
@@ -2295,7 +2297,7 @@ public struct FfiConverterTypeEncryptResult: FfiConverterRustBuffer {
                 cipherText: FfiConverterData.read(from: &buf), 
                 sender: FfiConverterTypeClientId.read(from: &buf), 
                 recipient: FfiConverterTypeClientId.read(from: &buf), 
-                epoch: FfiConverterUInt64.read(from: &buf)
+                epochs: FfiConverterTypeApqEpochs.read(from: &buf)
         )
     }
 
@@ -2303,7 +2305,7 @@ public struct FfiConverterTypeEncryptResult: FfiConverterRustBuffer {
         FfiConverterData.write(value.cipherText, into: &buf)
         FfiConverterTypeClientId.write(value.sender, into: &buf)
         FfiConverterTypeClientId.write(value.recipient, into: &buf)
-        FfiConverterUInt64.write(value.epoch, into: &buf)
+        FfiConverterTypeApqEpochs.write(value.epochs, into: &buf)
     }
 }
 

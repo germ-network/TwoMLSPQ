@@ -82,9 +82,10 @@ extension AbstractTwoMLS {
 			cipherText = base.cipherText
 			sender = base.sender.bytes
 			recipient = base.recipient.bytes
-			// GAP: the FFI EncryptResult reports a single epoch; the pq/classical
-			// split is not yet exported.
-			epochs = APQEpochs(pqEpoch: base.epoch, classicalEpoch: base.epoch)
+			epochs = APQEpochs(
+				pqEpoch: base.epochs.pqEpoch,
+				classicalEpoch: base.epochs.classicalEpoch
+			)
 		}
 	}
 
