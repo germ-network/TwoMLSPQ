@@ -293,18 +293,20 @@ pub enum TwoMlsPqError {
     DuplicateWelcome,
 }
 
+/// SHA-256 over `bytes` — the single hashing primitive behind every digest this
+/// crate emits (proposal digests, ordering contexts, session ids; the same function
+/// the cipher suite's `hash` resolves to). One implementation, so the "both sides
+/// derive the same value" invariants cannot split across call sites.
+pub(crate) fn sha256(bytes: &[u8]) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes).to_vec()
+}
+
 /// Derive the session identifier for a pair of clients.
 /// Both sides compute the same value from the same inputs regardless of who
 /// initiated, allowing CommProtocol to deduplicate concurrent session initiations.
 #[uniffi::export]
 pub fn derive_session_id(my_id: ClientId, their_id: ClientId) -> Result<SessionId> {
-    use mls_rs::{CipherSuiteProvider, CryptoProvider};
-    use mls_rs_crypto_rustcrypto::RustCryptoProvider;
-
-    let cs = RustCryptoProvider::new()
-        .cipher_suite_provider(mls_rs::CipherSuite::CURVE25519_CHACHA)
-        .ok_or(TwoMlsPqError::Mls)?;
-
     let (first, second) = if my_id.bytes <= their_id.bytes {
         (my_id.bytes, their_id.bytes)
     } else {
@@ -314,8 +316,9 @@ pub fn derive_session_id(my_id: ClientId, their_id: ClientId) -> Result<SessionI
     let mut input = first;
     input.extend_from_slice(&second);
 
-    let bytes = cs.hash(&input).map_err(|_| TwoMlsPqError::Mls)?;
-    Ok(SessionId { bytes })
+    Ok(SessionId {
+        bytes: sha256(&input),
+    })
 }
 
 impl From<mls_rs::error::MlsError> for TwoMlsPqError {

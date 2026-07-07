@@ -132,6 +132,19 @@ pub fn export_psk_pq<S: KeyPackageStorage + Clone>(
     Ok((psk_id, psk))
 }
 
+/// Register an exported PSK into every store in `stores` — the caller's registry of
+/// every store its groups resolve PSKs from. The single fan-out loop shared by the
+/// session layer and the PQ ratchet.
+pub fn register_psk_stores(
+    stores: &[mls_rs::storage_provider::in_memory::InMemoryPreSharedKeyStorage],
+    psk_id: &ExternalPskId,
+    psk: &PreSharedKey,
+) {
+    for store in stores {
+        store.clone().insert(psk_id.clone(), psk.clone());
+    }
+}
+
 /// Register an exported PSK into `client`'s classical and PQ stores.
 pub fn register_psk<S: KeyPackageStorage + Clone>(
     client: &CombinerClient<S>,

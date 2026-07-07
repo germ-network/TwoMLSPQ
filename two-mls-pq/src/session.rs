@@ -83,6 +83,10 @@ struct SessionInner {
     /// PSKs from the store of the client that created it, so registering only through
     /// `self.client` would strand every group created before the latest rotation.
     psk_stores: Vec<InMemoryPreSharedKeyStorage>,
+    /// The client whose PSK stores `psk_stores` last absorbed — the dedup key for
+    /// `track_psk_stores` (compared by Arc identity, so re-tracking the same client
+    /// is free and only a rotation-installed client grows the registry).
+    psk_stores_from: Arc<TwoMlsPqClient>,
     /// The opaque spawn token this acceptor session was created under (see
     /// `TwoMlsPqInvitation::receive`); `None` on initiator sessions. `forwarded`
     /// matches replayed initial frames against it. Opaque — this library never
@@ -406,7 +410,7 @@ impl TwoMlsPqSession {
                 if inner.client.client_id() != *new_id {
                     return Err(TwoMlsPqError::SessionNotReady);
                 }
-                let (new_signer, new_public) = inner.client.combiner().pq_signature_keypair()?;
+                let (new_signer, new_public) = inner.client.combiner().pq_signature_keypair();
                 Some((new_signer, new_public, new_id.bytes.clone()))
             }
             None => None,
@@ -587,7 +591,7 @@ impl TwoMlsPqSession {
                         if client.client_id() != *new_id {
                             return Err(TwoMlsPqError::SessionNotReady);
                         }
-                        Some(client.combiner().pq_signature_keypair()?)
+                        Some(client.combiner().pq_signature_keypair())
                     }
                     None => None,
                 };
@@ -658,6 +662,9 @@ impl TwoMlsPqSession {
                 inner.pq_turn_mine = true;
                 Ok(false)
             }
+            // Unreachable: the guard at the top of this function admits only the two
+            // rekey states. Kept (with the state restored) purely as exhaustiveness
+            // defense should the guard and this match ever drift apart.
             other => {
                 inner.pq_inflight = other;
                 Err(TwoMlsPqError::SessionNotReady)
@@ -728,15 +735,14 @@ fn decode_ratchet(bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
     Ok((commit, proposal, app))
 }
 
-/// SHA-256 digest of `bytes` — the raw 32-byte convention every digest on this FFI
-/// uses (see the note above `PrepareEncryptResult` in lib.rs). Both sides of the
-/// app-approval handshake derive the same value from the same object's bytes.
-fn sha256_digest(bytes: &[u8]) -> Result<Vec<u8>> {
-    use mls_rs::{CipherSuiteProvider, CryptoProvider};
-    let cs = mls_rs_crypto_rustcrypto::RustCryptoProvider::new()
-        .cipher_suite_provider(mls_rs::CipherSuite::CURVE25519_CHACHA)
-        .ok_or(TwoMlsPqError::Mls)?;
-    cs.hash(bytes).map_err(|_| TwoMlsPqError::Mls)
+/// The rendezvous exporter both routing surfaces derive:
+/// `exportSecret("rendezvous", "TwoMLS", 32)` on a group's classical (message) half.
+/// Listen-side and post-side addresses align because they are this one derivation.
+fn rendezvous_secret(group: &crate::key_package_store::MlsGroup) -> Result<Vec<u8>> {
+    group
+        .export_secret(RENDEZVOUS_LABEL, RENDEZVOUS_CONTEXT, RENDEZVOUS_LEN)
+        .map(|secret| secret.as_bytes().to_vec())
+        .map_err(|_| TwoMlsPqError::Mls)
 }
 
 /// The APQ epoch pair for a combiner group: the PQ side-band epoch (0 while that
@@ -752,14 +758,18 @@ fn apq_epochs(group: &CombinerGroup) -> crate::ApqEpochs {
 impl SessionInner {
     /// Register an exported PSK into every store this session's groups resolve from.
     fn register_psk(&self, psk_id: &ExternalPskId, psk: &PreSharedKey) {
-        for store in &self.psk_stores {
-            store.clone().insert(psk_id.clone(), psk.clone());
-        }
+        apq::register_psk_stores(&self.psk_stores, psk_id, psk);
     }
 
     /// Track `client`'s PSK stores so future `register_psk` calls reach any group half
     /// this client creates or joins for the session (A.4 bootstrap, return-welcome join).
-    fn track_psk_stores(&mut self, client: &TwoMlsPqClient) {
+    /// Idempotent per client: the common paths re-track the construction client, and
+    /// only a Phase 8 rotation actually introduces new stores.
+    fn track_psk_stores(&mut self, client: &Arc<TwoMlsPqClient>) {
+        if Arc::ptr_eq(client, &self.psk_stores_from) {
+            return;
+        }
+        self.psk_stores_from = Arc::clone(client);
         self.psk_stores
             .push(client.combiner().classical().secret_store());
         #[cfg(feature = "cryptokit")]
@@ -784,11 +794,8 @@ impl SessionInner {
         if self.listen_rendezvous.contains_key(&epoch) {
             return Ok(());
         }
-        let secret = group
-            .export_secret(RENDEZVOUS_LABEL, RENDEZVOUS_CONTEXT, RENDEZVOUS_LEN)
-            .map_err(|_| TwoMlsPqError::Mls)?;
-        self.listen_rendezvous
-            .insert(epoch, secret.as_bytes().to_vec());
+        let secret = rendezvous_secret(group)?;
+        self.listen_rendezvous.insert(epoch, secret);
 
         send.message_group_mut()
             .write_to_storage()
@@ -854,7 +861,7 @@ impl SessionInner {
         // The rotation stages a commit, not a proposal: the binding value is the
         // SHA-256 of the commit message itself (`encrypt` carries it as the app
         // message's authenticated data).
-        let proposal_hash = sha256_digest(&commit_bytes)?;
+        let proposal_hash = crate::sha256(&commit_bytes);
         self.pending_commit_message = Some(commit_bytes);
 
         let old_id = self.my_state.client_id();
@@ -939,7 +946,7 @@ impl SessionInner {
         // value the receiver reports as `QueuedRemoteProposal.digest`, and the classical
         // backend's convention. `encrypt` carries it as the app message's authenticated
         // data, so the staple is verifiable against the frame it rides in.
-        let proposal_hash = sha256_digest(&proposal_bytes)?;
+        let proposal_hash = crate::sha256(&proposal_bytes);
         self.pending_proposal_message = Some(proposal_bytes);
 
         let their_id = self.their_state.client_id();
@@ -971,6 +978,7 @@ fn build_session(
     ];
     #[cfg(not(feature = "cryptokit"))]
     let psk_stores = vec![client.combiner().classical().secret_store()];
+    let psk_stores_from = Arc::clone(&client);
     Arc::new(TwoMlsPqSession {
         inner: Mutex::new(SessionInner {
             client,
@@ -995,6 +1003,7 @@ fn build_session(
             listen_rendezvous: BTreeMap::new(),
             send_group_storage,
             psk_stores,
+            psk_stores_from,
             spawn_token: None,
         }),
     })
@@ -1482,7 +1491,7 @@ impl TwoMlsPqSession {
             let proposal = if proposal_bytes.is_empty() {
                 None
             } else {
-                let digest = sha256_digest(&proposal_bytes)?;
+                let digest = crate::sha256(&proposal_bytes);
                 inner.offered_proposal = Some((digest.clone(), proposal_bytes));
                 Some(crate::QueuedRemoteProposal {
                     digest,
@@ -1490,7 +1499,7 @@ impl TwoMlsPqSession {
                     proposing: sender_id.clone(),
                     // The ordering context is the SHA-256 of the receive group's
                     // (classical, message-half) group id — `proposal_context`'s value.
-                    context: sha256_digest(&group_id)?,
+                    context: crate::sha256(&group_id),
                 })
             };
 
@@ -1659,7 +1668,7 @@ impl TwoMlsPqSession {
         inner
             .recv_group
             .as_ref()
-            .and_then(|rg| sha256_digest(rg.classical.group_id()).ok())
+            .map(|rg| crate::sha256(rg.classical.group_id()))
     }
 
     /// Where to post outbound frames: the recv group's classical-half exporter at its
@@ -1671,12 +1680,8 @@ impl TwoMlsPqSession {
         let Some(recv) = inner.recv_group.as_ref() else {
             return Ok(None);
         };
-        let secret = recv
-            .message_group()
-            .export_secret(RENDEZVOUS_LABEL, RENDEZVOUS_CONTEXT, RENDEZVOUS_LEN)
-            .map_err(|_| TwoMlsPqError::Mls)?;
         Ok(Some(RendezvousId {
-            bytes: secret.as_bytes().to_vec(),
+            bytes: rendezvous_secret(recv.message_group())?,
         }))
     }
 
@@ -2272,7 +2277,7 @@ mod tests {
         assert_some!(assert_ok!(alice.process_incoming(enc.cipher_text)));
 
         // The PQ leaves still sign as the old agent until the A.5 handoff.
-        let (_, new_public) = assert_ok!(new_bob.combiner().pq_signature_keypair());
+        let (_, new_public) = new_bob.combiner().pq_signature_keypair();
         let new_key = new_public.as_bytes().to_vec();
         let before = own_pq_leaf_signature_keys(&bob);
         assert_ne!(before.0, new_key);
