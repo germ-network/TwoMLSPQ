@@ -22,6 +22,25 @@ pub fn version() -> String {
     env!("CARGO_PKG_VERSION").to_owned()
 }
 
+/// Record-shape contract stamp. Uniffi's load-time checks cover *function*
+/// signatures but NOT `uniffi::Record` field layouts or error-enum variants: a
+/// Record can change shape with every checksum unchanged, and a mismatched
+/// binding + binary pair then mis-reads FFI buffers at the first call touching
+/// the changed type (runtime trap mid-flow) instead of failing at startup.
+///
+/// RULE: bump this on ANY shape change to a `#[derive(uniffi::Record)]` struct
+/// or the error enum in this crate. The vendored Swift binding's consumer
+/// (AbstractTwoMLS) asserts the value at first construction, so a stale
+/// binding/binary pairing fails fast with an actionable message.
+const BINDING_CONTRACT_VERSION: u64 = 1;
+
+/// See `BINDING_CONTRACT_VERSION`. Exported so the Swift layer can verify the
+/// binding it was generated with matches the binary it loaded.
+#[uniffi::export]
+pub fn binding_contract_version() -> u64 {
+    BINDING_CONTRACT_VERSION
+}
+
 /// ATProto DID-scoped client identifier.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct ClientId {
