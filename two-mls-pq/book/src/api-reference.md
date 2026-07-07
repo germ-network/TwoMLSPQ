@@ -12,9 +12,14 @@ value is bumped on any shape change to an exported record or the error enum, so 
 stale binding/binary pairing fails fast with an actionable message instead of
 trapping mid-flow.
 
-## Digests
+## References (Digests)
 
-Digests cross the FFI as **raw 32-byte values**: SHA-256 over the stated object.
+The FFI holds on to some state internally, e.g. queued Proposals,
+and passes references across the FFI to the app to use in subsequent calls
+to indicate the queued state.
+
+The app can treat these references as opaque bytes-typed identifiers. They are in
+practice **raw 32-byte values**: SHA-256 over the stated object.
 That is this library's own wire convention; the app layer wraps them in whatever
 typed-digest encoding it uses — no app-layer type tags appear on this surface.
 
