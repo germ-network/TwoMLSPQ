@@ -419,22 +419,6 @@ fileprivate final class UniffiHandleMap<T>: @unchecked Sendable {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-fileprivate struct FfiConverterUInt8: FfiConverterPrimitive {
-    typealias FfiType = UInt8
-    typealias SwiftType = UInt8
-
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UInt8 {
-        return try lift(readInt(&buf))
-    }
-
-    public static func write(_ value: UInt8, into buf: inout [UInt8]) {
-        writeInt(&buf, lower(value))
-    }
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
 fileprivate struct FfiConverterUInt16: FfiConverterPrimitive {
     typealias FfiType = UInt16
     typealias SwiftType = UInt16
@@ -1440,14 +1424,21 @@ public protocol TwoMlsPqSessionProtocol: AnyObject, Sendable {
      */
     func processIncoming(ciphertext: Data) throws  -> DecryptResult?
     
-    func proposalContext()  -> TwoMlsPqDigest?
+    /**
+     * The SHA-256 of the receive group's classical (message-half) group id — the
+     * binding context for identity introductions, matching the classical backend's
+     * convention and `QueuedRemoteProposal.context`. Always the classical half:
+     * message ordering rides it, and it exists from establishment (the PQ half may
+     * still be deferred pre-A.4).
+     */
+    func proposalContext()  -> Data?
     
     /**
      * Approve the peer's stapled Upd proposal (identified by its digest). The proposal
      * message enters our send group's proposal cache, and the next
      * `prepare_to_encrypt(None)` commits it (with a cross-party PSK refresh).
      */
-    func queueProposal(digest: TwoMlsPqDigest) throws 
+    func queueProposal(digest: Data) throws 
     
     func receiveGroupId()  -> CombinerGroupId?
     
@@ -1906,8 +1897,15 @@ open func processIncoming(ciphertext: Data)throws  -> DecryptResult?  {
 })
 }
     
-open func proposalContext() -> TwoMlsPqDigest?  {
-    return try!  FfiConverterOptionTypeTwoMlsPqDigest.lift(try! rustCall() {
+    /**
+     * The SHA-256 of the receive group's classical (message-half) group id — the
+     * binding context for identity introductions, matching the classical backend's
+     * convention and `QueuedRemoteProposal.context`. Always the classical half:
+     * message ordering rides it, and it exists from establishment (the PQ half may
+     * still be deferred pre-A.4).
+     */
+open func proposalContext() -> Data?  {
+    return try!  FfiConverterOptionData.lift(try! rustCall() {
     uniffi_two_mls_pq_fn_method_twomlspqsession_proposal_context(
             self.uniffiCloneHandle(),$0
     )
@@ -1919,10 +1917,10 @@ open func proposalContext() -> TwoMlsPqDigest?  {
      * message enters our send group's proposal cache, and the next
      * `prepare_to_encrypt(None)` commits it (with a cross-party PSK refresh).
      */
-open func queueProposal(digest: TwoMlsPqDigest)throws   {try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
+open func queueProposal(digest: Data)throws   {try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
     uniffi_two_mls_pq_fn_method_twomlspqsession_queue_proposal(
             self.uniffiCloneHandle(),
-        FfiConverterTypeTwoMlsPqDigest_lower(digest),$0
+        FfiConverterData.lower(digest),$0
     )
 }
 }
@@ -2906,18 +2904,20 @@ public func FfiConverterTypeParsedCombinerKeyPackage_lower(_ value: ParsedCombin
 
 
 /**
- * Returned by `prepare_to_encrypt`. The app layer must bind `proposal_hash`
- * into its plaintext before calling `encrypt`. `did_commit` is false when
- * stuck in a prior epoch (no pending remote proposal to commit).
+ * Returned by `prepare_to_encrypt`. `proposal_hash` is the SHA-256 of the staged
+ * outbound object (the Upd(self) proposal message, or the rotation commit); `encrypt`
+ * also binds it into the app message's authenticated data, and the receiver reports
+ * the same value as `QueuedRemoteProposal.digest`. `did_commit` is false when stuck in
+ * a prior epoch (no pending remote proposal to commit).
  */
 public struct PrepareEncryptResult: Equatable, Hashable {
-    public var proposalHash: TwoMlsPqDigest
+    public var proposalHash: Data
     public var committedRemoteClientId: ClientId?
     public var didCommit: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(proposalHash: TwoMlsPqDigest, committedRemoteClientId: ClientId?, didCommit: Bool) {
+    public init(proposalHash: Data, committedRemoteClientId: ClientId?, didCommit: Bool) {
         self.proposalHash = proposalHash
         self.committedRemoteClientId = committedRemoteClientId
         self.didCommit = didCommit
@@ -2939,14 +2939,14 @@ public struct FfiConverterTypePrepareEncryptResult: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PrepareEncryptResult {
         return
             try PrepareEncryptResult(
-                proposalHash: FfiConverterTypeTwoMlsPqDigest.read(from: &buf), 
+                proposalHash: FfiConverterData.read(from: &buf), 
                 committedRemoteClientId: FfiConverterOptionTypeClientId.read(from: &buf), 
                 didCommit: FfiConverterBool.read(from: &buf)
         )
     }
 
     public static func write(_ value: PrepareEncryptResult, into buf: inout [UInt8]) {
-        FfiConverterTypeTwoMlsPqDigest.write(value.proposalHash, into: &buf)
+        FfiConverterData.write(value.proposalHash, into: &buf)
         FfiConverterOptionTypeClientId.write(value.committedRemoteClientId, into: &buf)
         FfiConverterBool.write(value.didCommit, into: &buf)
     }
@@ -2971,18 +2971,20 @@ public func FfiConverterTypePrepareEncryptResult_lower(_ value: PrepareEncryptRe
 /**
  * A remote proposal queued for app-layer acceptance. `sender` sent the
  * proposal; `proposing` is the client being proposed (differs when a client
- * proposes its own rotation). `context` is the receive group's group-ID hash,
- * used for ordering against the app-level sequence number.
+ * proposes its own rotation). `digest` is the SHA-256 of the proposal message
+ * (equal to the sender's `PrepareEncryptResult.proposal_hash`); `context` is
+ * the SHA-256 of the receive group's group id, used for ordering against the
+ * app-level sequence number.
  */
 public struct QueuedRemoteProposal: Equatable, Hashable {
-    public var digest: TwoMlsPqDigest
+    public var digest: Data
     public var sender: ClientId
     public var proposing: ClientId
-    public var context: TwoMlsPqDigest
+    public var context: Data
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(digest: TwoMlsPqDigest, sender: ClientId, proposing: ClientId, context: TwoMlsPqDigest) {
+    public init(digest: Data, sender: ClientId, proposing: ClientId, context: Data) {
         self.digest = digest
         self.sender = sender
         self.proposing = proposing
@@ -3005,18 +3007,18 @@ public struct FfiConverterTypeQueuedRemoteProposal: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> QueuedRemoteProposal {
         return
             try QueuedRemoteProposal(
-                digest: FfiConverterTypeTwoMlsPqDigest.read(from: &buf), 
+                digest: FfiConverterData.read(from: &buf), 
                 sender: FfiConverterTypeClientId.read(from: &buf), 
                 proposing: FfiConverterTypeClientId.read(from: &buf), 
-                context: FfiConverterTypeTwoMlsPqDigest.read(from: &buf)
+                context: FfiConverterData.read(from: &buf)
         )
     }
 
     public static func write(_ value: QueuedRemoteProposal, into buf: inout [UInt8]) {
-        FfiConverterTypeTwoMlsPqDigest.write(value.digest, into: &buf)
+        FfiConverterData.write(value.digest, into: &buf)
         FfiConverterTypeClientId.write(value.sender, into: &buf)
         FfiConverterTypeClientId.write(value.proposing, into: &buf)
-        FfiConverterTypeTwoMlsPqDigest.write(value.context, into: &buf)
+        FfiConverterData.write(value.context, into: &buf)
     }
 }
 
@@ -3142,70 +3144,6 @@ public func FfiConverterTypeSessionId_lift(_ buf: RustBuffer) throws -> SessionI
 #endif
 public func FfiConverterTypeSessionId_lower(_ value: SessionId) -> RustBuffer {
     return FfiConverterTypeSessionId.lower(value)
-}
-
-
-/**
- * Content-typed hash digest. Used by the app layer to identify and accept
- * MLS proposals before signalling back to the encryption layer.
- */
-public struct TwoMlsPqDigest: Equatable, Hashable {
-    /**
-     * Digest-type wire value, aligned with CommProtocol's `DigestTypes` (sha256 = 1).
-     */
-    public var hashType: UInt8
-    public var digest: Data
-
-    // Default memberwise initializers are never public by default, so we
-    // declare one manually.
-    public init(
-        /**
-         * Digest-type wire value, aligned with CommProtocol's `DigestTypes` (sha256 = 1).
-         */hashType: UInt8, digest: Data) {
-        self.hashType = hashType
-        self.digest = digest
-    }
-
-    
-
-    
-}
-
-#if compiler(>=6)
-extension TwoMlsPqDigest: Sendable {}
-#endif
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public struct FfiConverterTypeTwoMlsPqDigest: FfiConverterRustBuffer {
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> TwoMlsPqDigest {
-        return
-            try TwoMlsPqDigest(
-                hashType: FfiConverterUInt8.read(from: &buf), 
-                digest: FfiConverterData.read(from: &buf)
-        )
-    }
-
-    public static func write(_ value: TwoMlsPqDigest, into buf: inout [UInt8]) {
-        FfiConverterUInt8.write(value.hashType, into: &buf)
-        FfiConverterData.write(value.digest, into: &buf)
-    }
-}
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeTwoMlsPqDigest_lift(_ buf: RustBuffer) throws -> TwoMlsPqDigest {
-    return try FfiConverterTypeTwoMlsPqDigest.lift(buf)
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeTwoMlsPqDigest_lower(_ value: TwoMlsPqDigest) -> RustBuffer {
-    return FfiConverterTypeTwoMlsPqDigest.lower(value)
 }
 
 // Note that we don't yet support `indirect` for enums.
@@ -3611,30 +3549,6 @@ fileprivate struct FfiConverterOptionTypeRendezvousId: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-fileprivate struct FfiConverterOptionTypeTwoMlsPqDigest: FfiConverterRustBuffer {
-    typealias SwiftType = TwoMlsPqDigest?
-
-    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
-        guard let value = value else {
-            writeInt(&buf, Int8(0))
-            return
-        }
-        writeInt(&buf, Int8(1))
-        FfiConverterTypeTwoMlsPqDigest.write(value, into: &buf)
-    }
-
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
-        switch try readInt(&buf) as Int8 {
-        case 0: return nil
-        case 1: return try FfiConverterTypeTwoMlsPqDigest.read(from: &buf)
-        default: throw UniffiInternalError.unexpectedOptionalTag
-        }
-    }
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
 fileprivate struct FfiConverterSequenceTypeEpochRendezvous: FfiConverterRustBuffer {
     typealias SwiftType = [EpochRendezvous]
 
@@ -3896,10 +3810,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_process_incoming() != 56219) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_proposal_context() != 55198) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_proposal_context() != 26932) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_queue_proposal() != 20344) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_queue_proposal() != 52610) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_receive_group_id() != 24855) {

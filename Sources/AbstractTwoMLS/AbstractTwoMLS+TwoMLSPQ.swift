@@ -34,8 +34,6 @@ import TwoMLSPQ
 // MARK: - Errors
 
 public enum TwoMLSPQConformanceError: Error {
-	/// A `TwoMlsPqDigest.hashType` byte did not map to a known `DigestTypes`.
-	case unknownDigestType(UInt8)
 	/// TwoMLSPQ restores a session via `fromArchive(archive:client:)`, which
 	/// needs the owning client; the parameterless `Archivable.init(archive:)`
 	/// cannot supply it.
@@ -63,7 +61,9 @@ public enum TwoMLSPQConformanceError: Error {
 /// can change shape with every checksum unchanged, and the mismatch then traps
 /// at the first FFI buffer read mid-flow. This check fails fast instead, at the
 /// first client/invitation construction.
-private let expectedBindingContract: UInt64 = 1
+// v2: TwoMlsPqDigest removed from the FFI — digests are raw 32-byte SHA-256 values,
+// typed on this side by `liftDigest`.
+private let expectedBindingContract: UInt64 = 2
 
 enum TwoMLSPQBindingContract {
 	static let verified: Void = {
@@ -82,21 +82,12 @@ enum TwoMLSPQBindingContract {
 
 // MARK: - Scalar conversions
 
-extension TwoMLSPQ.TwoMlsPqDigest {
-	/// Lift the FFI digest into a `CommProtocol.TypedDigest`.
-	func toTypedDigest() throws -> TypedDigest {
-		guard let prefix = DigestTypes(rawValue: hashType) else {
-			throw TwoMLSPQConformanceError.unknownDigestType(hashType)
-		}
-		return try TypedDigest(prefix: prefix, checkedData: digest)
-	}
-}
-
-extension TypedDigest {
-	/// Lower a `TypedDigest` into the FFI digest shape.
-	var pqDigest: TwoMLSPQ.TwoMlsPqDigest {
-		.init(hashType: type.rawValue, digest: digest)
-	}
+/// Lift a raw FFI digest into a `CommProtocol.TypedDigest`. The FFI's documented
+/// convention is SHA-256-32 over the stated object (see the note above
+/// `PrepareEncryptResult` in TwoMLSPQ's lib.rs); the type tag is applied HERE — the
+/// Rust crate carries no app-layer digest-type values.
+private func liftDigest(_ raw: Data) throws -> TypedDigest {
+	try TypedDigest(prefix: .sha256, checkedData: raw)
 }
 
 extension TwoMLSPQ.ClientId {
@@ -136,7 +127,7 @@ extension AbstractTwoMLS {
 		public let didCommit: Bool
 
 		init(_ base: TwoMLSPQ.PrepareEncryptResult) throws {
-			proposalHash = try base.proposalHash.toTypedDigest()
+			proposalHash = try liftDigest(base.proposalHash)
 			commitedRemoteClientId = base.committedRemoteClientId?.bytes
 			didCommit = base.didCommit
 		}
@@ -161,10 +152,10 @@ extension AbstractTwoMLS {
 		public let context: TypedDigest
 
 		init(_ base: TwoMLSPQ.QueuedRemoteProposal) throws {
-			digest = try base.digest.toTypedDigest()
+			digest = try liftDigest(base.digest)
 			sender = base.sender.bytes
 			proposing = base.proposing.bytes
-			context = try base.context.toTypedDigest()
+			context = try liftDigest(base.context)
 		}
 	}
 
@@ -221,9 +212,9 @@ extension AbstractTwoMLS {
 
 		public var proposalContext: TypedDigest? {
 			// Non-throwing per the protocol; FFI digests are always well-formed
-			// sha256, so a conversion failure is treated as "no context".
+			// 32-byte values, so a conversion failure is treated as "no context".
 			guard let digest = base.proposalContext() else { return nil }
-			return try? digest.toTypedDigest()
+			return try? liftDigest(digest)
 		}
 
 		public var sendRendezvous: AbstractTwoMLS.RendezvousID? {
@@ -251,7 +242,7 @@ extension AbstractTwoMLS {
 		}
 
 		public func queueProposal(digest: TypedDigest) throws {
-			try base.queueProposal(digest: digest.pqDigest)
+			try base.queueProposal(digest: digest.digest)
 		}
 
 		public func forwarded(headerDecrypted: Data) throws -> PQSenderMessage? {
