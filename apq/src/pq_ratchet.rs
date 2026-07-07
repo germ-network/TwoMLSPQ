@@ -204,8 +204,8 @@ mod tests {
     use mls_rs::{CipherSuiteProvider, CryptoProvider};
     use mls_rs_crypto_awslc::{AwsLcCryptoProvider, MlKemKem};
 
-    fn client() -> CombinerClient<InMemoryKeyPackageStorage, AwsLcCryptoProvider, AwsLcCryptoProvider>
-    {
+    fn client(
+    ) -> CombinerClient<InMemoryKeyPackageStorage, AwsLcCryptoProvider, AwsLcCryptoProvider> {
         // A fresh, unique ClientId for tests (opaque random bytes, not a signing key).
         let cs = AwsLcCryptoProvider::new()
             .cipher_suite_provider(mls_rs::CipherSuite::CURVE25519_CHACHA)

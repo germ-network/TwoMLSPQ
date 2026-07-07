@@ -79,7 +79,10 @@ mod tests {
     fn test_seal_open_round_trips() {
         let cs = suite();
         let blob = seal(&cs, &key(7), b"hello archive").unwrap();
-        assert_eq!(open(&cs, &key(7), &blob).unwrap().to_vec(), b"hello archive");
+        assert_eq!(
+            open(&cs, &key(7), &blob).unwrap().to_vec(),
+            b"hello archive"
+        );
     }
 
     #[test]

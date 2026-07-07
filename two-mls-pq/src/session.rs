@@ -316,7 +316,11 @@ impl TwoMlsPqSession {
             Some(PqInflight::Initiating(eph)) => eph,
             _ => return Err(TwoMlsPqError::SessionNotReady),
         };
-        let s = Zeroizing::new(apq::pq_ratchet::decapsulate(&providers::pq_kem()?, &eph, ct)?);
+        let s = Zeroizing::new(apq::pq_ratchet::decapsulate(
+            &providers::pq_kem()?,
+            &eph,
+            ct,
+        )?);
         let stores = inner.psk_stores.clone();
         let send = inner
             .send_group
