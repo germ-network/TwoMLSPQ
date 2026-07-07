@@ -102,7 +102,7 @@ fn demo_e2e_full_session() {
     );
     println!(
         "[5] partial commit: alice -> bob \"hello bob\" (epoch {})",
-        enc.epoch
+        enc.epochs.classical_epoch
     );
 
     // Step 6 — full commit (0x07): Bob proposes, Alice queues + commits with PSK refresh.
@@ -125,7 +125,7 @@ fn demo_e2e_full_session() {
     );
     println!(
         "[6] full commit: epoch advanced to {} + PSK refreshed",
-        enc.epoch
+        enc.epochs.classical_epoch
     );
 
     // Step 7 — continued bidirectional messaging.

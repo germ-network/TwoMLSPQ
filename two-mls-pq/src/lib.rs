@@ -87,13 +87,15 @@ pub struct PrepareEncryptResult {
     pub did_commit: bool,
 }
 
-/// Returned by `encrypt`.
+/// Returned by `encrypt`. `epochs` is the send group's APQ pair at send time —
+/// the PQ side-band epoch (0 while that half is deferred) and the classical
+/// message epoch the ciphertext was produced in.
 #[derive(Debug, uniffi::Record)]
 pub struct EncryptResult {
     pub cipher_text: Vec<u8>,
     pub sender: ClientId,
     pub recipient: ClientId,
-    pub epoch: u64,
+    pub epochs: ApqEpochs,
 }
 
 /// Returned by `process_incoming`. Fields are `None` when not applicable to
