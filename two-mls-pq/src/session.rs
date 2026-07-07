@@ -8,8 +8,8 @@ use mls_rs::{group::ReceivedMessage, MlsMessage};
 use apq::create_group_with_member;
 use apq::{
     create_bound_classical_send_group, create_combiner_send_group, decode_apq_welcome,
-    encode_apq_welcome, export_psk, join_combiner_group, join_group_from_welcome, register_psk,
-    sender_client_id, APQ_TAG,
+    encode_apq_welcome, export_psk, forget_psk, join_combiner_group, join_group_from_welcome,
+    register_psk, sender_client_id, APQ_TAG,
 };
 
 use crate::key_package_store::CombinerGroup;
@@ -55,16 +55,27 @@ struct SessionInner {
     /// completing an operation passes the turn to the peer.
     pq_turn_mine: bool,
     /// Cross-party TwoMLS-PSKs of OUR send group's recent epochs, owned by the session
-    /// (this rides the session archive; the mls-rs secret stores are ephemeral plumbing,
+    /// (destined for the session archive; the mls-rs secret stores are ephemeral plumbing,
     /// filled just-in-time by `inject_send_psks`). The peer binds the PSK of our send
     /// group's epoch *as they last observed it*, so a frame that crossed one of our
     /// commits can reference an epoch mls-rs can no longer export — the ledger keeps a
-    /// small window instead of re-deriving at the current epoch only.
+    /// window instead of re-deriving at the current epoch only.
     send_psk_ledger: VecDeque<(ExternalPskId, PreSharedKey)>,
+    /// PSK ids evicted from the ledger (or consumed one-shot) but possibly still present in
+    /// the mls-rs secret stores from an earlier injection; the next `inject_send_psks`
+    /// deletes them so the stores never resolve PSKs the session no longer vouches for.
+    retired_send_psks: Vec<ExternalPskId>,
 }
 
-/// Ledger depth for `send_psk_ledger`, mirroring mls-rs's 3-epoch retention window.
-const SEND_PSK_WINDOW: usize = 3;
+/// Ledger depth for `send_psk_ledger`: one entry per send-group epoch. The peer references
+/// the epoch it last observed, so the window must cover every unilateral send-group commit
+/// (queued-proposal ratchet, agent rotation, PQ bind) that can cross one in-flight peer
+/// frame. That count is protocol-unbounded in principle — a host looping rotations while a
+/// peer frame is in transit can outrun any fixed window and permanently desync the
+/// direction (the failed frame is a commit, so there is no recovery) — but each entry is
+/// one 32-byte secret, so we keep a generous window and rely on hosts not committing
+/// unboundedly between peer frames.
+const SEND_PSK_WINDOW: usize = 8;
 
 /// A TwoMLSPQ session holding two asymmetric Combiner send groups.
 #[derive(uniffi::Object)]
@@ -247,13 +258,15 @@ impl TwoMlsPqSession {
         let cl_out = send
             .classical
             .commit_builder()
-            .add_external_psk(apq_psk_id)
+            .add_external_psk(apq_psk_id.clone())
             .map_err(|_| TwoMlsPqError::Mls)?
             .build()
             .map_err(|_| TwoMlsPqError::Mls)?;
         send.classical
             .apply_pending_commit()
             .map_err(|_| TwoMlsPqError::Mls)?;
+        // The bind consumed the one-shot apq PSK; drop it from the store.
+        send.forget_psk(&apq_psk_id);
         let cl_commit = cl_out
             .commit_message
             .to_bytes()
@@ -288,11 +301,13 @@ impl TwoMlsPqSession {
         if recv.pq.is_none() {
             return Err(TwoMlsPqError::SessionNotReady);
         }
-        apq::pq_ratchet::apply_injected_commit(recv, &s, &pq_commit)?;
+        let apq_psk_id = apq::pq_ratchet::apply_injected_commit(recv, &s, &pq_commit)?;
         let cl = MlsMessage::from_bytes(&cl_commit).map_err(|_| TwoMlsPqError::Mls)?;
         recv.classical
             .process_incoming_message(cl)
             .map_err(|_| TwoMlsPqError::Mls)?;
+        // The bind consumed the one-shot apq PSK; drop it from the store.
+        recv.forget_psk(&apq_psk_id);
         let app = MlsMessage::from_bytes(&app_ct).map_err(|_| TwoMlsPqError::Mls)?;
         let out = match recv
             .classical
@@ -412,7 +427,9 @@ impl SessionInner {
         {
             self.send_psk_ledger.push_back((psk_id, psk));
             while self.send_psk_ledger.len() > SEND_PSK_WINDOW {
-                self.send_psk_ledger.pop_front();
+                if let Some((evicted, _)) = self.send_psk_ledger.pop_front() {
+                    self.retired_send_psks.push(evicted);
+                }
             }
         }
         Ok(())
@@ -422,7 +439,9 @@ impl SessionInner {
     /// commit may reference one of these PSKs. Injection targets the stores each live
     /// group actually resolves from (captured at the group's creation — the current
     /// client's stores are the wrong target after an agent rotation), plus the current
-    /// client's stores for joins that are about to create a group.
+    /// client's stores for joins that are about to create a group. Retired ids are then
+    /// deleted from the same targets, so the stores' contents stay bounded by the ledger
+    /// and nothing remains resolvable that the session no longer vouches for.
     fn inject_send_psks(&mut self) -> Result<()> {
         self.remember_send_psk()?;
         for (psk_id, psk) in &self.send_psk_ledger {
@@ -434,10 +453,22 @@ impl SessionInner {
                 send.register_psk(psk_id, psk);
             }
         }
+        for psk_id in self.retired_send_psks.drain(..) {
+            forget_psk(self.client.combiner(), &psk_id);
+            if let Some(recv) = &self.recv_group {
+                recv.forget_psk(&psk_id);
+            }
+            if let Some(send) = &self.send_group {
+                send.forget_psk(&psk_id);
+            }
+        }
         Ok(())
     }
 
-    /// Phase 8: encode a rotation commit on send_group.pq with `new_id` in authenticated_data.
+    /// Phase 8: encode a rotation commit on the CLASSICAL send group with `new_id` in
+    /// authenticated_data (the PQ side-band is untouched; its epoch advances only on A.3/A.4
+    /// rounds). This advances the classical send epoch, which is why the PSK ledger brackets
+    /// the commit below.
     fn prepare_rotation(&mut self, new_id: ClientId) -> Result<crate::PrepareEncryptResult> {
         let new_client = self
             .pending_new_client
@@ -551,7 +582,7 @@ impl SessionInner {
                     .ok_or(TwoMlsPqError::SessionNotReady)?;
                 send.classical
                     .commit_builder()
-                    .add_external_psk(psk_id)
+                    .add_external_psk(psk_id.clone())
                     .map_err(|_| TwoMlsPqError::Mls)?
                     .build()
                     .map_err(|_| TwoMlsPqError::Mls)?
@@ -564,6 +595,8 @@ impl SessionInner {
                 send.classical
                     .apply_pending_commit()
                     .map_err(|_| TwoMlsPqError::Mls)?;
+                // The commit consumed the one-shot recv-group PSK; drop it from the store.
+                send.forget_psk(&psk_id);
             }
             // Our send group advanced: record the new epoch's PSK in the session ledger.
             self.remember_send_psk()?;
@@ -643,6 +676,7 @@ fn build_session(
             pq_turn_mine: initiated,
             pending_pq_outbound: None,
             send_psk_ledger: VecDeque::new(),
+            retired_send_psks: Vec::new(),
         }),
     })
 }
@@ -2058,6 +2092,51 @@ mod tests {
         assert_eq!(
             assert_some!(result.application_message).app_message_data,
             b"crossed"
+        );
+    }
+
+    /// One-shot PSKs (the recv-group export a full commit binds) are removed from the
+    /// mls-rs secret stores once the commit is applied — the stores hold nothing the
+    /// session doesn't currently vouch for.
+    #[test]
+    fn test_consumed_one_shot_psk_is_forgotten_from_stores() {
+        let alice = make_client();
+        let bob = make_client();
+        let alice_kp = make_combiner_kp(&alice);
+        let bob_kp = make_combiner_kp(&bob);
+        let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp));
+        let welcome_a = assert_some!(alice_session.pending_outbound());
+        let bob_session = assert_ok!(TwoMlsPqSession::accept(
+            Arc::clone(&bob),
+            welcome_a,
+            alice_kp
+        ));
+        let welcome_b = assert_some!(bob_session.pending_outbound());
+        assert_ok!(alice_session.process_incoming(welcome_b));
+
+        // Full-commit round: bob proposes, alice queues and commits. Alice's commit binds
+        // the one-shot PSK exported from her recv group (bob's send group) at its current
+        // epoch (1: established, no commits on it yet).
+        assert_ok!(bob_session.prepare_to_encrypt(None));
+        let enc = assert_ok!(bob_session.encrypt(b"proposal".to_vec()));
+        let result = assert_some!(assert_ok!(alice_session.process_incoming(enc.cipher_text)));
+        assert_ok!(alice_session.queue_proposal(assert_some!(result.proposal).digest));
+        let recv_gid = assert_some!(alice_session.receive_group_id())
+            .classical
+            .bytes;
+        assert_ok!(alice_session.prepare_to_encrypt(None));
+
+        let mut id_bytes = 1u64.to_le_bytes().to_vec();
+        id_bytes.extend_from_slice(&recv_gid);
+        let one_shot = mls_rs::psk::ExternalPskId::new(id_bytes);
+        assert!(
+            alice
+                .combiner()
+                .classical()
+                .secret_store()
+                .get(&one_shot)
+                .is_none(),
+            "one-shot recv-group PSK must be dropped after the commit is applied"
         );
     }
 

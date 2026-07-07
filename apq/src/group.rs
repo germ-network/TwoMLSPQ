@@ -87,6 +87,16 @@ impl<S: KeyPackageStorage + Clone> CombinerGroup<S> {
         pq.insert(psk_id.clone(), psk.clone());
     }
 
+    /// Remove a PSK from the stores this group's halves resolve from, once the commit that
+    /// referenced it has been applied/processed (or the session has retired it). Keeps the
+    /// stores' contents bounded by what the caller still vouches for.
+    pub fn forget_psk(&self, psk_id: &ExternalPskId) {
+        let mut classical = self.classical_psks.clone();
+        classical.delete(psk_id);
+        let mut pq = self.pq_psks.clone();
+        pq.delete(psk_id);
+    }
+
     /// The PQ half's captured secret-store handle, for the PQ side-band flows that manage
     /// a short-lived PSK themselves (insert *and* delete, see `pq_ratchet::InjectedSecret`).
     #[cfg(feature = "cryptokit")]
@@ -275,6 +285,21 @@ pub fn register_psk<S: KeyPackageStorage + Clone>(
     {
         let mut pq_store = client.pq().secret_store();
         pq_store.insert(psk_id.clone(), psk.clone());
+    }
+}
+
+/// Remove a PSK from a client's secret store(s) — the counterpart of [`register_psk`], for
+/// entries the caller has retired.
+pub fn forget_psk<S: KeyPackageStorage + Clone>(
+    client: &CombinerClient<S>,
+    psk_id: &ExternalPskId,
+) {
+    let mut store = client.classical().secret_store();
+    store.delete(psk_id);
+    #[cfg(feature = "cryptokit")]
+    {
+        let mut pq_store = client.pq().secret_store();
+        pq_store.delete(psk_id);
     }
 }
 

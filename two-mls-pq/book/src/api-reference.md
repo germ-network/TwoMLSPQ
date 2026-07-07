@@ -17,7 +17,7 @@ hub for group operations (see [Concepts](./concepts.md)).
   ML-KEM-768 key packages sharing one `ClientId`.
 - `generate_invitation() -> Vec<u8>` — capture a combiner key package's private
   material (and the signing identity) into a self-contained invitation archive,
-  purging the client's own copies.
+  purging the identity's own copies.
 
 ## `TwoMlsPqInvitation`
 
@@ -58,6 +58,6 @@ Not yet implemented (return `Err`): `archive`, `send_rendezvous`, `should_listen
 ## Errors
 
 All failures map to the flat `TwoMlsPqError` enum (`Mls`, `InvalidKeyPackage`,
-`MissingWelcome`, `PskBinding`, `SessionNotEstablished`, `SessionNotReady`,
-`ProposalRejected`, `DecryptionFailed`, `ArchiveInvalid`). mls-rs error types never
-cross the FFI boundary.
+`MissingWelcome`, `PskBinding`, `PqNotAvailable`, `SessionNotEstablished`,
+`SessionNotReady`, `ProposalRejected`, `DecryptionFailed`, `DuplicateWelcome`,
+`ArchiveInvalid`). mls-rs error types never cross the FFI boundary.

@@ -43,10 +43,12 @@ handle it was born with.
 The same ownership rule covers PSKs: the session keeps a small ledger of its send
 group's recent cross-party TwoMLS-PSKs and **live-injects** them into the stores a
 group actually resolves from, immediately before building or processing the commit
-that references them. The mls-rs secret stores are ephemeral plumbing — they hold
-nothing the session doesn't — so the ledger both rides the session archive and
-resolves frames that crossed one of our commits (which reference an epoch mls-rs
-can no longer export).
+that references them; retired and one-shot entries are deleted afterwards, so the
+mls-rs secret stores are ephemeral plumbing that holds nothing the session doesn't.
+The ledger resolves frames that crossed one of our commits (which reference an epoch
+mls-rs can no longer export), and it must be included in the session archive when
+that lands (it is session-owned state; see
+[planned features](./planned-features.md)).
 
 ## Two asymmetric send groups
 

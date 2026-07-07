@@ -115,6 +115,11 @@ impl PersistableGroupStorage {
     /// the group id so the caller can `load_group` it. Rejects blobs that violate the
     /// invariants `write` maintains — strictly ascending epoch ids and at most
     /// [`EPOCH_RETENTION`] of them — since `max_epoch_id` relies on them.
+    ///
+    /// This validates structure, not freshness: importing an archive older than the group's
+    /// live state (or the same archive into two instances) rewinds the sender ratchet, which
+    /// re-derives AEAD keys/nonces for new plaintexts and resurrects trimmed epoch secrets.
+    /// The caller (session archival) owns single-use/latest-only discipline for archives.
     pub fn import_group(&self, bytes: &[u8]) -> Result<Vec<u8>> {
         let (&version, mut reader) = bytes.split_first().ok_or(CombinerError::ArchiveInvalid)?;
         if version != STORAGE_FORMAT_VERSION {
