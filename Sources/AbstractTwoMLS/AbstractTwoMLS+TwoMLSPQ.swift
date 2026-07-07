@@ -13,10 +13,13 @@
 //  `AbstractTwoMLS` namespace rather than by extending the generated classes
 //  directly. The generated module stays pristine.
 //
-//  Status:
-//   - `PQSession` + the six result adapters are fully wired.
-//   - `PQClient` / `PQInvitation` are stubbed where TwoMLSPQ has no equivalent
-//     (see `notImplemented` throws and the GAP comments).
+//  Status (as of TwoMLSPQ 0.0.8):
+//   - `PQSession`, the six result adapters, `PQClient`, and `PQInvitation` are wired,
+//     including routing (`shouldListenOn`/`sendRendezvous`) and the true APQ epoch pair
+//     on encrypt results.
+//   - Remaining `notImplemented` stubs: credential rotation (`begin(rotating:)`),
+//     A.5 rekey (`begin(.rekey)`); `PQSession.init(archive:)` needs the owning client
+//     and session archive/restore is unimplemented upstream.
 //
 
 import CommProtocol
