@@ -40,6 +40,14 @@ client's whole store. This keeps archival correct across agent rotation — rota
 swaps the session's internal client, and a group's state keeps flowing through the
 handle it was born with.
 
+The same ownership rule covers PSKs: the session keeps a small ledger of its send
+group's recent cross-party TwoMLS-PSKs and **live-injects** them into the stores a
+group actually resolves from, immediately before building or processing the commit
+that references them. The mls-rs secret stores are ephemeral plumbing — they hold
+nothing the session doesn't — so the ledger both rides the session archive and
+resolves frames that crossed one of our commits (which reference an epoch mls-rs
+can no longer export).
+
 ## Two asymmetric send groups
 
 A classical MLS group is symmetric: every member can commit. TwoMLSPQ instead gives

@@ -2,6 +2,7 @@
 
 use mls_rs::{
     psk::{ExternalPskId, PreSharedKey},
+    storage_provider::in_memory::InMemoryPreSharedKeyStorage,
     ExtensionList, Group, KeyPackageStorage, MlsMessage,
 };
 use zeroize::Zeroizing;
@@ -28,12 +29,15 @@ pub struct CombinerGroup<S: KeyPackageStorage + Clone> {
     /// `None` while the PQ half is deferred: an acceptor's send group before the A.4
     /// bootstrap, and the initiator's recv group mirroring it.
     pub pq: Option<PqMlsGroup<S>>,
-    // Group-state storage handles of the client that created/joined each half. An mls-rs
-    // group writes through the config of its originating client, so archival must pull
-    // through these captured handles — a later client swap (agent rotation) must not
-    // redirect where an existing group's state is read from.
+    // Group-state and PSK storage handles of the client that created/joined each half. An
+    // mls-rs group reads and writes through the config of its originating client, so
+    // archival pulls (and PSK injection lands) through these captured handles — a later
+    // client swap (agent rotation) must not redirect where an existing group's state or
+    // PSK lookups resolve.
     classical_storage: PersistableGroupStorage,
     pq_storage: PersistableGroupStorage,
+    classical_psks: InMemoryPreSharedKeyStorage,
+    pq_psks: InMemoryPreSharedKeyStorage,
 }
 
 /// One Combiner group's exported state: a per-group blob per half, produced by
@@ -58,15 +62,29 @@ impl<S: KeyPackageStorage + Clone> CombinerGroup<S> {
             pq,
             classical_storage: client.classical_group_storage().clone(),
             pq_storage: pq_storage_of(client).clone(),
+            classical_psks: client.classical().secret_store(),
+            pq_psks: pq_psks_of(client),
         }
     }
 
     /// Attach a deferred (A.4) PQ half that was created/joined by `client`, capturing the
-    /// storage handle it writes through. The classical half's handle is untouched — it stays
-    /// with the client that originally produced that half.
+    /// storage handles it resolves through. The classical half's handles are untouched —
+    /// they stay with the client that originally produced that half.
     pub fn set_pq(&mut self, pq: PqMlsGroup<S>, client: &CombinerClient<S>) {
         self.pq = Some(pq);
         self.pq_storage = pq_storage_of(client).clone();
+        self.pq_psks = pq_psks_of(client);
+    }
+
+    /// Inject a PSK into the secret stores this group's halves resolve from (the
+    /// originating client's), immediately before building or processing a commit that
+    /// references it. Injecting via the current session client instead would miss after an
+    /// agent rotation — the group keeps reading the store it was born with.
+    pub fn register_psk(&self, psk_id: &ExternalPskId, psk: &PreSharedKey) {
+        let mut classical = self.classical_psks.clone();
+        classical.insert(psk_id.clone(), psk.clone());
+        let mut pq = self.pq_psks.clone();
+        pq.insert(psk_id.clone(), psk.clone());
     }
 
     /// Flush both halves and export each half's state + retained epoch secrets, pulled
@@ -111,6 +129,20 @@ fn pq_storage_of<S: KeyPackageStorage + Clone>(
     #[cfg(not(feature = "cryptokit"))]
     {
         client.classical_group_storage()
+    }
+}
+
+/// The secret store the PQ half resolves PSKs from (see [`pq_storage_of`]).
+fn pq_psks_of<S: KeyPackageStorage + Clone>(
+    client: &CombinerClient<S>,
+) -> InMemoryPreSharedKeyStorage {
+    #[cfg(feature = "cryptokit")]
+    {
+        client.pq().secret_store()
+    }
+    #[cfg(not(feature = "cryptokit"))]
+    {
+        client.classical().secret_store()
     }
 }
 
@@ -205,25 +237,48 @@ pub(crate) fn injected_secret_psk_id(epoch: u64, group_id: &[u8]) -> ExternalPsk
     ExternalPskId::new(id)
 }
 
-/// Export 32 bytes from `group` via exportSecret and register them in the client's PSK store.
-/// Both parties derive the same value from the same epoch, enabling independent PSK registration.
-/// Registers in both classical and PQ stores so both halves can use the PSK for group binding.
-pub fn export_and_register_psk<S: KeyPackageStorage + Clone>(
+/// Derive the exportable PSK for `group`'s current epoch: 32 bytes via exportSecret, with
+/// id = LE epoch || group_id. Pure derivation — no store side-effect. Both parties derive
+/// the same value from the same epoch. Pair with [`register_psk`]: durable PSK material
+/// belongs to the caller (session orchestration), which injects just-in-time before the
+/// commit that references it.
+pub fn export_psk<S: KeyPackageStorage + Clone>(
     group: &MlsGroup<S>,
-    client: &CombinerClient<S>,
-) -> Result<ExternalPskId> {
+) -> Result<(ExternalPskId, PreSharedKey)> {
     let secret = group
         .export_secret(b"exportSecret", b"derive", 32)
         .map_err(|_| CombinerError::Mls)?;
-    let psk_id = make_psk_id(group.current_epoch(), group.group_id());
-    let psk = PreSharedKey::new(secret.as_bytes().to_vec());
+    Ok((
+        make_psk_id(group.current_epoch(), group.group_id()),
+        PreSharedKey::new(secret.as_bytes().to_vec()),
+    ))
+}
+
+/// Inject a PSK into the client's secret store(s) — both halves, so either can resolve it —
+/// immediately before building or processing the commit that references it. The stores are
+/// ephemeral plumbing; they are not archived and hold nothing the caller doesn't.
+pub fn register_psk<S: KeyPackageStorage + Clone>(
+    client: &CombinerClient<S>,
+    psk_id: &ExternalPskId,
+    psk: &PreSharedKey,
+) {
     let mut store = client.classical().secret_store();
     store.insert(psk_id.clone(), psk.clone());
     #[cfg(feature = "cryptokit")]
     {
         let mut pq_store = client.pq().secret_store();
-        pq_store.insert(psk_id.clone(), psk);
+        pq_store.insert(psk_id.clone(), psk.clone());
     }
+}
+
+/// [`export_psk`] + [`register_psk`] for derive-and-use-immediately sites (establishment,
+/// where the PSK is consumed by a join/commit in the same call).
+pub fn export_and_register_psk<S: KeyPackageStorage + Clone>(
+    group: &MlsGroup<S>,
+    client: &CombinerClient<S>,
+) -> Result<ExternalPskId> {
+    let (psk_id, psk) = export_psk(group)?;
+    register_psk(client, &psk_id, &psk);
     Ok(psk_id)
 }
 
@@ -239,12 +294,7 @@ pub fn export_and_register_psk_pq<S: KeyPackageStorage + Clone>(
         .map_err(|_| CombinerError::Mls)?;
     let psk_id = make_psk_id(group.current_epoch(), group.group_id());
     let psk = PreSharedKey::new(secret.as_bytes().to_vec());
-    let mut store = client.classical().secret_store();
-    store.insert(psk_id.clone(), psk.clone());
-    {
-        let mut pq_store = client.pq().secret_store();
-        pq_store.insert(psk_id.clone(), psk);
-    }
+    register_psk(client, &psk_id, &psk);
     Ok(psk_id)
 }
 
