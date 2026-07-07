@@ -236,14 +236,14 @@ impl TwoMlsPqSession {
             _ => return Err(TwoMlsPqError::SessionNotReady),
         };
         let s = Zeroizing::new(apq::pq_ratchet::decapsulate(&eph, ct)?);
-        let client = inner.client.clone();
         let send = inner
             .send_group
             .as_mut()
             .ok_or(TwoMlsPqError::SessionNotReady)?;
-        let send_pq = send.pq.as_mut().ok_or(TwoMlsPqError::SessionNotReady)?;
-        let (pq_commit, apq_psk_id) =
-            apq::pq_ratchet::inject_and_commit(send_pq, &s, client.combiner())?;
+        if send.pq.is_none() {
+            return Err(TwoMlsPqError::SessionNotReady);
+        }
+        let (pq_commit, apq_psk_id) = apq::pq_ratchet::inject_and_commit(send, &s)?;
         let cl_out = send
             .classical
             .commit_builder()
@@ -281,13 +281,14 @@ impl TwoMlsPqSession {
             Some(PqInflight::Responding(s)) => s,
             _ => return Err(TwoMlsPqError::SessionNotReady),
         };
-        let client = inner.client.clone();
         let recv = inner
             .recv_group
             .as_mut()
             .ok_or(TwoMlsPqError::SessionNotReady)?;
-        let recv_pq = recv.pq.as_mut().ok_or(TwoMlsPqError::SessionNotReady)?;
-        apq::pq_ratchet::apply_injected_commit(recv_pq, &s, &pq_commit, client.combiner())?;
+        if recv.pq.is_none() {
+            return Err(TwoMlsPqError::SessionNotReady);
+        }
+        apq::pq_ratchet::apply_injected_commit(recv, &s, &pq_commit)?;
         let cl = MlsMessage::from_bytes(&cl_commit).map_err(|_| TwoMlsPqError::Mls)?;
         recv.classical
             .process_incoming_message(cl)
@@ -1471,6 +1472,39 @@ mod tests {
         let bind = assert_some!(alice.pq_take_pending_outbound());
         let got = assert_ok!(bob.pq_ratchet_apply(bind));
         assert_eq!(got, b"hello-pq");
+    }
+
+    /// The PQ side-band must survive an agent rotation: the injected-secret and apq PSKs
+    /// have to land in the stores the group halves actually resolve from (captured at
+    /// group creation), not the rotated-in client's stores — otherwise Alice's bind and
+    /// Bob's apply both fail to find their PSKs after the client swap.
+    #[test]
+    #[cfg(feature = "cryptokit")]
+    fn test_pq_ratchet_completes_after_agent_rotation() {
+        let (alice, bob) = establish_sessions();
+
+        // Rotate both agents, delivering each rotation commit so the peer's recv group
+        // tracks the new epoch.
+        let new_alice = make_client();
+        assert_ok!(alice.stage_rotation(Arc::clone(&new_alice)));
+        assert_ok!(alice.prepare_to_encrypt(Some(new_alice.client_id())));
+        let enc = assert_ok!(alice.encrypt(b"alice-rotated".to_vec()));
+        assert_some!(assert_ok!(bob.process_incoming(enc.cipher_text)));
+
+        let new_bob = make_client();
+        assert_ok!(bob.stage_rotation(Arc::clone(&new_bob)));
+        assert_ok!(bob.prepare_to_encrypt(Some(new_bob.client_id())));
+        let enc = assert_ok!(bob.encrypt(b"bob-rotated".to_vec()));
+        assert_some!(assert_ok!(alice.process_incoming(enc.cipher_text)));
+
+        // A full A.3 round after both rotations: Alice injects on her send group's PQ half
+        // and binds into its classical half; Bob applies on his recv halves.
+        let ek = assert_ok!(alice.pq_ratchet_begin());
+        assert_ok!(bob.pq_ratchet_respond(ek));
+        let ct = assert_some!(bob.pq_take_pending_outbound());
+        assert_ok!(alice.pq_ratchet_bind(ct, b"pq-after-rotation".to_vec()));
+        let bind = assert_some!(alice.pq_take_pending_outbound());
+        assert_eq!(assert_ok!(bob.pq_ratchet_apply(bind)), b"pq-after-rotation");
     }
 
     /// Complete the A.4 bootstrap after establishment so both directions are full

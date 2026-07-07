@@ -87,6 +87,13 @@ impl<S: KeyPackageStorage + Clone> CombinerGroup<S> {
         pq.insert(psk_id.clone(), psk.clone());
     }
 
+    /// The PQ half's captured secret-store handle, for the PQ side-band flows that manage
+    /// a short-lived PSK themselves (insert *and* delete, see `pq_ratchet::InjectedSecret`).
+    #[cfg(feature = "cryptokit")]
+    pub(crate) fn pq_psk_store(&self) -> InMemoryPreSharedKeyStorage {
+        self.pq_psks.clone()
+    }
+
     /// Flush both halves and export each half's state + retained epoch secrets, pulled
     /// through the storage handles captured at construction (so this works regardless of
     /// which client the session currently holds).
@@ -282,6 +289,20 @@ pub fn export_and_register_psk<S: KeyPackageStorage + Clone>(
     Ok(psk_id)
 }
 
+/// [`export_psk`] for a PQ group, which is a distinct type when `cryptokit` is on.
+#[cfg(feature = "cryptokit")]
+pub fn export_psk_pq<S: KeyPackageStorage + Clone>(
+    group: &PqMlsGroup<S>,
+) -> Result<(ExternalPskId, PreSharedKey)> {
+    let secret = group
+        .export_secret(b"exportSecret", b"derive", 32)
+        .map_err(|_| CombinerError::Mls)?;
+    Ok((
+        make_psk_id(group.current_epoch(), group.group_id()),
+        PreSharedKey::new(secret.as_bytes().to_vec()),
+    ))
+}
+
 /// Export and register PSK from a PQ group. Identical to `export_and_register_psk` but
 /// accepts `PqMlsGroup`, which differs from `MlsGroup` when the `cryptokit` feature is on.
 #[cfg(feature = "cryptokit")]
@@ -289,11 +310,7 @@ pub fn export_and_register_psk_pq<S: KeyPackageStorage + Clone>(
     group: &PqMlsGroup<S>,
     client: &CombinerClient<S>,
 ) -> Result<ExternalPskId> {
-    let secret = group
-        .export_secret(b"exportSecret", b"derive", 32)
-        .map_err(|_| CombinerError::Mls)?;
-    let psk_id = make_psk_id(group.current_epoch(), group.group_id());
-    let psk = PreSharedKey::new(secret.as_bytes().to_vec());
+    let (psk_id, psk) = export_psk_pq(group)?;
     register_psk(client, &psk_id, &psk);
     Ok(psk_id)
 }
