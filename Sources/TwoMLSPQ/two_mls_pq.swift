@@ -993,7 +993,8 @@ public protocol TwoMlsPqInvitationProtocol: AnyObject, Sendable {
     
     /**
      * Serialise the invitation's signing identity + key-package private material, plus the
-     * consumed-remote set so the transport dedup guard survives a restore.
+     * consumed-remote set and the spawned-group forward table so the transport dedup
+     * guard and replay routing survive a restore.
      */
     func archive() throws  -> Data
     
@@ -1008,6 +1009,14 @@ public protocol TwoMlsPqInvitationProtocol: AnyObject, Sendable {
     func combinerKeyPackage()  -> CombinerKeyPackage
     
     /**
+     * Resolve an initial frame's spawn token against the forward table: `Some` names the
+     * receive group of the session this invitation already spawned from an identical
+     * frame (route the payload there — see `TwoMlsPqSession::forwarded`), `None` means
+     * the frame is fresh and should proceed through app validation to `receive`.
+     */
+    func forwardGroupId(spawnToken: Data)  -> CombinerGroupId?
+    
+    /**
      * HPKE-decrypt data sealed to this invitation's (classical) key package init key — the
      * initial routing-header pattern from classical TwoMLS. `info` defaults to the
      * ClientId; `kem_output` and `ciphertext` are the two components of the HPKE ciphertext
@@ -1019,8 +1028,15 @@ public protocol TwoMlsPqInvitationProtocol: AnyObject, Sendable {
      * Receive a remote initiator's APQWelcome and establish the session using this
      * invitation's captured key package. Rejects a second welcome from the same remote
      * (`DuplicateWelcome`).
+     *
+     * `spawn_token` is an opaque, caller-chosen, replay-stable identifier for the
+     * initial frame this welcome arrived in (the Swift adapter passes the app's
+     * combined-welcome digest; this library never interprets it). On success it keys
+     * the forward table: a replayed frame decodes to the same token, `forward_group_id`
+     * resolves it to the spawned session, and `TwoMlsPqSession::forwarded`
+     * acknowledges it there.
      */
-    func receive(welcome: Data, theirKeyPackage: CombinerKeyPackage) throws  -> TwoMlsPqSession
+    func receive(welcome: Data, theirKeyPackage: CombinerKeyPackage, spawnToken: Data) throws  -> TwoMlsPqSession
     
 }
 /**
@@ -1100,7 +1116,8 @@ public convenience init(archive: Data)throws  {
     
     /**
      * Serialise the invitation's signing identity + key-package private material, plus the
-     * consumed-remote set so the transport dedup guard survives a restore.
+     * consumed-remote set and the spawned-group forward table so the transport dedup
+     * guard and replay routing survive a restore.
      */
 open func archive()throws  -> Data  {
     return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
@@ -1133,6 +1150,21 @@ open func combinerKeyPackage() -> CombinerKeyPackage  {
 }
     
     /**
+     * Resolve an initial frame's spawn token against the forward table: `Some` names the
+     * receive group of the session this invitation already spawned from an identical
+     * frame (route the payload there — see `TwoMlsPqSession::forwarded`), `None` means
+     * the frame is fresh and should proceed through app validation to `receive`.
+     */
+open func forwardGroupId(spawnToken: Data) -> CombinerGroupId?  {
+    return try!  FfiConverterOptionTypeCombinerGroupId.lift(try! rustCall() {
+    uniffi_two_mls_pq_fn_method_twomlspqinvitation_forward_group_id(
+            self.uniffiCloneHandle(),
+        FfiConverterData.lower(spawnToken),$0
+    )
+})
+}
+    
+    /**
      * HPKE-decrypt data sealed to this invitation's (classical) key package init key — the
      * initial routing-header pattern from classical TwoMLS. `info` defaults to the
      * ClientId; `kem_output` and `ciphertext` are the two components of the HPKE ciphertext
@@ -1154,13 +1186,21 @@ open func hpkeOpen(kemOutput: Data, ciphertext: Data, info: Data?, aad: Data?)th
      * Receive a remote initiator's APQWelcome and establish the session using this
      * invitation's captured key package. Rejects a second welcome from the same remote
      * (`DuplicateWelcome`).
+     *
+     * `spawn_token` is an opaque, caller-chosen, replay-stable identifier for the
+     * initial frame this welcome arrived in (the Swift adapter passes the app's
+     * combined-welcome digest; this library never interprets it). On success it keys
+     * the forward table: a replayed frame decodes to the same token, `forward_group_id`
+     * resolves it to the spawned session, and `TwoMlsPqSession::forwarded`
+     * acknowledges it there.
      */
-open func receive(welcome: Data, theirKeyPackage: CombinerKeyPackage)throws  -> TwoMlsPqSession  {
+open func receive(welcome: Data, theirKeyPackage: CombinerKeyPackage, spawnToken: Data)throws  -> TwoMlsPqSession  {
     return try  FfiConverterTypeTwoMlsPqSession_lift(try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
     uniffi_two_mls_pq_fn_method_twomlspqinvitation_receive(
             self.uniffiCloneHandle(),
         FfiConverterData.lower(welcome),
-        FfiConverterTypeCombinerKeyPackage_lower(theirKeyPackage),$0
+        FfiConverterTypeCombinerKeyPackage_lower(theirKeyPackage),
+        FfiConverterData.lower(spawnToken),$0
     )
 })
 }
@@ -1239,9 +1279,16 @@ public protocol TwoMlsPqSessionProtocol: AnyObject, Sendable {
     func epochs()  -> ApqEpochs
     
     /**
-     * Process a message forwarded from another of the user's own devices.
+     * Acknowledge a replayed initial frame routed here by the invitation's forward
+     * table. `spawn_token` is the caller's opaque identifier for the frame (the same
+     * value it computes for `TwoMlsPqInvitation::forward_group_id`); it must equal the
+     * token this session was spawned under. Returns `Ok(None)`: a PQ initiator cannot
+     * staple a private message pre-establishment, so a replay of the initial frame
+     * never carries an undelivered payload. A mismatched token is a mis-route
+     * (`DecryptionFailed`); initiator-side sessions have no spawn token and refuse
+     * (`SessionNotReady`).
      */
-    func forwarded(headerDecrypted: Data) throws  -> MlsSenderMessage?
+    func forwarded(spawnToken: Data) throws  -> MlsSenderMessage?
     
     func hasReceiveGroup()  -> Bool
     
@@ -1569,13 +1616,20 @@ open func epochs() -> ApqEpochs  {
 }
     
     /**
-     * Process a message forwarded from another of the user's own devices.
+     * Acknowledge a replayed initial frame routed here by the invitation's forward
+     * table. `spawn_token` is the caller's opaque identifier for the frame (the same
+     * value it computes for `TwoMlsPqInvitation::forward_group_id`); it must equal the
+     * token this session was spawned under. Returns `Ok(None)`: a PQ initiator cannot
+     * staple a private message pre-establishment, so a replay of the initial frame
+     * never carries an undelivered payload. A mismatched token is a mis-route
+     * (`DecryptionFailed`); initiator-side sessions have no spawn token and refuse
+     * (`SessionNotReady`).
      */
-open func forwarded(headerDecrypted: Data)throws  -> MlsSenderMessage?  {
+open func forwarded(spawnToken: Data)throws  -> MlsSenderMessage?  {
     return try  FfiConverterOptionTypeMlsSenderMessage.lift(try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
     uniffi_two_mls_pq_fn_method_twomlspqsession_forwarded(
             self.uniffiCloneHandle(),
-        FfiConverterData.lower(headerDecrypted),$0
+        FfiConverterData.lower(spawnToken),$0
     )
 })
 }
@@ -3752,7 +3806,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_two_mls_pq_checksum_method_twomlspqclient_generate_key_package() != 11864) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqinvitation_archive() != 65507) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqinvitation_archive() != 5365) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqinvitation_client_id() != 34545) {
@@ -3761,10 +3815,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_two_mls_pq_checksum_method_twomlspqinvitation_combiner_key_package() != 28961) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_two_mls_pq_checksum_method_twomlspqinvitation_forward_group_id() != 28585) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_two_mls_pq_checksum_method_twomlspqinvitation_hpke_open() != 30342) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqinvitation_receive() != 8113) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqinvitation_receive() != 3744) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_active_session_id() != 37750) {
@@ -3779,7 +3836,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_epochs() != 27665) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_forwarded() != 20430) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_forwarded() != 29611) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_has_receive_group() != 35549) {

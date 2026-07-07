@@ -381,8 +381,10 @@ struct ForwardRoutingDemo {
 				ciphertext: freshWelcome)
 		else { throw TestErrors.unexpected }
 
-		//and the spawned session still messages normally after the replay
-		try localSession.exchange(with: remoteSession)
+		//and the spawned session still messages normally after the replay (the
+		//acceptor's first frame staples its return welcome, completing the
+		//initiator's side of establishment)
+		try remoteSession.exchange(with: localSession)
 	}
 }
 

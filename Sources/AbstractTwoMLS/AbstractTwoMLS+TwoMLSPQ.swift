@@ -13,16 +13,18 @@
 //  `AbstractTwoMLS` namespace rather than by extending the generated classes
 //  directly. The generated module stays pristine.
 //
-//  Status (as of the TwoMLSPQ 0.0.9 binding, increment B):
+//  Status (as of the TwoMLSPQ 0.0.9 binding, increment C):
 //   - `PQSession`, the six result adapters, `PQClient`, and `PQInvitation` are wired,
 //     including routing (`shouldListenOn`/`sendRendezvous`), the true APQ epoch pair
-//     on encrypt results, A.5 rekey (`begin(.rekey)`), and agent rotation —
+//     on encrypt results, A.5 rekey (`begin(.rekey)`), agent rotation —
 //     `receive(newClientId:)` stages the dedicated agent, `prepareToEncrypt(proposing:)`
-//     commits the Phase 8 handoff, and `begin(.rekey/.finishBootstrap, rotating:)`
-//     moves the PQ leaves (the peer reads `PQInbound.rotatedCredential`).
-//   - Remaining gaps: `PQSession.init(archive:)` needs the owning client and session
-//     archive/restore is unimplemented upstream; `combinedWelcomeDigest` is not yet
-//     threaded into the FFI receive.
+//     commits the Phase 8 handoff, `begin(.rekey/.finishBootstrap, rotating:)` moves
+//     the PQ leaves (the peer reads `PQInbound.rotatedCredential`) — and forward
+//     routing: a replayed initial frame decodes as `.forward` via the invitation's
+//     spawn-token table (`combinedWelcomeDigest` doubles as the opaque token) and the
+//     spawned session acknowledges it through `forwarded(headerDecrypted:)`.
+//   - Remaining gap: `PQSession.init(archive:)` needs the owning client and session
+//     archive/restore is unimplemented upstream.
 //
 
 import CommProtocol
@@ -253,8 +255,14 @@ extension AbstractTwoMLS {
 		}
 
 		public func forwarded(headerDecrypted: Data) throws -> PQSenderMessage? {
-			try base.forwarded(headerDecrypted: headerDecrypted)
-				.map(PQSenderMessage.init)
+			// The forward table and this session's spawn token are keyed by the
+			// app-layer digest of the header-decrypted frame; recompute it here so the
+			// FFI stays digest-convention-agnostic (opaque token). Always nil for the
+			// PQ backend today: a replayed initial frame carries nothing undelivered.
+			try base.forwarded(
+				spawnToken: TypedDigest(prefix: .sha256, over: headerDecrypted).wireFormat
+			)
+			.map(PQSenderMessage.init)
 		}
 
 		public func shouldListenOn() throws -> (
@@ -454,11 +462,25 @@ extension AbstractTwoMLS {
 				info: nil,
 				aad: nil
 			)
-			// GAP: the `.forward` case (routing to already-spawned groups) needs the
-			// spawned-group table; every successful decrypt is an AppWelcome for now.
+			// The digest doubles as the FFI's opaque spawn token: receive() keyed the
+			// invitation's forward table with it, so a transport re-delivery of an
+			// already-accepted frame routes to the spawned session (its receive group
+			// — the group this frame's welcome created) instead of re-surfacing as a
+			// fresh AppWelcome. The digest/sha256 convention lives entirely on this
+			// side of the FFI; the Rust crate never interprets the token.
+			let digest = TypedDigest(prefix: .sha256, over: decrypted)
+			if let spawned = base.forwardGroupId(spawnToken: digest.wireFormat) {
+				return .forward(
+					groupId: try DataIdentifier(
+						prefix: .bits256,
+						checkedData: spawned.classical.bytes
+					),
+					mlsMessageData: decrypted
+				)
+			}
 			// The PQ initiator cannot staple a private message pre-establishment.
 			return .appWelcome(
-				appWelcomeDigest: TypedDigest(prefix: .sha256, over: decrypted),
+				appWelcomeDigest: digest,
 				appWelcome: decrypted,
 				stapledPrivateMessage: nil
 			)
@@ -472,9 +494,6 @@ extension AbstractTwoMLS {
 			stapledMessage: Data?,
 			newClientId: AbstractTwoMLS.ClientID
 		) throws -> (PQSession, plaintext: Data?) {
-			// NB: `combinedWelcomeDigest` (receive-group bookkeeping) is not yet
-			// threaded into the FFI receive; the classical flow uses it and the PQ
-			// backend will grow an equivalent.
 			let pair = try decodeCombinerKeyPackage(bytes: remoteKeyPackage)
 
 			// Bind the key package to the authenticated identity from the validated
@@ -485,10 +504,15 @@ extension AbstractTwoMLS {
 			}
 
 			// Joins both halves from the APQ welcome and stands up the bound return
-			// send group; the invitation dedups repeat welcomes per remote.
+			// send group; the invitation dedups repeat welcomes per remote. The
+			// combined-welcome digest travels as the FFI's opaque spawn token: it keys
+			// the invitation's forward table, so a transport re-delivery of the same
+			// initial frame decodes as `.forward` to this session (`decodeHeader`
+			// recomputes the digest over the decrypted frame and looks it up).
 			let session = PQSession(try base.receive(
 				welcome: sendGroupWelcome,
-				theirKeyPackage: pair
+				theirKeyPackage: pair,
+				spawnToken: combinedWelcomeDigest.wireFormat
 			))
 
 			// Fail open on the stapled message — the session proceeds even if the
