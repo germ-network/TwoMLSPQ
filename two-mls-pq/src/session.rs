@@ -83,6 +83,12 @@ struct SessionInner {
     /// PSKs from the store of the client that created it, so registering only through
     /// `self.client` would strand every group created before the latest rotation.
     psk_stores: Vec<InMemoryPreSharedKeyStorage>,
+    /// The opaque spawn token this acceptor session was created under (see
+    /// `TwoMlsPqInvitation::receive`); `None` on initiator sessions. `forwarded`
+    /// matches replayed initial frames against it. Opaque — this library never
+    /// interprets the bytes. Must be serialized when `archive()` is implemented, or
+    /// restored sessions stop acknowledging replayed initial frames.
+    spawn_token: Option<Vec<u8>>,
 }
 
 /// A TwoMLSPQ session holding two asymmetric Combiner send groups.
@@ -1006,6 +1012,7 @@ fn build_session(
             listen_rendezvous: BTreeMap::new(),
             send_group_storage,
             psk_stores,
+            spawn_token: None,
         }),
     })
 }
@@ -1017,6 +1024,13 @@ impl TwoMlsPqSession {
     /// the lock policy is uniform and panic-free (the crate denies `unwrap`/`expect`/`panic`).
     fn lock(&self) -> std::sync::MutexGuard<'_, SessionInner> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Record the opaque spawn token this acceptor session was created under. Called by
+    /// `TwoMlsPqInvitation::receive` right after a successful `accept`; `forwarded`
+    /// matches replayed initial frames against it.
+    pub(crate) fn set_spawn_token(&self, token: Vec<u8>) {
+        self.lock().spawn_token = Some(token);
     }
 }
 
@@ -1725,9 +1739,24 @@ impl TwoMlsPqSession {
         Ok(())
     }
 
-    /// Process a message forwarded from another of the user's own devices.
-    pub fn forwarded(&self, _header_decrypted: Vec<u8>) -> Result<Option<MlsSenderMessage>> {
-        Err(TwoMlsPqError::SessionNotReady)
+    /// Acknowledge a replayed initial frame routed here by the invitation's forward
+    /// table. `spawn_token` is the caller's opaque identifier for the frame (the same
+    /// value it computes for `TwoMlsPqInvitation::forward_group_id`); it must equal the
+    /// token this session was spawned under. Returns `Ok(None)`: a PQ initiator cannot
+    /// staple a private message pre-establishment, so a replay of the initial frame
+    /// never carries an undelivered payload. A mismatched token is a mis-route
+    /// (`DecryptionFailed`); initiator-side sessions have no spawn token and refuse
+    /// (`SessionNotReady`).
+    pub fn forwarded(&self, spawn_token: Vec<u8>) -> Result<Option<MlsSenderMessage>> {
+        let inner = self.lock();
+        let expected = inner
+            .spawn_token
+            .as_ref()
+            .ok_or(TwoMlsPqError::SessionNotReady)?;
+        if *expected != spawn_token {
+            return Err(TwoMlsPqError::DecryptionFailed);
+        }
+        Ok(None)
     }
 
     /// The combiner group ids and per-epoch rendezvous addresses the transport should
@@ -2764,10 +2793,16 @@ mod tests {
     }
 
     #[test]
-    fn test_forwarded_returns_session_not_ready() {
-        let (alice_session, _) = establish_sessions();
+    fn test_forwarded_refused_without_spawn_token() {
+        // Initiator sessions (and acceptor sessions built directly via `accept`, not
+        // through an invitation) carry no spawn token — nothing to match replays against.
+        let (alice_session, bob_session) = establish_sessions();
         assert_err!(
             alice_session.forwarded(vec![]),
+            TwoMlsPqError::SessionNotReady
+        );
+        assert_err!(
+            bob_session.forwarded(b"anything".to_vec()),
             TwoMlsPqError::SessionNotReady
         );
     }
@@ -3082,10 +3117,6 @@ mod tests {
     #[test]
     #[ignore = "archive() is not yet implemented"]
     fn test_archive_round_trips_session_state() {}
-
-    #[test]
-    #[ignore = "forwarded() is not yet implemented"]
-    fn test_forwarded_decrypts_inner_payload() {}
 
     #[test]
     fn test_psk_export_uses_correct_label_and_context() {
