@@ -1313,6 +1313,32 @@ public protocol TwoMlsPqSessionProtocol: AnyObject, Sendable {
     func pqRatchetRespond(ekMsg: Data) throws 
     
     /**
+     * Apply an A.5 rekey Commit' (0x17). As the initiator mid-operation (frame carries
+     * the counter-Upd'), apply the peer's commit to our recv mirror, commit the
+     * counter-Upd' on our own send-PQ with the freshly-exported cross-PSK, park the
+     * final 0x17, and return `true` (pick it up via `pq_take_pending_outbound`). As the
+     * responder (empty counter slot), apply the final commit, take the turn, and return
+     * `false` — the operation is complete.
+     */
+    func pqRekeyApply(msg: Data) throws  -> Bool
+    
+    /**
+     * A.5 initiator — propose Upd'(self) into the peer's send-PQ (our recv mirror) and
+     * return the 0x15 frame. Requires both PQ halves live (post-A.4 only), the turn, and
+     * no other side-band operation in flight. Proposal only: no epochs move until the
+     * responder commits.
+     */
+    func pqRekeyBegin() throws  -> Data
+    
+    /**
+     * A.5 responder — commit the initiator's Upd' on our own send-PQ with an updatePath
+     * and a PSK exported from our recv-PQ mirror (the initiator derives the same PSK from
+     * its send-PQ), then park the `[Commit'][counter-Upd'(self)]` frame (0x17) for pickup
+     * via `pq_take_pending_outbound`.
+     */
+    func pqRekeyRespond(updMsg: Data) throws 
+    
+    /**
      * Consume the side-band frame parked by the responder-side operations
      * (`pq_ratchet_respond` / `pq_ratchet_bind` / `pq_bootstrap_respond`). Single slot,
      * single delivery: those operations refuse to start while a frame is waiting.
@@ -1333,10 +1359,14 @@ public protocol TwoMlsPqSessionProtocol: AnyObject, Sendable {
      * Process an incoming message.
      *
      * - APQWelcome (0x01) → join recv groups; `Ok(None)`
-     * - Rotation commit+app (0x03) → advance send epoch then decrypt; `DecryptResult`
-     * - Partial bundle (0x05) → advance send.pq then decrypt app; `DecryptResult`
-     * - Full bundle (0x07) → epoch advance + PSK refresh then decrypt; `DecryptResult`
-     * - MLS ciphertext → decrypt on recv_group.pq; `DecryptResult`
+     * - Rotation commit+app (0x03) → apply the peer's rotation commit to
+     * `recv_group.classical`, then decrypt; `DecryptResult`
+     * - A.2 ratchet frame (0x05) → apply the commit (if any) to `recv_group.classical`,
+     * stage the stapled Upd(sender) for app approval, decrypt; `DecryptResult`
+     * - 0x07 (pre-A.2 full bundle) → retired; rejected rather than misparsed
+     * - Stapled welcome (0x09) → join recv groups from the embedded APQWelcome, then
+     * process the inner frame
+     * - Bare MLS ciphertext → decrypt on `recv_group.classical`; `DecryptResult`
      *
      * PQ-ratchet frames (0x0B/0x0D/0x0F) are **not** handled here — the host must route them to
      * `pq_ratchet_respond`/`pq_ratchet_bind`/`pq_ratchet_apply` by their leading tag byte. Passing
@@ -1681,6 +1711,51 @@ open func pqRatchetRespond(ekMsg: Data)throws   {try rustCallWithError(FfiConver
 }
     
     /**
+     * Apply an A.5 rekey Commit' (0x17). As the initiator mid-operation (frame carries
+     * the counter-Upd'), apply the peer's commit to our recv mirror, commit the
+     * counter-Upd' on our own send-PQ with the freshly-exported cross-PSK, park the
+     * final 0x17, and return `true` (pick it up via `pq_take_pending_outbound`). As the
+     * responder (empty counter slot), apply the final commit, take the turn, and return
+     * `false` — the operation is complete.
+     */
+open func pqRekeyApply(msg: Data)throws  -> Bool  {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
+    uniffi_two_mls_pq_fn_method_twomlspqsession_pq_rekey_apply(
+            self.uniffiCloneHandle(),
+        FfiConverterData.lower(msg),$0
+    )
+})
+}
+    
+    /**
+     * A.5 initiator — propose Upd'(self) into the peer's send-PQ (our recv mirror) and
+     * return the 0x15 frame. Requires both PQ halves live (post-A.4 only), the turn, and
+     * no other side-band operation in flight. Proposal only: no epochs move until the
+     * responder commits.
+     */
+open func pqRekeyBegin()throws  -> Data  {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
+    uniffi_two_mls_pq_fn_method_twomlspqsession_pq_rekey_begin(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * A.5 responder — commit the initiator's Upd' on our own send-PQ with an updatePath
+     * and a PSK exported from our recv-PQ mirror (the initiator derives the same PSK from
+     * its send-PQ), then park the `[Commit'][counter-Upd'(self)]` frame (0x17) for pickup
+     * via `pq_take_pending_outbound`.
+     */
+open func pqRekeyRespond(updMsg: Data)throws   {try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
+    uniffi_two_mls_pq_fn_method_twomlspqsession_pq_rekey_respond(
+            self.uniffiCloneHandle(),
+        FfiConverterData.lower(updMsg),$0
+    )
+}
+}
+    
+    /**
      * Consume the side-band frame parked by the responder-side operations
      * (`pq_ratchet_respond` / `pq_ratchet_bind` / `pq_bootstrap_respond`). Single slot,
      * single delivery: those operations refuse to start while a frame is waiting.
@@ -1714,10 +1789,14 @@ open func prepareToEncrypt(proposing: ClientId?)throws  -> PrepareEncryptResult 
      * Process an incoming message.
      *
      * - APQWelcome (0x01) → join recv groups; `Ok(None)`
-     * - Rotation commit+app (0x03) → advance send epoch then decrypt; `DecryptResult`
-     * - Partial bundle (0x05) → advance send.pq then decrypt app; `DecryptResult`
-     * - Full bundle (0x07) → epoch advance + PSK refresh then decrypt; `DecryptResult`
-     * - MLS ciphertext → decrypt on recv_group.pq; `DecryptResult`
+     * - Rotation commit+app (0x03) → apply the peer's rotation commit to
+     * `recv_group.classical`, then decrypt; `DecryptResult`
+     * - A.2 ratchet frame (0x05) → apply the commit (if any) to `recv_group.classical`,
+     * stage the stapled Upd(sender) for app approval, decrypt; `DecryptResult`
+     * - 0x07 (pre-A.2 full bundle) → retired; rejected rather than misparsed
+     * - Stapled welcome (0x09) → join recv groups from the embedded APQWelcome, then
+     * process the inner frame
+     * - Bare MLS ciphertext → decrypt on `recv_group.classical`; `DecryptResult`
      *
      * PQ-ratchet frames (0x0B/0x0D/0x0F) are **not** handled here — the host must route them to
      * `pq_ratchet_respond`/`pq_ratchet_bind`/`pq_ratchet_apply` by their leading tag byte. Passing
@@ -3701,13 +3780,22 @@ private let initializationResult: InitializationResult = {
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_ratchet_respond() != 47447) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_rekey_apply() != 12895) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_rekey_begin() != 52998) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_rekey_respond() != 34606) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_take_pending_outbound() != 34962) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_prepare_to_encrypt() != 16181) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_process_incoming() != 20883) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_process_incoming() != 56219) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_proposal_context() != 55198) {

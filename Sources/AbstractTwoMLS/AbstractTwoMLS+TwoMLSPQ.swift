@@ -301,9 +301,7 @@ extension AbstractTwoMLS {
 			case .ratchet:
 				return PQOutbound(kind: kind, payload: try base.pqRatchetBegin())
 			case .rekey:
-				throw TwoMLSPQConformanceError.notImplemented(
-					"PQRatchet.begin(.rekey) — A.5 has no FFI surface yet"
-				)
+				return PQOutbound(kind: kind, payload: try base.pqRekeyBegin())
 			}
 		}
 
@@ -315,8 +313,23 @@ extension AbstractTwoMLS {
 
 		public func ingest(_ message: Data) throws -> PQInbound {
 			// PQ side-band frame tags (session.rs): EK 0x0B, CT 0x0D, bind 0x0F,
-			// bootstrap KP 0x11, bootstrap bind 0x13.
+			// bootstrap KP 0x11, bootstrap bind 0x13, rekey Upd' 0x15, rekey Commit' 0x17.
 			switch message.first {
+			case 0x15:
+				// A.5 responder: commit the initiator's Upd' on our send-PQ; the
+				// [Commit'][counter-Upd'] reply parks for `advance` to hand out.
+				try base.pqRekeyRespond(updMsg: message)
+				return PQInbound(
+					kind: .rekey, advancedGroup: .ours,
+					newEpochs: epochs, rotatedCredential: nil)
+			case 0x17:
+				// Mid-operation (initiator: counter-Upd' present) our own send-PQ also
+				// committed and the final Commit' parks for `advance`; final (responder:
+				// empty counter) only our recv mirror advanced and the turn is ours.
+				let continued = try base.pqRekeyApply(msg: message)
+				return PQInbound(
+					kind: .rekey, advancedGroup: continued ? .ours : .theirs,
+					newEpochs: epochs, rotatedCredential: nil)
 			case 0x11:
 				try base.pqBootstrapRespond(kpMsg: message)
 				return PQInbound(
