@@ -18,6 +18,19 @@ expect_used = "deny"
 panic = "deny"
 unwrap_used = "deny"
 
+# Size-optimized release profile: the dylib ships inside the Germ App Clip, which has a
+# 15 MB uncompressed budget (physical invocations). panic=abort drops unwind tables and
+# std's backtrace machinery (~0.5 MB) — a Rust panic aborts the process instead of
+# surfacing as a UniFFI internal error, acceptable since clippy denies panic/unwrap/expect
+# workspace-wide. strip=symbols keeps the exported (FFI + uniffi metadata) symbols.
+# If benchmarks regress meaningfully, relax opt-level to "s" before anything else.
+[profile.release]
+codegen-units = 1
+lto = "fat"
+opt-level = "z"
+panic = "abort"
+strip = "symbols"
+
 [workspace.dependencies]
 mls-rs = { version = "0.55", features = ["psk", "private_message", "serde"] }
 mls-rs-crypto-cryptokit = { version = "0.11", git = "https://github.com/germ-network/mls-rs", rev = "3743c75d32257ab48bde2875f5e8d624410147e9", features = [

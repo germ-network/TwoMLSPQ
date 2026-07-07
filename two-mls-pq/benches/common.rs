@@ -13,7 +13,8 @@ use two_mls_pq::{
     MlsCipherSuite,
 };
 
-pub fn signing_key() -> Vec<u8> {
+/// A fresh, unique ClientId for benches (opaque random bytes, not a signing key).
+pub fn client_id() -> Vec<u8> {
     let crypto = RustCryptoProvider::new();
     let cs = crypto
         .cipher_suite_provider(mls_rs::CipherSuite::CURVE25519_CHACHA)
@@ -23,7 +24,7 @@ pub fn signing_key() -> Vec<u8> {
 }
 
 pub fn client() -> Arc<TwoMlsPqClient> {
-    TwoMlsPqClient::new(signing_key()).unwrap()
+    TwoMlsPqClient::new(client_id()).unwrap()
 }
 
 pub fn combiner_kp(client: &TwoMlsPqClient) -> CombinerKeyPackage {
