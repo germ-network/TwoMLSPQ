@@ -33,6 +33,7 @@ strip = "symbols"
 
 [workspace.dependencies]
 mls-rs = { version = "0.55", features = ["psk", "private_message", "serde"] }
+mls-rs-core = { version = "0.27", git = "https://github.com/germ-network/mls-rs", rev = "3743c75d32257ab48bde2875f5e8d624410147e9" }
 mls-rs-crypto-cryptokit = { version = "0.11", git = "https://github.com/germ-network/mls-rs", rev = "3743c75d32257ab48bde2875f5e8d624410147e9", features = [
   "post-quantum",
 ] }

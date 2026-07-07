@@ -20,10 +20,12 @@
 ))]
 compile_error!("the `cryptokit` feature requires a macOS or iOS target");
 
+pub mod archive;
 mod client;
 mod group;
 #[cfg(feature = "cryptokit")]
 pub mod pq_ratchet;
+pub mod storage;
 
 pub use client::{CombinerClient, MlsClient, OurConfig};
 #[cfg(feature = "cryptokit")]
