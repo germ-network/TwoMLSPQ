@@ -26,7 +26,7 @@ use crate::{
     },
     AgentState, Archive, ClientId, CombinerGroupId, CommitResult, DecryptResult, EncryptResult,
     EpochRendezvous, ListenChannels, MlsGroupId, MlsSenderMessage, PrepareEncryptResult,
-    RendezvousId, Result, SessionId, TwoMlsPqDigest, TwoMlsPqError,
+    RendezvousId, Result, SessionId, TwoMlsPqError,
 };
 
 #[cfg(feature = "cryptokit")]
@@ -39,15 +39,15 @@ struct SessionInner {
     send_group: Option<CombinerGroup>,
     recv_group: Option<CombinerGroup>,
     pending_outbound: Option<Vec<u8>>,
-    pending_proposal_hash: Option<TwoMlsPqDigest>,
+    pending_proposal_hash: Option<Vec<u8>>,
     /// Send-group commit to bundle with the next outbound app message (rotation, or epoch advance).
     pending_commit_message: Option<Vec<u8>>,
     /// Upd(self) proposal for the peer's send group, stapled onto the next outbound frame.
     pending_proposal_message: Option<Vec<u8>>,
     /// The peer's stapled Upd proposal awaiting app approval (digest, proposal bytes). It
     /// enters our send group's proposal cache only via `queue_proposal`.
-    offered_proposal: Option<(TwoMlsPqDigest, Vec<u8>)>,
-    queued_proposal: Option<TwoMlsPqDigest>,
+    offered_proposal: Option<(Vec<u8>, Vec<u8>)>,
+    queued_proposal: Option<Vec<u8>>,
     pending_new_client: Option<Arc<TwoMlsPqClient>>,
     #[cfg(feature = "cryptokit")]
     pq_inflight: Option<PqInflight>,
@@ -728,17 +728,15 @@ fn decode_ratchet(bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
     Ok((commit, proposal, app))
 }
 
-/// SHA-256 digest of `bytes`, typed for the FFI. Identifies a stapled proposal in the
-/// app-approval handshake; both sides derive it from the proposal message bytes.
-fn sha256_digest(bytes: &[u8]) -> Result<TwoMlsPqDigest> {
+/// SHA-256 digest of `bytes` — the raw 32-byte convention every digest on this FFI
+/// uses (see the note above `PrepareEncryptResult` in lib.rs). Both sides of the
+/// app-approval handshake derive the same value from the same object's bytes.
+fn sha256_digest(bytes: &[u8]) -> Result<Vec<u8>> {
     use mls_rs::{CipherSuiteProvider, CryptoProvider};
     let cs = mls_rs_crypto_rustcrypto::RustCryptoProvider::new()
         .cipher_suite_provider(mls_rs::CipherSuite::CURVE25519_CHACHA)
         .ok_or(TwoMlsPqError::Mls)?;
-    Ok(TwoMlsPqDigest {
-        hash_type: crate::DIGEST_SHA256,
-        digest: cs.hash(bytes).map_err(|_| TwoMlsPqError::Mls)?,
-    })
+    cs.hash(bytes).map_err(|_| TwoMlsPqError::Mls)
 }
 
 /// The APQ epoch pair for a combiner group: the PQ side-band epoch (0 while that
@@ -853,6 +851,10 @@ impl SessionInner {
             .commit_message
             .to_bytes()
             .map_err(|_| TwoMlsPqError::Mls)?;
+        // The rotation stages a commit, not a proposal: the binding value is the
+        // SHA-256 of the commit message itself (`encrypt` carries it as the app
+        // message's authenticated data).
+        let proposal_hash = sha256_digest(&commit_bytes)?;
         self.pending_commit_message = Some(commit_bytes);
 
         let old_id = self.my_state.client_id();
@@ -862,18 +864,6 @@ impl SessionInner {
         };
         self.client = new_client;
 
-        let nonce = self
-            .send_group
-            .as_ref()
-            .ok_or(TwoMlsPqError::SessionNotReady)?
-            .classical
-            .export_secret(b"proposal", b"prepare", 32)
-            .map_err(|_| TwoMlsPqError::Mls)?;
-
-        let proposal_hash = TwoMlsPqDigest {
-            hash_type: crate::DIGEST_SHA256,
-            digest: nonce.as_bytes().to_vec(),
-        };
         self.pending_proposal_hash = Some(proposal_hash.clone());
 
         Ok(crate::PrepareEncryptResult {
@@ -944,22 +934,15 @@ impl SessionInner {
                 .propose_update(Vec::new())
                 .map_err(|_| TwoMlsPqError::Mls)?
         };
-        self.pending_proposal_message =
-            Some(proposal_msg.to_bytes().map_err(|_| TwoMlsPqError::Mls)?);
+        let proposal_bytes = proposal_msg.to_bytes().map_err(|_| TwoMlsPqError::Mls)?;
+        // The binding value is the SHA-256 of the staged Upd(self) proposal — the same
+        // value the receiver reports as `QueuedRemoteProposal.digest`, and the classical
+        // backend's convention. `encrypt` carries it as the app message's authenticated
+        // data, so the staple is verifiable against the frame it rides in.
+        let proposal_hash = sha256_digest(&proposal_bytes)?;
+        self.pending_proposal_message = Some(proposal_bytes);
 
         let their_id = self.their_state.client_id();
-        let nonce = self
-            .send_group
-            .as_ref()
-            .ok_or(TwoMlsPqError::SessionNotReady)?
-            .classical
-            .export_secret(b"proposal", b"prepare", 32)
-            .map_err(|_| TwoMlsPqError::Mls)?;
-
-        let proposal_hash = TwoMlsPqDigest {
-            hash_type: crate::DIGEST_SHA256,
-            digest: nonce.as_bytes().to_vec(),
-        };
         self.pending_proposal_hash = Some(proposal_hash.clone());
 
         Ok(crate::PrepareEncryptResult {
@@ -1329,7 +1312,7 @@ impl TwoMlsPqSession {
 
             let cipher_msg = send
                 .message_group_mut()
-                .encrypt_application_message(&app_message, proposal_hash.digest)
+                .encrypt_application_message(&app_message, proposal_hash)
                 .map_err(|_| TwoMlsPqError::Mls)?;
 
             let epochs = apq_epochs(send);
@@ -1505,10 +1488,9 @@ impl TwoMlsPqSession {
                     digest,
                     sender: sender_id.clone(),
                     proposing: sender_id.clone(),
-                    context: TwoMlsPqDigest {
-                        hash_type: crate::DIGEST_SHA256,
-                        digest: group_id,
-                    },
+                    // The ordering context is the SHA-256 of the receive group's
+                    // (classical, message-half) group id — `proposal_context`'s value.
+                    context: sha256_digest(&group_id)?,
                 })
             };
 
@@ -1667,16 +1649,17 @@ impl TwoMlsPqSession {
         }
     }
 
-    pub fn proposal_context(&self) -> Option<TwoMlsPqDigest> {
+    /// The SHA-256 of the receive group's classical (message-half) group id — the
+    /// binding context for identity introductions, matching the classical backend's
+    /// convention and `QueuedRemoteProposal.context`. Always the classical half:
+    /// message ordering rides it, and it exists from establishment (the PQ half may
+    /// still be deferred pre-A.4).
+    pub fn proposal_context(&self) -> Option<Vec<u8>> {
         let inner = self.lock();
-        inner.recv_group.as_ref().map(|rg| TwoMlsPqDigest {
-            hash_type: crate::DIGEST_SHA256,
-            digest: rg
-                .pq
-                .as_ref()
-                .map(|pq| pq.group_id().to_vec())
-                .unwrap_or_else(|| rg.classical.group_id().to_vec()),
-        })
+        inner
+            .recv_group
+            .as_ref()
+            .and_then(|rg| sha256_digest(rg.classical.group_id()).ok())
     }
 
     /// Where to post outbound frames: the recv group's classical-half exporter at its
@@ -1704,13 +1687,13 @@ impl TwoMlsPqSession {
     /// Approve the peer's stapled Upd proposal (identified by its digest). The proposal
     /// message enters our send group's proposal cache, and the next
     /// `prepare_to_encrypt(None)` commits it (with a cross-party PSK refresh).
-    pub fn queue_proposal(&self, digest: TwoMlsPqDigest) -> Result<()> {
+    pub fn queue_proposal(&self, digest: Vec<u8>) -> Result<()> {
         let mut inner = self.lock();
         let (offered, proposal_bytes) = inner
             .offered_proposal
             .take()
             .ok_or(TwoMlsPqError::ProposalRejected)?;
-        if offered.digest != digest.digest {
+        if offered != digest {
             inner.offered_proposal = Some((offered, proposal_bytes));
             return Err(TwoMlsPqError::ProposalRejected);
         }
@@ -2655,7 +2638,7 @@ mod tests {
     fn test_prepare_to_encrypt_returns_proposal_hash() {
         let (alice_session, _bob_session) = establish_sessions();
         let result = assert_ok!(alice_session.prepare_to_encrypt(None));
-        assert!(!result.proposal_hash.digest.is_empty());
+        assert!(!result.proposal_hash.is_empty());
         assert!(!result.did_commit);
     }
 
@@ -2821,6 +2804,30 @@ mod tests {
 
         assert!(prep.did_commit, "should commit after queued proposal");
         assert!(prep.committed_remote_client_id.is_some());
+    }
+
+    /// The binding values are honest digests with cross-side coherence: the sender's
+    /// `proposal_hash` is the SHA-256 of the staged Upd(self) proposal, so the
+    /// receiver's `QueuedRemoteProposal.digest` — derived independently from the
+    /// received bytes — equals it; and the receiver's ordering `context` equals its own
+    /// `proposal_context` (SHA-256 of its recv group's classical group id).
+    #[test]
+    fn test_proposal_hash_is_digest_of_the_staple_both_sides_agree_on() {
+        let (alice_session, bob_session) = establish_sessions();
+
+        let prep = assert_ok!(bob_session.prepare_to_encrypt(None));
+        let enc = assert_ok!(bob_session.encrypt(b"hello from bob".to_vec()));
+        let result = assert_some!(assert_ok!(alice_session.process_incoming(enc.cipher_text)));
+        let proposal = assert_some!(result.proposal);
+
+        // Sender's binding value == receiver's independently derived digest.
+        assert_eq!(prep.proposal_hash, proposal.digest);
+        assert_eq!(prep.proposal_hash.len(), 32);
+        // Self-consistent across the receiver's two surfaces.
+        assert_eq!(
+            proposal.context,
+            assert_some!(alice_session.proposal_context())
+        );
     }
 
     #[test]
@@ -3262,8 +3269,8 @@ mod tests {
         let (alice_session, bob_session) = establish_sessions();
         let alice_ctx = assert_some!(alice_session.proposal_context());
         let bob_ctx = assert_some!(bob_session.proposal_context());
-        assert!(!alice_ctx.digest.is_empty());
-        assert!(!bob_ctx.digest.is_empty());
+        assert!(!alice_ctx.is_empty());
+        assert!(!bob_ctx.is_empty());
     }
 
     #[test]
@@ -3299,7 +3306,7 @@ mod tests {
         let result = assert_some!(assert_ok!(bob_session.process_incoming(enc.cipher_text)));
 
         let proposal = assert_some!(result.proposal);
-        assert!(!proposal.digest.digest.is_empty());
+        assert!(!proposal.digest.is_empty());
         assert_eq!(proposal.sender, alice_session.my_agent_state().client_id());
     }
 
