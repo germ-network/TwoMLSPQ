@@ -214,8 +214,12 @@ jobs:
       - name: Test (cryptokit)
         run: cargo test -p two-mls-pq --features cryptokit
 
-      # apq's macOS test run adds the CryptoKit ↔ awslc interop tests (Apple-gated
-      # dev-dependency): raw ML-KEM encap/decap, mixed-provider MLS groups, and archive
-      # blobs crossing providers.
-      - name: Test (apq, incl. cross-provider interop)
-        run: cargo test -p apq
+      - name: Test (apq)
+        run: cargo test -p apq --lib
+
+      # CryptoKit ↔ awslc interop as its own gate: raw ML-KEM encap/decap, mixed-provider
+      # MLS groups, archive blobs, and the HPKE envelope, each crossing providers in both
+      # directions. This is what keeps a Linux/awslc peer wire-compatible with an
+      # Apple/CryptoKit peer.
+      - name: Cross-provider interop (cryptokit <-> awslc)
+        run: cargo test -p apq --test provider_interop

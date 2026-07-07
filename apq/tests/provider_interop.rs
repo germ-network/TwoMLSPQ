@@ -1,14 +1,16 @@
-//! Cross-provider integration tests (born as the Phase 0 spike of the provider-agnostic
-//! plan; the interop tests are the permanent awslc ↔ CryptoKit coverage).
+//! Provider interop suite: everything that must agree across the two pinned providers
+//! for mixed deployments (a Linux/awslc peer talking to an Apple/CryptoKit peer).
 //!
-//! Proves:
+//! Covers:
 //!   1. `AwsLcCryptoProvider` runs a full PQ MLS group on suite 0xFDEA (ML-KEM-768) — the
-//!      portable PQ provider CI uses on Linux.
+//!      portable provider CI uses on Linux.
 //!   2. The same provider covers the classical half (CURVE25519_CHACHA), so one provider
 //!      selection serves both halves.
 //!   3. (Apple targets) CryptoKit and awslc agree on the ML-KEM-768 wire: raw KEM
 //!      encap/decap crosses providers, a group with one member on each provider works,
-//!      and the archive blob format survives the provider swap.
+//!      the archive blob format survives the provider swap, and the HPKE envelope (the
+//!      A.1 initial routing header, sealed to the PQ key package's init key) opens
+//!      across providers in both directions.
 
 // Test-only crate: helper fns aren't `#[test]` items, so the workspace's unwrap/panic
 // denies would fire despite clippy.toml's allow-unwrap-in-tests.
@@ -147,6 +149,35 @@ mod cryptokit_interop {
         let cryptokit = build_client(CryptoKitMlKemProvider, ML_KEM_768, b"cryptokit");
         group_round_trip(&awslc, &cryptokit);
         group_round_trip(&cryptokit, &awslc);
+    }
+
+    /// The HPKE envelope crosses providers in both directions — the mixed-deployment
+    /// shape of `two-mls-pq`'s `hpke_seal_to_key_package` / `hpke_open`: the keypair
+    /// stays with its generating provider (an invitation's init key), the peer seals
+    /// to the public key with the other provider.
+    #[test]
+    fn hpke_envelope_crosses_providers() {
+        let awslc_cs = AwsLcCryptoProvider::new()
+            .cipher_suite_provider(ML_KEM_768)
+            .unwrap();
+        let ck_cs = CryptoKitMlKemProvider
+            .cipher_suite_provider(ML_KEM_768)
+            .unwrap();
+        let (info, aad, pt): (&[u8], &[u8], &[u8]) = (b"client-id", b"aad", b"routing-header");
+
+        // CryptoKit holds the keypair; awslc seals to it; CryptoKit opens.
+        let (dk, ek) = ck_cs.kem_generate().unwrap();
+        let sealed = awslc_cs.hpke_seal(&ek, info, Some(aad), pt).unwrap();
+        let opened = ck_cs.hpke_open(&sealed, &dk, &ek, info, Some(aad)).unwrap();
+        assert_eq!(&*opened, pt);
+
+        // awslc holds the keypair; CryptoKit seals to it; awslc opens.
+        let (dk, ek) = awslc_cs.kem_generate().unwrap();
+        let sealed = ck_cs.hpke_seal(&ek, info, Some(aad), pt).unwrap();
+        let opened = awslc_cs
+            .hpke_open(&sealed, &dk, &ek, info, Some(aad))
+            .unwrap();
+        assert_eq!(&*opened, pt);
     }
 
     /// The archive blob format survives a provider swap: sealed with awslc's
