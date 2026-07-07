@@ -11,9 +11,9 @@ operations for a credential funnel through the one object.
 TwoMLSPQ deliberately breaks this up into three app-facing objects, each owning
 exactly the state its job needs:
 
-- **`TwoMlsPqClient`** — the agent identity. Its job is minting key packages and
+- **`TwoMlsPqIdentity`** — the agent identity. Its job is minting key packages and
   invitations and holding their private material only until it is captured into an
-  invitation (`generate_invitation` purges the client's own copies). It is not a
+  invitation (`generate_invitation` purges the identity's own copies). It is not a
   hub for group operations.
 - **`TwoMlsPqInvitation`** — a self-contained receiving capability: one published
   combiner key package's private material, the signing identity, and the

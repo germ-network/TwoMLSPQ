@@ -14,7 +14,7 @@ use crate::key_package_store::CombinerGroup;
 
 use crate::{
     key_packages::{
-        ensure_pq_available, parse_mls_key_package, CombinerKeyPackage, TwoMlsPqClient,
+        ensure_pq_available, parse_mls_key_package, CombinerKeyPackage, TwoMlsPqIdentity,
     },
     AgentState, Archive, ClientId, CombinerGroupId, CommitResult, DecryptResult, EncryptResult,
     ListenChannels, MlsGroupId, MlsSenderMessage, PrepareEncryptResult, RendezvousId, Result,
@@ -27,7 +27,7 @@ use apq::{export_and_register_psk_pq, pq_create_group_with_member, pq_join_group
 use zeroize::Zeroizing;
 
 struct SessionInner {
-    client: Arc<TwoMlsPqClient>,
+    client: Arc<TwoMlsPqIdentity>,
     send_group: Option<CombinerGroup>,
     recv_group: Option<CombinerGroup>,
     pending_outbound: Option<Vec<u8>>,
@@ -40,7 +40,7 @@ struct SessionInner {
     /// enters our send group's proposal cache only via `queue_proposal`.
     offered_proposal: Option<(TwoMlsPqDigest, Vec<u8>)>,
     queued_proposal: Option<TwoMlsPqDigest>,
-    pending_new_client: Option<Arc<TwoMlsPqClient>>,
+    pending_new_client: Option<Arc<TwoMlsPqIdentity>>,
     #[cfg(feature = "cryptokit")]
     pq_inflight: Option<PqInflight>,
     session_id: SessionId,
@@ -531,7 +531,7 @@ impl SessionInner {
 }
 
 fn build_session(
-    client: Arc<TwoMlsPqClient>,
+    client: Arc<TwoMlsPqIdentity>,
     send_group: Option<CombinerGroup>,
     recv_group: Option<CombinerGroup>,
     pending_outbound: Option<Vec<u8>>,
@@ -581,7 +581,7 @@ impl TwoMlsPqSession {
     /// Retrieve the outbound APQWelcome bytes via `pending_outbound`.
     #[uniffi::constructor]
     pub fn initiate(
-        client: Arc<TwoMlsPqClient>,
+        client: Arc<TwoMlsPqIdentity>,
         their_key_package: CombinerKeyPackage,
     ) -> Result<Arc<Self>> {
         ensure_pq_available(&their_key_package)?;
@@ -610,7 +610,7 @@ impl TwoMlsPqSession {
     /// Retrieve this party's return Welcome via `pending_outbound`.
     #[uniffi::constructor]
     pub fn accept(
-        client: Arc<TwoMlsPqClient>,
+        client: Arc<TwoMlsPqIdentity>,
         welcome: Vec<u8>,
         their_key_package: CombinerKeyPackage,
     ) -> Result<Arc<Self>> {
@@ -643,7 +643,7 @@ impl TwoMlsPqSession {
 
     /// Restore a session from a serialised archive.
     #[uniffi::constructor]
-    pub fn from_archive(_archive: Archive, _client: Arc<TwoMlsPqClient>) -> Result<Arc<Self>> {
+    pub fn from_archive(_archive: Archive, _client: Arc<TwoMlsPqIdentity>) -> Result<Arc<Self>> {
         Err(TwoMlsPqError::ArchiveInvalid)
     }
 
@@ -1235,7 +1235,7 @@ impl TwoMlsPqSession {
 
     /// Register a new agent client for the next rotation commit.
     /// Call before `prepare_to_encrypt(Some(new_client.client_id()))`.
-    pub fn stage_rotation(&self, new_client: Arc<TwoMlsPqClient>) -> Result<()> {
+    pub fn stage_rotation(&self, new_client: Arc<TwoMlsPqIdentity>) -> Result<()> {
         let mut inner = self.lock();
         inner.pending_new_client = Some(new_client);
         Ok(())

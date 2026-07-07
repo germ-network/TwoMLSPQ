@@ -18,18 +18,18 @@ use crate::{ClientId, MlsCipherSuite, Result, TwoMlsPqError};
 ///
 /// Unlike mls-rs's monolithic per-credential `Client`, this object is *not* the hub
 /// for group operations: `generate_invitation` captures key-package private material
-/// into a self-contained `TwoMlsPqInvitation` and purges this client's copies, and
+/// into a self-contained `TwoMlsPqInvitation` and purges this identity's copies, and
 /// group state lives inside `TwoMlsPqSession`s (which hold their own internal client
 /// objects). See the book's Concepts chapter for the object model.
 ///
 /// Thin UniFFI wrapper around `apq::CombinerClient`; the MLS plumbing lives in the
 /// `apq` crate.
 #[derive(uniffi::Object)]
-pub struct TwoMlsPqClient {
+pub struct TwoMlsPqIdentity {
     inner: CombinerClient,
 }
 
-impl TwoMlsPqClient {
+impl TwoMlsPqIdentity {
     pub(crate) fn combiner(&self) -> &CombinerClient {
         &self.inner
     }
@@ -52,8 +52,8 @@ impl TwoMlsPqClient {
 }
 
 #[uniffi::export]
-impl TwoMlsPqClient {
-    /// Create a TwoMlsPqClient for the given ClientId, generating a fresh agent signing
+impl TwoMlsPqIdentity {
+    /// Create a TwoMlsPqIdentity for the given ClientId, generating a fresh agent signing
     /// key internally. `client_id` is opaque identity bytes, independent of any key.
     #[uniffi::constructor]
     pub fn new(client_id: Vec<u8>) -> Result<Arc<Self>> {
@@ -91,7 +91,7 @@ impl TwoMlsPqClient {
     }
 
     /// Generate a combiner key package and capture it, with the signing identity, into a
-    /// self-contained [`TwoMlsPqInvitation`] archive. The client keeps no key-package
+    /// self-contained [`TwoMlsPqInvitation`] archive. The identity keeps no key-package
     /// private data — the Invitation owns it. Publish the invitation's `combinerKeyPackage`
     /// and reconstruct the receiving side with `TwoMlsPqInvitation(archive:)`.
     pub fn generate_invitation(&self) -> Result<Vec<u8>> {
@@ -313,10 +313,10 @@ pub(crate) fn ensure_pq_available(_their_kp: &CombinerKeyPackage) -> Result<()> 
 
 /// The receiving/holding side of a published combiner key package: a self-contained
 /// invitation that owns one key package's private material plus the signing identity, and
-/// can turn a remote initiator's welcome into a session with no live `TwoMlsPqClient`. The
+/// can turn a remote initiator's welcome into a session with no live `TwoMlsPqIdentity`. The
 /// Rust analogue of the classical `MLSInvitationClientV2`.
 ///
-/// The private key-package material lives here (not in a `TwoMlsPqClient`); each `receive`
+/// The private key-package material lives here (not in a `TwoMlsPqIdentity`); each `receive`
 /// rebuilds a stateless client from the archived invitation, so one invitation can service
 /// multiple welcomes. A remote whose welcome has already been consumed is rejected.
 #[derive(uniffi::Object)]
@@ -330,7 +330,7 @@ pub struct TwoMlsPqInvitation {
 
 #[uniffi::export]
 impl TwoMlsPqInvitation {
-    /// Restore an invitation from its archive (from `TwoMlsPqClient.generateInvitation` or
+    /// Restore an invitation from its archive (from `TwoMlsPqIdentity.generateInvitation` or
     /// `archive()`).
     #[uniffi::constructor]
     pub fn new(archive: Vec<u8>) -> Result<Arc<Self>> {
@@ -384,7 +384,7 @@ impl TwoMlsPqInvitation {
             return Err(TwoMlsPqError::DuplicateWelcome);
         }
 
-        match TwoMlsPqClient::from_combiner_invitation(&self.invitation)
+        match TwoMlsPqIdentity::from_combiner_invitation(&self.invitation)
             .and_then(|client| TwoMlsPqSession::accept(client, welcome, their_key_package))
         {
             Ok(session) => Ok(session),
@@ -442,7 +442,7 @@ mod tests {
     use mls_rs::{CipherSuiteProvider, CryptoProvider};
     use mls_rs_crypto_rustcrypto::RustCryptoProvider;
 
-    use super::TwoMlsPqClient;
+    use super::TwoMlsPqIdentity;
     use crate::{assert_err, assert_ok, assert_some, MlsCipherSuite};
 
     /// A fresh, unique ClientId for tests (opaque random bytes, not a signing key).
@@ -456,14 +456,14 @@ mod tests {
     #[test]
     fn test_client_id_is_the_provided_bytes() {
         let id = test_client_id();
-        let client = assert_ok!(TwoMlsPqClient::new(id.clone()));
+        let client = assert_ok!(TwoMlsPqIdentity::new(id.clone()));
         // The ClientId is exactly the bytes provided — no longer derived from a key.
         assert_eq!(client.client_id().bytes, id);
     }
 
     #[test]
     fn test_generate_key_package_classical_succeeds() {
-        let client = assert_ok!(TwoMlsPqClient::new(test_client_id()));
+        let client = assert_ok!(TwoMlsPqIdentity::new(test_client_id()));
         let bytes = assert_ok!(client.generate_key_package(MlsCipherSuite::x25519_chacha()));
         assert!(!bytes.is_empty());
     }
@@ -471,14 +471,14 @@ mod tests {
     #[test]
     #[cfg(feature = "cryptokit")]
     fn test_generate_key_package_ml_kem_768_succeeds() {
-        let client = assert_ok!(TwoMlsPqClient::new(test_client_id()));
+        let client = assert_ok!(TwoMlsPqIdentity::new(test_client_id()));
         let bytes = assert_ok!(client.generate_key_package(MlsCipherSuite::ml_kem_768()));
         assert!(!bytes.is_empty());
     }
 
     #[test]
     fn test_parse_mls_key_package_returns_correct_client_id_and_suite() {
-        let client = assert_ok!(TwoMlsPqClient::new(test_client_id()));
+        let client = assert_ok!(TwoMlsPqIdentity::new(test_client_id()));
         let bytes = assert_ok!(client.generate_key_package(MlsCipherSuite::x25519_chacha()));
         let parsed = assert_ok!(super::parse_mls_key_package(bytes));
         assert_eq!(parsed.client_id, client.client_id());
@@ -505,7 +505,7 @@ mod tests {
     #[test]
     #[cfg(feature = "cryptokit")]
     fn test_generate_combiner_key_package_produces_matching_client_ids() {
-        let client = assert_ok!(TwoMlsPqClient::new(test_client_id()));
+        let client = assert_ok!(TwoMlsPqIdentity::new(test_client_id()));
         let ckp = assert_ok!(client.generate_combiner_key_package());
         let parsed = assert_ok!(super::parse_combiner_key_package(ckp));
         assert_eq!(parsed.client_id, client.client_id());
@@ -514,7 +514,7 @@ mod tests {
     #[test]
     #[cfg(feature = "cryptokit")]
     fn test_parse_combiner_key_package_returns_correct_suites() {
-        let client = assert_ok!(TwoMlsPqClient::new(test_client_id()));
+        let client = assert_ok!(TwoMlsPqIdentity::new(test_client_id()));
         let ckp = assert_ok!(client.generate_combiner_key_package());
         let parsed = assert_ok!(super::parse_combiner_key_package(ckp));
         assert_eq!(
@@ -526,8 +526,8 @@ mod tests {
 
     #[test]
     fn test_parse_combiner_key_package_mismatched_identities_returns_error() {
-        let client_a = assert_ok!(TwoMlsPqClient::new(test_client_id()));
-        let client_b = assert_ok!(TwoMlsPqClient::new(test_client_id()));
+        let client_a = assert_ok!(TwoMlsPqIdentity::new(test_client_id()));
+        let client_b = assert_ok!(TwoMlsPqIdentity::new(test_client_id()));
         let classical = assert_ok!(client_a.generate_key_package(MlsCipherSuite::x25519_chacha()));
         let pq = assert_ok!(client_b.generate_key_package(MlsCipherSuite::x25519_chacha()));
         assert_err!(

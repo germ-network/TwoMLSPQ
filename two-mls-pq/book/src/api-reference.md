@@ -4,13 +4,13 @@ This is a narrative overview; the authoritative reference is rustdoc
 (`cargo doc -p two-mls-pq --open`). All exported names are flat because UniFFI has no
 module paths — hence the `TwoMlsPq*` / `Combiner*` / `Mls*` prefixes.
 
-## `TwoMlsPqClient`
+## `TwoMlsPqIdentity`
 
 The agent identity and key-package/invitation mint — deliberately *not* an mls-rs-style
 hub for group operations (see [Concepts](./concepts.md)).
 
-- `new(client_id) -> Arc<TwoMlsPqClient>` — build a client for opaque identity bytes;
-  the MLS signing key is generated internally.
+- `new(client_id) -> Arc<TwoMlsPqIdentity>` — build an identity for opaque `ClientId`
+  bytes; the MLS signing key is generated internally.
 - `client_id() -> ClientId` — the identity bytes.
 - `generate_key_package(suite) -> Vec<u8>` — one MLS key package.
 - `generate_combiner_key_package() -> CombinerKeyPackage` — paired classical +
