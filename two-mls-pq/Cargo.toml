@@ -19,9 +19,12 @@ workspace = true
 # Exposes bench fixtures and gates the `benches/*` targets; combine with `cryptokit`
 # for real ML-KEM-768 numbers.
 benchmark_util = ["apq/benchmark_util"]
-cryptokit = ["apq/cryptokit", "dep:mls-rs-crypto-cryptokit"]
+# NOTE(Phase 1 of the provider-agnostic refactor): apq no longer has provider features;
+# these entries only keep the workspace feature graph resolvable until Phase 2 rewires
+# this crate onto the generic apq API (features become: cryptokit | awslc, no default).
+cryptokit = ["dep:mls-rs-crypto-cryptokit"]
 default = ["rustcrypto"]
-rustcrypto = ["apq/rustcrypto"]
+rustcrypto = []
 
 [dependencies]
 apq = { path = "../apq", version = "0.1.0", default-features = false }
