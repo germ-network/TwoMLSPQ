@@ -13,13 +13,16 @@
 //  `AbstractTwoMLS` namespace rather than by extending the generated classes
 //  directly. The generated module stays pristine.
 //
-//  Status (as of TwoMLSPQ 0.0.8):
+//  Status (as of the TwoMLSPQ 0.0.9 binding, increment B):
 //   - `PQSession`, the six result adapters, `PQClient`, and `PQInvitation` are wired,
-//     including routing (`shouldListenOn`/`sendRendezvous`) and the true APQ epoch pair
-//     on encrypt results.
-//   - Remaining `notImplemented` stubs: credential rotation (`begin(rotating:)`),
-//     A.5 rekey (`begin(.rekey)`); `PQSession.init(archive:)` needs the owning client
-//     and session archive/restore is unimplemented upstream.
+//     including routing (`shouldListenOn`/`sendRendezvous`), the true APQ epoch pair
+//     on encrypt results, A.5 rekey (`begin(.rekey)`), and agent rotation —
+//     `receive(newClientId:)` stages the dedicated agent, `prepareToEncrypt(proposing:)`
+//     commits the Phase 8 handoff, and `begin(.rekey/.finishBootstrap, rotating:)`
+//     moves the PQ leaves (the peer reads `PQInbound.rotatedCredential`).
+//   - Remaining gaps: `PQSession.init(archive:)` needs the owning client and session
+//     archive/restore is unimplemented upstream; `combinedWelcomeDigest` is not yet
+//     threaded into the FFI receive.
 //
 
 import CommProtocol
@@ -40,6 +43,10 @@ public enum TwoMLSPQConformanceError: Error {
 	case remoteIdentityMismatch
 	/// The initial-message header envelope failed to parse.
 	case malformedHeaderFrame
+	/// A.3 ratchet rounds inject a PSK with no updatePath, so `begin(.ratchet,
+	/// rotating:)` has nothing to carry a new leaf credential — rotations ride
+	/// `.rekey` (A.5) or `.finishBootstrap` (A.4).
+	case rotationCannotRideRatchet
 	/// No TwoMLSPQ FFI surface backs this abstract member yet.
 	case notImplemented(String)
 }
@@ -290,18 +297,29 @@ extension AbstractTwoMLS {
 			_ kind: PQOperationKind,
 			rotating: AbstractTwoMLS.ClientID?
 		) throws -> PQOutbound {
-			guard rotating == nil else {
-				throw TwoMLSPQConformanceError.notImplemented(
-					"PQRatchet.begin(rotating:) — A.4/A.5 credential handoff"
-				)
-			}
+			// `rotating` is the A.4/A.5 credential handoff: it must name the session's
+			// CURRENT agent (the Phase 8 classical rotation — receive staging +
+			// prepareToEncrypt(proposing:) — has already swapped to it), and the
+			// operation then moves the PQ leaves to that agent's signing key. The
+			// peer observes it as PQInbound.rotatedCredential on the rekey Upd'.
 			switch kind {
 			case .finishBootstrap:
-				return PQOutbound(kind: kind, payload: try base.pqBootstrapBegin())
+				return PQOutbound(
+					kind: kind,
+					payload: try base.pqBootstrapBegin(rotating: rotating?.pqClientId)
+				)
 			case .ratchet:
+				// A.3 injects a PSK with no updatePath — nothing carries a new
+				// leaf credential.
+				guard rotating == nil else {
+					throw TwoMLSPQConformanceError.rotationCannotRideRatchet
+				}
 				return PQOutbound(kind: kind, payload: try base.pqRatchetBegin())
 			case .rekey:
-				return PQOutbound(kind: kind, payload: try base.pqRekeyBegin())
+				return PQOutbound(
+					kind: kind,
+					payload: try base.pqRekeyBegin(rotating: rotating?.pqClientId)
+				)
 			}
 		}
 
@@ -318,10 +336,13 @@ extension AbstractTwoMLS {
 			case 0x15:
 				// A.5 responder: commit the initiator's Upd' on our send-PQ; the
 				// [Commit'][counter-Upd'] reply parks for `advance` to hand out.
-				try base.pqRekeyRespond(updMsg: message)
+				// A credential handoff announces the initiator's (already Phase
+				// 8-rotated) agent id in the Upd' — by the time this returns, the
+				// initiator's leaf in our send-PQ has moved to that agent's key.
+				let rotated = try base.pqRekeyRespond(updMsg: message)
 				return PQInbound(
 					kind: .rekey, advancedGroup: .ours,
-					newEpochs: epochs, rotatedCredential: nil)
+					newEpochs: epochs, rotatedCredential: rotated?.bytes)
 			case 0x17:
 				// Mid-operation (initiator: counter-Upd' present) our own send-PQ also
 				// committed and the final Commit' parks for `advance`; final (responder:
@@ -451,9 +472,9 @@ extension AbstractTwoMLS {
 			stapledMessage: Data?,
 			newClientId: AbstractTwoMLS.ClientID
 		) throws -> (PQSession, plaintext: Data?) {
-			// NB: `combinedWelcomeDigest` (receive-group bookkeeping) and `newClientId`
-			// (rotation staging) are not yet threaded into the FFI receive; the classical
-			// flow uses them and the PQ backend will grow equivalents.
+			// NB: `combinedWelcomeDigest` (receive-group bookkeeping) is not yet
+			// threaded into the FFI receive; the classical flow uses it and the PQ
+			// backend will grow an equivalent.
 			let pair = try decodeCombinerKeyPackage(bytes: remoteKeyPackage)
 
 			// Bind the key package to the authenticated identity from the validated
@@ -477,6 +498,14 @@ extension AbstractTwoMLS {
 				else { return nil }
 				return result.applicationMessage?.appMessageData
 			}
+
+			// Stage the app-spawned session-dedicated agent for the Phase 8 rotation.
+			// The handoff commits when the app drives the first reply with
+			// `prepareToEncrypt(proposing: newClientId)`; the PQ leaves catch up at
+			// the next `begin(.rekey, rotating: newClientId)` (A.5).
+			try session.base.stageRotation(
+				newClient: TwoMlsPqClient(clientId: newClientId)
+			)
 
 			return (session, plaintext)
 		}
