@@ -2,7 +2,6 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use apq::storage::PersistableGroupStorage;
-#[cfg(feature = "cryptokit")]
 use mls_rs::identity::SigningIdentity;
 use mls_rs::{
     group::ReceivedMessage,
@@ -11,12 +10,10 @@ use mls_rs::{
     GroupStateStorage, MlsMessage,
 };
 
-#[cfg(not(feature = "cryptokit"))]
-use apq::create_group_with_member;
 use apq::{
-    create_bound_classical_send_group, create_combiner_send_group, decode_apq_welcome,
-    encode_apq_welcome, export_psk, forget_psk, join_combiner_group, join_group_from_welcome,
-    register_psk, sender_client_id, APQ_TAG,
+    create_bound_classical_send_group, create_combiner_send_group, create_group_with_member,
+    decode_apq_welcome, encode_apq_welcome, export_psk, forget_psk, join_combiner_group,
+    join_group_from_welcome, register_psk, sender_client_id, APQ_TAG,
 };
 
 use crate::key_package_store::CombinerGroup;
@@ -30,10 +27,9 @@ use crate::{
     RendezvousId, Result, SessionId, TwoMlsPqError,
 };
 
-#[cfg(feature = "cryptokit")]
-use apq::{export_psk_pq, pq_create_group_with_member, pq_join_group_from_welcome};
-#[cfg(feature = "cryptokit")]
 use zeroize::Zeroizing;
+
+use crate::providers;
 
 struct SessionInner {
     client: Arc<TwoMlsPqIdentity>,
@@ -50,7 +46,6 @@ struct SessionInner {
     offered_proposal: Option<(Vec<u8>, Vec<u8>)>,
     queued_proposal: Option<Vec<u8>>,
     pending_new_client: Option<Arc<TwoMlsPqIdentity>>,
-    #[cfg(feature = "cryptokit")]
     pq_inflight: Option<PqInflight>,
     session_id: SessionId,
     my_state: AgentState,
@@ -147,11 +142,8 @@ const RENDEZVOUS_LEN: usize = 32;
 // PQ ratchet (architecture-diagrams PR #2 §A.3), cryptokit only:
 // 0x0B carries the initiator's ML-KEM encapsulation key, 0x0D the responder's ciphertext,
 // 0x0F the bind = [pq partial-commit][classical commit][app], all length-prefixed.
-#[cfg(feature = "cryptokit")]
 const PQ_EK_TAG: u8 = 0x0B;
-#[cfg(feature = "cryptokit")]
 const PQ_CT_TAG: u8 = 0x0D;
-#[cfg(feature = "cryptokit")]
 const PQ_BIND_TAG: u8 = 0x0F;
 
 /// A.4 bootstrap: this side's PQ key package, sent so the peer can stand up its deferred
@@ -168,13 +160,10 @@ const PQ_BOOTSTRAP_BIND_TAG: u8 = 0x13;
 // carries its counter-proposal, the initiator's final commit an empty slot. Each Commit'
 // cross-injects a PSK exported from the opposite PQ send group; the bumped pq_epoch
 // reconciles into APQInfo at the next A.3 bind (no AppDataUpdate rides these commits).
-#[cfg(feature = "cryptokit")]
 const PQ_REKEY_UPD_TAG: u8 = 0x15;
-#[cfg(feature = "cryptokit")]
 const PQ_REKEY_COMMIT_TAG: u8 = 0x17;
 
 /// PQ ratchet round state carried between the messages of one exchange.
-#[cfg(feature = "cryptokit")]
 enum PqInflight {
     /// Initiator holds the ephemeral (decapsulation key) until it receives the ciphertext.
     Initiating(apq::pq_ratchet::PqEphemeral),
@@ -220,7 +209,6 @@ fn read_sections<const N: usize>(body: &[u8]) -> Result<[Vec<u8>; N]> {
     Ok(out)
 }
 
-#[cfg(feature = "cryptokit")]
 fn encode_pq_bind(pq_commit: Vec<u8>, classical_commit: Vec<u8>, app: Vec<u8>) -> Vec<u8> {
     let mut out =
         Vec::with_capacity(1 + 4 + pq_commit.len() + 4 + classical_commit.len() + 4 + app.len());
@@ -248,7 +236,6 @@ fn decode_bootstrap_bind(bytes: &[u8]) -> Result<Vec<u8>> {
     Ok(rest.to_vec())
 }
 
-#[cfg(feature = "cryptokit")]
 fn decode_pq_bind(bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
     let (&tag, rest) = bytes.split_first().ok_or(TwoMlsPqError::Mls)?;
     if tag != PQ_BIND_TAG {
@@ -259,7 +246,6 @@ fn decode_pq_bind(bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
 }
 
 /// Encode an A.5 rekey Commit' frame: `[0x17][commit][counter-Upd'-or-empty]`.
-#[cfg(feature = "cryptokit")]
 fn encode_pq_rekey_commit(commit: Vec<u8>, counter_proposal: Vec<u8>) -> Vec<u8> {
     let mut out = Vec::with_capacity(1 + 8 + commit.len() + counter_proposal.len());
     out.push(PQ_REKEY_COMMIT_TAG);
@@ -268,7 +254,6 @@ fn encode_pq_rekey_commit(commit: Vec<u8>, counter_proposal: Vec<u8>) -> Vec<u8>
     out
 }
 
-#[cfg(feature = "cryptokit")]
 fn decode_pq_rekey_commit(bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
     let (&tag, rest) = bytes.split_first().ok_or(TwoMlsPqError::Mls)?;
     if tag != PQ_REKEY_COMMIT_TAG {
@@ -278,7 +263,6 @@ fn decode_pq_rekey_commit(bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
     Ok((commit, counter_proposal))
 }
 
-#[cfg(feature = "cryptokit")]
 #[uniffi::export]
 impl TwoMlsPqSession {
     /// Initiator step 1 — generate an ML-KEM ephemeral and return the encapsulation-key message
@@ -288,7 +272,7 @@ impl TwoMlsPqSession {
         if inner.pq_inflight.is_some() {
             return Err(TwoMlsPqError::SessionNotReady);
         }
-        let eph = apq::pq_ratchet::generate_ephemeral()?;
+        let eph = apq::pq_ratchet::generate_ephemeral(&providers::pq_kem()?)?;
         let mut msg = vec![PQ_EK_TAG];
         msg.extend_from_slice(&eph.encapsulation_key());
         inner.pq_inflight = Some(PqInflight::Initiating(eph));
@@ -306,7 +290,7 @@ impl TwoMlsPqSession {
         if inner.pq_inflight.is_some() || inner.pending_pq_outbound.is_some() {
             return Err(TwoMlsPqError::SessionNotReady);
         }
-        let (s, ct) = apq::pq_ratchet::encapsulate(ek)?;
+        let (s, ct) = apq::pq_ratchet::encapsulate(&providers::pq_kem()?, ek)?;
         inner.pq_inflight = Some(PqInflight::Responding(Zeroizing::new(s)));
         let mut msg = vec![PQ_CT_TAG];
         msg.extend_from_slice(&ct);
@@ -332,7 +316,7 @@ impl TwoMlsPqSession {
             Some(PqInflight::Initiating(eph)) => eph,
             _ => return Err(TwoMlsPqError::SessionNotReady),
         };
-        let s = Zeroizing::new(apq::pq_ratchet::decapsulate(&eph, ct)?);
+        let s = Zeroizing::new(apq::pq_ratchet::decapsulate(&providers::pq_kem()?, &eph, ct)?);
         let stores = inner.psk_stores.clone();
         let send = inner
             .send_group
@@ -508,7 +492,7 @@ impl TwoMlsPqSession {
                 .as_ref()
                 .and_then(|g| g.pq.as_ref())
                 .ok_or(TwoMlsPqError::SessionNotReady)?;
-            let (psk_id, psk) = export_psk_pq(recv_pq)?;
+            let (psk_id, psk) = export_psk(recv_pq)?;
             inner.register_psk(&psk_id, &psk);
             psk_id
         };
@@ -587,7 +571,7 @@ impl TwoMlsPqSession {
                 .as_ref()
                 .and_then(|g| g.pq.as_ref())
                 .ok_or(TwoMlsPqError::SessionNotReady)?;
-            let (psk_id, psk) = export_psk_pq(send_pq)?;
+            let (psk_id, psk) = export_psk(send_pq)?;
             inner.register_psk(&psk_id, &psk);
         }
         match inner.pq_inflight.take() {
@@ -612,7 +596,7 @@ impl TwoMlsPqSession {
                         ReceivedMessage::Commit(_) => {}
                         _ => return Err(TwoMlsPqError::Mls),
                     }
-                    export_psk_pq(&*recv_pq)?
+                    export_psk(&*recv_pq)?
                 };
                 inner.register_psk(&psk_id, &psk);
                 // Commit the counter-Upd' on our own send-PQ. If this rekey carries a
@@ -806,7 +790,6 @@ impl SessionInner {
         self.psk_stores_from = Arc::clone(client);
         self.psk_stores
             .push(client.combiner().classical().secret_store());
-        #[cfg(feature = "cryptokit")]
         self.psk_stores.push(client.combiner().pq().secret_store());
     }
 
@@ -1086,13 +1069,10 @@ fn build_session(
 ) -> Arc<TwoMlsPqSession> {
     let my_id = client.client_id();
     let send_group_storage = client.combiner().classical_group_storage().clone();
-    #[cfg(feature = "cryptokit")]
     let psk_stores = vec![
         client.combiner().classical().secret_store(),
         client.combiner().pq().secret_store(),
     ];
-    #[cfg(not(feature = "cryptokit"))]
-    let psk_stores = vec![client.combiner().classical().secret_store()];
     let psk_stores_from = Arc::clone(&client);
     Arc::new(TwoMlsPqSession {
         inner: Mutex::new(SessionInner {
@@ -1106,7 +1086,6 @@ fn build_session(
             offered_proposal: None,
             queued_proposal: None,
             pending_new_client: None,
-            #[cfg(feature = "cryptokit")]
             pq_inflight: None,
             session_id,
             my_state: AgentState::Sync { client_id: my_id },
@@ -1293,10 +1272,7 @@ impl TwoMlsPqSession {
         if !ready {
             return Err(TwoMlsPqError::SessionNotReady);
         }
-        #[cfg(feature = "cryptokit")]
         let kp = inner.client.combiner().generate_pq_key_package()?;
-        #[cfg(not(feature = "cryptokit"))]
-        let kp = inner.client.combiner().generate_classical_key_package()?;
         let mut msg = vec![PQ_BOOTSTRAP_KP_TAG];
         msg.extend_from_slice(&kp);
         Ok(msg)
@@ -1326,10 +1302,7 @@ impl TwoMlsPqSession {
             if send.pq.is_some() {
                 return Err(TwoMlsPqError::SessionNotReady);
             }
-            #[cfg(feature = "cryptokit")]
-            let (pq_group, pq_welcome) = pq_create_group_with_member(client.pq(), kp, &[])?;
-            #[cfg(not(feature = "cryptokit"))]
-            let (pq_group, pq_welcome) = create_group_with_member(client.classical(), kp, &[])?;
+            let (pq_group, pq_welcome) = create_group_with_member(client.pq(), kp, &[])?;
             // PQ-groups-only (spec A.4): no classical bind here. The new PQ half's
             // secrecy reaches ASG-cl at the next A.3 ratchet; until then ASG-cl keeps
             // the PQ-derived security chained in at establishment.
@@ -1358,10 +1331,7 @@ impl TwoMlsPqSession {
             if recv.pq.is_some() {
                 return Err(TwoMlsPqError::SessionNotReady);
             }
-            #[cfg(feature = "cryptokit")]
-            let pq = pq_join_group_from_welcome(client.pq(), &pq_welcome)?;
-            #[cfg(not(feature = "cryptokit"))]
-            let pq = join_group_from_welcome(client.classical(), &pq_welcome)?;
+            let pq = join_group_from_welcome(client.pq(), &pq_welcome)?;
             recv.set_pq(pq, client.combiner());
         }
         inner.pq_turn_mine = false;
@@ -1540,13 +1510,7 @@ impl TwoMlsPqSession {
                 return Ok(None);
             }
             // Join the PQ group first, then re-derive the intra-party APQ-PSK from it.
-            #[cfg(feature = "cryptokit")]
-            let pq = pq_join_group_from_welcome(client.pq(), &pq_welcome)?;
-            #[cfg(not(feature = "cryptokit"))]
-            let pq = join_group_from_welcome(client.classical(), &pq_welcome)?;
-            #[cfg(feature = "cryptokit")]
-            let (psk_id, psk) = export_psk_pq(&pq)?;
-            #[cfg(not(feature = "cryptokit"))]
+            let pq = join_group_from_welcome(client.pq(), &pq_welcome)?;
             let (psk_id, psk) = export_psk(&pq)?;
             inner.register_psk(&psk_id, &psk);
             // Join the classical group (bound with the cross-party + APQ PSKs).
@@ -1737,7 +1701,6 @@ impl TwoMlsPqSession {
         // not this method — they are a stateful KEM exchange, not a self-contained decryptable
         // message. Reject them explicitly so a host that misroutes one gets a clear signal instead
         // of an opaque `DecryptionFailed` from the MLS parser below. See `pq_ratchet_begin`.
-        #[cfg(feature = "cryptokit")]
         if let Some(&b) = ciphertext.first() {
             if b == PQ_EK_TAG || b == PQ_CT_TAG || b == PQ_BIND_TAG {
                 return Err(TwoMlsPqError::SessionNotReady);
@@ -2173,7 +2136,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "cryptokit")]
     fn test_encrypt_epochs_diverge_post_bootstrap() {
         let (alice, bob) = establish_full();
         // Post-A.4 the acceptor's send group has its PQ half (epoch 1); a commit
@@ -2236,7 +2198,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "cryptokit")]
     fn test_pq_ratchet_bind_mints_new_listen_address() {
         let (alice, bob) = establish_sessions();
         let before = assert_ok!(alice.should_listen_on())
@@ -2263,7 +2224,6 @@ mod tests {
 
     /// Drive one full A.5 rekey with `initiator` holding the turn. Returns after the
     /// responder applies the final commit (turn flipped to the responder).
-    #[cfg(feature = "cryptokit")]
     fn rekey_round(initiator: &Arc<TwoMlsPqSession>, responder: &Arc<TwoMlsPqSession>) {
         let upd = assert_ok!(initiator.pq_rekey_begin(None));
         assert_eq!(upd.first(), Some(&super::PQ_REKEY_UPD_TAG));
@@ -2276,7 +2236,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "cryptokit")]
     fn test_pq_rekey_full_round() {
         let (alice, bob) = establish_full();
         // Bob holds the turn after Alice's bootstrap completed.
@@ -2320,7 +2279,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "cryptokit")]
     fn test_pq_rekey_then_ratchet_still_works() {
         let (alice, bob) = establish_full();
         rekey_round(&bob, &alice);
@@ -2337,7 +2295,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "cryptokit")]
     fn test_pq_rekey_requires_full_establishment() {
         // Pre-A.4 the acceptor's send-PQ (and the initiator's recv mirror) is missing.
         let (alice, _bob) = establish_sessions();
@@ -2346,7 +2303,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "cryptokit")]
     fn test_pq_rekey_requires_turn_and_rejects_unsolicited() {
         let (alice, bob) = establish_full();
         // Alice's bootstrap completion passed the turn to Bob.
@@ -2361,7 +2317,6 @@ mod tests {
 
     /// The session's own leaf signature public keys in (send-PQ, recv-PQ) — the two
     /// leaves an A.5 credential handoff must move to the new agent.
-    #[cfg(feature = "cryptokit")]
     fn own_pq_leaf_signature_keys(session: &Arc<TwoMlsPqSession>) -> (Vec<u8>, Vec<u8>) {
         let inner = session.lock();
         let send = inner
@@ -2388,7 +2343,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "cryptokit")]
     fn test_pq_rekey_rotation_hands_pq_leaves_to_new_agent() {
         let (alice, bob) = establish_full();
 
@@ -2442,7 +2396,6 @@ mod tests {
     /// psk_stores registry (a plain rekey, an A.3 ratchet, and a full classical
     /// commit round, all post-rotation, no credential handoff involved).
     #[test]
-    #[cfg(feature = "cryptokit")]
     fn test_psk_flows_survive_rotation_without_handoff() {
         let (alice, bob) = establish_full();
 
@@ -2486,7 +2439,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "cryptokit")]
     fn test_pq_rekey_begin_rotating_requires_current_agent() {
         let (_alice, bob) = establish_full();
         // Bob holds the turn, but no Phase 8 rotation has run: a handoff to an
@@ -2500,7 +2452,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "cryptokit")]
     fn test_pq_bootstrap_begin_rotating_requires_current_agent() {
         let (alice, bob) = establish_sessions();
         let stranger = make_client();
@@ -2526,7 +2477,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "cryptokit")]
     fn test_a4_bootstrap_mints_no_listen_addresses_but_advertises_pq_id() {
         let (alice, bob) = establish_sessions();
         let bob_before = assert_ok!(bob.should_listen_on());
@@ -2548,7 +2498,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "cryptokit")]
     fn test_pq_ratchet_round_trip_delivers_app_message() {
         let (alice, bob) = establish_sessions();
         // Alice initiates a PQ ratchet on her send group; Bob responds and applies.
@@ -2566,7 +2515,6 @@ mod tests {
     /// group creation), not the rotated-in client's stores — otherwise Alice's bind and
     /// Bob's apply both fail to find their PSKs after the client swap.
     #[test]
-    #[cfg(feature = "cryptokit")]
     fn test_pq_ratchet_completes_after_agent_rotation() {
         let (alice, bob) = establish_sessions();
 
@@ -2596,7 +2544,6 @@ mod tests {
 
     /// Complete the A.4 bootstrap after establishment so both directions are full
     /// APQ — required before the deferred acceptor side can ratchet.
-    #[cfg(feature = "cryptokit")]
     fn establish_full() -> (Arc<TwoMlsPqSession>, Arc<TwoMlsPqSession>) {
         let (alice, bob) = establish_sessions();
         let kp = assert_ok!(alice.pq_bootstrap_begin(None));
@@ -2607,7 +2554,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "cryptokit")]
     fn test_pq_ratchet_turn_flips_to_responder() {
         let (alice, bob) = establish_full();
         // Round 1: Alice initiates.
@@ -2627,7 +2573,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "cryptokit")]
     fn test_pq_ratchet_bind_without_begin_is_rejected() {
         let (alice, _bob) = establish_sessions();
         let mut ct = vec![super::PQ_CT_TAG];
@@ -2639,7 +2584,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "cryptokit")]
     fn test_classical_round_still_works_after_pq_ratchet() {
         let (alice, bob) = establish_sessions();
         let ek = assert_ok!(alice.pq_ratchet_begin());
@@ -2660,7 +2604,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "cryptokit")]
     fn test_three_sequential_pq_ratchets_alternate_and_deliver() {
         let (alice, bob) = establish_full();
         for (i, (initiator, responder)) in [(&alice, &bob), (&bob, &alice), (&alice, &bob)]
@@ -2678,7 +2621,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "cryptokit")]
     fn test_pq_ratchet_respond_rejects_wrong_tag() {
         let (_alice, bob) = establish_sessions();
         assert_err!(
@@ -2688,7 +2630,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "cryptokit")]
     fn test_pq_frame_routed_to_process_incoming_is_rejected() {
         let (_alice, bob) = establish_sessions();
         // A PQ-ratchet EK frame must never be silently swallowed as an MLS ciphertext.
@@ -2698,7 +2639,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "cryptokit")]
     fn test_pq_ratchet_apply_without_respond_is_rejected() {
         let (alice, bob) = establish_sessions();
         let ek = assert_ok!(alice.pq_ratchet_begin());
@@ -2712,7 +2652,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "cryptokit")]
     fn test_pq_ratchet_double_begin_is_rejected() {
         let (alice, _bob) = establish_sessions();
         assert_ok!(alice.pq_ratchet_begin());
@@ -2720,7 +2659,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "cryptokit")]
     fn test_pq_ratchet_tampered_ciphertext_fails_to_apply() {
         let (alice, bob) = establish_sessions();
         let ek = assert_ok!(alice.pq_ratchet_begin());
@@ -2735,7 +2673,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "cryptokit")]
     fn test_decode_pq_bind_rejects_truncated_and_trailing() {
         let frame = super::encode_pq_bind(b"aa".to_vec(), b"bb".to_vec(), b"cc".to_vec());
         assert_ok!(super::decode_pq_bind(&frame));
@@ -2749,7 +2686,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "cryptokit")]
     fn test_initiate_fails_when_both_suites_classical() {
         let alice = make_client();
         let bob = make_client();
@@ -2892,7 +2828,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "cryptokit")]
     fn test_create_bound_send_group_ml_kem_768_with_psk_succeeds() {
         let (alice_session, bob_session) = establish_sessions();
         assert!(alice_session.is_established());
@@ -3061,7 +2996,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "cryptokit")]
     fn test_full_establishment_sequence_ml_kem_768() {
         let (alice_session, bob_session) = establish_sessions();
         assert!(alice_session.is_established());

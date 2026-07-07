@@ -3,6 +3,7 @@ uniffi::setup_scaffolding!();
 mod invitation;
 mod key_package_store;
 pub mod key_packages;
+mod providers;
 mod psk;
 pub mod session;
 #[cfg(test)]
@@ -52,8 +53,6 @@ pub struct ClientId {
 
 /// The APQ epoch pair for the send group: the PQ side-band epoch and the classical
 /// (traditional) message epoch. Zeros until the corresponding group exists.
-/// NB: in non-`cryptokit` builds the PQ half is a classical placeholder, so `pq_epoch`
-/// does not describe a real ML-KEM group — see the BUG note on `ensure_pq_available`.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct ApqEpochs {
     pub pq_epoch: u64,
@@ -335,6 +334,11 @@ impl From<apq::CombinerError> for TwoMlsPqError {
             apq::CombinerError::MissingWelcome => TwoMlsPqError::MissingWelcome,
             apq::CombinerError::DecryptionFailed => TwoMlsPqError::DecryptionFailed,
             apq::CombinerError::ArchiveInvalid => TwoMlsPqError::ArchiveInvalid,
+            // A provider that cannot supply a required cipher suite is a build/provider
+            // configuration bug caught at client construction — unreachable in a correctly
+            // built binary (providers.rs pins matching providers). Folded into `Mls`
+            // rather than growing the FFI error enum (a binding-contract shape change).
+            apq::CombinerError::UnsupportedCipherSuite => TwoMlsPqError::Mls,
         }
     }
 }

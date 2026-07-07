@@ -5,22 +5,23 @@
 
 use std::sync::Arc;
 
-use mls_rs::{CipherSuiteProvider, CryptoProvider};
-use mls_rs_crypto_rustcrypto::RustCryptoProvider;
 use two_mls_pq::{
     key_packages::{CombinerKeyPackage, TwoMlsPqIdentity},
     session::TwoMlsPqSession,
     MlsCipherSuite,
 };
 
-/// A fresh, unique ClientId for benches (opaque random bytes, not a signing key).
+/// A fresh, unique ClientId for benches. The bytes are opaque — uniqueness is all that
+/// matters, so a counter + timestamp avoids pulling a crypto provider in here.
 pub fn client_id() -> Vec<u8> {
-    let crypto = RustCryptoProvider::new();
-    let cs = crypto
-        .cipher_suite_provider(mls_rs::CipherSuite::CURVE25519_CHACHA)
-        .unwrap();
-    let (secret, _) = cs.signature_key_generate().unwrap();
-    secret.as_bytes().to_vec()
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    format!("bench-client-{n}-{t}").into_bytes()
 }
 
 pub fn client() -> Arc<TwoMlsPqIdentity> {
@@ -28,20 +29,7 @@ pub fn client() -> Arc<TwoMlsPqIdentity> {
 }
 
 pub fn combiner_kp(client: &TwoMlsPqIdentity) -> CombinerKeyPackage {
-    #[cfg(feature = "cryptokit")]
-    {
-        client.generate_combiner_key_package().unwrap()
-    }
-    #[cfg(not(feature = "cryptokit"))]
-    {
-        let classical = client
-            .generate_key_package(MlsCipherSuite::x25519_chacha())
-            .unwrap();
-        let pq = client
-            .generate_key_package(MlsCipherSuite::x25519_chacha())
-            .unwrap();
-        CombinerKeyPackage { classical, pq }
-    }
+    client.generate_combiner_key_package().unwrap()
 }
 
 pub fn established() -> (Arc<TwoMlsPqSession>, Arc<TwoMlsPqSession>) {
@@ -57,12 +45,12 @@ pub fn established() -> (Arc<TwoMlsPqSession>, Arc<TwoMlsPqSession>) {
     (alice_session, bob_session)
 }
 
-/// Suite label for `BenchmarkId`s so default (simulated) and `cryptokit` (real
-/// ML-KEM-768) runs are distinguishable in reports.
+/// Suite + provider label for `BenchmarkId`s so cryptokit and awslc runs are
+/// distinguishable in reports.
 pub fn suite_label() -> &'static str {
     if cfg!(feature = "cryptokit") {
-        "ml_kem_768"
+        "ml_kem_768/cryptokit"
     } else {
-        "simulated"
+        "ml_kem_768/awslc"
     }
 }

@@ -13,11 +13,11 @@ use crate::{
 fn provider_label() -> &'static str {
     #[cfg(feature = "cryptokit")]
     {
-        "cryptokit (AWS-LC, real ML-KEM-768)"
+        "cryptokit (Apple CryptoKit, real ML-KEM-768)"
     }
-    #[cfg(not(feature = "cryptokit"))]
+    #[cfg(all(feature = "awslc", not(feature = "cryptokit")))]
     {
-        "rustcrypto (PQ half simulated with X25519/ChaCha20)"
+        "awslc (aws-lc, real ML-KEM-768)"
     }
 }
 
