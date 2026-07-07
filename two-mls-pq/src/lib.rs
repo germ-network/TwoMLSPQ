@@ -22,6 +22,28 @@ pub fn version() -> String {
     env!("CARGO_PKG_VERSION").to_owned()
 }
 
+/// Record-shape contract stamp. Uniffi's load-time checks cover *function*
+/// signatures but NOT `uniffi::Record` field layouts or error-enum variants: a
+/// Record can change shape with every checksum unchanged, and a mismatched
+/// binding + binary pair then mis-reads FFI buffers at the first call touching
+/// the changed type (runtime trap mid-flow) instead of failing at startup.
+///
+/// RULE: bump this on ANY shape change to a `#[derive(uniffi::Record)]` struct
+/// or the error enum in this crate. The vendored Swift binding's consumer
+/// (AbstractTwoMLS) asserts the value at first construction, so a stale
+/// binding/binary pairing fails fast with an actionable message.
+// v2 (2026-07-07): TwoMlsPqDigest removed — digests are raw 32-byte SHA-256 values
+// (`Vec<u8>` fields on PrepareEncryptResult / QueuedRemoteProposal and in the
+// queue_proposal / proposal_context signatures).
+const BINDING_CONTRACT_VERSION: u64 = 2;
+
+/// See `BINDING_CONTRACT_VERSION`. Exported so the Swift layer can verify the
+/// binding it was generated with matches the binary it loaded.
+#[uniffi::export]
+pub fn binding_contract_version() -> u64 {
+    BINDING_CONTRACT_VERSION
+}
+
 /// ATProto DID-scoped client identifier.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct ClientId {
@@ -30,6 +52,8 @@ pub struct ClientId {
 
 /// The APQ epoch pair for the send group: the PQ side-band epoch and the classical
 /// (traditional) message epoch. Zeros until the corresponding group exists.
+/// NB: in non-`cryptokit` builds the PQ half is a classical placeholder, so `pq_epoch`
+/// does not describe a real ML-KEM group — see the BUG note on `ensure_pq_available`.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct ApqEpochs {
     pub pq_epoch: u64,
@@ -64,36 +88,32 @@ pub struct RendezvousId {
     pub bytes: Vec<u8>,
 }
 
-/// Digest-type wire value for SHA-256-width (32-byte) digests, matching CommProtocol's
-/// `DigestTypes.sha256`. All digests this library emits are 32-byte values.
-pub(crate) const DIGEST_SHA256: u8 = 1;
+// Digests cross this FFI as raw 32-byte values: SHA-256 over the stated object. That is
+// this library's OWN wire convention (matching the classical backend's values, so both
+// stacks bind the same bytes); the app layer wraps them in whatever typed-digest
+// encoding it uses. No app-layer type tags or enum values appear on this surface.
 
-/// Content-typed hash digest. Used by the app layer to identify and accept
-/// MLS proposals before signalling back to the encryption layer.
-#[derive(Debug, Clone, uniffi::Record)]
-pub struct TwoMlsPqDigest {
-    /// Digest-type wire value, aligned with CommProtocol's `DigestTypes` (sha256 = 1).
-    pub hash_type: u8,
-    pub digest: Vec<u8>,
-}
-
-/// Returned by `prepare_to_encrypt`. The app layer must bind `proposal_hash`
-/// into its plaintext before calling `encrypt`. `did_commit` is false when
-/// stuck in a prior epoch (no pending remote proposal to commit).
+/// Returned by `prepare_to_encrypt`. `proposal_hash` is the SHA-256 of the staged
+/// outbound object (the Upd(self) proposal message, or the rotation commit); `encrypt`
+/// also binds it into the app message's authenticated data, and the receiver reports
+/// the same value as `QueuedRemoteProposal.digest`. `did_commit` is false when stuck in
+/// a prior epoch (no pending remote proposal to commit).
 #[derive(Debug, uniffi::Record)]
 pub struct PrepareEncryptResult {
-    pub proposal_hash: TwoMlsPqDigest,
+    pub proposal_hash: Vec<u8>,
     pub committed_remote_client_id: Option<ClientId>,
     pub did_commit: bool,
 }
 
-/// Returned by `encrypt`.
+/// Returned by `encrypt`. `epochs` is the send group's APQ pair at send time —
+/// the PQ side-band epoch (0 while that half is deferred) and the classical
+/// message epoch the ciphertext was produced in.
 #[derive(Debug, uniffi::Record)]
 pub struct EncryptResult {
     pub cipher_text: Vec<u8>,
     pub sender: ClientId,
     pub recipient: ClientId,
-    pub epoch: u64,
+    pub epochs: ApqEpochs,
 }
 
 /// Returned by `process_incoming`. Fields are `None` when not applicable to
@@ -115,14 +135,16 @@ pub struct MlsSenderMessage {
 
 /// A remote proposal queued for app-layer acceptance. `sender` sent the
 /// proposal; `proposing` is the client being proposed (differs when a client
-/// proposes its own rotation). `context` is the receive group's group-ID hash,
-/// used for ordering against the app-level sequence number.
+/// proposes its own rotation). `digest` is the SHA-256 of the proposal message
+/// (equal to the sender's `PrepareEncryptResult.proposal_hash`); `context` is
+/// the SHA-256 of the receive group's group id, used for ordering against the
+/// app-level sequence number.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct QueuedRemoteProposal {
-    pub digest: TwoMlsPqDigest,
+    pub digest: Vec<u8>,
     pub sender: ClientId,
     pub proposing: ClientId,
-    pub context: TwoMlsPqDigest,
+    pub context: Vec<u8>,
 }
 
 /// Result of processing a remote commit. `new_sender` is `None` in
@@ -271,18 +293,20 @@ pub enum TwoMlsPqError {
     DuplicateWelcome,
 }
 
+/// SHA-256 over `bytes` — the single hashing primitive behind every digest this
+/// crate emits (proposal digests, ordering contexts, session ids; the same function
+/// the cipher suite's `hash` resolves to). One implementation, so the "both sides
+/// derive the same value" invariants cannot split across call sites.
+pub(crate) fn sha256(bytes: &[u8]) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes).to_vec()
+}
+
 /// Derive the session identifier for a pair of clients.
 /// Both sides compute the same value from the same inputs regardless of who
 /// initiated, allowing CommProtocol to deduplicate concurrent session initiations.
 #[uniffi::export]
 pub fn derive_session_id(my_id: ClientId, their_id: ClientId) -> Result<SessionId> {
-    use mls_rs::{CipherSuiteProvider, CryptoProvider};
-    use mls_rs_crypto_rustcrypto::RustCryptoProvider;
-
-    let cs = RustCryptoProvider::new()
-        .cipher_suite_provider(mls_rs::CipherSuite::CURVE25519_CHACHA)
-        .ok_or(TwoMlsPqError::Mls)?;
-
     let (first, second) = if my_id.bytes <= their_id.bytes {
         (my_id.bytes, their_id.bytes)
     } else {
@@ -292,8 +316,9 @@ pub fn derive_session_id(my_id: ClientId, their_id: ClientId) -> Result<SessionI
     let mut input = first;
     input.extend_from_slice(&second);
 
-    let bytes = cs.hash(&input).map_err(|_| TwoMlsPqError::Mls)?;
-    Ok(SessionId { bytes })
+    Ok(SessionId {
+        bytes: sha256(&input),
+    })
 }
 
 impl From<mls_rs::error::MlsError> for TwoMlsPqError {

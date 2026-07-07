@@ -39,6 +39,7 @@ pub(crate) type KeyPackageSecret = (Vec<u8>, KeyPackageData);
 pub(crate) type CombinerClient = apq::CombinerClient<SyntheticKeyPackageStore>;
 pub(crate) type CombinerGroup = apq::CombinerGroup<SyntheticKeyPackageStore>;
 pub(crate) type MlsClient = apq::MlsClient<SyntheticKeyPackageStore>;
+pub(crate) type MlsGroup = apq::MlsGroup<SyntheticKeyPackageStore>;
 #[cfg(feature = "cryptokit")]
 pub(crate) type PqMlsClient = apq::PqMlsClient<SyntheticKeyPackageStore>;
 

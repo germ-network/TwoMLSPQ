@@ -97,13 +97,6 @@ impl<S: KeyPackageStorage + Clone> CombinerGroup<S> {
         pq.delete(psk_id);
     }
 
-    /// The PQ half's captured secret-store handle, for the PQ side-band flows that manage
-    /// a short-lived PSK themselves (insert *and* delete, see `pq_ratchet::InjectedSecret`).
-    #[cfg(feature = "cryptokit")]
-    pub(crate) fn pq_psk_store(&self) -> InMemoryPreSharedKeyStorage {
-        self.pq_psks.clone()
-    }
-
     /// Flush both halves and export each half's state + retained epoch secrets, pulled
     /// through the storage handles captured at construction (so this works regardless of
     /// which client the session currently holds).
@@ -256,9 +249,11 @@ pub(crate) fn injected_secret_psk_id(epoch: u64, group_id: &[u8]) -> ExternalPsk
 
 /// Derive the exportable PSK for `group`'s current epoch: 32 bytes via exportSecret, with
 /// id = LE epoch || group_id. Pure derivation — no store side-effect. Both parties derive
-/// the same value from the same epoch. Pair with [`register_psk`]: durable PSK material
-/// belongs to the caller (session orchestration), which injects just-in-time before the
-/// commit that references it.
+/// the same value from the same epoch. Durable PSK material belongs to the caller (session
+/// orchestration), which registers the pair into every PSK store its groups resolve from
+/// just-in-time before the commit that references it — an mls-rs group reads the store of
+/// the client that created it, which a session's current client may no longer be after an
+/// agent rotation. See [`register_psk`] / [`register_psk_stores`].
 pub fn export_psk<S: KeyPackageStorage + Clone>(
     group: &MlsGroup<S>,
 ) -> Result<(ExternalPskId, PreSharedKey)> {
@@ -269,6 +264,30 @@ pub fn export_psk<S: KeyPackageStorage + Clone>(
         make_psk_id(group.current_epoch(), group.group_id()),
         PreSharedKey::new(secret.as_bytes().to_vec()),
     ))
+}
+
+/// Register an exported PSK into every store in `stores` — the caller's registry of
+/// every store its groups resolve PSKs from. The single fan-out loop shared by the
+/// session layer and the PQ ratchet.
+pub fn register_psk_stores(
+    stores: &[mls_rs::storage_provider::in_memory::InMemoryPreSharedKeyStorage],
+    psk_id: &ExternalPskId,
+    psk: &PreSharedKey,
+) {
+    for store in stores {
+        store.clone().insert(psk_id.clone(), psk.clone());
+    }
+}
+
+/// Remove a PSK from every store in `stores` — the counterpart of [`register_psk_stores`],
+/// for one-shot entries the caller has retired.
+pub fn forget_psk_stores(
+    stores: &[mls_rs::storage_provider::in_memory::InMemoryPreSharedKeyStorage],
+    psk_id: &ExternalPskId,
+) {
+    for store in stores {
+        store.clone().delete(psk_id);
+    }
 }
 
 /// Inject a PSK into the client's secret store(s) — both halves, so either can resolve it —
