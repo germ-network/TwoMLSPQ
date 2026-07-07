@@ -1,7 +1,10 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use mls_rs::{group::ReceivedMessage, GroupStateStorage, MlsMessage};
+use mls_rs::{
+    group::ReceivedMessage, storage_provider::in_memory::InMemoryGroupStateStorage,
+    GroupStateStorage, MlsMessage,
+};
 
 #[cfg(not(feature = "cryptokit"))]
 use apq::create_group_with_member;
@@ -60,6 +63,14 @@ struct SessionInner {
     /// Keyed by classical epoch; the window follows mls-rs's own epoch retention (see
     /// `record_listen_rendezvous`) — current epoch + the prior epochs mls-rs retains.
     listen_rendezvous: BTreeMap<u64, Vec<u8>>,
+    /// The group-state storage backing the send group's classical half, captured from
+    /// the client that CONSTRUCTED the session. The retention probe must read this
+    /// handle, not one reached through `self.client`: a Phase 8 rotation replaces
+    /// `self.client` with the new agent's client (whose injected storage is a fresh,
+    /// empty map), while the send group keeps flushing into the storage it was built
+    /// with — probing the new client's handle would prune every prior epoch's listen
+    /// address right after rotation.
+    send_group_storage: InMemoryGroupStateStorage,
 }
 
 /// A TwoMLSPQ session holding two asymmetric Combiner send groups.
@@ -72,8 +83,10 @@ pub struct TwoMlsPqSession {
 // Rotation commit+app: [0x03 tag][u32-LE commit-len][commit][u32-LE app-len][app]
 // Used only for Phase 8 agent rotation (no PSK refresh).
 const BUNDLED_TAG: u8 = 0x03;
-// Partial commit: [0x05 tag][u32-LE recv-commit-len][recv-commit][u32-LE app-len][app]
-// Alice commits on Group_B (recv group) to refresh her HPKE leaf key, then sends app on Group_A.
+// A.2 ratchet frame: [0x05 tag][send-commit][Upd(sender) proposal][app], each section
+// u32-LE length-prefixed (see encode_ratchet; sections may be empty — routine rounds
+// carry no commit). Per A.2 the sender commits in its OWN send group; the receiver
+// applies that commit to its recv group and stages the stapled Upd for app approval.
 const PARTIAL_TAG: u8 = 0x05;
 // 0x07 was the pre-A.2 full-bundle frame (send + recv commits); retired — the tag
 // stays reserved so old frames are rejected rather than misparsed.
@@ -422,9 +435,11 @@ impl SessionInner {
             .write_to_storage()
             .map_err(|_| TwoMlsPqError::Mls)?;
         let group_id = send.message_group().group_id().to_vec();
-        // Read the storage handle we injected at client construction (clones share
-        // one map), not one pulled back off the session's group objects.
-        let storage = self.client.combiner().classical_group_storage();
+        // Probe the storage captured at session construction — the one the send group
+        // actually flushes into. NOT `self.client`'s: after a Phase 8 rotation that is
+        // the new agent's client with a fresh, empty storage, and probing it would
+        // prune every prior epoch's listen address (dropping in-flight traffic).
+        let storage = &self.send_group_storage;
         self.listen_rendezvous
             .retain(|&e, _| e == epoch || matches!(storage.epoch(&group_id, e), Ok(Some(_))));
         Ok(())
@@ -603,6 +618,7 @@ fn build_session(
     initiated: bool,
 ) -> Arc<TwoMlsPqSession> {
     let my_id = client.client_id();
+    let send_group_storage = client.combiner().classical_group_storage().clone();
     Arc::new(TwoMlsPqSession {
         inner: Mutex::new(SessionInner {
             client,
@@ -625,6 +641,7 @@ fn build_session(
             pq_turn_mine: initiated,
             pending_pq_outbound: None,
             listen_rendezvous: BTreeMap::new(),
+            send_group_storage,
         }),
     })
 }
@@ -969,10 +986,14 @@ impl TwoMlsPqSession {
     /// Process an incoming message.
     ///
     /// - APQWelcome (0x01) → join recv groups; `Ok(None)`
-    /// - Rotation commit+app (0x03) → advance send epoch then decrypt; `DecryptResult`
-    /// - Partial bundle (0x05) → advance send.pq then decrypt app; `DecryptResult`
-    /// - Full bundle (0x07) → epoch advance + PSK refresh then decrypt; `DecryptResult`
-    /// - MLS ciphertext → decrypt on recv_group.pq; `DecryptResult`
+    /// - Rotation commit+app (0x03) → apply the peer's rotation commit to
+    ///   `recv_group.classical`, then decrypt; `DecryptResult`
+    /// - A.2 ratchet frame (0x05) → apply the commit (if any) to `recv_group.classical`,
+    ///   stage the stapled Upd(sender) for app approval, decrypt; `DecryptResult`
+    /// - 0x07 (pre-A.2 full bundle) → retired; rejected rather than misparsed
+    /// - Stapled welcome (0x09) → join recv groups from the embedded APQWelcome, then
+    ///   process the inner frame
+    /// - Bare MLS ciphertext → decrypt on `recv_group.classical`; `DecryptResult`
     ///
     /// PQ-ratchet frames (0x0B/0x0D/0x0F) are **not** handled here — the host must route them to
     /// `pq_ratchet_respond`/`pq_ratchet_bind`/`pq_ratchet_apply` by their leading tag byte. Passing
@@ -1545,6 +1566,37 @@ mod tests {
         assert!(prepared.did_commit);
         let frame = assert_ok!(committer.encrypt(b"commit".to_vec()));
         assert_some!(assert_ok!(peer.process_incoming(frame.cipher_text)));
+    }
+
+    #[test]
+    fn test_rotation_commit_mints_new_listen_address() {
+        let (alice, bob) = establish_sessions();
+        let before = assert_ok!(alice.should_listen_on());
+        let bob_post_before = assert_some!(assert_ok!(bob.send_rendezvous()));
+
+        // Phase 8 rotation: stage a new client and commit it on alice's send group.
+        // The rotation branch shares the listen-address capture point with the
+        // ratchet commit — this pins that it actually fires there too.
+        let new_client = make_client();
+        assert_ok!(alice.stage_rotation(Arc::clone(&new_client)));
+        let prepared = assert_ok!(alice.prepare_to_encrypt(Some(new_client.client_id())));
+        assert!(prepared.did_commit);
+        let after = assert_ok!(alice.should_listen_on());
+        assert_eq!(
+            after.rendezvous_by_epoch.len(),
+            before.rendezvous_by_epoch.len() + 1
+        );
+
+        // Bob applies the rotation frame; his post address migrates to the new
+        // epoch's channel, present in alice's listen set.
+        let frame = assert_ok!(alice.encrypt(b"rotate".to_vec()));
+        assert_some!(assert_ok!(bob.process_incoming(frame.cipher_text)));
+        let bob_post_after = assert_some!(assert_ok!(bob.send_rendezvous()));
+        assert_ne!(bob_post_after.bytes, bob_post_before.bytes);
+        assert!(after
+            .rendezvous_by_epoch
+            .iter()
+            .any(|e| e.rendezvous_id.bytes == bob_post_after.bytes));
     }
 
     #[test]
