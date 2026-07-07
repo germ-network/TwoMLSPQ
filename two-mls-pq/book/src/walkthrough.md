@@ -25,7 +25,8 @@ The narrative, step by step:
    advancing the epoch and refreshing the PSK.
 7. **Continued messaging** — bidirectional traffic continues post-refresh.
 8. **Rotation** — Alice `stage_rotation` + `prepare_to_encrypt(Some(new_id))`; Bob
-   observes `CommitResult.new_sender`.
+   observes `CommitResult.new_sender`. Her PQ leaves catch up on her next re-key
+   (`pq_rekey_begin(rotating: new_id)` — see Session Lifecycle).
 
 For the full sequence diagrams see `docs/flows.md`, `docs/alice-bob.md`, and
 `docs/diagrams.md` in the repository.

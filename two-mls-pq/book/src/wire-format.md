@@ -15,6 +15,8 @@ have no tag (they are raw MLS ciphertext starting with the MLS version bytes).
 | `PQ_BIND_TAG` | `0x0F` | PQ ratchet bind: PQ partial commit + classical commit + app (`cryptokit` builds) |
 | `PQ_BOOTSTRAP_KP_TAG` | `0x11` | Bootstrap: PQ key package for the deferred send-group half |
 | `PQ_BOOTSTRAP_BIND_TAG` | `0x13` | Bootstrap: the new PQ group's Welcome |
+| `PQ_REKEY_UPD_TAG` | `0x15` | PQ re-key: initiator's `Upd'` proposal (`cryptokit` builds) |
+| `PQ_REKEY_COMMIT_TAG` | `0x17` | PQ re-key: `[Commit'][counter-Upd'-or-empty]` (`cryptokit` builds) |
 
 All tags are **odd**. Each tagged frame uses a `u32`-LE length prefix per embedded
 field. For example, the APQ Welcome is:
