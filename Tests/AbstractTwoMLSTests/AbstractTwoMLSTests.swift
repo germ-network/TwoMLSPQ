@@ -138,7 +138,9 @@ struct LifecycleTests {
 		// The initiator's send group is a full APQ pair from birth: pq stays 1
 		// while the commit advanced classical to 2 — and the encrypt result
 		// matches the session's own epoch view at send time.
-		#expect(commitFrame.epochs == AbstractTwoMLS.APQEpochs(pqEpoch: 1, classicalEpoch: 2))
+		#expect(
+			commitFrame.epochs
+				== AbstractTwoMLS.APQEpochs(pqEpoch: 1, classicalEpoch: 2))
 		#expect(commitFrame.epochs.pqEpoch == localBase.epochs().pqEpoch)
 		#expect(commitFrame.epochs.classicalEpoch == localBase.epochs().classicalEpoch)
 
@@ -153,10 +155,12 @@ struct LifecycleTests {
 		#expect(remotePostAfterCommit.bytes != remotePostBeforeCommit.bytes)
 		#expect(
 			localListenAfterCommit.rendezvousByEpoch
-				.first { $0.epoch == 2 }?.rendezvousId.bytes == remotePostAfterCommit.bytes)
+				.first { $0.epoch == 2 }?.rendezvousId.bytes
+				== remotePostAfterCommit.bytes)
 		#expect(
 			localListenAfterCommit.rendezvousByEpoch
-				.first { $0.epoch == 1 }?.rendezvousId.bytes == remotePostBeforeCommit.bytes)
+				.first { $0.epoch == 1 }?.rendezvousId.bytes
+				== remotePostBeforeCommit.bytes)
 		#expect(try postAddressMatches(poster: localBase, listener: remoteBase))
 		#expect(try postAddressMatches(poster: remoteBase, listener: localBase))
 

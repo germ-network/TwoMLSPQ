@@ -9,12 +9,12 @@ struct ClientWrapper<C: AbstractTwoMLS.Client> {
 	let agentKey = AgentPrivateKey()
 	let client: C
 	let currentInvitation: C.Invitation
-	
+
 	init() throws {
 		client = try C(clientId: agentKey.publicKey.wireFormat)
 		currentInvitation = try .init(archive: try client.makeInvitation())
 	}
-	
+
 	var clientId: Data {
 		get throws {
 			agentKey.publicKey.wireFormat
@@ -217,7 +217,8 @@ struct RotationDemo {
 		guard prep?.didCommit == true else { throw TestErrors.unexpected }
 		let frame = try remoteSession.encrypt(appMessage: Data("rotate".utf8))
 		guard
-			let decrypted = try localSession.processIncoming(ciphertext: frame.cipherText),
+			let decrypted = try localSession.processIncoming(
+				ciphertext: frame.cipherText),
 			decrypted.remoteCommit?.newSender == dedicatedAgentId,
 			decrypted.applicationMessage?.appMessageData == Data("rotate".utf8)
 		else {

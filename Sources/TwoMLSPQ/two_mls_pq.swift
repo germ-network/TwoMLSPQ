@@ -993,12 +993,13 @@ public protocol TwoMlsPqInvitationProtocol: AnyObject, Sendable {
     func combinerKeyPackage()  -> CombinerKeyPackage
     
     /**
-     * Resolve an initial frame's spawn token against the forward table: `Some` names the
-     * receive group of the session this invitation already spawned from an identical
-     * frame (route the payload there — see `TwoMlsPqSession::forwarded`), `None` means
-     * the frame is fresh and should proceed through app validation to `receive`.
+     * Resolve an initial frame's spawn token against the forward table: `Some` names
+     * the receive group (classical, message-half id) of the session this invitation
+     * already spawned from an identical frame (route the payload there — see
+     * `TwoMlsPqSession::forwarded`), `None` means the frame is fresh and should
+     * proceed through app validation to `receive`.
      */
-    func forwardGroupId(spawnToken: Data)  -> CombinerGroupId?
+    func forwardGroupId(spawnToken: Data)  -> MlsGroupId?
     
     /**
      * HPKE-decrypt data sealed to this invitation's (classical) key package init key — the
@@ -1134,13 +1135,14 @@ open func combinerKeyPackage() -> CombinerKeyPackage  {
 }
     
     /**
-     * Resolve an initial frame's spawn token against the forward table: `Some` names the
-     * receive group of the session this invitation already spawned from an identical
-     * frame (route the payload there — see `TwoMlsPqSession::forwarded`), `None` means
-     * the frame is fresh and should proceed through app validation to `receive`.
+     * Resolve an initial frame's spawn token against the forward table: `Some` names
+     * the receive group (classical, message-half id) of the session this invitation
+     * already spawned from an identical frame (route the payload there — see
+     * `TwoMlsPqSession::forwarded`), `None` means the frame is fresh and should
+     * proceed through app validation to `receive`.
      */
-open func forwardGroupId(spawnToken: Data) -> CombinerGroupId?  {
-    return try!  FfiConverterOptionTypeCombinerGroupId.lift(try! rustCall() {
+open func forwardGroupId(spawnToken: Data) -> MlsGroupId?  {
+    return try!  FfiConverterOptionTypeMlsGroupId.lift(try! rustCall() {
     uniffi_two_mls_pq_fn_method_twomlspqinvitation_forward_group_id(
             self.uniffiCloneHandle(),
         FfiConverterData.lower(spawnToken),$0
@@ -3477,6 +3479,30 @@ fileprivate struct FfiConverterOptionTypeDecryptResult: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeMlsGroupId: FfiConverterRustBuffer {
+    typealias SwiftType = MlsGroupId?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeMlsGroupId.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeMlsGroupId.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeMlsSenderMessage: FfiConverterRustBuffer {
     typealias SwiftType = MlsSenderMessage?
 
@@ -3729,7 +3755,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_two_mls_pq_checksum_method_twomlspqinvitation_combiner_key_package() != 28961) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqinvitation_forward_group_id() != 28585) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqinvitation_forward_group_id() != 59815) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqinvitation_hpke_open() != 30342) {

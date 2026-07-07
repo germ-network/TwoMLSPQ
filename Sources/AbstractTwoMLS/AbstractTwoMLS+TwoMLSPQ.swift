@@ -7,7 +7,7 @@
 //  Conforms the TwoMLSPQ UniFFI types to the AbstractTwoMLS protocol surface.
 //
 //  Because the abstraction speaks in `Data`/`TypedDigest` while TwoMLSPQ wraps
-//  those in single-field structs (`ClientId`, `TwoMlsPqDigest`, …), and because
+//  identity bytes in single-field structs (`ClientId`, …), and because
 //  several abstract members collide with the generated methods only on return
 //  type, the conformances are provided by thin adapter types in the
 //  `AbstractTwoMLS` namespace rather than by extending the generated classes
@@ -251,7 +251,8 @@ extension AbstractTwoMLS {
 			// FFI stays digest-convention-agnostic (opaque token). Always nil for the
 			// PQ backend today: a replayed initial frame carries nothing undelivered.
 			try base.forwarded(
-				spawnToken: TypedDigest(prefix: .sha256, over: headerDecrypted).wireFormat
+				spawnToken: TypedDigest(prefix: .sha256, over: headerDecrypted)
+					.wireFormat
 			)
 			.map(PQSenderMessage.init)
 		}
@@ -267,7 +268,9 @@ extension AbstractTwoMLS {
 			// empty id that then changes mid-session.
 			let groupId = channels.sendGroup.classical.bytes
 			let rendezvous = Dictionary(
-				channels.rendezvousByEpoch.map { ($0.epoch, $0.rendezvousId.bytes) },
+				channels.rendezvousByEpoch.map {
+					($0.epoch, $0.rendezvousId.bytes)
+				},
 				uniquingKeysWith: { first, _ in first }
 			)
 			return (groupId, rendezvous)
@@ -305,7 +308,8 @@ extension AbstractTwoMLS {
 			case .finishBootstrap:
 				return PQOutbound(
 					kind: kind,
-					payload: try base.pqBootstrapBegin(rotating: rotating?.pqClientId)
+					payload: try base.pqBootstrapBegin(
+						rotating: rotating?.pqClientId)
 				)
 			case .ratchet:
 				// A.3 injects a PSK with no updatePath — nothing carries a new
@@ -317,7 +321,8 @@ extension AbstractTwoMLS {
 			case .rekey:
 				return PQOutbound(
 					kind: kind,
-					payload: try base.pqRekeyBegin(rotating: rotating?.pqClientId)
+					payload: try base.pqRekeyBegin(
+						rotating: rotating?.pqClientId)
 				)
 			}
 		}
@@ -464,7 +469,7 @@ extension AbstractTwoMLS {
 				return .forward(
 					groupId: try DataIdentifier(
 						prefix: .bits256,
-						checkedData: spawned.classical.bytes
+						checkedData: spawned.bytes
 					),
 					mlsMessageData: decrypted
 				)
@@ -500,11 +505,16 @@ extension AbstractTwoMLS {
 			// the invitation's forward table, so a transport re-delivery of the same
 			// initial frame decodes as `.forward` to this session (`decodeHeader`
 			// recomputes the digest over the decrypted frame and looks it up).
-			let session = PQSession(try base.receive(
-				welcome: sendGroupWelcome,
-				theirKeyPackage: pair,
-				spawnToken: combinedWelcomeDigest.wireFormat
-			))
+			// CONTRACT: callers must pass `decodeHeader`'s `appWelcomeDigest` back
+			// verbatim as `combinedWelcomeDigest` — a digest over anything other than
+			// the exact header-decrypted frame bytes (e.g. a re-serialized welcome)
+			// silently breaks replay forwarding.
+			let session = PQSession(
+				try base.receive(
+					welcome: sendGroupWelcome,
+					theirKeyPackage: pair,
+					spawnToken: combinedWelcomeDigest.wireFormat
+				))
 
 			// Fail open on the stapled message — the session proceeds even if the
 			// staple does not process (mirrors the classical receiveWelcome).
@@ -557,7 +567,8 @@ extension AbstractTwoMLS {
 			// An opaque combiner blob reports its PQ half's suite; fall back to a bare
 			// MLS key package message.
 			if let pair = try? decodeCombinerKeyPackage(bytes: encoded) {
-				return (try? parseMlsKeyPackage(bytes: pair.pq).cipherSuite.value()) ?? 0
+				return (try? parseMlsKeyPackage(bytes: pair.pq).cipherSuite.value())
+					?? 0
 			}
 			return (try? parseMlsKeyPackage(bytes: encoded).cipherSuite.value()) ?? 0
 		}
@@ -575,7 +586,8 @@ extension AbstractTwoMLS {
 			myKeyPackage: Data
 		) {
 			let pair = try decodeCombinerKeyPackage(bytes: keyPackageMessage)
-			let session = try TwoMlsPqSession.initiate(client: base, theirKeyPackage: pair)
+			let session = try TwoMlsPqSession.initiate(
+				client: base, theirKeyPackage: pair)
 			guard let welcome = session.pendingOutbound() else {
 				throw TwoMLSPQConformanceError.notImplemented(
 					"PQClient.reply — initiate produced no welcome"
