@@ -23,6 +23,13 @@ mls-rs = { workspace = true }
 mls-rs-core = { workspace = true }
 mls-rs-crypto-cryptokit = { workspace = true, optional = true }
 mls-rs-crypto-rustcrypto = { workspace = true }
-mls-rs-crypto-traits = { version = "0.22", git = "https://github.com/germ-network/mls-rs", rev = "3743c75d32257ab48bde2875f5e8d624410147e9", optional = true }
+mls-rs-crypto-traits = { workspace = true, optional = true }
 thiserror = { workspace = true }
 zeroize = { workspace = true }
+
+[dev-dependencies]
+# Phase 0 spike (provider-agnostic plan): prove aws-lc serves both halves — ML-KEM-768
+# (0xFDEA) for the PQ group and CURVE25519_CHACHA for the classical group — and that it
+# interops with CryptoKit. See tests/provider_spike.rs.
+mls-rs-crypto-awslc = { workspace = true }
+mls-rs-crypto-traits = { workspace = true }
