@@ -48,11 +48,22 @@ jobs:
       - name: Check Rust formatting
         run: cargo fmt --all -- --check
 
-      # `cryptokit` is Apple-only (mls-rs-crypto-cryptokit) and cannot build on Linux.
-      # Lint everything except cryptokit: `--features benchmark_util` keeps the default
-      # `rustcrypto` plus the bench targets while leaving `cryptokit` off.
+      # `cryptokit` is Apple-only (linted/tested in the macos-cryptokit job); on Linux we
+      # lint every other feature. `--features benchmark_util` keeps the default `rustcrypto`
+      # plus the bench targets while leaving `cryptokit` off.
       - name: Clippy
         run: cargo clippy --all-targets --features benchmark_util -- -D warnings
+
+      # The `cryptokit` feature must not build off-Apple (guarded by a compile_error! in the
+      # crate). Assert the build fails, so a regression that makes it build on Linux is
+      # caught here rather than silently "working".
+      - name: cryptokit must not build on Linux (expected failure)
+        run: |
+          if cargo build -p two-mls-pq --no-default-features --features cryptokit 2>/dev/null; then
+            echo "::error::cryptokit unexpectedly built on Linux; it is Apple-only"
+            exit 1
+          fi
+          echo "cryptokit correctly fails to build on Linux"
 
       - name: Clippy (default features / rustcrypto, no cryptokit)
         run: cargo clippy --all-targets --no-default-features --features rustcrypto -- -D warnings
@@ -88,8 +99,8 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml') }}
 
-      # `cryptokit` is Apple-only; on Linux run everything else (default `rustcrypto`
-      # plus the bench fixtures). The macOS runner covers the real ML-KEM-768 path.
+      # `cryptokit` is Apple-only; the macos-cryptokit job runs the real ML-KEM-768 tests.
+      # Here we run everything else (default `rustcrypto` + bench fixtures).
       - name: Test
         run: cargo test --features benchmark_util
 
@@ -147,3 +158,29 @@ jobs:
       # surface we care about. Catches accidental use of newer-than-1.85 language/stdlib features.
       - name: cargo check (rustcrypto, no cryptokit)
         run: cargo check --no-default-features --features rustcrypto
+
+  macos-cryptokit:
+    name: CryptoKit (macOS)
+    # CryptoKit's ML-KEM-768 primitives require macOS 26, so pin the runner explicitly
+    # rather than relying on the macos-latest migration.
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-cryptokit-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml') }}
+
+      - name: Clippy (cryptokit)
+        run: cargo clippy -p two-mls-pq --all-targets --features cryptokit -- -D warnings
+
+      - name: Test (cryptokit)
+        run: cargo test -p two-mls-pq --features cryptokit
