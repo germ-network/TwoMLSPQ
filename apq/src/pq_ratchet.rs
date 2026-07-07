@@ -85,11 +85,7 @@ impl<'a> InjectedSecret<'a> {
         stores: &'a [InMemoryPreSharedKeyStorage],
     ) -> Self {
         let id = injected_psk_id(group);
-        for store in stores {
-            store
-                .clone()
-                .insert(id.clone(), PreSharedKey::new(s.to_vec()));
-        }
+        crate::group::register_psk_stores(stores, &id, &PreSharedKey::new(s.to_vec()));
         Self { id, stores }
     }
 }
@@ -99,13 +95,6 @@ impl Drop for InjectedSecret<'_> {
         for store in self.stores {
             store.clone().delete(&self.id);
         }
-    }
-}
-
-/// Register an exported PSK into every store in the caller's registry.
-fn register_into(stores: &[InMemoryPreSharedKeyStorage], id: &ExternalPskId, psk: &PreSharedKey) {
-    for store in stores {
-        store.clone().insert(id.clone(), psk.clone());
     }
 }
 
@@ -130,7 +119,7 @@ pub fn inject_and_commit<S: KeyPackageStorage + Clone>(
     // S is now folded into the new epoch; wipe it from the stores before re-exporting.
     drop(secret);
     let (apq_psk_id, apq_psk) = export_psk_pq(pq_group)?;
-    register_into(stores, &apq_psk_id, &apq_psk);
+    crate::group::register_psk_stores(stores, &apq_psk_id, &apq_psk);
     let bytes = out
         .commit_message
         .to_bytes()
@@ -154,7 +143,7 @@ pub fn apply_injected_commit<S: KeyPackageStorage + Clone>(
     // S is now folded into the new epoch; wipe it before re-exporting.
     drop(secret);
     let (apq_psk_id, apq_psk) = export_psk_pq(pq_group)?;
-    register_into(stores, &apq_psk_id, &apq_psk);
+    crate::group::register_psk_stores(stores, &apq_psk_id, &apq_psk);
     Ok(apq_psk_id)
 }
 

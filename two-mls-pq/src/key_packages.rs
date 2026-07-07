@@ -9,7 +9,7 @@ use crate::invitation::{
 use crate::key_package_store::PqMlsClient;
 use crate::key_package_store::{CombinerClient, MlsClient};
 use crate::session::TwoMlsPqSession;
-use crate::{ClientId, CombinerGroupId, MlsCipherSuite, Result, TwoMlsPqError};
+use crate::{ClientId, MlsCipherSuite, MlsGroupId, Result, TwoMlsPqError};
 
 /// Holds an agent identity (ClientId) and manages MLS key packages for publication.
 /// The ClientId is the Basic Credential that identifies this agent as a leaf node in
@@ -393,18 +393,19 @@ impl TwoMlsPqInvitation {
 
         match TwoMlsPqClient::from_combiner_invitation(&self.invitation)
             .and_then(|client| TwoMlsPqSession::accept(client, welcome, their_key_package))
-        {
-            Ok(session) => {
+            .and_then(|session| {
                 // Enter the spawn in the forward table; the acceptor always has a
-                // receive group straight out of `accept`.
+                // receive group straight out of `accept`, but any failure in this
+                // bookkeeping must release the reservation like a failed accept.
                 let gid = session.receive_group_id().ok_or(TwoMlsPqError::Mls)?;
                 self.spawned
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .insert(spawn_token.clone(), (gid.classical.bytes, gid.pq.bytes));
+                    .insert(spawn_token.clone(), gid.classical.bytes);
                 session.set_spawn_token(spawn_token);
                 Ok(session)
-            }
+            }) {
+            Ok(session) => Ok(session),
             Err(e) => {
                 // Establishment failed — release the reservation so a valid retry can proceed.
                 self.consumed
@@ -416,20 +417,18 @@ impl TwoMlsPqInvitation {
         }
     }
 
-    /// Resolve an initial frame's spawn token against the forward table: `Some` names the
-    /// receive group of the session this invitation already spawned from an identical
-    /// frame (route the payload there — see `TwoMlsPqSession::forwarded`), `None` means
-    /// the frame is fresh and should proceed through app validation to `receive`.
-    pub fn forward_group_id(&self, spawn_token: Vec<u8>) -> Option<CombinerGroupId> {
+    /// Resolve an initial frame's spawn token against the forward table: `Some` names
+    /// the receive group (classical, message-half id) of the session this invitation
+    /// already spawned from an identical frame (route the payload there — see
+    /// `TwoMlsPqSession::forwarded`), `None` means the frame is fresh and should
+    /// proceed through app validation to `receive`.
+    pub fn forward_group_id(&self, spawn_token: Vec<u8>) -> Option<MlsGroupId> {
         self.spawned
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(&spawn_token)
-            .map(|(classical, pq)| CombinerGroupId {
-                classical: crate::MlsGroupId {
-                    bytes: classical.clone(),
-                },
-                pq: crate::MlsGroupId { bytes: pq.clone() },
+            .map(|classical| MlsGroupId {
+                bytes: classical.clone(),
             })
     }
 
@@ -746,8 +745,7 @@ mod tests {
         // The replayed token now names the spawned session's receive group…
         let gid = assert_some!(bob_inv.forward_group_id(token.clone()));
         let recv = assert_some!(bob_session.receive_group_id());
-        assert_eq!(gid.classical.bytes, recv.classical.bytes);
-        assert_eq!(gid.pq.bytes, recv.pq.bytes);
+        assert_eq!(gid.bytes, recv.classical.bytes);
         // …a different token still routes nowhere…
         assert!(bob_inv.forward_group_id(b"other".to_vec()).is_none());
 
@@ -787,7 +785,7 @@ mod tests {
             assert_ok!(bob_inv.archive())
         ));
         let gid = assert_some!(restored.forward_group_id(token));
-        assert_eq!(gid.classical.bytes, recv.classical.bytes);
+        assert_eq!(gid.bytes, recv.classical.bytes);
         assert!(restored.forward_group_id(b"other".to_vec()).is_none());
     }
 

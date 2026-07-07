@@ -20,10 +20,10 @@ use crate::{Result, TwoMlsPqError};
 const INVITATION_VERSION: u8 = 2;
 
 /// The spawned-group forward table: an opaque caller-supplied spawn token → the spawned
-/// session's receive-group ids (classical, pq). The token is whatever the caller passed
-/// to `receive` — this library never interprets it (the Swift adapter uses the app's
-/// combined-welcome digest, but any replay-stable byte string works).
-pub(crate) type SpawnedGroups = BTreeMap<Vec<u8>, (Vec<u8>, Vec<u8>)>;
+/// session's receive-group classical (message-half) id. The token is whatever the caller
+/// passed to `receive` — this library never interprets it (the Swift adapter uses the
+/// app's combined-welcome digest, but any replay-stable byte string works).
+pub(crate) type SpawnedGroups = BTreeMap<Vec<u8>, Vec<u8>>;
 
 // Tags whether the PQ half is real ML-KEM (`cryptokit`) or a classical simulation (default
 // build). Baked into the archive so a mismatched build fails loudly at decode rather than
@@ -105,10 +105,9 @@ pub(crate) fn encode_archive(
     for id in consumed {
         put_bytes(&mut out, id)?;
     }
-    for (token, (classical, pq)) in spawned {
+    for (token, classical) in spawned {
         put_bytes(&mut out, token)?;
         put_bytes(&mut out, classical)?;
-        put_bytes(&mut out, pq)?;
     }
     Ok(out)
 }
@@ -118,11 +117,7 @@ pub(crate) fn decode_archive(
 ) -> Result<(CombinerInvitation, BTreeSet<Vec<u8>>, SpawnedGroups)> {
     let mut rest = bytes;
     let invitation = CombinerInvitation::decode(&take_bytes(&mut rest)?)?;
-    if rest.len() < 4 {
-        return Err(TwoMlsPqError::ArchiveInvalid);
-    }
-    let count = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
-    rest = &rest[4..];
+    let count = take_u32(&mut rest)? as usize;
     let mut consumed = BTreeSet::new();
     for _ in 0..count {
         consumed.insert(take_bytes(&mut rest)?);
@@ -131,8 +126,7 @@ pub(crate) fn decode_archive(
     while !rest.is_empty() {
         let token = take_bytes(&mut rest)?;
         let classical = take_bytes(&mut rest)?;
-        let pq = take_bytes(&mut rest)?;
-        spawned.insert(token, (classical, pq));
+        spawned.insert(token, classical);
     }
     Ok((invitation, consumed, spawned))
 }
@@ -225,16 +219,23 @@ pub(crate) fn put_bytes(out: &mut Vec<u8>, v: &[u8]) -> Result<()> {
 }
 
 pub(crate) fn take_bytes(rest: &mut &[u8]) -> Result<Vec<u8>> {
-    if rest.len() < 4 {
-        return Err(TwoMlsPqError::ArchiveInvalid);
-    }
-    let len = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
-    *rest = &rest[4..];
+    let len = take_u32(rest)? as usize;
     if rest.len() < len {
         return Err(TwoMlsPqError::ArchiveInvalid);
     }
     let v = rest[..len].to_vec();
     *rest = &rest[len..];
+    Ok(v)
+}
+
+/// The single bounds-checked u32-LE read behind every length and count in the
+/// archive layout.
+fn take_u32(rest: &mut &[u8]) -> Result<u32> {
+    if rest.len() < 4 {
+        return Err(TwoMlsPqError::ArchiveInvalid);
+    }
+    let v = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]);
+    *rest = &rest[4..];
     Ok(v)
 }
 
