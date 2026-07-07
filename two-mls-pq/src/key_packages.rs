@@ -3,13 +3,13 @@ use std::sync::{Arc, Mutex};
 
 use crate::invitation::{
     combiner_from_invitation, decode_archive, encode_archive, generate_combiner_invitation,
-    take_bytes, CombinerInvitation,
+    take_bytes, CombinerInvitation, SpawnedGroups,
 };
 #[cfg(feature = "cryptokit")]
 use crate::key_package_store::PqMlsClient;
 use crate::key_package_store::{CombinerClient, MlsClient};
 use crate::session::TwoMlsPqSession;
-use crate::{ClientId, MlsCipherSuite, Result, TwoMlsPqError};
+use crate::{ClientId, CombinerGroupId, MlsCipherSuite, Result, TwoMlsPqError};
 
 /// Holds an agent identity (ClientId) and manages MLS key packages for publication.
 /// The ClientId is the Basic Credential that identifies this agent as a leaf node in
@@ -91,6 +91,7 @@ impl TwoMlsPqClient {
         encode_archive(
             &generate_combiner_invitation(&self.inner)?,
             &BTreeSet::new(),
+            &SpawnedGroups::new(),
         )
     }
 }
@@ -316,6 +317,11 @@ pub struct TwoMlsPqInvitation {
     // Persisted in `archive()` (a `BTreeSet` for deterministic encoding) so the guard
     // survives a restore.
     consumed: Mutex<BTreeSet<Vec<u8>>>,
+    // The forward table: opaque spawn token → the spawned session's receive-group ids.
+    // A replayed initial frame decodes to a token already in this table; the caller
+    // routes it to the owning session instead of treating it as a fresh welcome.
+    // Persisted in `archive()` so forwarding survives a restore.
+    spawned: Mutex<SpawnedGroups>,
 }
 
 #[uniffi::export]
@@ -324,18 +330,21 @@ impl TwoMlsPqInvitation {
     /// `archive()`).
     #[uniffi::constructor]
     pub fn new(archive: Vec<u8>) -> Result<Arc<Self>> {
-        let (invitation, consumed) = decode_archive(&archive)?;
+        let (invitation, consumed, spawned) = decode_archive(&archive)?;
         Ok(Arc::new(Self {
             invitation,
             consumed: Mutex::new(consumed),
+            spawned: Mutex::new(spawned),
         }))
     }
 
     /// Serialise the invitation's signing identity + key-package private material, plus the
-    /// consumed-remote set so the transport dedup guard survives a restore.
+    /// consumed-remote set and the spawned-group forward table so the transport dedup
+    /// guard and replay routing survive a restore.
     pub fn archive(&self) -> Result<Vec<u8>> {
         let consumed = self.consumed.lock().unwrap_or_else(|e| e.into_inner());
-        encode_archive(&self.invitation, &consumed)
+        let spawned = self.spawned.lock().unwrap_or_else(|e| e.into_inner());
+        encode_archive(&self.invitation, &consumed, &spawned)
     }
 
     /// The agent's ClientId.
@@ -356,10 +365,18 @@ impl TwoMlsPqInvitation {
     /// Receive a remote initiator's APQWelcome and establish the session using this
     /// invitation's captured key package. Rejects a second welcome from the same remote
     /// (`DuplicateWelcome`).
+    ///
+    /// `spawn_token` is an opaque, caller-chosen, replay-stable identifier for the
+    /// initial frame this welcome arrived in (the Swift adapter passes the app's
+    /// combined-welcome digest; this library never interprets it). On success it keys
+    /// the forward table: a replayed frame decodes to the same token, `forward_group_id`
+    /// resolves it to the spawned session, and `TwoMlsPqSession::forwarded`
+    /// acknowledges it there.
     pub fn receive(
         &self,
         welcome: Vec<u8>,
         their_key_package: CombinerKeyPackage,
+        spawn_token: Vec<u8>,
     ) -> Result<Arc<TwoMlsPqSession>> {
         let their_id = parse_mls_key_package(their_key_package.classical.clone())?.client_id;
 
@@ -377,7 +394,17 @@ impl TwoMlsPqInvitation {
         match TwoMlsPqClient::from_combiner_invitation(&self.invitation)
             .and_then(|client| TwoMlsPqSession::accept(client, welcome, their_key_package))
         {
-            Ok(session) => Ok(session),
+            Ok(session) => {
+                // Enter the spawn in the forward table; the acceptor always has a
+                // receive group straight out of `accept`.
+                let gid = session.receive_group_id().ok_or(TwoMlsPqError::Mls)?;
+                self.spawned
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(spawn_token.clone(), (gid.classical.bytes, gid.pq.bytes));
+                session.set_spawn_token(spawn_token);
+                Ok(session)
+            }
             Err(e) => {
                 // Establishment failed — release the reservation so a valid retry can proceed.
                 self.consumed
@@ -387,6 +414,23 @@ impl TwoMlsPqInvitation {
                 Err(e)
             }
         }
+    }
+
+    /// Resolve an initial frame's spawn token against the forward table: `Some` names the
+    /// receive group of the session this invitation already spawned from an identical
+    /// frame (route the payload there — see `TwoMlsPqSession::forwarded`), `None` means
+    /// the frame is fresh and should proceed through app validation to `receive`.
+    pub fn forward_group_id(&self, spawn_token: Vec<u8>) -> Option<CombinerGroupId> {
+        self.spawned
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&spawn_token)
+            .map(|(classical, pq)| CombinerGroupId {
+                classical: crate::MlsGroupId {
+                    bytes: classical.clone(),
+                },
+                pq: crate::MlsGroupId { bytes: pq.clone() },
+            })
     }
 
     /// HPKE-decrypt data sealed to this invitation's (classical) key package init key — the
@@ -549,7 +593,7 @@ mod tests {
         let welcome_a = assert_some!(alice_session.pending_outbound());
 
         // Bob accepts through the invitation (no live client that generated the KP).
-        let bob_session = assert_ok!(bob_inv.receive(welcome_a, alice_kp));
+        let bob_session = assert_ok!(bob_inv.receive(welcome_a, alice_kp, b"token".to_vec()));
         let welcome_b = assert_some!(bob_session.pending_outbound());
         assert_ok!(alice_session.process_incoming(welcome_b));
 
@@ -576,10 +620,10 @@ mod tests {
         let welcome_a = assert_some!(alice_session.pending_outbound());
 
         // First receive consumes Alice's identity.
-        assert_ok!(bob_inv.receive(welcome_a.clone(), alice_kp.clone()));
+        assert_ok!(bob_inv.receive(welcome_a.clone(), alice_kp.clone(), b"token".to_vec()));
         // A second welcome from the same remote is rejected as a replay.
         assert_err!(
-            bob_inv.receive(welcome_a, alice_kp),
+            bob_inv.receive(welcome_a, alice_kp, b"token".to_vec()),
             crate::TwoMlsPqError::DuplicateWelcome
         );
     }
@@ -651,14 +695,14 @@ mod tests {
         let welcome_a = assert_some!(alice_session.pending_outbound());
 
         // Consume Alice on the live invitation.
-        assert_ok!(bob_inv.receive(welcome_a.clone(), alice_kp.clone()));
+        assert_ok!(bob_inv.receive(welcome_a.clone(), alice_kp.clone(), b"token".to_vec()));
 
         // Archive + restore; the consumed set must survive so the replay is still rejected.
         let restored = assert_ok!(super::TwoMlsPqInvitation::new(
             assert_ok!(bob_inv.archive())
         ));
         assert_err!(
-            restored.receive(welcome_a, alice_kp),
+            restored.receive(welcome_a, alice_kp, b"token".to_vec()),
             crate::TwoMlsPqError::DuplicateWelcome
         );
     }
@@ -669,6 +713,82 @@ mod tests {
             super::TwoMlsPqInvitation::new(vec![0xFF, 0xFF, 0xFF]),
             crate::TwoMlsPqError::ArchiveInvalid
         );
+    }
+
+    /// Increment C — replay routing. A successful `receive` enters the spawn in the
+    /// forward table under the caller's opaque token: the same token resolves to the
+    /// spawned session's receive group, the session acknowledges the replay via
+    /// `forwarded`, and a mis-routed token is refused.
+    #[test]
+    fn test_forward_table_routes_replayed_spawn_token() {
+        use crate::session::TwoMlsPqSession;
+        use crate::test_utils::{make_client, make_combiner_kp};
+        use std::sync::Arc;
+
+        let alice = make_client();
+        let bob = make_client();
+        let alice_kp = make_combiner_kp(&alice);
+
+        let bob_inv = assert_ok!(super::TwoMlsPqInvitation::new(assert_ok!(
+            bob.generate_invitation()
+        )));
+        let bob_kp = bob_inv.combiner_key_package();
+
+        let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp));
+        let welcome_a = assert_some!(alice_session.pending_outbound());
+
+        // Fresh frame: nothing to forward to yet.
+        let token = b"spawn-token".to_vec();
+        assert!(bob_inv.forward_group_id(token.clone()).is_none());
+
+        let bob_session = assert_ok!(bob_inv.receive(welcome_a, alice_kp, token.clone()));
+
+        // The replayed token now names the spawned session's receive group…
+        let gid = assert_some!(bob_inv.forward_group_id(token.clone()));
+        let recv = assert_some!(bob_session.receive_group_id());
+        assert_eq!(gid.classical.bytes, recv.classical.bytes);
+        assert_eq!(gid.pq.bytes, recv.pq.bytes);
+        // …a different token still routes nowhere…
+        assert!(bob_inv.forward_group_id(b"other".to_vec()).is_none());
+
+        // …and the session acknowledges the replay: nothing new inside (the PQ
+        // initiator cannot staple pre-establishment), a mis-route is refused.
+        assert!(assert_ok!(bob_session.forwarded(token)).is_none());
+        assert_err!(
+            bob_session.forwarded(b"other".to_vec()),
+            crate::TwoMlsPqError::DecryptionFailed
+        );
+    }
+
+    /// The forward table survives archive/restore alongside the consumed set.
+    #[test]
+    fn test_invitation_archive_persists_forward_table() {
+        use crate::session::TwoMlsPqSession;
+        use crate::test_utils::{make_client, make_combiner_kp};
+        use std::sync::Arc;
+
+        let alice = make_client();
+        let bob = make_client();
+        let alice_kp = make_combiner_kp(&alice);
+
+        let bob_inv = assert_ok!(super::TwoMlsPqInvitation::new(assert_ok!(
+            bob.generate_invitation()
+        )));
+        let bob_kp = bob_inv.combiner_key_package();
+
+        let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp));
+        let welcome_a = assert_some!(alice_session.pending_outbound());
+
+        let token = b"spawn-token".to_vec();
+        let bob_session = assert_ok!(bob_inv.receive(welcome_a, alice_kp, token.clone()));
+        let recv = assert_some!(bob_session.receive_group_id());
+
+        let restored = assert_ok!(super::TwoMlsPqInvitation::new(
+            assert_ok!(bob_inv.archive())
+        ));
+        let gid = assert_some!(restored.forward_group_id(token));
+        assert_eq!(gid.classical.bytes, recv.classical.bytes);
+        assert!(restored.forward_group_id(b"other".to_vec()).is_none());
     }
 
     #[test]
@@ -733,9 +853,11 @@ mod tests {
         // A failed establishment must NOT consume the remote — the reservation is rolled
         // back, so a valid retry from the same remote still succeeds.
         assert!(bob_inv
-            .receive(b"not-a-welcome".to_vec(), alice_kp.clone())
+            .receive(b"not-a-welcome".to_vec(), alice_kp.clone(), b"bad".to_vec())
             .is_err());
-        assert_ok!(bob_inv.receive(welcome_a, alice_kp));
+        // …and the failed spawn must not enter the forward table either.
+        assert!(bob_inv.forward_group_id(b"bad".to_vec()).is_none());
+        assert_ok!(bob_inv.receive(welcome_a, alice_kp, b"token".to_vec()));
     }
 
     #[test]
