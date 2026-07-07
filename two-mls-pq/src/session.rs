@@ -117,6 +117,18 @@ const PQ_BOOTSTRAP_KP_TAG: u8 = 0x11;
 /// A.4 bootstrap reply: the new PQ group's welcome plus the classical APQ-PSK bind commit.
 const PQ_BOOTSTRAP_BIND_TAG: u8 = 0x13;
 
+// A.5 rekey (architecture-diagrams §A.5), cryptokit only — updatePath commits run on the
+// PQ groups alone so the classical ratchet is never blocked behind a large ML-KEM
+// updatePath. 0x15 carries the initiator's Upd' proposal for the responder's send-PQ;
+// 0x17 = [Commit'][counter-Upd'-or-empty], length-prefixed — the responder's reply
+// carries its counter-proposal, the initiator's final commit an empty slot. Each Commit'
+// cross-injects a PSK exported from the opposite PQ send group; the bumped pq_epoch
+// reconciles into APQInfo at the next A.3 bind (no AppDataUpdate rides these commits).
+#[cfg(feature = "cryptokit")]
+const PQ_REKEY_UPD_TAG: u8 = 0x15;
+#[cfg(feature = "cryptokit")]
+const PQ_REKEY_COMMIT_TAG: u8 = 0x17;
+
 /// PQ ratchet round state carried between the messages of one exchange.
 #[cfg(feature = "cryptokit")]
 enum PqInflight {
@@ -125,6 +137,10 @@ enum PqInflight {
     /// Responder holds the shared secret until it receives the stapled bind. `Zeroizing` wipes the
     /// secret from memory on drop, whether it is consumed by the bind or abandoned.
     Responding(Zeroizing<Vec<u8>>),
+    /// A.5 initiator awaiting the responder's Commit' (+ counter-Upd').
+    RekeyInitiated,
+    /// A.5 responder awaiting the initiator's final Commit'.
+    RekeyResponded,
 }
 
 /// Append `part` to `out` as a u32-LE length-prefixed section.
@@ -194,6 +210,26 @@ fn decode_pq_bind(bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
     }
     let [pq_commit, classical_commit, app] = read_sections::<3>(rest)?;
     Ok((pq_commit, classical_commit, app))
+}
+
+/// Encode an A.5 rekey Commit' frame: `[0x17][commit][counter-Upd'-or-empty]`.
+#[cfg(feature = "cryptokit")]
+fn encode_pq_rekey_commit(commit: Vec<u8>, counter_proposal: Vec<u8>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + 8 + commit.len() + counter_proposal.len());
+    out.push(PQ_REKEY_COMMIT_TAG);
+    push_section(&mut out, &commit);
+    push_section(&mut out, &counter_proposal);
+    out
+}
+
+#[cfg(feature = "cryptokit")]
+fn decode_pq_rekey_commit(bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
+    let (&tag, rest) = bytes.split_first().ok_or(TwoMlsPqError::Mls)?;
+    if tag != PQ_REKEY_COMMIT_TAG {
+        return Err(TwoMlsPqError::Mls);
+    }
+    let [commit, counter_proposal] = read_sections::<2>(rest)?;
+    Ok((commit, counter_proposal))
 }
 
 #[cfg(feature = "cryptokit")]
@@ -318,6 +354,219 @@ impl TwoMlsPqSession {
         // We finished receiving this operation; the next one is ours to start.
         inner.pq_turn_mine = true;
         out
+    }
+
+    /// A.5 initiator — propose Upd'(self) into the peer's send-PQ (our recv mirror) and
+    /// return the 0x15 frame. Requires both PQ halves live (post-A.4 only), the turn, and
+    /// no other side-band operation in flight. Proposal only: no epochs move until the
+    /// responder commits.
+    pub fn pq_rekey_begin(&self) -> Result<Vec<u8>> {
+        let mut inner = self.lock();
+        if !inner.pq_turn_mine || inner.pending_pq_outbound.is_some() || inner.pq_inflight.is_some()
+        {
+            return Err(TwoMlsPqError::SessionNotReady);
+        }
+        if inner
+            .send_group
+            .as_ref()
+            .and_then(|g| g.pq.as_ref())
+            .is_none()
+        {
+            return Err(TwoMlsPqError::SessionNotReady);
+        }
+        let recv_pq = inner
+            .recv_group
+            .as_mut()
+            .and_then(|g| g.pq.as_mut())
+            .ok_or(TwoMlsPqError::SessionNotReady)?;
+        let proposal = recv_pq
+            .propose_update(Vec::new())
+            .map_err(|_| TwoMlsPqError::Mls)?;
+        let mut msg = vec![PQ_REKEY_UPD_TAG];
+        msg.extend_from_slice(&proposal.to_bytes().map_err(|_| TwoMlsPqError::Mls)?);
+        inner.pq_inflight = Some(PqInflight::RekeyInitiated);
+        Ok(msg)
+    }
+
+    /// A.5 responder — commit the initiator's Upd' on our own send-PQ with an updatePath
+    /// and a PSK exported from our recv-PQ mirror (the initiator derives the same PSK from
+    /// its send-PQ), then park the `[Commit'][counter-Upd'(self)]` frame (0x17) for pickup
+    /// via `pq_take_pending_outbound`.
+    pub fn pq_rekey_respond(&self, upd_msg: Vec<u8>) -> Result<()> {
+        let (&tag, proposal_bytes) = upd_msg.split_first().ok_or(TwoMlsPqError::Mls)?;
+        if tag != PQ_REKEY_UPD_TAG {
+            return Err(TwoMlsPqError::Mls);
+        }
+        let proposal_msg =
+            MlsMessage::from_bytes(proposal_bytes).map_err(|_| TwoMlsPqError::Mls)?;
+        let mut inner = self.lock();
+        if inner.pending_pq_outbound.is_some() || inner.pq_inflight.is_some() {
+            return Err(TwoMlsPqError::SessionNotReady);
+        }
+        let client = inner.client.clone();
+        // Cross-PSK from our recv-PQ mirror (§A.5: "Export PSK from [ASG-PQ]") — the
+        // initiator registers the same value from its own send-PQ at this epoch.
+        let psk_id = {
+            let recv_pq = inner
+                .recv_group
+                .as_ref()
+                .and_then(|g| g.pq.as_ref())
+                .ok_or(TwoMlsPqError::SessionNotReady)?;
+            export_and_register_psk_pq(recv_pq, client.combiner())?
+        };
+        let commit_bytes = {
+            let send_pq = inner
+                .send_group
+                .as_mut()
+                .and_then(|g| g.pq.as_mut())
+                .ok_or(TwoMlsPqError::SessionNotReady)?;
+            match send_pq
+                .process_incoming_message(proposal_msg)
+                .map_err(|_| TwoMlsPqError::Mls)?
+            {
+                ReceivedMessage::Proposal(_) => {}
+                _ => return Err(TwoMlsPqError::Mls),
+            }
+            let out = send_pq
+                .commit_builder()
+                .add_external_psk(psk_id)
+                .map_err(|_| TwoMlsPqError::Mls)?
+                .build()
+                .map_err(|_| TwoMlsPqError::Mls)?;
+            send_pq
+                .apply_pending_commit()
+                .map_err(|_| TwoMlsPqError::Mls)?;
+            out.commit_message
+                .to_bytes()
+                .map_err(|_| TwoMlsPqError::Mls)?
+        };
+        // Counter-Upd'(self) for the initiator's send-PQ (our recv mirror).
+        let counter = {
+            let recv_pq = inner
+                .recv_group
+                .as_mut()
+                .and_then(|g| g.pq.as_mut())
+                .ok_or(TwoMlsPqError::SessionNotReady)?;
+            recv_pq
+                .propose_update(Vec::new())
+                .map_err(|_| TwoMlsPqError::Mls)?
+                .to_bytes()
+                .map_err(|_| TwoMlsPqError::Mls)?
+        };
+        inner.pq_inflight = Some(PqInflight::RekeyResponded);
+        inner.pending_pq_outbound = Some(encode_pq_rekey_commit(commit_bytes, counter));
+        Ok(())
+    }
+
+    /// Apply an A.5 rekey Commit' (0x17). As the initiator mid-operation (frame carries
+    /// the counter-Upd'), apply the peer's commit to our recv mirror, commit the
+    /// counter-Upd' on our own send-PQ with the freshly-exported cross-PSK, park the
+    /// final 0x17, and return `true` (pick it up via `pq_take_pending_outbound`). As the
+    /// responder (empty counter slot), apply the final commit, take the turn, and return
+    /// `false` — the operation is complete.
+    pub fn pq_rekey_apply(&self, msg: Vec<u8>) -> Result<bool> {
+        let (commit_bytes, counter_bytes) = decode_pq_rekey_commit(&msg)?;
+        let mut inner = self.lock();
+        // Reject unsolicited commits before parsing or registering anything.
+        if !matches!(
+            inner.pq_inflight,
+            Some(PqInflight::RekeyInitiated) | Some(PqInflight::RekeyResponded)
+        ) {
+            return Err(TwoMlsPqError::SessionNotReady);
+        }
+        let commit_msg = MlsMessage::from_bytes(&commit_bytes).map_err(|_| TwoMlsPqError::Mls)?;
+        let client = inner.client.clone();
+        // Both roles pre-register the peer's cross-injected PSK: it was exported from the
+        // peer's recv-PQ mirror, which is our own send-PQ at its current state.
+        {
+            let send_pq = inner
+                .send_group
+                .as_ref()
+                .and_then(|g| g.pq.as_ref())
+                .ok_or(TwoMlsPqError::SessionNotReady)?;
+            export_and_register_psk_pq(send_pq, client.combiner())?;
+        }
+        match inner.pq_inflight.take() {
+            Some(PqInflight::RekeyInitiated) => {
+                if counter_bytes.is_empty() {
+                    return Err(TwoMlsPqError::SessionNotReady);
+                }
+                let counter_msg =
+                    MlsMessage::from_bytes(&counter_bytes).map_err(|_| TwoMlsPqError::Mls)?;
+                // Apply the responder's Commit' to our recv mirror, then export the
+                // cross-PSK from its NEW epoch (§A.5: "Export PSK from [BSG-PQ]").
+                let psk_id = {
+                    let recv_pq = inner
+                        .recv_group
+                        .as_mut()
+                        .and_then(|g| g.pq.as_mut())
+                        .ok_or(TwoMlsPqError::SessionNotReady)?;
+                    match recv_pq
+                        .process_incoming_message(commit_msg)
+                        .map_err(|_| TwoMlsPqError::Mls)?
+                    {
+                        ReceivedMessage::Commit(_) => {}
+                        _ => return Err(TwoMlsPqError::Mls),
+                    }
+                    export_and_register_psk_pq(&*recv_pq, client.combiner())?
+                };
+                // Commit the counter-Upd' on our own send-PQ.
+                let commit2 = {
+                    let send_pq = inner
+                        .send_group
+                        .as_mut()
+                        .and_then(|g| g.pq.as_mut())
+                        .ok_or(TwoMlsPqError::SessionNotReady)?;
+                    match send_pq
+                        .process_incoming_message(counter_msg)
+                        .map_err(|_| TwoMlsPqError::Mls)?
+                    {
+                        ReceivedMessage::Proposal(_) => {}
+                        _ => return Err(TwoMlsPqError::Mls),
+                    }
+                    let out = send_pq
+                        .commit_builder()
+                        .add_external_psk(psk_id)
+                        .map_err(|_| TwoMlsPqError::Mls)?
+                        .build()
+                        .map_err(|_| TwoMlsPqError::Mls)?;
+                    send_pq
+                        .apply_pending_commit()
+                        .map_err(|_| TwoMlsPqError::Mls)?;
+                    out.commit_message
+                        .to_bytes()
+                        .map_err(|_| TwoMlsPqError::Mls)?
+                };
+                // Our operation completes once the peer applies; the turn passes.
+                inner.pq_turn_mine = false;
+                inner.pending_pq_outbound = Some(encode_pq_rekey_commit(commit2, Vec::new()));
+                Ok(true)
+            }
+            Some(PqInflight::RekeyResponded) => {
+                if !counter_bytes.is_empty() {
+                    return Err(TwoMlsPqError::SessionNotReady);
+                }
+                let recv_pq = inner
+                    .recv_group
+                    .as_mut()
+                    .and_then(|g| g.pq.as_mut())
+                    .ok_or(TwoMlsPqError::SessionNotReady)?;
+                match recv_pq
+                    .process_incoming_message(commit_msg)
+                    .map_err(|_| TwoMlsPqError::Mls)?
+                {
+                    ReceivedMessage::Commit(_) => {}
+                    _ => return Err(TwoMlsPqError::Mls),
+                }
+                // We finished receiving this operation; the next one is ours to start.
+                inner.pq_turn_mine = true;
+                Ok(false)
+            }
+            other => {
+                inner.pq_inflight = other;
+                Err(TwoMlsPqError::SessionNotReady)
+            }
+        }
     }
 }
 
@@ -1734,6 +1983,103 @@ mod tests {
             .rendezvous_by_epoch
             .iter()
             .any(|e| e.rendezvous_id.bytes == bob_post.bytes));
+    }
+
+    /// Drive one full A.5 rekey with `initiator` holding the turn. Returns after the
+    /// responder applies the final commit (turn flipped to the responder).
+    #[cfg(feature = "cryptokit")]
+    fn rekey_round(initiator: &Arc<TwoMlsPqSession>, responder: &Arc<TwoMlsPqSession>) {
+        let upd = assert_ok!(initiator.pq_rekey_begin());
+        assert_eq!(upd.first(), Some(&super::PQ_REKEY_UPD_TAG));
+        assert_ok!(responder.pq_rekey_respond(upd));
+        let reply = assert_some!(responder.pq_take_pending_outbound());
+        assert!(assert_ok!(initiator.pq_rekey_apply(reply)));
+        let fin = assert_some!(initiator.pq_take_pending_outbound());
+        assert!(!assert_ok!(responder.pq_rekey_apply(fin)));
+    }
+
+    #[test]
+    #[cfg(feature = "cryptokit")]
+    fn test_pq_rekey_full_round() {
+        let (alice, bob) = establish_full();
+        // Bob holds the turn after Alice's bootstrap completed.
+        assert!(bob.my_pq_turn());
+        let alice_classical = alice.epochs().classical_epoch;
+        let alice_listen = assert_ok!(alice.should_listen_on())
+            .rendezvous_by_epoch
+            .len();
+
+        rekey_round(&bob, &alice);
+
+        // Both send groups' PQ epochs advanced; classical and the listen map are
+        // untouched (A.5 is PQ-groups-only); the turn flipped back to Alice.
+        assert_eq!(alice.epochs().pq_epoch, 2);
+        assert_eq!(bob.epochs().pq_epoch, 2);
+        assert_eq!(alice.epochs().classical_epoch, alice_classical);
+        assert_eq!(
+            assert_ok!(alice.should_listen_on())
+                .rendezvous_by_epoch
+                .len(),
+            alice_listen
+        );
+        assert!(alice.my_pq_turn());
+        assert!(!bob.my_pq_turn());
+
+        // Messaging still flows both ways on the rekeyed groups, and the next
+        // encrypt reports the bumped pq epoch.
+        assert_ok!(alice.prepare_to_encrypt(None));
+        let a2b = assert_ok!(alice.encrypt(b"post-rekey".to_vec()));
+        assert_eq!(a2b.epochs.pq_epoch, 2);
+        let got = assert_ok!(bob.process_incoming(a2b.cipher_text));
+        assert_eq!(
+            assert_some!(assert_some!(got).application_message).app_message_data,
+            b"post-rekey".to_vec()
+        );
+
+        // Consecutive rekeys work: the turn machine supports Alice going next.
+        rekey_round(&alice, &bob);
+        assert_eq!(alice.epochs().pq_epoch, 3);
+        assert_eq!(bob.epochs().pq_epoch, 3);
+    }
+
+    #[test]
+    #[cfg(feature = "cryptokit")]
+    fn test_pq_rekey_then_ratchet_still_works() {
+        let (alice, bob) = establish_full();
+        rekey_round(&bob, &alice);
+        // A.3 ratchet after a rekey: Alice holds the turn.
+        let ek = assert_ok!(alice.pq_ratchet_begin());
+        assert_ok!(bob.pq_ratchet_respond(ek));
+        let ct = assert_some!(bob.pq_take_pending_outbound());
+        assert_ok!(alice.pq_ratchet_bind(ct, b"post-rekey-ratchet".to_vec()));
+        let bind = assert_some!(alice.pq_take_pending_outbound());
+        assert_eq!(
+            assert_ok!(bob.pq_ratchet_apply(bind)),
+            b"post-rekey-ratchet"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "cryptokit")]
+    fn test_pq_rekey_requires_full_establishment() {
+        // Pre-A.4 the acceptor's send-PQ (and the initiator's recv mirror) is missing.
+        let (alice, _bob) = establish_sessions();
+        assert!(alice.my_pq_turn());
+        assert_err!(alice.pq_rekey_begin(), TwoMlsPqError::SessionNotReady);
+    }
+
+    #[test]
+    #[cfg(feature = "cryptokit")]
+    fn test_pq_rekey_requires_turn_and_rejects_unsolicited() {
+        let (alice, bob) = establish_full();
+        // Alice's bootstrap completion passed the turn to Bob.
+        assert_err!(alice.pq_rekey_begin(), TwoMlsPqError::SessionNotReady);
+        // An unsolicited final commit (no rekey in flight) is rejected.
+        let bogus = super::encode_pq_rekey_commit(vec![0u8; 8], Vec::new());
+        assert_err!(bob.pq_rekey_apply(bogus), TwoMlsPqError::SessionNotReady);
+        // A second begin while one is in flight is rejected (single slot).
+        let _upd = assert_ok!(bob.pq_rekey_begin());
+        assert_err!(bob.pq_rekey_begin(), TwoMlsPqError::SessionNotReady);
     }
 
     #[test]
