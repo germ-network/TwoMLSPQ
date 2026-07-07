@@ -32,7 +32,10 @@ pub fn version() -> String {
 /// or the error enum in this crate. The vendored Swift binding's consumer
 /// (AbstractTwoMLS) asserts the value at first construction, so a stale
 /// binding/binary pairing fails fast with an actionable message.
-const BINDING_CONTRACT_VERSION: u64 = 1;
+// v2 (2026-07-07): TwoMlsPqDigest removed — digests are raw 32-byte SHA-256 values
+// (`Vec<u8>` fields on PrepareEncryptResult / QueuedRemoteProposal and in the
+// queue_proposal / proposal_context signatures).
+const BINDING_CONTRACT_VERSION: u64 = 2;
 
 /// See `BINDING_CONTRACT_VERSION`. Exported so the Swift layer can verify the
 /// binding it was generated with matches the binary it loaded.
@@ -85,25 +88,19 @@ pub struct RendezvousId {
     pub bytes: Vec<u8>,
 }
 
-/// Digest-type wire value for SHA-256-width (32-byte) digests, matching CommProtocol's
-/// `DigestTypes.sha256`. All digests this library emits are 32-byte values.
-pub(crate) const DIGEST_SHA256: u8 = 1;
+// Digests cross this FFI as raw 32-byte values: SHA-256 over the stated object. That is
+// this library's OWN wire convention (matching the classical backend's values, so both
+// stacks bind the same bytes); the app layer wraps them in whatever typed-digest
+// encoding it uses. No app-layer type tags or enum values appear on this surface.
 
-/// Content-typed hash digest. Used by the app layer to identify and accept
-/// MLS proposals before signalling back to the encryption layer.
-#[derive(Debug, Clone, uniffi::Record)]
-pub struct TwoMlsPqDigest {
-    /// Digest-type wire value, aligned with CommProtocol's `DigestTypes` (sha256 = 1).
-    pub hash_type: u8,
-    pub digest: Vec<u8>,
-}
-
-/// Returned by `prepare_to_encrypt`. The app layer must bind `proposal_hash`
-/// into its plaintext before calling `encrypt`. `did_commit` is false when
-/// stuck in a prior epoch (no pending remote proposal to commit).
+/// Returned by `prepare_to_encrypt`. `proposal_hash` is the SHA-256 of the staged
+/// outbound object (the Upd(self) proposal message, or the rotation commit); `encrypt`
+/// also binds it into the app message's authenticated data, and the receiver reports
+/// the same value as `QueuedRemoteProposal.digest`. `did_commit` is false when stuck in
+/// a prior epoch (no pending remote proposal to commit).
 #[derive(Debug, uniffi::Record)]
 pub struct PrepareEncryptResult {
-    pub proposal_hash: TwoMlsPqDigest,
+    pub proposal_hash: Vec<u8>,
     pub committed_remote_client_id: Option<ClientId>,
     pub did_commit: bool,
 }
@@ -138,14 +135,16 @@ pub struct MlsSenderMessage {
 
 /// A remote proposal queued for app-layer acceptance. `sender` sent the
 /// proposal; `proposing` is the client being proposed (differs when a client
-/// proposes its own rotation). `context` is the receive group's group-ID hash,
-/// used for ordering against the app-level sequence number.
+/// proposes its own rotation). `digest` is the SHA-256 of the proposal message
+/// (equal to the sender's `PrepareEncryptResult.proposal_hash`); `context` is
+/// the SHA-256 of the receive group's group id, used for ordering against the
+/// app-level sequence number.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct QueuedRemoteProposal {
-    pub digest: TwoMlsPqDigest,
+    pub digest: Vec<u8>,
     pub sender: ClientId,
     pub proposing: ClientId,
-    pub context: TwoMlsPqDigest,
+    pub context: Vec<u8>,
 }
 
 /// Result of processing a remote commit. `new_sender` is `None` in
