@@ -62,9 +62,27 @@ export PATH="$SHIM_DIR:$PATH"
     x86_64-apple-ios \
     aarch64-apple-darwin || true
 
-# Clean previous artifacts
-rm -rf "$BUILD_DIR/$FRAMEWORK.xcframework" "$BUILD_DIR/$FRAMEWORK.xcframework.zip" "$FW_DIR" || true
-mkdir -p "$BUILD_DIR" "$FW_DIR"
+# Clean intermediates only. The published artifacts ($FRAMEWORK.xcframework + .zip)
+# are NOT removed here: downstream consumes buildIos/TwoMLSPQ.xcframework directly
+# (AbstractTwoMLS's LOCAL DEV path), so the old artifact must survive a failed build.
+# New output is staged and swapped in atomically at the end.
+STAGE_DIR="$BUILD_DIR/.stage"
+rm -rf "$FW_DIR" "$STAGE_DIR" || true
+mkdir -p "$BUILD_DIR" "$FW_DIR" "$STAGE_DIR"
+
+# Purge stale CryptoKit-bridge builds. A host `cargo test --features cryptokit` (or any
+# host build) leaves macOS-target Swift objects in the bridge's SwiftPM cache, and cargo's
+# fingerprinting does not notice — a later iOS cross-build then embeds macOS objects into
+# mls-rs-crypto-cryptokit's rlib and fails at link with
+# "building for 'iOS-simulator', but linking in object file built for 'macOS'".
+# Dropping the bridge cache and the crate's build artifacts forces a correct per-target
+# rebuild (costs seconds per target).
+for bridge in "$HOME"/.cargo/git/checkouts/mls-rs-*/*/mls-rs-crypto-cryptokit/cryptokit-bridge/.build; do
+    [ -d "$bridge" ] && rm -rf "$bridge"
+done
+for triple in aarch64-apple-ios-sim aarch64-apple-ios x86_64-apple-ios aarch64-apple-darwin; do
+    "$CARGO" clean -p mls-rs-crypto-cryptokit --release --target "$triple" 2>/dev/null || true
+done
 
 # Release cdylib builds (iOS device + simulator + macOS).
 "$CARGO" build "${BUILD_FLAGS[@]}" --target=aarch64-apple-ios-sim
@@ -145,12 +163,19 @@ flat_fw "$FW_DIR/sim-build/${LIB_NAME}.dylib" "$FW_DIR/sim" "17.0" "iPhoneSimula
 # macOS
 versioned_fw "target/aarch64-apple-darwin/release/${LIB_NAME}.dylib" "$FW_DIR/macos"
 
+# Assemble + zip in the staging dir, then swap into place only on success, so a
+# failed run never destroys the previously published artifact.
 xcodebuild -create-xcframework \
     -framework "$FW_DIR/ios/${MODULE}.framework" \
     -framework "$FW_DIR/sim/${MODULE}.framework" \
     -framework "$FW_DIR/macos/${MODULE}.framework" \
-    -output "$BUILD_DIR/$FRAMEWORK.xcframework"
+    -output "$STAGE_DIR/$FRAMEWORK.xcframework"
 
-cd "$BUILD_DIR"
-zip -r "$FRAMEWORK.xcframework.zip" "$FRAMEWORK.xcframework"
-swift package compute-checksum "$FRAMEWORK.xcframework.zip"
+(cd "$STAGE_DIR" && zip -r "$FRAMEWORK.xcframework.zip" "$FRAMEWORK.xcframework")
+
+rm -rf "$BUILD_DIR/$FRAMEWORK.xcframework" "$BUILD_DIR/$FRAMEWORK.xcframework.zip"
+mv "$STAGE_DIR/$FRAMEWORK.xcframework" "$BUILD_DIR/$FRAMEWORK.xcframework"
+mv "$STAGE_DIR/$FRAMEWORK.xcframework.zip" "$BUILD_DIR/$FRAMEWORK.xcframework.zip"
+rmdir "$STAGE_DIR"
+
+swift package compute-checksum "$BUILD_DIR/$FRAMEWORK.xcframework.zip"
