@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::invitation::{
     combiner_from_invitation, decode_archive, encode_archive, generate_combiner_invitation,
-    take_bytes, CombinerInvitation,
+    CombinerInvitation,
 };
 #[cfg(feature = "cryptokit")]
 use crate::key_package_store::PqMlsClient;
@@ -197,12 +197,22 @@ pub fn decode_combiner_key_package(bytes: Vec<u8>) -> Result<CombinerKeyPackage>
     if version != COMBINER_KEY_PACKAGE_VERSION {
         return Err(TwoMlsPqError::InvalidKeyPackage);
     }
-    let classical = take_bytes(&mut rest).map_err(|_| TwoMlsPqError::InvalidKeyPackage)?;
-    let pq = take_bytes(&mut rest).map_err(|_| TwoMlsPqError::InvalidKeyPackage)?;
+    let classical = take_bytes(&mut rest).ok_or(TwoMlsPqError::InvalidKeyPackage)?;
+    let pq = take_bytes(&mut rest).ok_or(TwoMlsPqError::InvalidKeyPackage)?;
     if !rest.is_empty() {
         return Err(TwoMlsPqError::InvalidKeyPackage);
     }
     Ok(CombinerKeyPackage { classical, pq })
+}
+
+/// Reader for the u32-LE framing above. This blob is published wire data, so it keeps its
+/// byte-stable bespoke framing rather than the MLS codec used by the archive formats.
+fn take_bytes(rest: &mut &[u8]) -> Option<Vec<u8>> {
+    let len = u32::from_le_bytes(rest.get(..4)?.try_into().ok()?) as usize;
+    *rest = &rest[4..];
+    let v = rest.get(..len)?.to_vec();
+    *rest = &rest[len..];
+    Some(v)
 }
 
 /// The two components of an HPKE one-shot seal. Kept separate (like
@@ -737,9 +747,14 @@ mod tests {
 
         let bob = make_client();
         let mut archive = assert_ok!(bob.generate_invitation());
-        // Layout: [u32 len][version][PQ_MODE]…; flip the PQ_MODE byte to mimic an archive
-        // produced by the other build.
-        archive[5] ^= 1;
+        // Layout: [varint len][version][PQ_MODE]…; the MLS varint's top two bits give the
+        // header width. Flip the PQ_MODE byte to mimic an archive from the other build.
+        let header = match archive[0] >> 6 {
+            0 => 1,
+            1 => 2,
+            _ => 4,
+        };
+        archive[header + 1] ^= 1;
         assert_err!(
             super::TwoMlsPqInvitation::new(archive),
             crate::TwoMlsPqError::ArchiveInvalid
