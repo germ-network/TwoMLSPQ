@@ -388,6 +388,48 @@ struct ForwardRoutingDemo {
 	}
 }
 
+//Digest-surface cleanup: the binding values the backends expose through the
+//TypedDigest slots are honest sha256 digests with cross-side coherence — the
+//classical backend's semantics, now matched by the PQ backend (previously an
+//exporter nonce / raw group ids wearing the label).
+struct ProposalBindingDemo {
+	let local: ClientWrapper<AbstractTwoMLS.PQClient>
+	let remote: ClientWrapper<AbstractTwoMLS.PQClient>
+
+	init() throws {
+		local = try .init()
+		remote = try .init()
+	}
+
+	@Test func proposalBindingIsCoherentAcrossSides() async throws {
+		let (localSession, encryptedCombinedWelcome) = try local.client.reply(
+			remoteClientId: remote.clientId,
+			encodedRemoteKpkg: remote.currentInvitation.encodedKeyPackage
+		)
+		let (remoteSession, _) = try remote.currentInvitation.receiveReply(
+			ciphertext: encryptedCombinedWelcome,
+			expecting: try local.clientId
+		)
+		//remote's first frame staples the return welcome; local joins in-band
+		try remoteSession.send(to: localSession)
+
+		//the sender's proposalHash is the sha256 of the staged Upd(self) proposal,
+		//so the receiver's independently derived digest equals it
+		let prep = try #require(try remoteSession.prepareToEncrypt(proposing: nil))
+		let frame = try remoteSession.encrypt(appMessage: Data("staple".utf8))
+		let decrypted = try #require(
+			try localSession.processIncoming(ciphertext: frame.cipherText)
+		)
+		let offered = try #require(decrypted.proposal)
+		#expect(prep.proposalHash == offered.digest)
+		#expect(prep.proposalHash.type == .sha256)
+
+		//the receiver's ordering context equals its own proposalContext (sha256 of
+		//its recv group's classical group id) — self-consistent across surfaces
+		#expect(offered.context == localSession.proposalContext)
+	}
+}
+
 struct MockAppWelcome: Codable, Sendable {
 	let mySendGroupWelcome: Data
 	let myKeyPackage: Data
