@@ -183,6 +183,133 @@ struct APIDemo {
 	}
 }
 
+//Increment B: agent rotation. Phase 8 (classical) rides the session surface —
+//receive(newClientId:) stages the dedicated agent, prepareToEncrypt(proposing:)
+//commits the handoff — and the PQ side-band catches the PQ leaves up via
+//begin(.rekey, rotating:), which the peer observes as PQInbound.rotatedCredential.
+struct RotationDemo {
+	let local: ClientWrapper<AbstractTwoMLS.PQClient>
+	let remote: ClientWrapper<AbstractTwoMLS.PQClient>
+
+	init() throws {
+		local = try .init()
+		remote = try .init()
+	}
+
+	@Test func acceptorRotatesToDedicatedAgent() async throws {
+		let (localSession, encryptedCombinedWelcome) = try local.client.reply(
+			remoteClientId: remote.clientId,
+			encodedRemoteKpkg: remote.currentInvitation.encodedKeyPackage
+		)
+
+		//the app spawns a dedicated agent for this session and passes its id in;
+		//receive stages it for the Phase 8 rotation
+		let dedicatedAgentId = AbstractTwoMLS.ClientID.mock()
+		let (remoteSession, _) = try remote.currentInvitation.receiveReply(
+			ciphertext: encryptedCombinedWelcome,
+			expecting: try local.clientId,
+			newClientId: dedicatedAgentId
+		)
+
+		//Phase 8: the acceptor's first reply bundles the rotation commit (and
+		//staples the return welcome); the initiator observes the new identity
+		let prep = try remoteSession.prepareToEncrypt(proposing: dedicatedAgentId)
+		guard prep?.didCommit == true else { throw TestErrors.unexpected }
+		let frame = try remoteSession.encrypt(appMessage: Data("rotate".utf8))
+		guard
+			let decrypted = try localSession.processIncoming(ciphertext: frame.cipherText),
+			decrypted.remoteCommit?.newSender == dedicatedAgentId,
+			decrypted.applicationMessage?.appMessageData == Data("rotate".utf8)
+		else {
+			throw TestErrors.unexpected
+		}
+
+		//messaging still flows both ways under the rotated agent
+		try localSession.exchange(with: remoteSession)
+	}
+
+	@Test func rekeyCarriesCredentialHandoff() async throws {
+		let (localSession, encryptedCombinedWelcome) = try local.client.reply(
+			remoteClientId: remote.clientId,
+			encodedRemoteKpkg: remote.currentInvitation.encodedKeyPackage
+		)
+		let dedicatedAgentId = AbstractTwoMLS.ClientID.mock()
+		let (remoteSession, _) = try remote.currentInvitation.receiveReply(
+			ciphertext: encryptedCombinedWelcome,
+			expecting: try local.clientId,
+			newClientId: dedicatedAgentId
+		)
+
+		//Phase 8 first: the classical rotation announces the dedicated agent and
+		//swaps the session client (the first reply also staples the return welcome)
+		_ = try remoteSession.prepareToEncrypt(proposing: dedicatedAgentId)
+		let frame = try remoteSession.encrypt(appMessage: Data("rotate".utf8))
+		guard
+			try localSession.processIncoming(ciphertext: frame.cipherText)?
+				.remoteCommit?.newSender == dedicatedAgentId
+		else { throw TestErrors.unexpected }
+		//a reply confirms the rotation on the acceptor's side
+		try localSession.send(to: remoteSession)
+
+		guard
+			let localPQ = localSession as? any AbstractTwoMLS.PQRatchetingSession,
+			let remotePQ = remoteSession as? any AbstractTwoMLS.PQRatchetingSession
+		else { throw TestErrors.unexpected }
+
+		//A.4: local owes the bootstrap; remote's new send-PQ half is born under
+		//the dedicated agent
+		let kp = try localPQ.begin(.finishBootstrap, rotating: nil)
+		let bootIn = try remotePQ.ingest(kp.payload)
+		guard let bootReply = try remotePQ.advance(after: bootIn) else {
+			throw TestErrors.unexpected
+		}
+		_ = try localPQ.ingest(bootReply.payload)
+		guard remotePQ.isFullyEstablished, remotePQ.turn == .weInitiate else {
+			throw TestErrors.unexpected
+		}
+
+		//A.3 cannot carry a rotation — no updatePath rides the ratchet
+		guard (try? remotePQ.begin(.ratchet, rotating: dedicatedAgentId)) == nil else {
+			throw TestErrors.unexpected
+		}
+
+		//A.5 with the credential handoff: the rekey hands remote's PQ leaves to
+		//the dedicated agent; local observes the announced credential
+		let rekey = try remotePQ.begin(.rekey, rotating: dedicatedAgentId)
+		let rekeyIn1 = try localPQ.ingest(rekey.payload)
+		guard rekeyIn1.kind == .rekey, rekeyIn1.rotatedCredential == dedicatedAgentId
+		else { throw TestErrors.unexpected }
+		guard let rekeyReply = try localPQ.advance(after: rekeyIn1) else {
+			throw TestErrors.unexpected
+		}
+		let rekeyIn2 = try remotePQ.ingest(rekeyReply.payload)
+		guard rekeyIn2.rotatedCredential == nil else { throw TestErrors.unexpected }
+		guard let rekeyFinal = try remotePQ.advance(after: rekeyIn2) else {
+			throw TestErrors.unexpected
+		}
+		_ = try localPQ.ingest(rekeyFinal.payload)
+		guard localPQ.epochs.pqEpoch == 2, remotePQ.epochs.pqEpoch == 2 else {
+			throw TestErrors.unexpected
+		}
+
+		//the rekeyed, rotated groups keep working — and a rotation-less rekey
+		//(local's turn) reports no credential
+		try localSession.exchange(with: remoteSession)
+		guard localPQ.turn == .weInitiate else { throw TestErrors.unexpected }
+		let plain = try localPQ.begin(.rekey, rotating: nil)
+		let plainIn = try remotePQ.ingest(plain.payload)
+		guard plainIn.rotatedCredential == nil else { throw TestErrors.unexpected }
+		guard let plainReply = try remotePQ.advance(after: plainIn) else {
+			throw TestErrors.unexpected
+		}
+		let plainIn2 = try localPQ.ingest(plainReply.payload)
+		guard let plainFinal = try localPQ.advance(after: plainIn2) else {
+			throw TestErrors.unexpected
+		}
+		_ = try remotePQ.ingest(plainFinal.payload)
+	}
+}
+
 struct MockAppWelcome: Codable, Sendable {
 	let mySendGroupWelcome: Data
 	let myKeyPackage: Data
@@ -226,9 +353,13 @@ extension AbstractTwoMLS.Client {
 }
 
 extension AbstractTwoMLS.Invitation {
+	// `newClientId` is the fresh session-dedicated agent the acceptor stages for
+	// rotation (the app spawns it — see AuthDIDManager.createSession); the default
+	// mirrors that for tests that never drive the rotation.
 	func receiveReply(
 		ciphertext: Data,
-		expecting remoteClientId: AbstractTwoMLS.ClientID
+		expecting remoteClientId: AbstractTwoMLS.ClientID,
+		newClientId: AbstractTwoMLS.ClientID = .mock()
 	) throws -> (Session, Data?) {
 		let headerDecrypted = try decodeHeader(
 			ciphertext: ciphertext
@@ -257,7 +388,7 @@ extension AbstractTwoMLS.Invitation {
 			remoteClientId: remoteClientId,
 			combinedWelcomeDigest: appWelcomeDigest,
 			stapledMessage: stapledPrivateMessage,
-			newClientId: remoteClientId
+			newClientId: newClientId
 		)
 	}
 }
