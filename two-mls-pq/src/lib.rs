@@ -30,6 +30,8 @@ pub struct ClientId {
 
 /// The APQ epoch pair for the send group: the PQ side-band epoch and the classical
 /// (traditional) message epoch. Zeros until the corresponding group exists.
+/// NB: in non-`cryptokit` builds the PQ half is a classical placeholder, so `pq_epoch`
+/// does not describe a real ML-KEM group — see the BUG note on `ensure_pq_available`.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct ApqEpochs {
     pub pq_epoch: u64,
