@@ -1,9 +1,11 @@
 /target
 /buildIos
+/buildIosFramework
 /bindings
 Cargo.lock
 *.xcframework
 *.a
+*.dylib
 *.d
 **/*.rs.bk
 .DS_Store
