@@ -23,29 +23,30 @@ fn aead() -> Result<impl CipherSuiteProvider> {
 /// Seal `plaintext` under `seal_key`, prepending a fresh random nonce.
 pub fn seal(seal_key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
     if seal_key.len() != SEAL_KEY_LEN {
-        return Err(CombinerError::Mls);
+        return Err(CombinerError::ArchiveInvalid);
     }
     let cs = aead()?;
-    let mut nonce = vec![0u8; cs.aead_nonce_size()];
-    cs.random_bytes(&mut nonce)
-        .map_err(|_| CombinerError::Mls)?;
+    let n = cs.aead_nonce_size();
+    let mut out = vec![0u8; n];
+    cs.random_bytes(&mut out).map_err(|_| CombinerError::Mls)?;
     let ct = cs
-        .aead_seal(seal_key, plaintext, Some(ARCHIVE_AAD), &nonce)
+        .aead_seal(seal_key, plaintext, Some(ARCHIVE_AAD), &out)
         .map_err(|_| CombinerError::Mls)?;
-    let mut out = nonce;
+    out.reserve_exact(ct.len());
     out.extend_from_slice(&ct);
     Ok(out)
 }
 
-/// Open a blob produced by [`seal`]. Fails (no plaintext leaked) on a wrong key or tampering.
+/// Open a blob produced by [`seal`]. Fails (no plaintext leaked) on a wrong key or tampering
+/// (`DecryptionFailed`); a blob too short to even carry a nonce is `ArchiveInvalid`.
 pub fn open(seal_key: &[u8], blob: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
     if seal_key.len() != SEAL_KEY_LEN {
-        return Err(CombinerError::Mls);
+        return Err(CombinerError::ArchiveInvalid);
     }
     let cs = aead()?;
     let n = cs.aead_nonce_size();
     if blob.len() < n {
-        return Err(CombinerError::Mls);
+        return Err(CombinerError::ArchiveInvalid);
     }
     let (nonce, ct) = blob.split_at(n);
     cs.aead_open(seal_key, ct, Some(ARCHIVE_AAD), nonce)

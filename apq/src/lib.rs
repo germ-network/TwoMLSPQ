@@ -54,6 +54,12 @@ pub enum CombinerError {
     MissingWelcome,
     #[error("decryption failed")]
     DecryptionFailed,
+    /// A persistence blob (session archive or group-state snapshot) is structurally invalid:
+    /// wrong version, truncation, trailing bytes, or a violated storage invariant. Distinct
+    /// from [`DecryptionFailed`](Self::DecryptionFailed), which is an authentication failure
+    /// of a sealed blob (wrong key or tampered ciphertext).
+    #[error("invalid archive")]
+    ArchiveInvalid,
 }
 
 pub type Result<T> = std::result::Result<T, CombinerError>;
