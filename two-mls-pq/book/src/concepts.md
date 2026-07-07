@@ -32,6 +32,14 @@ serialises what it owns (`TwoMlsPqInvitation.archive()` today; session archives 
 [planned work](./planned-features.md)). There is no mls-rs-style "restore the
 client and find your groups again" path — you restore an invitation or a session.
 
+Concretely, a session archives by **enumerating its groups**: each of its (up to
+four) MLS groups is exported per group through the group object and the storage
+handle captured when that group was created or joined (`apq`'s
+`CombinerGroup::export_state` / `load_combiner_group`), never by snapshotting a
+client's whole store. This keeps archival correct across agent rotation — rotation
+swaps the session's internal client, and a group's state keeps flowing through the
+handle it was born with.
+
 ## Two asymmetric send groups
 
 A classical MLS group is symmetric: every member can commit. TwoMLSPQ instead gives

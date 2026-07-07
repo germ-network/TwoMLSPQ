@@ -1,8 +1,10 @@
-//! A group-state storage provider whose contents can be serialised, so a `CombinerClient`'s MLS
-//! groups survive a process restart. Semantics match mls-rs's in-memory provider (epoch retention
-//! of three, insert/update/trim per write); the addition is `to_bytes` / `restore_from_bytes`
-//! over the whole map, which session archival seals and persists. The blob is encoded with
-//! `mls_rs_codec` (the workspace-standard MLS wire codec), not a bespoke framing.
+//! A group-state storage provider whose records can be exported and re-imported one group at a
+//! time, so MLS groups survive a process restart. Semantics match mls-rs's in-memory provider
+//! (epoch retention of three, insert/update/trim per write); the addition is
+//! `export_group` / `import_group`, which session archival pulls per group — the session
+//! enumerates the groups it owns rather than snapshotting any client's whole store (see the
+//! book's object-model notes). Blobs are encoded with `mls_rs_codec` (the workspace-standard
+//! MLS wire codec), not a bespoke framing.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::convert::Infallible;
@@ -22,7 +24,7 @@ use crate::{CombinerError, Result};
 /// messages.
 const EPOCH_RETENTION: usize = 3;
 
-/// Format tag for the `to_bytes` blob, so the layout can evolve (or grow a migration path)
+/// Format tag for the `export_group` blob, so the layout can evolve (or grow a migration path)
 /// without old archives decoding as garbage. Bump on any change to the wire structs.
 const STORAGE_FORMAT_VERSION: u8 = 1;
 
@@ -79,14 +81,15 @@ impl PersistableGroupStorage {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Serialise the whole map (group states + retained epoch secrets) into a self-describing,
+    /// Serialise one group's record (state + retained epoch secrets) into a self-describing,
     /// versioned MLS-codec blob. The output is plaintext secret material; callers must seal it.
-    pub fn to_bytes(&self) -> Result<Zeroizing<Vec<u8>>> {
-        let entries: Vec<GroupEntry> = self
-            .lock()
-            .iter()
-            .map(|(gid, rec)| GroupEntry {
-                id: gid.clone(),
+    /// Callers typically `write_to_storage()` on the live group first so the record is current.
+    pub fn export_group(&self, group_id: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+        let entry = {
+            let map = self.lock();
+            let rec = map.get(group_id).ok_or(CombinerError::ArchiveInvalid)?;
+            GroupEntry {
+                id: group_id.to_vec(),
                 state: rec.state.clone(),
                 epochs: rec
                     .epochs
@@ -96,48 +99,46 @@ impl PersistableGroupStorage {
                         data: data.clone(),
                     })
                     .collect(),
-            })
-            .collect();
+            }
+        };
         // Exact-size preallocation: a growing Vec would strand unwiped partial copies of the
         // secrets in freed allocations, out of reach of the final `Zeroizing` wrapper.
-        let mut out = Zeroizing::new(Vec::with_capacity(1 + entries.mls_encoded_len()));
+        let mut out = Zeroizing::new(Vec::with_capacity(1 + entry.mls_encoded_len()));
         out.push(STORAGE_FORMAT_VERSION);
-        entries
+        entry
             .mls_encode(&mut out)
             .map_err(|_| CombinerError::ArchiveInvalid)?;
         Ok(out)
     }
 
-    /// Replace this storage's contents with a map decoded from `bytes` (produced by `to_bytes`).
-    /// Rejects blobs that violate the invariants `write` maintains — strictly ascending epoch
-    /// ids and at most [`EPOCH_RETENTION`] of them — since `max_epoch_id` relies on them.
-    pub fn restore_from_bytes(&self, bytes: &[u8]) -> Result<()> {
+    /// Insert one group record decoded from `bytes` (produced by [`export_group`]), returning
+    /// the group id so the caller can `load_group` it. Rejects blobs that violate the
+    /// invariants `write` maintains — strictly ascending epoch ids and at most
+    /// [`EPOCH_RETENTION`] of them — since `max_epoch_id` relies on them.
+    pub fn import_group(&self, bytes: &[u8]) -> Result<Vec<u8>> {
         let (&version, mut reader) = bytes.split_first().ok_or(CombinerError::ArchiveInvalid)?;
         if version != STORAGE_FORMAT_VERSION {
             return Err(CombinerError::ArchiveInvalid);
         }
-        let entries = Vec::<GroupEntry>::mls_decode(&mut reader)
-            .map_err(|_| CombinerError::ArchiveInvalid)?;
+        let entry =
+            GroupEntry::mls_decode(&mut reader).map_err(|_| CombinerError::ArchiveInvalid)?;
         if !reader.is_empty() {
             return Err(CombinerError::ArchiveInvalid);
         }
-        let mut map = BTreeMap::new();
-        for entry in entries {
-            let ascending = entry.epochs.windows(2).all(|w| w[0].id < w[1].id);
-            if !ascending || entry.epochs.len() > EPOCH_RETENTION {
-                return Err(CombinerError::ArchiveInvalid);
-            }
-            let epochs = entry.epochs.into_iter().map(|e| (e.id, e.data)).collect();
-            map.insert(
-                entry.id,
-                GroupRecord {
-                    state: entry.state,
-                    epochs,
-                },
-            );
+        let ascending = entry.epochs.windows(2).all(|w| w[0].id < w[1].id);
+        if !ascending || entry.epochs.len() > EPOCH_RETENTION {
+            return Err(CombinerError::ArchiveInvalid);
         }
-        *self.lock() = map;
-        Ok(())
+        let group_id = entry.id.clone();
+        let epochs = entry.epochs.into_iter().map(|e| (e.id, e.data)).collect();
+        self.lock().insert(
+            entry.id,
+            GroupRecord {
+                state: entry.state,
+                epochs,
+            },
+        );
+        Ok(group_id)
     }
 }
 
@@ -213,7 +214,10 @@ mod tests {
         .unwrap();
 
         let restored = PersistableGroupStorage::new();
-        restored.restore_from_bytes(&s.to_bytes().unwrap()).unwrap();
+        let gid = restored
+            .import_group(&s.export_group(b"g1").unwrap())
+            .unwrap();
+        assert_eq!(gid, b"g1".to_vec());
 
         assert_eq!(
             restored.state(b"g1").unwrap().map(|z| z.to_vec()),
@@ -224,6 +228,12 @@ mod tests {
             Some(b"epoch0".to_vec())
         );
         assert_eq!(restored.max_epoch_id(b"g1").unwrap(), Some(0));
+    }
+
+    #[test]
+    fn test_export_unknown_group_fails() {
+        let s = PersistableGroupStorage::new();
+        assert!(s.export_group(b"nope").is_err());
     }
 
     #[test]
@@ -245,59 +255,53 @@ mod tests {
         assert!(s.epoch(b"g", EPOCH_RETENTION as u64 + 1).unwrap().is_some());
     }
 
-    #[test]
-    fn test_restore_rejects_truncated_blob() {
-        let s = PersistableGroupStorage::new();
-        assert!(s
-            .restore_from_bytes(&[STORAGE_FORMAT_VERSION, 0xFF])
-            .is_err());
+    /// A valid single-group blob for tamper tests.
+    fn sample_blob() -> Vec<u8> {
+        let mut s = PersistableGroupStorage::new();
+        s.write(
+            GroupState {
+                id: b"g".to_vec(),
+                data: Zeroizing::new(vec![1]),
+            },
+            vec![EpochRecord::new(0, Zeroizing::new(vec![2]))],
+            vec![],
+        )
+        .unwrap();
+        s.export_group(b"g").unwrap().to_vec()
     }
 
     #[test]
-    fn test_restore_rejects_trailing_bytes() {
+    fn test_import_rejects_truncated_blob() {
         let s = PersistableGroupStorage::new();
-        let mut blob = s.to_bytes().unwrap().to_vec();
+        assert!(s.import_group(&[STORAGE_FORMAT_VERSION, 0xFF]).is_err());
+        let blob = sample_blob();
+        assert!(s.import_group(&blob[..blob.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn test_import_rejects_trailing_bytes() {
+        let s = PersistableGroupStorage::new();
+        let mut blob = sample_blob();
         blob.push(0x00);
-        assert!(s.restore_from_bytes(&blob).is_err());
+        assert!(s.import_group(&blob).is_err());
     }
 
     #[test]
-    fn test_restore_rejects_wrong_version() {
+    fn test_import_rejects_wrong_version() {
         let s = PersistableGroupStorage::new();
-        let mut blob = s.to_bytes().unwrap().to_vec();
+        let mut blob = sample_blob();
         blob[0] = STORAGE_FORMAT_VERSION + 1;
-        assert!(s.restore_from_bytes(&blob).is_err());
-        assert!(s.restore_from_bytes(&[]).is_err());
+        assert!(s.import_group(&blob).is_err());
+        assert!(s.import_group(&[]).is_err());
     }
 
     /// `max_epoch_id` returns the back of the deque, which is the maximum only while epoch ids
-    /// ascend; a blob violating that (or exceeding the retention bound) must not restore.
+    /// ascend; a blob violating that (or exceeding the retention bound) must not import.
     #[test]
-    fn test_restore_rejects_invariant_violating_epochs() {
-        let make_blob = |ids: &[u64]| {
-            let s = PersistableGroupStorage::new();
-            for &id in ids {
-                let mut s2 = s.clone();
-                s2.write(
-                    GroupState {
-                        id: b"g".to_vec(),
-                        data: Zeroizing::new(vec![1]),
-                    },
-                    vec![EpochRecord::new(id, Zeroizing::new(vec![2]))],
-                    vec![],
-                )
-                .unwrap();
-            }
-            s.to_bytes().unwrap()
-        };
-        // Baseline: an in-order blob restores.
-        let restored = PersistableGroupStorage::new();
-        assert!(restored.restore_from_bytes(&make_blob(&[0, 1, 2])).is_ok());
-
-        // Out-of-order and duplicate epoch ids are rejected. `write` can't produce these, so
-        // build the malformed payloads at the wire layer.
+    fn test_import_rejects_invariant_violating_epochs() {
+        // `write` can't produce these, so build the malformed payloads at the wire layer.
         let encode = |ids: &[u64]| {
-            let entries = vec![GroupEntry {
+            let entry = GroupEntry {
                 id: b"g".to_vec(),
                 state: Zeroizing::new(vec![1]),
                 epochs: ids
@@ -307,14 +311,17 @@ mod tests {
                         data: Zeroizing::new(vec![2]),
                     })
                     .collect(),
-            }];
+            };
             let mut out = vec![STORAGE_FORMAT_VERSION];
-            entries.mls_encode(&mut out).unwrap();
+            entry.mls_encode(&mut out).unwrap();
             out
         };
-        assert!(restored.restore_from_bytes(&encode(&[2, 1])).is_err());
-        assert!(restored.restore_from_bytes(&encode(&[1, 1])).is_err());
-        assert!(restored.restore_from_bytes(&encode(&[1, 2, 3, 4])).is_err());
+        let s = PersistableGroupStorage::new();
+        // Baseline: an in-order blob imports.
+        assert!(s.import_group(&encode(&[0, 1, 2])).is_ok());
+        assert!(s.import_group(&encode(&[2, 1])).is_err());
+        assert!(s.import_group(&encode(&[1, 1])).is_err());
+        assert!(s.import_group(&encode(&[1, 2, 3, 4])).is_err());
     }
 
     /// Pins `EPOCH_RETENTION` (and the trim behaviour) to mls-rs's in-memory provider at the

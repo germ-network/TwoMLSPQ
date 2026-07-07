@@ -749,7 +749,7 @@ impl TwoMlsPqSession {
             // PQ-groups-only (spec A.4): no classical bind here. The new PQ half's
             // secrecy reaches ASG-cl at the next A.3 ratchet; until then ASG-cl keeps
             // the PQ-derived security chained in at establishment.
-            send.pq = Some(pq_group);
+            send.set_pq(pq_group, client.combiner());
             encode_bootstrap_bind(pq_welcome)
         };
         inner.pq_turn_mine = true;
@@ -776,7 +776,7 @@ impl TwoMlsPqSession {
             let pq = pq_join_group_from_welcome(client.pq(), &pq_welcome)?;
             #[cfg(not(feature = "cryptokit"))]
             let pq = join_group_from_welcome(client.classical(), &pq_welcome)?;
-            recv.pq = Some(pq);
+            recv.set_pq(pq, client.combiner());
         }
         inner.pq_turn_mine = false;
         Ok(())
@@ -934,10 +934,11 @@ impl TwoMlsPqSession {
             // classical group only; the PQ half arrives with the bootstrap flow.
             if pq_welcome.is_empty() {
                 let classical = join_group_from_welcome(client.classical(), &classical_welcome)?;
-                inner.recv_group = Some(CombinerGroup {
+                inner.recv_group = Some(CombinerGroup::from_client(
+                    client.combiner(),
                     classical,
-                    pq: None,
-                });
+                    None,
+                ));
                 return Ok(None);
             }
             // Join the PQ group first, then re-derive the intra-party APQ-PSK from it.
@@ -952,10 +953,11 @@ impl TwoMlsPqSession {
             // Join the classical group (bound with the cross-party + APQ PSKs).
             let classical = join_group_from_welcome(client.classical(), &classical_welcome)?;
 
-            inner.recv_group = Some(CombinerGroup {
+            inner.recv_group = Some(CombinerGroup::from_client(
+                client.combiner(),
                 classical,
-                pq: Some(pq),
-            });
+                Some(pq),
+            ));
             return Ok(None);
         }
 
