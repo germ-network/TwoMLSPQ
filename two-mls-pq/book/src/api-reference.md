@@ -6,11 +6,33 @@ module paths — hence the `TwoMlsPq*` / `Combiner*` / `Mls*` prefixes.
 
 ## `TwoMlsPqClient`
 
-- `new(signing_key) -> Arc<TwoMlsPqClient>` — build a client from an agent signing key.
-- `client_id() -> ClientId` — the public signing key bytes.
+The agent identity and key-package/invitation mint — deliberately *not* an mls-rs-style
+hub for group operations (see [Concepts](./concepts.md)).
+
+- `new(client_id) -> Arc<TwoMlsPqClient>` — build a client for opaque identity bytes;
+  the MLS signing key is generated internally.
+- `client_id() -> ClientId` — the identity bytes.
 - `generate_key_package(suite) -> Vec<u8>` — one MLS key package.
 - `generate_combiner_key_package() -> CombinerKeyPackage` — paired classical +
   ML-KEM-768 key packages sharing one `ClientId`.
+- `generate_invitation() -> Vec<u8>` — capture a combiner key package's private
+  material (and the signing identity) into a self-contained invitation archive,
+  purging the client's own copies.
+
+## `TwoMlsPqInvitation`
+
+The receiving side of a published combiner key package; restored from an archive, no
+live client needed.
+
+- `new(archive) -> Arc<TwoMlsPqInvitation>` — restore from `generate_invitation` or
+  `archive()` output.
+- `archive() -> Vec<u8>` — re-serialise, including the consumed-remote replay guard.
+- `client_id()` / `combiner_key_package()` — the identity and the published pair.
+- `receive(welcome, their_key_package) -> Arc<TwoMlsPqSession>` — accept a remote
+  initiator's welcome; rejects a replayed remote (`DuplicateWelcome`).
+- `hpke_open(kem_output, ciphertext, info, aad) -> Vec<u8>` — decrypt data sealed to
+  the invitation's key package init key (the initial routing-header pattern; the
+  sender side is `hpke_seal_to_key_package`).
 
 ## Parsing & routing
 

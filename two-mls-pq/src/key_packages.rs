@@ -11,9 +11,16 @@ use crate::key_package_store::{CombinerClient, MlsClient};
 use crate::session::TwoMlsPqSession;
 use crate::{ClientId, MlsCipherSuite, Result, TwoMlsPqError};
 
-/// Holds an agent identity (ClientId) and manages MLS key packages for publication.
-/// The ClientId is the Basic Credential that identifies this agent as a leaf node in
-/// MLS groups; the MLS signing key is generated internally and is independent of it.
+/// Holds an agent identity (ClientId) and mints MLS key packages and invitations for
+/// publication. The ClientId is the Basic Credential that identifies this agent as a
+/// leaf node in MLS groups; the MLS signing key is generated internally and is
+/// independent of it.
+///
+/// Unlike mls-rs's monolithic per-credential `Client`, this object is *not* the hub
+/// for group operations: `generate_invitation` captures key-package private material
+/// into a self-contained `TwoMlsPqInvitation` and purges this client's copies, and
+/// group state lives inside `TwoMlsPqSession`s (which hold their own internal client
+/// objects). See the book's Concepts chapter for the object model.
 ///
 /// Thin UniFFI wrapper around `apq::CombinerClient`; the MLS plumbing lives in the
 /// `apq` crate.
