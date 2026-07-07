@@ -47,11 +47,11 @@ re-exports the cross-party PSK from its **receive** group's classical half at th
 current epoch and injects it into its own send-group commit, re-binding the two
 directions and providing break-in recovery.
 
-The PQ half's secrecy refreshes on the PQ ratchet (`cryptokit` builds): fresh ML-KEM
+The PQ half's secrecy refreshes on the PQ ratchet: fresh ML-KEM
 entropy is injected into the send group's PQ half as a per-round PSK, and the
 re-exported APQ-PSK is bound into the classical half's commit in the same round.
 
-The PQ re-key (`cryptokit` builds) adds a third, PQ-to-PQ chain: each of its two
+The PQ re-key adds a third, PQ-to-PQ chain: each of its two
 `Commit'`s cross-injects a PSK exported from the **opposite** PQ send group (same
 exporter invariants, same exported-ID encoding), tying the two directions' PQ halves
 to each other while their updatePaths rotate the leaves.
