@@ -1861,6 +1861,8 @@ public func FfiConverterTypeTwoMlsPqSession_lower(_ value: TwoMlsPqSession) -> U
 /**
  * The APQ epoch pair for the send group: the PQ side-band epoch and the classical
  * (traditional) message epoch. Zeros until the corresponding group exists.
+ * NB: in non-`cryptokit` builds the PQ half is a classical placeholder, so `pq_epoch`
+ * does not describe a real ML-KEM group — see the BUG note on `ensure_pq_available`.
  */
 public struct ApqEpochs: Equatable, Hashable {
     public var pqEpoch: UInt64
@@ -3481,6 +3483,16 @@ fileprivate struct FfiConverterSequenceTypeEpochRendezvous: FfiConverterRustBuff
     }
 }
 /**
+ * See `BINDING_CONTRACT_VERSION`. Exported so the Swift layer can verify the
+ * binding it was generated with matches the binary it loaded.
+ */
+public func bindingContractVersion() -> UInt64  {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_two_mls_pq_fn_func_binding_contract_version($0
+    )
+})
+}
+/**
  * Derive the session identifier for a pair of clients.
  * Both sides compute the same value from the same inputs regardless of who
  * initiated, allowing CommProtocol to deduplicate concurrent session initiations.
@@ -3574,6 +3586,9 @@ private let initializationResult: InitializationResult = {
     let scaffolding_contract_version = ffi_two_mls_pq_uniffi_contract_version()
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
+    }
+    if (uniffi_two_mls_pq_checksum_func_binding_contract_version() != 52582) {
+        return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_func_derive_session_id() != 62066) {
         return InitializationResult.apiChecksumMismatch

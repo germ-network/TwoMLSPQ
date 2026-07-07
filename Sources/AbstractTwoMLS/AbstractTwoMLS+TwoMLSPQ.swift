@@ -41,6 +41,33 @@ public enum TwoMLSPQConformanceError: Error {
 	case notImplemented(String)
 }
 
+// MARK: - Binding/binary pairing guard
+
+/// The uniffi Record-shape contract this vendored binding was generated against.
+/// Must equal TwoMLSPQ's `BINDING_CONTRACT_VERSION`; update it as part of the
+/// binding re-sync ritual (binding + binary from the SAME build).
+///
+/// Uniffi's own load-time checksums cover function signatures only — a Record
+/// can change shape with every checksum unchanged, and the mismatch then traps
+/// at the first FFI buffer read mid-flow. This check fails fast instead, at the
+/// first client/invitation construction.
+private let expectedBindingContract: UInt64 = 1
+
+enum TwoMLSPQBindingContract {
+	static let verified: Void = {
+		let actual = bindingContractVersion()
+		precondition(
+			actual == expectedBindingContract,
+			"""
+			TwoMLSPQ binding/binary mismatch: the vendored two_mls_pq.swift expects \
+			contract \(expectedBindingContract) but the loaded binary provides \(actual). \
+			Re-sync Sources/TwoMLSPQ/two_mls_pq.swift and the TwoMLSPQ xcframework \
+			from the SAME build.
+			"""
+		)
+	}()
+}
+
 // MARK: - Scalar conversions
 
 extension TwoMLSPQ.TwoMlsPqDigest {
@@ -345,6 +372,7 @@ extension AbstractTwoMLS {
 		let base: TwoMLSPQ.TwoMlsPqInvitation
 
 		init(base: TwoMLSPQ.TwoMlsPqInvitation) {
+			_ = TwoMLSPQBindingContract.verified
 			self.base = base
 		}
 
@@ -449,6 +477,7 @@ extension AbstractTwoMLS {
 		let base: TwoMLSPQ.TwoMlsPqClient
 
 		init(base: TwoMLSPQ.TwoMlsPqClient) {
+			_ = TwoMLSPQBindingContract.verified
 			self.base = base
 		}
 
