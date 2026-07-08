@@ -10,7 +10,7 @@ import TwoMLSPQ  // post-quantum two-mls-pq
 @Test func twoLibrariesCoexistSideBySide() throws {
 	// Object from the PQ library. The ClientId is now opaque identity bytes — the agent
 	// signing key is generated internally, so no key material is passed in.
-	let pqClient = try TwoMlsPqClient(clientId: Data([0x01, 0x02, 0x03]))
+	let pqClient = try TwoMlsPqIdentity(clientId: Data([0x01, 0x02, 0x03]))
 	let pqId = pqClient.clientId()
 	#expect(!pqId.bytes.isEmpty)
 

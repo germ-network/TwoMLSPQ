@@ -68,8 +68,8 @@ let package = Package(
 			// MUST come from the same build). Keep that swap uncommitted.
 			// path: "../TwoMLSPQ/buildIos/TwoMLSPQ.xcframework"
 			url:
-				"https://github.com/germ-network/TwoMLSPQ/releases/download/0.0.8/TwoMLSPQ.xcframework.zip",
-			checksum: "4f2295a9698b64c5994a9758351e2f95478c07c531c818b7471d3acc904b9c85"
+				"https://github.com/germ-network/TwoMLSPQ/releases/download/0.0.9/TwoMLSPQ.xcframework.zip",
+			checksum: "fdd4a7bc05f74ec05a9c8a7d150adbd2114700dfab503191a5d57aaab114390c"
 		),
 		.testTarget(
 			name: "AbstractTwoMLSTests",

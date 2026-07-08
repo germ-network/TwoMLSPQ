@@ -63,7 +63,7 @@ public enum TwoMLSPQConformanceError: Error {
 /// first client/invitation construction.
 // v2: TwoMlsPqDigest removed from the FFI — digests are raw 32-byte SHA-256 values,
 // typed on this side by `liftDigest`.
-private let expectedBindingContract: UInt64 = 2
+private let expectedBindingContract: UInt64 = 3
 
 enum TwoMLSPQBindingContract {
 	static let verified: Void = {
@@ -432,7 +432,7 @@ extension AbstractTwoMLS {
 		public init(clientId: AbstractTwoMLS.ClientID) throws {
 			// A fresh invitation: mint a client for this identity, have it generate and
 			// capture a combiner key package, and hold the resulting self-contained archive.
-			let archive = try TwoMlsPqClient(clientId: clientId).generateInvitation()
+			let archive = try TwoMlsPqIdentity(clientId: clientId).generateInvitation()
 			self.init(base: try TwoMlsPqInvitation(archive: archive))
 		}
 
@@ -529,7 +529,7 @@ extension AbstractTwoMLS {
 			// `prepareToEncrypt(proposing: newClientId)`; the PQ leaves catch up at
 			// the next `begin(.rekey, rotating: newClientId)` (A.5).
 			try session.base.stageRotation(
-				newClient: TwoMlsPqClient(clientId: newClientId)
+				newClient: TwoMlsPqIdentity(clientId: newClientId)
 			)
 
 			return (session, plaintext)
@@ -544,15 +544,15 @@ extension AbstractTwoMLS {
 	public struct PQClient: AbstractTwoMLS.Client {
 		public typealias Invitation = PQInvitation
 
-		let base: TwoMLSPQ.TwoMlsPqClient
+		let base: TwoMLSPQ.TwoMlsPqIdentity
 
-		init(base: TwoMLSPQ.TwoMlsPqClient) {
+		init(base: TwoMLSPQ.TwoMlsPqIdentity) {
 			_ = TwoMLSPQBindingContract.verified
 			self.base = base
 		}
 
 		public init(clientId: AbstractTwoMLS.ClientID) throws {
-			self.init(base: try TwoMlsPqClient(clientId: clientId))
+			self.init(base: try TwoMlsPqIdentity(clientId: clientId))
 		}
 
 		public func makeInvitation() throws -> PQInvitation.Archive {
