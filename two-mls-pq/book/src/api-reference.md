@@ -23,18 +23,21 @@ practice **raw 32-byte values**: SHA-256 over the stated object.
 That is this library's own wire convention; the app layer wraps them in whatever
 typed-digest encoding it uses — no app-layer type tags appear on this surface.
 
-## `TwoMlsPqClient`
+## `TwoMlsPqIdentity`
 
-- `new(client_id) -> Arc<TwoMlsPqClient>` — `client_id` is opaque identity bytes
-  (carried as the Basic Credential); the MLS signing keys are generated internally
-  and are independent of it.
-- `client_id() -> ClientId` — those bytes back.
+The agent identity and key-package/invitation mint — deliberately *not* an mls-rs-style
+hub for group operations (see [Concepts](./concepts.md)).
+
+- `new(client_id) -> Arc<TwoMlsPqIdentity>` — build an identity for opaque `ClientId`
+  bytes (carried as the Basic Credential); the MLS signing keys are generated
+  internally and are independent of it.
+- `client_id() -> ClientId` — the identity bytes.
 - `generate_key_package(suite) -> Vec<u8>` — one MLS key package.
 - `generate_combiner_key_package() -> CombinerKeyPackage` — paired classical +
   ML-KEM-768 key packages sharing one `ClientId`.
 - `generate_invitation() -> Vec<u8>` — capture a combiner key package's private
-  material, with the signing identity, into a self-contained invitation archive; the
-  client keeps none of it.
+  material, with the signing identity, into a self-contained invitation archive,
+  purging the identity's own copies.
 
 ## `TwoMlsPqInvitation`
 
@@ -95,5 +98,5 @@ Not yet implemented (return `Err`): `archive`, `from_archive`. See
 
 All failures map to the flat `TwoMlsPqError` enum (`Mls`, `InvalidKeyPackage`,
 `MissingWelcome`, `PskBinding`, `PqNotAvailable`, `SessionNotEstablished`,
-`SessionNotReady`, `ProposalRejected`, `DecryptionFailed`, `ArchiveInvalid`,
-`DuplicateWelcome`). mls-rs error types never cross the FFI boundary.
+`SessionNotReady`, `ProposalRejected`, `DecryptionFailed`, `DuplicateWelcome`,
+`ArchiveInvalid`). mls-rs error types never cross the FFI boundary.

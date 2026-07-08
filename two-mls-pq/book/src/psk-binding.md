@@ -32,6 +32,14 @@ Group_A.classical (the acceptor's receive group) at its current epoch
   → injected into Group_B.classical's creation commit
 ```
 
+Derivation only works at the group's *current* epoch, though — a frame that crossed
+one of the deriver's own commits references an epoch mls-rs can no longer export. The
+session therefore keeps a small **PSK ledger** of its send group's recent epochs
+(derived when each epoch is entered, retained across a window of commits) and
+live-injects it into the resolving stores immediately before processing a bound
+Welcome or commit; entries falling out of the window are deleted from the stores.
+See the [Concepts](./concepts.md) object-model notes.
+
 ## Refresh
 
 On a full commit — one that consumes the peer's approved Upd proposal — the committer

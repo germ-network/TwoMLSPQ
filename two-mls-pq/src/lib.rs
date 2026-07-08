@@ -334,6 +334,7 @@ impl From<apq::CombinerError> for TwoMlsPqError {
             apq::CombinerError::InvalidKeyPackage => TwoMlsPqError::InvalidKeyPackage,
             apq::CombinerError::MissingWelcome => TwoMlsPqError::MissingWelcome,
             apq::CombinerError::DecryptionFailed => TwoMlsPqError::DecryptionFailed,
+            apq::CombinerError::ArchiveInvalid => TwoMlsPqError::ArchiveInvalid,
         }
     }
 }
