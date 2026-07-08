@@ -102,6 +102,51 @@ pub(crate) fn injected_secret_psk_id(epoch: u64, group_id: &[u8]) -> ExternalPsk
     ExternalPskId::new(id)
 }
 
+/// Export 32 bytes from `group` via exportSecret at its current epoch, WITHOUT
+/// registering them anywhere. Both parties derive the same value from the same epoch.
+/// Callers register the pair into every PSK store their groups resolve from — an
+/// mls-rs group reads the store of the client that created it, which a session's
+/// current client may no longer be after an agent rotation.
+pub fn export_psk<S: KeyPackageStorage + Clone>(
+    group: &MlsGroup<S>,
+) -> Result<(ExternalPskId, PreSharedKey)> {
+    let secret = group
+        .export_secret(b"exportSecret", b"derive", 32)
+        .map_err(|_| CombinerError::Mls)?;
+    let psk_id = make_psk_id(group.current_epoch(), group.group_id());
+    let psk = PreSharedKey::new(secret.as_bytes().to_vec());
+    Ok((psk_id, psk))
+}
+
+/// Export a PSK from a PQ group. Identical to `export_psk` but accepts `PqMlsGroup`,
+/// which differs from `MlsGroup` when the `cryptokit` feature is on.
+#[cfg(feature = "cryptokit")]
+pub fn export_psk_pq<S: KeyPackageStorage + Clone>(
+    group: &PqMlsGroup<S>,
+) -> Result<(ExternalPskId, PreSharedKey)> {
+    let secret = group
+        .export_secret(b"exportSecret", b"derive", 32)
+        .map_err(|_| CombinerError::Mls)?;
+    let psk_id = make_psk_id(group.current_epoch(), group.group_id());
+    let psk = PreSharedKey::new(secret.as_bytes().to_vec());
+    Ok((psk_id, psk))
+}
+
+/// Register an exported PSK into `client`'s classical and PQ stores.
+pub fn register_psk<S: KeyPackageStorage + Clone>(
+    client: &CombinerClient<S>,
+    psk_id: &ExternalPskId,
+    psk: &PreSharedKey,
+) {
+    let mut store = client.classical().secret_store();
+    store.insert(psk_id.clone(), psk.clone());
+    #[cfg(feature = "cryptokit")]
+    {
+        let mut pq_store = client.pq().secret_store();
+        pq_store.insert(psk_id.clone(), psk.clone());
+    }
+}
+
 /// Export 32 bytes from `group` via exportSecret and register them in the client's PSK store.
 /// Both parties derive the same value from the same epoch, enabling independent PSK registration.
 /// Registers in both classical and PQ stores so both halves can use the PSK for group binding.
@@ -109,18 +154,8 @@ pub fn export_and_register_psk<S: KeyPackageStorage + Clone>(
     group: &MlsGroup<S>,
     client: &CombinerClient<S>,
 ) -> Result<ExternalPskId> {
-    let secret = group
-        .export_secret(b"exportSecret", b"derive", 32)
-        .map_err(|_| CombinerError::Mls)?;
-    let psk_id = make_psk_id(group.current_epoch(), group.group_id());
-    let psk = PreSharedKey::new(secret.as_bytes().to_vec());
-    let mut store = client.classical().secret_store();
-    store.insert(psk_id.clone(), psk.clone());
-    #[cfg(feature = "cryptokit")]
-    {
-        let mut pq_store = client.pq().secret_store();
-        pq_store.insert(psk_id.clone(), psk);
-    }
+    let (psk_id, psk) = export_psk(group)?;
+    register_psk(client, &psk_id, &psk);
     Ok(psk_id)
 }
 
@@ -131,17 +166,8 @@ pub fn export_and_register_psk_pq<S: KeyPackageStorage + Clone>(
     group: &PqMlsGroup<S>,
     client: &CombinerClient<S>,
 ) -> Result<ExternalPskId> {
-    let secret = group
-        .export_secret(b"exportSecret", b"derive", 32)
-        .map_err(|_| CombinerError::Mls)?;
-    let psk_id = make_psk_id(group.current_epoch(), group.group_id());
-    let psk = PreSharedKey::new(secret.as_bytes().to_vec());
-    let mut store = client.classical().secret_store();
-    store.insert(psk_id.clone(), psk.clone());
-    {
-        let mut pq_store = client.pq().secret_store();
-        pq_store.insert(psk_id.clone(), psk);
-    }
+    let (psk_id, psk) = export_psk_pq(group)?;
+    register_psk(client, &psk_id, &psk);
     Ok(psk_id)
 }
 
