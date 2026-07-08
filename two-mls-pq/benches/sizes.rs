@@ -63,8 +63,10 @@ fn main() {
         a_s.process_incoming(wb).unwrap();
 
         let ek = a_s.pq_ratchet_begin().unwrap();
-        let ct = b_s.pq_ratchet_respond(ek.clone()).unwrap();
-        let bind = a_s.pq_ratchet_bind(ct.clone(), payload.to_vec()).unwrap();
+        b_s.pq_ratchet_respond(ek.clone()).unwrap();
+        let ct = b_s.pq_take_pending_outbound().unwrap();
+        a_s.pq_ratchet_bind(ct.clone(), payload.to_vec()).unwrap();
+        let bind = a_s.pq_take_pending_outbound().unwrap();
         b_s.pq_ratchet_apply(bind.clone()).unwrap();
 
         let rdlen = |buf: &[u8], at: usize| {
