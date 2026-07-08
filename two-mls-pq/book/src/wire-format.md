@@ -18,12 +18,30 @@ have no tag (they are raw MLS ciphertext starting with the MLS version bytes).
 | `PQ_REKEY_UPD_TAG` | `0x15` | PQ re-key: initiator's `Upd'` proposal |
 | `PQ_REKEY_COMMIT_TAG` | `0x17` | PQ re-key: `[Commit'][counter-Upd'-or-empty]` |
 
-All tags are **odd**. Each tagged frame uses a `u32`-LE length prefix per embedded
-field. For example, the APQ Welcome is:
+Each tagged frame uses a `u32`-LE length prefix per embedded field. For example, the
+APQ Welcome is:
 
 ```
 [0x01][u32-LE classical-len][classical bytes][u32-LE pq-len][pq bytes]
 ```
+
+## Why the tags are odd
+
+All tags are **odd** — not decoration, but the rule that lets a tagged frame and an
+untagged application message be told apart from their first byte alone.
+
+A plain application message carries no tag: it is a raw `MLSMessage`, and an `MLSMessage`
+begins with its two-byte `ProtocolVersion` (MLS 1.0 = `0x0001`, big-endian), so its
+**first byte is always `0x00`**. On receipt the leading byte is the discriminator — a
+recognised tag routes to that frame's decoder, and anything else falls through to the MLS
+parser. A tag of `0x00` would make a bare MLS frame and a tagged frame indistinguishable.
+
+Restricting tags to odd values enforces the "never `0x00`" property by construction
+(`0x00` is even), so no odd tag can collide with the MLS version prefix — and it does so
+without anyone having to reason about which byte values the MLS encoding might take. It
+also keeps the entire **even** space unused and in reserve. Extending the protocol is
+then simply "take the next unused odd value," which is why the invariant below is stated
+that way.
 
 ## Invariants
 

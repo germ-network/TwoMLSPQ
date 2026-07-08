@@ -28,5 +28,6 @@ The narrative, step by step:
    observes `CommitResult.new_sender`. Her PQ leaves catch up on her next re-key
    (`pq_rekey_begin(rotating: new_id)` — see Session Lifecycle).
 
-For the full sequence diagrams see `docs/flows.md`, `docs/alice-bob.md`, and
-`docs/diagrams.md` in the repository.
+For the full flow detail — the PQ side-band rounds, routing, and rotation — see the
+[Session Lifecycle](./session-lifecycle.md) chapter, and the [Wire Format](./wire-format.md)
+chapter for the frame tags each step emits.
