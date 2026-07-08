@@ -33,7 +33,8 @@ pub use group::{
     create_bound_classical_send_group, create_bound_combiner_send_group,
     create_combiner_send_group, create_group_with_member, decode_apq_welcome, encode_apq_welcome,
     export_and_register_psk, export_psk, join_combiner_group, join_group_from_welcome,
-    register_psk, sender_client_id, CombinerGroup, MlsGroup, PqMlsGroup, APQ_TAG,
+    register_psk, register_psk_stores, sender_client_id, CombinerGroup, MlsGroup, PqMlsGroup,
+    APQ_TAG,
 };
 #[cfg(feature = "cryptokit")]
 pub use group::{
