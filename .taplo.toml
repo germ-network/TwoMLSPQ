@@ -1,3 +1,5 @@
+exclude = ["fuzz/**"]
+
 [formatting]
 reorder_keys = false
 
