@@ -2125,6 +2125,43 @@ mod tests {
     }
 
     #[test]
+    fn test_rotation_preserves_listen_window_across_epochs() {
+        // Regression check for the rotation × listen-window collapse: before
+        // per-group persistence, `prepare_rotation`'s client swap left
+        // `record_listen_rendezvous` probing the new client's empty storage, so
+        // the window collapsed to the current epoch on every later commit
+        // ([1,2] → rotate → [3] → [5], never recovering). With storage pulled
+        // through the group objects, the swap must not touch the window.
+        let epochs = |s: &Arc<TwoMlsPqSession>| -> Vec<u64> {
+            assert_ok!(s.should_listen_on())
+                .rendezvous_by_epoch
+                .iter()
+                .map(|e| e.epoch)
+                .collect()
+        };
+        let (alice, bob) = establish_sessions();
+        approved_commit_round(&alice, &bob);
+        assert_eq!(epochs(&alice), vec![1, 2]);
+
+        // Phase 8 rotation: commit the new agent on alice's send group. The
+        // prior epochs must survive the client swap.
+        let new_client = make_client();
+        assert_ok!(alice.stage_rotation(Arc::clone(&new_client)));
+        let prepared = assert_ok!(alice.prepare_to_encrypt(Some(new_client.client_id())));
+        assert!(prepared.did_commit);
+        let frame = assert_ok!(alice.encrypt(b"rotate".to_vec()));
+        assert_some!(assert_ok!(bob.process_incoming(frame.cipher_text)));
+        assert_eq!(epochs(&alice), vec![1, 2, 3]);
+
+        // And the window keeps growing on later rounds, up to mls-rs's
+        // retention cap (current + 3 retained priors).
+        approved_commit_round(&alice, &bob);
+        assert_eq!(epochs(&alice), vec![1, 2, 3, 4]);
+        approved_commit_round(&alice, &bob);
+        assert_eq!(epochs(&alice), vec![2, 3, 4, 5]);
+    }
+
+    #[test]
     fn test_listen_window_follows_mls_rs_epoch_retention() {
         let (alice, bob) = establish_sessions();
         // Five committed rounds: alice's send group moves from epoch 1 to epoch 6.
