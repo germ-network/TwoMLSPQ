@@ -31,7 +31,7 @@ fn main() {
     let partial = alice_s.encrypt(payload.to_vec()).unwrap().cipher_text;
     bob_s.process_incoming(partial.clone()).unwrap();
 
-    // Full commit (epoch advance + PSK refresh) — tag 0x07.
+    // Full commit (epoch advance + PSK refresh) — still an A.2 ratchet frame, tag 0x05.
     bob_s.prepare_to_encrypt(None).unwrap();
     let prop = bob_s.encrypt(b"proposal".to_vec()).unwrap();
     let res = alice_s.process_incoming(prop.cipher_text).unwrap().unwrap();
@@ -84,7 +84,7 @@ fn main() {
     println!("APQ welcome A (0x01)         : {:>6} B", welcome_a.len());
     println!("APQ welcome B (0x01)         : {:>6} B", welcome_b.len());
     println!("partial commit + app (0x05)  : {:>6} B", partial.len());
-    println!("full bundle + app (0x07)     : {:>6} B", full.len());
+    println!("full commit + app (0x05)     : {:>6} B", full.len());
     println!("rotation commit + app (0x03) : {:>6} B", rotation.len());
     println!(
         "overhead: partial={} B, full={} B, rotation={} B (over payload)\n",
