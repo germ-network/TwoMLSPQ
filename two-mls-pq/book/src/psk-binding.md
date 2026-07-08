@@ -1,26 +1,52 @@
 # PSK Binding
 
-The two halves of a Combiner group — and the two parties' groups — are tied together
-by a PSK chain. This is what makes the construction hybrid: an attacker must break the
-classical half *and* the ML-KEM-768 half to break a session.
+Two distinct PSK chains tie the construction together. The **APQ-PSK** binds the two
+halves of one Combiner group — this is what makes the construction hybrid: an attacker
+must break the classical half *and* the ML-KEM-768 half to break a session. The
+**cross-party TwoMLS-PSK** ties one party's send group to the group it receives on, so
+the two directions of a session share fate.
 
-## The chain
+## The APQ-PSK (hybrid binding, PQ → classical)
+
+Each Combiner group is created PQ half first; the classical half then absorbs the PQ
+half's secrecy at birth:
 
 ```
-Group_A.classical epoch N
+Group_A.pq epoch N
   → exportSecret(label="exportSecret", context="derive", len=32)
   → ExternalPsk ID = LE-u64(epoch) || group_id bytes
-  → injected into Group_A.pq + Group_B.classical + Group_B.pq
+  → injected into Group_A.classical's creation commit
 ```
 
-Both parties are members of Group_A, so both can independently re-derive the same PSK
-and register it before processing the bound Welcome or commit.
+Both parties are members of Group_A.pq, so the joiner independently re-derives the
+same PSK: it joins the PQ half first, registers the APQ-PSK, then joins the classical
+half whose Welcome demands it.
+
+## The cross-party TwoMLS-PSK (receive → send)
+
+The acceptor's send group is bound to the group it receives on:
+
+```
+Group_A.classical (the acceptor's receive group) at its current epoch
+  → exportSecret(label="exportSecret", context="derive", len=32)
+  → injected into Group_B.classical's creation commit
+```
 
 ## Refresh
 
-On a full commit, the send group advances to epoch `N+1`, a fresh PSK is exported from
-that epoch and injected into the receive group. This re-binds the two groups to the new
-epoch and provides break-in recovery.
+On a full commit — one that consumes the peer's approved Upd proposal — the committer
+re-exports the cross-party PSK from its **receive** group's classical half at the
+current epoch and injects it into its own send-group commit, re-binding the two
+directions and providing break-in recovery.
+
+The PQ half's secrecy refreshes on the PQ ratchet (`cryptokit` builds): fresh ML-KEM
+entropy is injected into the send group's PQ half as a per-round PSK, and the
+re-exported APQ-PSK is bound into the classical half's commit in the same round.
+
+The PQ re-key (`cryptokit` builds) adds a third, PQ-to-PQ chain: each of its two
+`Commit'`s cross-injects a PSK exported from the **opposite** PQ send group (same
+exporter invariants, same exported-ID encoding), tying the two directions' PQ halves
+to each other while their updatePaths rotate the leaves.
 
 ## Invariants — never change
 
@@ -30,4 +56,7 @@ interoperability:
 - `export_secret` label: `b"exportSecret"`
 - `export_secret` context: `b"derive"`
 - output length: `32`
-- PSK ID encoding: `epoch.to_le_bytes() || group_id_bytes`
+- exported PSK ID encoding (APQ-PSK and cross-party PSK):
+  `epoch.to_le_bytes() || group_id_bytes`
+- injected-secret PSK ID (the PQ ratchet's per-round entropy): the exported encoding
+  plus a trailing domain byte `0x52`, keeping the two ID spaces disjoint

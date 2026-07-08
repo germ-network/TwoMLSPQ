@@ -15,7 +15,8 @@ material without coordinating a shared committer.
 
 Each "group" above is really a **Combiner group**: a classical half (`0x0003`) and an
 ML-KEM-768 half (`0xFDEA`). The two halves are bound by injecting a PSK derived from
-the classical half into the PQ half (and into the peer's groups). An attacker must
+the PQ half into the classical half at creation; a second, cross-party PSK ties each
+party's send group to the group it receives on. An attacker must
 break *both* halves to break the session — so the classical half keeps protecting
 traffic even if ML-KEM were to fail, and vice-versa. This is the hybrid property,
 achieved at the group level. See [PSK Binding](./psk-binding.md).
