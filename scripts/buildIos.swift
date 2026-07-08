@@ -26,14 +26,29 @@ let fwDir = "\(buildDir)/frameworks"
 let installName = "@rpath/\(module).framework/\(module)"
 let buildFlags = ["--release", "--package", crate, "--no-default-features", "--features", "cryptokit"]
 
+// Cross-compile targets — single source of truth, shared by rustup target-add and the
+// per-target bridge purge. The four `cargo build` calls stay spelled out (each carries its
+// own deployment-target env), but must cover exactly these triples.
+let targets = ["aarch64-apple-ios-sim", "aarch64-apple-ios", "x86_64-apple-ios", "aarch64-apple-darwin"]
+
 let fm = FileManager.default
 let home = fm.homeDirectoryForCurrentUser
 let cargo = home.appending(path: ".cargo/bin/cargo").path
 let rustup = home.appending(path: ".cargo/bin/rustup").path
+let repoRoot = fm.currentDirectoryPath
 
-func run(_ launchPath: String, _ args: [String], env: [String: String] = [:], allow: [Int32] = [0]) {
+// Swift-build shim dir (populated in the build section below). Once set, run() prepends it
+// to PATH so the nested `swift build` inside mls-rs-crypto-cryptokit's build.rs resolves to
+// our wrapper. Cleaned up on exit, mirroring the shell script's `trap … EXIT`.
+var shimDirGlobal = ""
+atexit { if !shimDirGlobal.isEmpty { try? FileManager.default.removeItem(atPath: shimDirGlobal) } }
+
+// fatal: false mirrors the shell's `|| true` — a nonzero exit is reported on stderr but
+// does not abort the build (used for best-effort steps like `cargo clean`).
+func run(_ launchPath: String, _ args: [String], env: [String: String] = [:], allow: [Int32] = [0], fatal: Bool = true) {
     let p = Process()
     var e = ProcessInfo.processInfo.environment
+    if !shimDirGlobal.isEmpty { e["PATH"] = "\(shimDirGlobal):\(e["PATH"] ?? "")" }
     for (k, v) in env { e[k] = v }
     p.environment = e
     p.executableURL = URL(fileURLWithPath: launchPath)
@@ -42,8 +57,21 @@ func run(_ launchPath: String, _ args: [String], env: [String: String] = [:], al
     p.waitUntilExit()
     guard p.terminationStatus == 0 || allow.contains(p.terminationStatus) else {
         print("\(launchPath) \(args.joined(separator: " ")) failed: \(p.terminationStatus)")
-        exit(-1)
+        if fatal { exit(-1) }
+        return
     }
+}
+
+// Capture stdout of a command (trimmed). Used to resolve the real `swift` for the shim.
+func capture(_ launchPath: String, _ args: [String]) -> String {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: launchPath)
+    p.arguments = args
+    let pipe = Pipe(); p.standardOutput = pipe
+    do { try p.run() } catch { print("failed to launch \(launchPath): \(error)"); exit(-1) }
+    p.waitUntilExit()
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    return (String(data: data, encoding: .utf8) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
 }
 
 func write(_ text: String, to path: String) {
@@ -121,13 +149,68 @@ func versionedFramework(dylib: String, destParent: String) {
 
 // ---- build ----
 
-run(rustup, ["target", "add", "aarch64-apple-ios-sim", "aarch64-apple-ios",
-             "x86_64-apple-ios", "aarch64-apple-darwin"], allow: [0, 1])
+// Swift build-system shim. mls-rs-crypto-cryptokit's build.rs runs a bare `swift build` and
+// links libcryptokit-bridge.a from the legacy SwiftPM layout. Xcode 16.3+/Swift 6.4 default
+// the engine to "swiftbuild", which emits elsewhere, so the link fails with "could not find
+// native static library cryptokit-bridge". We can't pass flags into that nested invocation,
+// so shim `swift build` on PATH (prepended in run()) to force the legacy "native" engine.
+let realSwift = capture("/usr/bin/xcrun", ["-f", "swift"])
+shimDirGlobal = "\(NSTemporaryDirectory())twomlspq-shim-\(ProcessInfo.processInfo.processIdentifier)"
+mkdirs(shimDirGlobal)
+write("""
+#!/usr/bin/env bash
+if [ "${1:-}" = "build" ]; then
+    shift
+    exec "\(realSwift)" build --build-system native "$@"
+fi
+exec "\(realSwift)" "$@"
+""", to: "\(shimDirGlobal)/swift")
+run("/bin/chmod", ["+x", "\(shimDirGlobal)/swift"])
 
-try? fm.removeItem(atPath: "\(buildDir)/\(frameworkName).xcframework")
-try? fm.removeItem(atPath: "\(buildDir)/\(frameworkName).xcframework.zip")
+run(rustup, ["target", "add"] + targets, allow: [0, 1])
+
+// Clean intermediates only. The published artifacts (TwoMLSPQ.xcframework + .zip) are NOT
+// removed here: downstream consumes buildIos/TwoMLSPQ.xcframework directly (AbstractTwoMLS's
+// LOCAL DEV path), so the old artifact must survive a failed build. New output is staged and
+// swapped in atomically at the end.
+let stageDir = "\(buildDir)/.stage"
 try? fm.removeItem(atPath: fwDir)
-mkdirs(buildDir); mkdirs(fwDir)
+try? fm.removeItem(atPath: stageDir)
+mkdirs(buildDir); mkdirs(fwDir); mkdirs(stageDir)
+
+// Purge stale CryptoKit-bridge builds. A host `cargo test --features cryptokit` (or any host
+// build) leaves macOS-target Swift objects in the bridge's SwiftPM cache that cargo's
+// fingerprinting does not notice; a later iOS cross-build then embeds macOS objects into
+// mls-rs-crypto-cryptokit's rlib and fails at link with "building for 'iOS-simulator', but
+// linking in object file built for 'macOS'". Dropping the bridge cache and the crate's
+// build artifacts forces a correct per-target rebuild (costs seconds per target).
+//
+// CAUTION: ~/.cargo/git/checkouts is machine-global shared state. This purge is safe for a
+// single serial build but is NOT concurrency-safe: a parallel build in another worktree — or
+// a CI job on a shared runner — against the same mls-rs rev can race it. Do not run this in
+// parallel with another cryptokit build on the same machine.
+let checkouts = home.appending(path: ".cargo/git/checkouts").path
+var purged = 0
+for dir in (try? fm.contentsOfDirectory(atPath: checkouts)) ?? [] where dir.hasPrefix("mls-rs-") {
+    let revsBase = "\(checkouts)/\(dir)"
+    for rev in (try? fm.contentsOfDirectory(atPath: revsBase)) ?? [] {
+        let bridge = "\(revsBase)/\(rev)/mls-rs-crypto-cryptokit/cryptokit-bridge/.build"
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: bridge, isDirectory: &isDir), isDir.boolValue else { continue }
+        print("purge: removing stale bridge cache \(bridge)")
+        try? fm.removeItem(atPath: bridge)
+        purged += 1
+    }
+}
+if purged == 0 {
+    FileHandle.standardError.write(Data("purge: WARNING — no cryptokit-bridge .build cache matched; the mls-rs dependency layout may have changed and this purge is now a no-op\n".utf8))
+}
+// fatal: false so a clean failure can't abort the build, but stderr stays visible: a broken
+// package spec (e.g. after a crate rename) now surfaces instead of being swallowed.
+for triple in targets {
+    print("purge: cargo clean mls-rs-crypto-cryptokit (\(triple))")
+    run(cargo, ["clean", "-p", "mls-rs-crypto-cryptokit", "--release", "--target", triple], fatal: false)
+}
 
 // Release cdylib builds (iOS device + simulator + macOS).
 run(cargo, ["build"] + buildFlags + ["--target=aarch64-apple-ios-sim"])
@@ -155,14 +238,33 @@ flatFramework(dylib: "\(fwDir)/sim-build/\(libName).dylib",
 versionedFramework(dylib: "target/aarch64-apple-darwin/release/\(libName).dylib",
                    destParent: "\(fwDir)/macos")
 
+// Assemble + zip in the staging dir, then swap into place only on success, so a failed run
+// never destroys the previously published artifact.
 run("/usr/bin/xcodebuild", [
     "-create-xcframework",
     "-framework", "\(fwDir)/ios/\(module).framework",
     "-framework", "\(fwDir)/sim/\(module).framework",
     "-framework", "\(fwDir)/macos/\(module).framework",
-    "-output", "\(buildDir)/\(frameworkName).xcframework",
+    "-output", "\(stageDir)/\(frameworkName).xcframework",
 ])
 
-guard fm.changeCurrentDirectoryPath(buildDir) else { print("cd \(buildDir) failed"); exit(-1) }
-run("/usr/bin/zip", ["-r", "\(frameworkName).xcframework.zip", "\(frameworkName).xcframework"])
-run("/usr/bin/swift", ["package", "compute-checksum", "\(frameworkName).xcframework.zip"])
+// -y preserves the macOS versioned framework's symlinks (Versions/Current, etc.) instead of
+// dereferencing them into duplicated content. zip has no cwd flag, so cd into the stage dir
+// to keep TwoMLSPQ.xcframework at the archive root, then restore cwd for the swap.
+guard fm.changeCurrentDirectoryPath(stageDir) else { print("cd \(stageDir) failed"); exit(-1) }
+run("/usr/bin/zip", ["-ry", "\(frameworkName).xcframework.zip", "\(frameworkName).xcframework"])
+guard fm.changeCurrentDirectoryPath(repoRoot) else { print("cd \(repoRoot) failed"); exit(-1) }
+
+let publishedFw = "\(buildDir)/\(frameworkName).xcframework"
+let publishedZip = "\(buildDir)/\(frameworkName).xcframework.zip"
+try? fm.removeItem(atPath: publishedFw)
+try? fm.removeItem(atPath: publishedZip)
+do {
+    try fm.moveItem(atPath: "\(stageDir)/\(frameworkName).xcframework", toPath: publishedFw)
+    try fm.moveItem(atPath: "\(stageDir)/\(frameworkName).xcframework.zip", toPath: publishedZip)
+} catch { print("artifact swap failed: \(error)"); exit(-1) }
+
+// Checksum before stage teardown so its output — which the release recipe consumes — is
+// never gated behind cleanup; removeItem tolerates any stray files left in the stage dir.
+run("/usr/bin/swift", ["package", "compute-checksum", publishedZip])
+try? fm.removeItem(atPath: stageDir)

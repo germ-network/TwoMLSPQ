@@ -28,6 +28,7 @@ apq = { path = "../apq", version = "0.1.0", default-features = false }
 mls-rs = { workspace = true }
 mls-rs-crypto-cryptokit = { workspace = true, optional = true }
 mls-rs-crypto-rustcrypto = { workspace = true }
+sha2 = { workspace = true }
 thiserror = { workspace = true }
 uniffi = { workspace = true }
 zeroize = { workspace = true }

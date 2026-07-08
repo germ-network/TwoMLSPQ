@@ -19,12 +19,14 @@ The narrative, step by step:
    `0x0003`, the PQ suite `0xFDEA`; the two `ClientId`s must match.
 4. **Establishment** — `initiate` → `APQWelcome_A` → `accept` → `APQWelcome_B` →
    `process_incoming`. Both sides are now established with the PSK chain bound.
-5. **Partial commit** — Alice `prepare_to_encrypt(None)` + `encrypt`; Bob decrypts.
+5. **Routine round** — Alice `prepare_to_encrypt(None)` + `encrypt` (the frame staples
+   an `Upd(Alice)` proposal for Bob to approve); Bob decrypts.
 6. **Full commit** — Bob proposes; Alice `queue_proposal` then commits on her next send,
    advancing the epoch and refreshing the PSK.
 7. **Continued messaging** — bidirectional traffic continues post-refresh.
 8. **Rotation** — Alice `stage_rotation` + `prepare_to_encrypt(Some(new_id))`; Bob
-   observes `CommitResult.new_sender`.
+   observes `CommitResult.new_sender`. Her PQ leaves catch up on her next re-key
+   (`pq_rekey_begin(rotating: new_id)` — see Session Lifecycle).
 
 For the full sequence diagrams see `docs/flows.md`, `docs/alice-bob.md`, and
 `docs/diagrams.md` in the repository.

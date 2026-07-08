@@ -33,6 +33,12 @@ INSTALL_NAME="@rpath/${MODULE}.framework/${MODULE}"
 # Real ML-KEM-768 (AWS-LC) — the PQ half the coexistence check exercises.
 BUILD_FLAGS=(--release --package "$CRATE" --no-default-features --features cryptokit)
 
+# Cross-compile targets: iOS sim (arm64), iOS device, iOS sim (x86_64 — XCode Cloud), macOS.
+# Single source of truth, shared by rustup target-add and the per-target bridge purge below.
+# The four `cargo build` invocations stay spelled out because each carries its own
+# deployment-target env var, but they must cover exactly these triples.
+TARGETS=(aarch64-apple-ios-sim aarch64-apple-ios x86_64-apple-ios aarch64-apple-darwin)
+
 # Swift build-system shim. mls-rs-crypto-cryptokit's build.rs runs a bare `swift build`
 # and then links libcryptokit-bridge.a from the legacy SwiftPM layout
 # (.build/<unversioned-triple>/<profile>/). Xcode 16.3+/Swift 6.4 changed the default
@@ -56,15 +62,46 @@ chmod +x "$SHIM_DIR/swift"
 export PATH="$SHIM_DIR:$PATH"
 
 # Ensure all required targets are installed
-"$RUSTUP" target add \
-    aarch64-apple-ios-sim \
-    aarch64-apple-ios \
-    x86_64-apple-ios \
-    aarch64-apple-darwin || true
+"$RUSTUP" target add "${TARGETS[@]}" || true
 
-# Clean previous artifacts
-rm -rf "$BUILD_DIR/$FRAMEWORK.xcframework" "$BUILD_DIR/$FRAMEWORK.xcframework.zip" "$FW_DIR" || true
-mkdir -p "$BUILD_DIR" "$FW_DIR"
+# Clean intermediates only. The published artifacts ($FRAMEWORK.xcframework + .zip)
+# are NOT removed here: downstream consumes buildIos/TwoMLSPQ.xcframework directly
+# (AbstractTwoMLS's LOCAL DEV path), so the old artifact must survive a failed build.
+# New output is staged and swapped in atomically at the end.
+STAGE_DIR="$BUILD_DIR/.stage"
+rm -rf "$FW_DIR" "$STAGE_DIR" || true
+mkdir -p "$BUILD_DIR" "$FW_DIR" "$STAGE_DIR"
+
+# Purge stale CryptoKit-bridge builds. A host `cargo test --features cryptokit` (or any
+# host build) leaves macOS-target Swift objects in the bridge's SwiftPM cache, and cargo's
+# fingerprinting does not notice — a later iOS cross-build then embeds macOS objects into
+# mls-rs-crypto-cryptokit's rlib and fails at link with
+# "building for 'iOS-simulator', but linking in object file built for 'macOS'".
+# Dropping the bridge cache and the crate's build artifacts forces a correct per-target
+# rebuild (costs seconds per target).
+#
+# CAUTION: ~/.cargo/git/checkouts is machine-global shared state. This purge is safe for a
+# single serial dev/release build, but it is NOT concurrency-safe: a parallel build in
+# another worktree — or a CI job on a shared runner — against the same mls-rs rev can race
+# it (one job deletes the bridge cache mid-compile of another). Do not run this script in
+# parallel with another cryptokit build on the same machine.
+purged=0
+for bridge in "$HOME"/.cargo/git/checkouts/mls-rs-*/*/mls-rs-crypto-cryptokit/cryptokit-bridge/.build; do
+    [ -d "$bridge" ] || continue
+    echo "purge: removing stale bridge cache $bridge"
+    rm -rf "$bridge"
+    purged=$((purged + 1))
+done
+if [ "$purged" -eq 0 ]; then
+    echo "purge: WARNING — no cryptokit-bridge .build cache matched the glob; the mls-rs" \
+         "dependency layout may have changed and this purge is now a no-op" >&2
+fi
+# `|| true` so a clean failure can't abort the build, but stderr is left visible: a broken
+# package spec (e.g. after a crate rename) now surfaces instead of being swallowed.
+for triple in "${TARGETS[@]}"; do
+    echo "purge: cargo clean mls-rs-crypto-cryptokit ($triple)"
+    "$CARGO" clean -p mls-rs-crypto-cryptokit --release --target "$triple" || true
+done
 
 # Release cdylib builds (iOS device + simulator + macOS).
 "$CARGO" build "${BUILD_FLAGS[@]}" --target=aarch64-apple-ios-sim
@@ -145,12 +182,24 @@ flat_fw "$FW_DIR/sim-build/${LIB_NAME}.dylib" "$FW_DIR/sim" "17.0" "iPhoneSimula
 # macOS
 versioned_fw "target/aarch64-apple-darwin/release/${LIB_NAME}.dylib" "$FW_DIR/macos"
 
+# Assemble + zip in the staging dir, then swap into place only on success, so a
+# failed run never destroys the previously published artifact.
 xcodebuild -create-xcframework \
     -framework "$FW_DIR/ios/${MODULE}.framework" \
     -framework "$FW_DIR/sim/${MODULE}.framework" \
     -framework "$FW_DIR/macos/${MODULE}.framework" \
-    -output "$BUILD_DIR/$FRAMEWORK.xcframework"
+    -output "$STAGE_DIR/$FRAMEWORK.xcframework"
 
-cd "$BUILD_DIR"
-zip -r "$FRAMEWORK.xcframework.zip" "$FRAMEWORK.xcframework"
-swift package compute-checksum "$FRAMEWORK.xcframework.zip"
+# -y preserves the macOS versioned framework's symlinks (Versions/Current, etc.) instead
+# of dereferencing them into duplicated content.
+(cd "$STAGE_DIR" && zip -ry "$FRAMEWORK.xcframework.zip" "$FRAMEWORK.xcframework")
+
+rm -rf "$BUILD_DIR/$FRAMEWORK.xcframework" "$BUILD_DIR/$FRAMEWORK.xcframework.zip"
+mv "$STAGE_DIR/$FRAMEWORK.xcframework" "$BUILD_DIR/$FRAMEWORK.xcframework"
+mv "$STAGE_DIR/$FRAMEWORK.xcframework.zip" "$BUILD_DIR/$FRAMEWORK.xcframework.zip"
+
+# Checksum before cleanup: the release recipe needs this line's output, so it must not be
+# gated behind stage teardown. `rm -rf` (not `rmdir`) so a stray file — e.g. a Finder
+# .DS_Store — in the stage dir can't fail the run after the artifact is already published.
+swift package compute-checksum "$BUILD_DIR/$FRAMEWORK.xcframework.zip"
+rm -rf "$STAGE_DIR"
