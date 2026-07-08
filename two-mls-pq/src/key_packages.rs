@@ -5,9 +5,7 @@ use crate::invitation::{
     combiner_from_invitation, decode_archive, encode_archive, generate_combiner_invitation,
     CombinerInvitation, SpawnedGroups,
 };
-#[cfg(feature = "cryptokit")]
-use crate::key_package_store::PqMlsClient;
-use crate::key_package_store::{CombinerClient, MlsClient};
+use crate::key_package_store::{CombinerClient, MlsClient, PqMlsClient};
 use crate::session::TwoMlsPqSession;
 use crate::{ClientId, MlsCipherSuite, MlsGroupId, Result, TwoMlsPqError};
 
@@ -45,7 +43,6 @@ impl TwoMlsPqIdentity {
         self.inner.classical()
     }
 
-    #[cfg(feature = "cryptokit")]
     pub(crate) fn pq(&self) -> &PqMlsClient {
         self.inner.pq()
     }
@@ -57,7 +54,7 @@ impl TwoMlsPqIdentity {
     /// key internally. `client_id` is opaque identity bytes, independent of any key.
     #[uniffi::constructor]
     pub fn new(client_id: Vec<u8>) -> Result<Arc<Self>> {
-        let inner = CombinerClient::new(client_id)?;
+        let inner = CombinerClient::new(client_id, crate::providers::crypto_config())?;
         Ok(Arc::new(Self { inner }))
     }
 
@@ -76,7 +73,6 @@ impl TwoMlsPqIdentity {
             MlsCipherSuite::DHKEM_X25519_CHACHA => {
                 Ok(self.inner.generate_classical_key_package()?)
             }
-            #[cfg(feature = "cryptokit")]
             MlsCipherSuite::ML_KEM_768 => Ok(self.inner.generate_pq_key_package()?),
             _ => Err(TwoMlsPqError::Mls),
         }
@@ -260,7 +256,7 @@ pub fn hpke_seal_to_key_package(
     };
 
     use mls_rs::CipherSuiteProvider;
-    let cs = pq_envelope_suite()?;
+    let cs = crate::providers::pq_envelope_suite()?;
     let sealed = cs
         .hpke_seal(&kp.hpke_init_key, &info, aad.as_deref(), &plaintext)
         .map_err(|_| TwoMlsPqError::Mls)?;
@@ -270,52 +266,13 @@ pub fn hpke_seal_to_key_package(
     })
 }
 
-/// The cipher suite the initial envelope is sealed under: the PQ half's suite (spec A.1 —
-/// "encrypted to the PQ EK in KP'"; classical MLS Welcome encryption protects the group
-/// secrets regardless). Under the default build the PQ half is the classical simulation.
-#[cfg(feature = "cryptokit")]
-fn pq_envelope_suite(
-) -> Result<impl mls_rs::CipherSuiteProvider<Error = impl std::error::Error + Send + Sync + 'static>>
-{
-    use mls_rs::CryptoProvider;
-    mls_rs_crypto_cryptokit::CryptoKitMlKemProvider
-        .cipher_suite_provider(mls_rs::CipherSuite::from(0xFDEA))
-        .ok_or(TwoMlsPqError::Mls)
-}
-
-#[cfg(not(feature = "cryptokit"))]
-fn pq_envelope_suite(
-) -> Result<impl mls_rs::CipherSuiteProvider<Error = impl std::error::Error + Send + Sync + 'static>>
-{
-    use mls_rs::CryptoProvider;
-    mls_rs_crypto_rustcrypto::RustCryptoProvider::new()
-        .cipher_suite_provider(mls_rs::CipherSuite::CURVE25519_CHACHA)
-        .ok_or(TwoMlsPqError::Mls)
-}
-
 /// Reject a peer combiner whose both halves are classical (no PQ protection).
-///
-/// No-op without `cryptokit`: there the PQ half is deliberately classical
-/// (ML-KEM is simulated), so the check would reject every session.
-#[cfg(feature = "cryptokit")]
 pub(crate) fn ensure_pq_available(their_kp: &CombinerKeyPackage) -> Result<()> {
     let classical = parse_mls_key_package(their_kp.classical.clone())?;
     let pq = parse_mls_key_package(their_kp.pq.clone())?;
     if !classical.cipher_suite.is_supported() && !pq.cipher_suite.is_supported() {
         return Err(TwoMlsPqError::PqNotAvailable);
     }
-    Ok(())
-}
-
-// BUG(known, fix pending elsewhere): without `cryptokit` there is no real PQ provider —
-// the "PQ" half is a classical placeholder group — yet this no-op lets sessions
-// construct and claim APQ pairing (and report a fake `ApqEpochs.pq_epoch`). The intended
-// behavior is to REJECT: this variant (and the kp-generation / invitation / bootstrap
-// fallbacks that simulate the PQ half) should return `Err(TwoMlsPqError::PqNotAvailable)`,
-// with the non-cryptokit test suite re-gated accordingly. Until then, non-cryptokit
-// builds are for CI lint/unit coverage only — never a functional deployment.
-#[cfg(not(feature = "cryptokit"))]
-pub(crate) fn ensure_pq_available(_their_kp: &CombinerKeyPackage) -> Result<()> {
     Ok(())
 }
 
@@ -473,7 +430,7 @@ impl TwoMlsPqInvitation {
         let public = key_package.hpke_init_key;
         let secret = &self.invitation.pq_kpd.1.init_key;
 
-        let cs = pq_envelope_suite()?;
+        let cs = crate::providers::pq_envelope_suite()?;
 
         let info = info.unwrap_or_else(|| self.invitation.client_id.clone());
         let ciphertext = HpkeCiphertext {
@@ -490,14 +447,13 @@ impl TwoMlsPqInvitation {
 #[cfg(test)]
 mod tests {
     use mls_rs::{CipherSuiteProvider, CryptoProvider};
-    use mls_rs_crypto_rustcrypto::RustCryptoProvider;
 
     use super::TwoMlsPqIdentity;
     use crate::{assert_err, assert_ok, assert_some, MlsCipherSuite};
 
     /// A fresh, unique ClientId for tests (opaque random bytes, not a signing key).
     fn test_client_id() -> Vec<u8> {
-        let crypto = RustCryptoProvider::new();
+        let crypto = crate::providers::classical();
         let cs = assert_some!(crypto.cipher_suite_provider(mls_rs::CipherSuite::CURVE25519_CHACHA));
         let (secret, _) = assert_ok!(cs.signature_key_generate());
         secret.as_bytes().to_vec()
@@ -519,7 +475,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "cryptokit")]
     fn test_generate_key_package_ml_kem_768_succeeds() {
         let client = assert_ok!(TwoMlsPqIdentity::new(test_client_id()));
         let bytes = assert_ok!(client.generate_key_package(MlsCipherSuite::ml_kem_768()));
@@ -553,7 +508,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "cryptokit")]
     fn test_generate_combiner_key_package_produces_matching_client_ids() {
         let client = assert_ok!(TwoMlsPqIdentity::new(test_client_id()));
         let ckp = assert_ok!(client.generate_combiner_key_package());
@@ -562,7 +516,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "cryptokit")]
     fn test_parse_combiner_key_package_returns_correct_suites() {
         let client = assert_ok!(TwoMlsPqIdentity::new(test_client_id()));
         let ckp = assert_ok!(client.generate_combiner_key_package());

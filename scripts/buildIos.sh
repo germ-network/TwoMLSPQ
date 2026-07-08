@@ -23,8 +23,9 @@ rm -f  "$BUILD_DIR/libtwo_mls_pq_sim_combined.a" || true
 
 mkdir -p "$BUILD_DIR"
 
-# Debug build + generate Swift bindings
-"$CARGO" build
+# Debug build + generate Swift bindings. The shipped configuration is CryptoKit for
+# both halves (see two-mls-pq/src/providers.rs).
+"$CARGO" build --features two-mls-pq/cryptokit
 "$CARGO" run -p uniffi-bindgen --bin uniffi-bindgen \
     generate --library ./target/debug/libtwo_mls_pq.dylib \
     --language swift \
@@ -33,10 +34,10 @@ mkdir -p "$BUILD_DIR"
 mv "$BINDINGS_DIR/two_mls_pqFFI.modulemap" "$BINDINGS_DIR/module.modulemap"
 
 # Release builds
-"$CARGO" build --release --target=aarch64-apple-ios-sim
-IPHONEOS_DEPLOYMENT_TARGET=17.0 "$CARGO" build --release --target=aarch64-apple-ios
-MACOS_DEPLOYMENT_TARGET=10_15   "$CARGO" build --release --target=aarch64-apple-darwin
-"$CARGO" build --release --target=x86_64-apple-ios  # XCode Cloud runs x86_64
+"$CARGO" build --release --features two-mls-pq/cryptokit --target=aarch64-apple-ios-sim
+IPHONEOS_DEPLOYMENT_TARGET=17.0 "$CARGO" build --release --features two-mls-pq/cryptokit --target=aarch64-apple-ios
+MACOS_DEPLOYMENT_TARGET=10_15   "$CARGO" build --release --features two-mls-pq/cryptokit --target=aarch64-apple-darwin
+"$CARGO" build --release --features two-mls-pq/cryptokit --target=x86_64-apple-ios  # XCode Cloud runs x86_64
 
 # Combine arm + x86_64 simulator slices (required for XCode Cloud)
 # https://forums.developer.apple.com/forums/thread/711294?answerId=722588022#722588022

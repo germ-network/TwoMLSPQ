@@ -35,10 +35,13 @@ strip = "symbols"
 [workspace.dependencies]
 mls-rs = { version = "0.55", features = ["psk", "private_message", "serde"] }
 mls-rs-core = { version = "0.27", git = "https://github.com/germ-network/mls-rs", rev = "3743c75d32257ab48bde2875f5e8d624410147e9" }
+mls-rs-crypto-awslc = { version = "0.25", git = "https://github.com/germ-network/mls-rs", rev = "3743c75d32257ab48bde2875f5e8d624410147e9", features = [
+  "post-quantum",
+] }
 mls-rs-crypto-cryptokit = { version = "0.11", git = "https://github.com/germ-network/mls-rs", rev = "3743c75d32257ab48bde2875f5e8d624410147e9", features = [
   "post-quantum",
 ] }
-mls-rs-crypto-rustcrypto = { version = "0.22", git = "https://github.com/germ-network/mls-rs", rev = "3743c75d32257ab48bde2875f5e8d624410147e9" }
+mls-rs-crypto-traits = { version = "0.22", git = "https://github.com/germ-network/mls-rs", rev = "3743c75d32257ab48bde2875f5e8d624410147e9" }
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
 thiserror = "1"

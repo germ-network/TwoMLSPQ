@@ -55,12 +55,22 @@ just bindgen
 
 ## CryptoKit / ML-KEM-768 tests (macOS 26+)
 
-The `cryptokit` feature enables real ML-KEM-768 (FIPS 203) session tests, with the
-post-quantum half backed by Apple CryptoKit's native `MLKEM768` (via
-`mls-rs-crypto-cryptokit`, `post-quantum` feature); the classical half stays on
-RustCrypto. CryptoKit's ML-KEM primitives require **iOS 26 / macOS 26**, so the
-feature builds and runs only on a macOS 26+ host with the matching Xcode toolchain
-(it links a Swift bridge and is not cross-platform):
+The crates are crypto-provider agnostic: `apq` compiles no provider at all, and
+`two-mls-pq` pins one per build feature (see `two-mls-pq/src/providers.rs`). Exactly one
+provider feature must be selected — there is no default:
+
+- `cryptokit` — Apple CryptoKit for both halves (classical suites + native `MLKEM768`
+  via `mls-rs-crypto-cryptokit`, `post-quantum` feature). The shipped configuration.
+  CryptoKit's ML-KEM primitives require **iOS 26 / macOS 26**, so this feature builds
+  and runs only on a macOS 26+ host with the matching Xcode toolchain (it links a Swift
+  bridge and is not cross-platform).
+- `awslc` — aws-lc for both halves; portable (Linux CI runs the full suite, including
+  every real ML-KEM-768 path, with it) and wire-compatible with `cryptokit` (`apq`'s
+  macOS test run includes cross-provider interop tests).
+
+```sh
+cargo test --features awslc,benchmark_util   # any platform
+```
 
 ```sh
 cargo test -p two-mls-pq --features cryptokit
