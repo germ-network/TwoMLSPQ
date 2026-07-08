@@ -1,6 +1,6 @@
 # TwoMLSPQ
 
-Germ Network's implementation of 1:1 encrypted messaging sessions built on two asymmetric MLS send groups (Distributed MLS — draft-xue-distributed-mls).
+Germ Network's implementation of 1:1 encrypted messaging sessions built on two asymmetric MLS send groups.
 
 ## Documentation
 
