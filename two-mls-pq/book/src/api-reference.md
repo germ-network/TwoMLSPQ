@@ -69,7 +69,10 @@ The receiving side of a published key package — no live client required.
 
 ## `TwoMlsPqSession`
 
-Constructors: `initiate`, `accept`, `from_archive` (the last is not yet implemented).
+Constructors: `initiate`, `accept`, `from_archive(archive, client)` — `client` must be
+the session's current agent (mid-rotation, the NEW identity); the restored groups sign
+with the keys embedded in their snapshots, so the client supplies identity, storage,
+and provider plumbing rather than the original signing keys.
 
 State: `is_established`, `is_fully_established`, `has_receive_group`,
 `active_session_id`, `receive_group_id`, `my_agent_state`, `their_agent_state`,
@@ -91,7 +94,16 @@ PQ side-band (see [Session Lifecycle](./session-lifecycle.md)): `my_pq_turn`,
 parameters carry the agent credential handoff and must name the session's current
 agent.
 
-Not yet implemented (return `Err`): `archive`, `from_archive`. See
+Persistence: `archive() -> Archive` serialises the full session — both group
+snapshots, the cross-party PSK ledger, the per-epoch listen map, the spawn token, and
+every parked one-shot frame. The bytes are **plaintext secret material**: seal them
+before persisting (`apq::archive::seal` is the provided tool; the key belongs in the
+platform keystore). An archive is **single-use** — any further use of the live session
+(or a second restore) rewinds the sender ratchet into AEAD nonce reuse. Archiving is
+refused (`SessionNotReady`) at exactly two non-quiescent points: mid-A.3 PQ round (the
+per-round KEM material is deliberately unserializable) and while a staged rotation
+holds a second identity; A.5 rekey rounds and unconfirmed (`Pending`) rotations archive
+fine. Reconnect remains unimplemented — see
 [Planned Features](./planned-features.md).
 
 ## Errors

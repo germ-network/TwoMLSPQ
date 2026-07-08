@@ -178,6 +178,141 @@ enum PqInflight {
     RekeyResponded,
 }
 
+// The session archive layout version. The byte covers the WHOLE layout; any change to the
+// wire struct below bumps it, and older archives are rejected as `ArchiveInvalid`
+// (pre-release, no migration).
+const SESSION_ARCHIVE_VERSION: u8 = 1;
+// Tags the PQ half as real ML-KEM, mirroring the invitation archive's header byte, so any
+// future PQ-mode change (e.g. conf+auth) fails loudly across builds instead of
+// misinterpreting group snapshots.
+const SESSION_ARCHIVE_PQ_MODE: u8 = 1;
+
+// In its own module because the derive-generated impls reference the std `Result`, which
+// the crate-local `Result` alias would shadow (same pattern as `invitation::wire`).
+mod archive_wire {
+    use mls_rs::mls_rs_codec::{self, MlsDecode, MlsEncode, MlsSize};
+    use mls_rs::psk::{ExternalPskId, PreSharedKey};
+    use zeroize::Zeroizing;
+
+    /// One exported mls-rs group snapshot (plaintext secret material — the enclosing
+    /// archive carries the sealing obligation, see [`super::TwoMlsPqSession::archive`]).
+    /// A one-field struct so `Option<GroupBlob>` composes with the `byte_vec` framing
+    /// (the `with` module has no Option-awareness).
+    #[derive(MlsSize, MlsEncode, MlsDecode)]
+    pub(super) struct GroupBlob {
+        #[mls_codec(with = "mls_rs_codec::byte_vec")]
+        pub(super) bytes: Zeroizing<Vec<u8>>,
+    }
+
+    /// One Combiner group: the classical half's snapshot and, when live, the PQ half's.
+    #[derive(MlsSize, MlsEncode, MlsDecode)]
+    pub(super) struct GroupEntry {
+        pub(super) classical: GroupBlob,
+        pub(super) pq: Option<GroupBlob>,
+    }
+
+    /// One session-owned cross-party PSK ledger entry. `PreSharedKey`'s codec keeps the
+    /// payload `Zeroizing` through decode.
+    #[derive(MlsSize, MlsEncode, MlsDecode)]
+    pub(super) struct PskEntry {
+        pub(super) id: ExternalPskId,
+        pub(super) psk: PreSharedKey,
+    }
+
+    /// One per-epoch listen address (rendezvous exporter, captured at its live epoch).
+    #[derive(MlsSize, MlsEncode, MlsDecode)]
+    pub(super) struct ListenEntry {
+        pub(super) epoch: u64,
+        #[mls_codec(with = "mls_rs_codec::byte_vec")]
+        pub(super) addr: Vec<u8>,
+    }
+
+    /// `AgentState` on the wire: `Sync { client_id: active }` when `pending_new` is
+    /// `None`, else `Pending { old: active, new: pending_new }`.
+    #[derive(MlsSize, MlsEncode, MlsDecode)]
+    pub(super) struct WireAgentState {
+        #[mls_codec(with = "mls_rs_codec::byte_vec")]
+        pub(super) active: Vec<u8>,
+        pub(super) pending_new: Option<Vec<u8>>,
+    }
+
+    /// The peer's stapled Upd awaiting app approval: (digest, proposal bytes).
+    #[derive(MlsSize, MlsEncode, MlsDecode)]
+    pub(super) struct OfferedProposal {
+        #[mls_codec(with = "mls_rs_codec::byte_vec")]
+        pub(super) digest: Vec<u8>,
+        #[mls_codec(with = "mls_rs_codec::byte_vec")]
+        pub(super) proposal: Vec<u8>,
+    }
+
+    /// The archivable `PqInflight` variants — the A.5 markers hold no secrets (the round
+    /// state proper lives in the group snapshots). `initiated: true` is
+    /// `RekeyInitiated { rotating }`; `false` is `RekeyResponded` (`rotating` must be
+    /// `None`).
+    #[derive(MlsSize, MlsEncode, MlsDecode)]
+    pub(super) struct RekeyInflight {
+        pub(super) initiated: bool,
+        pub(super) rotating: Option<Vec<u8>>,
+    }
+
+    /// The persisted form of a `TwoMlsPqSession`. Everything a quiesced session needs to
+    /// resume: identity/turn state, both group snapshots, the cross-party PSK ledger, the
+    /// per-epoch listen map, the spawn token, and every parked one-shot frame (dropping a
+    /// parked side-band frame whose turn already flipped would desync the side-band
+    /// permanently).
+    #[derive(MlsSize, MlsEncode, MlsDecode)]
+    pub(super) struct SessionArchive {
+        #[mls_codec(with = "mls_rs_codec::byte_vec")]
+        pub(super) session_id: Vec<u8>,
+        pub(super) my_state: WireAgentState,
+        pub(super) their_state: WireAgentState,
+        pub(super) pq_turn_mine: bool,
+        pub(super) spawn_token: Option<Vec<u8>>,
+        /// Required: every constructor creates a send group, so its absence marks a
+        /// forged or corrupt archive.
+        pub(super) send_group: GroupEntry,
+        pub(super) recv_group: Option<GroupEntry>,
+        pub(super) send_psk_ledger: Vec<PskEntry>,
+        pub(super) retired_send_psks: Vec<ExternalPskId>,
+        pub(super) listen_rendezvous: Vec<ListenEntry>,
+        pub(super) pending_outbound: Option<Vec<u8>>,
+        pub(super) pending_proposal_hash: Option<Vec<u8>>,
+        pub(super) pending_commit_message: Option<Vec<u8>>,
+        pub(super) pending_proposal_message: Option<Vec<u8>>,
+        pub(super) offered_proposal: Option<OfferedProposal>,
+        pub(super) queued_proposal: Option<Vec<u8>>,
+        pub(super) pending_pq_outbound: Option<Vec<u8>>,
+        pub(super) pq_rekey_inflight: Option<RekeyInflight>,
+    }
+}
+
+/// `AgentState` → its wire form.
+fn wire_agent_state(state: &AgentState) -> archive_wire::WireAgentState {
+    match state {
+        AgentState::Sync { client_id } => archive_wire::WireAgentState {
+            active: client_id.bytes.clone(),
+            pending_new: None,
+        },
+        AgentState::Pending { old, new } => archive_wire::WireAgentState {
+            active: old.bytes.clone(),
+            pending_new: Some(new.bytes.clone()),
+        },
+    }
+}
+
+/// Wire form → `AgentState`.
+fn agent_state_from_wire(wire: archive_wire::WireAgentState) -> AgentState {
+    match wire.pending_new {
+        None => AgentState::Sync {
+            client_id: ClientId { bytes: wire.active },
+        },
+        Some(new) => AgentState::Pending {
+            old: ClientId { bytes: wire.active },
+            new: ClientId { bytes: new },
+        },
+    }
+}
+
 /// Append `part` to `out` as a u32-LE length-prefixed section.
 fn push_section(out: &mut Vec<u8>, part: &[u8]) {
     out.extend_from_slice(&(part.len() as u32).to_le_bytes());
@@ -1202,10 +1337,148 @@ impl TwoMlsPqSession {
         Ok(session)
     }
 
-    /// Restore a session from a serialised archive.
+    /// Restore a session from a serialised archive (see `archive` for the single-use
+    /// contract). `client` must be the session's current agent: the `Sync` identity, or
+    /// the NEW identity when the archive was taken mid-rotation (`prepare_rotation`
+    /// installs the new client before the peer's ack resolves the rotation). The
+    /// restored groups sign with the keys embedded in their snapshots, so `client`
+    /// supplies identity, storage, and provider plumbing — not the original signing keys.
     #[uniffi::constructor]
-    pub fn from_archive(_archive: Archive, _client: Arc<TwoMlsPqIdentity>) -> Result<Arc<Self>> {
-        Err(TwoMlsPqError::ArchiveInvalid)
+    pub fn from_archive(archive: Archive, client: Arc<TwoMlsPqIdentity>) -> Result<Arc<Self>> {
+        use mls_rs::mls_rs_codec::MlsDecode;
+
+        let mut rest = match archive.bytes.as_slice() {
+            [SESSION_ARCHIVE_VERSION, SESSION_ARCHIVE_PQ_MODE, rest @ ..] => rest,
+            _ => return Err(TwoMlsPqError::ArchiveInvalid),
+        };
+        let wire = archive_wire::SessionArchive::mls_decode(&mut rest)
+            .map_err(|_| TwoMlsPqError::ArchiveInvalid)?;
+        if !rest.is_empty() {
+            return Err(TwoMlsPqError::ArchiveInvalid);
+        }
+
+        // Structural invariants the live session maintains; reject blobs that violate
+        // them rather than resurrecting an impossible state.
+        if wire.send_psk_ledger.len() > SEND_PSK_WINDOW {
+            return Err(TwoMlsPqError::ArchiveInvalid);
+        }
+        let digest_ok = |d: &[u8]| d.len() == 32;
+        if wire
+            .pending_proposal_hash
+            .as_deref()
+            .is_some_and(|d| !digest_ok(d))
+            || wire
+                .offered_proposal
+                .as_ref()
+                .is_some_and(|o| !digest_ok(&o.digest))
+            || wire
+                .queued_proposal
+                .as_deref()
+                .is_some_and(|d| !digest_ok(d))
+        {
+            return Err(TwoMlsPqError::ArchiveInvalid);
+        }
+        if wire
+            .listen_rendezvous
+            .iter()
+            .any(|e| e.addr.len() != RENDEZVOUS_LEN)
+        {
+            return Err(TwoMlsPqError::ArchiveInvalid);
+        }
+        if wire
+            .pq_rekey_inflight
+            .as_ref()
+            .is_some_and(|r| !r.initiated && r.rotating.is_some())
+        {
+            return Err(TwoMlsPqError::ArchiveInvalid);
+        }
+
+        let my_state = agent_state_from_wire(wire.my_state);
+        let their_state = agent_state_from_wire(wire.their_state);
+
+        // The restoring client must be the session's CURRENT agent: mid-rotation
+        // (`Pending`), that is the new identity — `prepare_rotation` swapped the live
+        // session's client before the archive was taken.
+        let expected = match &my_state {
+            AgentState::Sync { client_id } => client_id,
+            AgentState::Pending { new, .. } => new,
+        };
+        if client.client_id().bytes != expected.bytes {
+            return Err(TwoMlsPqError::ArchiveInvalid);
+        }
+
+        let group_state = |entry: archive_wire::GroupEntry| apq::CombinerGroupState {
+            classical: entry.classical.bytes,
+            pq: entry.pq.map(|blob| blob.bytes),
+        };
+        let send_group =
+            apq::load_combiner_group(client.combiner(), &group_state(wire.send_group))?;
+        let recv_group = match wire.recv_group {
+            Some(entry) => Some(apq::load_combiner_group(
+                client.combiner(),
+                &group_state(entry),
+            )?),
+            None => None,
+        };
+
+        let pq_inflight = wire.pq_rekey_inflight.map(|r| {
+            if r.initiated {
+                PqInflight::RekeyInitiated {
+                    rotating: r.rotating.map(|bytes| ClientId { bytes }),
+                }
+            } else {
+                PqInflight::RekeyResponded
+            }
+        });
+
+        // The imports above re-homed every group's captured storage and PSK handles onto
+        // `client`, so the plumbing collapses to `client`'s handles exactly as
+        // `build_session` derives them — the multi-store history a rotation accumulated
+        // existed only to serve groups born on pre-rotation clients, and those bindings
+        // are dissolved by the import.
+        let send_group_storage = client.combiner().classical_group_storage().clone();
+        let psk_stores = vec![
+            client.combiner().classical().secret_store(),
+            client.combiner().pq().secret_store(),
+        ];
+        let psk_stores_from = Arc::clone(&client);
+        Ok(Arc::new(TwoMlsPqSession {
+            inner: Mutex::new(SessionInner {
+                client,
+                send_group: Some(send_group),
+                recv_group,
+                pending_outbound: wire.pending_outbound,
+                pending_proposal_hash: wire.pending_proposal_hash,
+                pending_commit_message: wire.pending_commit_message,
+                pending_proposal_message: wire.pending_proposal_message,
+                offered_proposal: wire.offered_proposal.map(|o| (o.digest, o.proposal)),
+                queued_proposal: wire.queued_proposal,
+                pending_new_client: None,
+                pq_inflight,
+                session_id: SessionId {
+                    bytes: wire.session_id,
+                },
+                my_state,
+                their_state,
+                pq_turn_mine: wire.pq_turn_mine,
+                pending_pq_outbound: wire.pending_pq_outbound,
+                send_psk_ledger: wire
+                    .send_psk_ledger
+                    .into_iter()
+                    .map(|entry| (entry.id, entry.psk))
+                    .collect(),
+                retired_send_psks: wire.retired_send_psks,
+                listen_rendezvous: wire
+                    .listen_rendezvous
+                    .into_iter()
+                    .map(|entry| (entry.epoch, entry.addr))
+                    .collect(),
+                send_group_storage,
+                psk_stores,
+                psk_stores_from,
+                spawn_token: wire.spawn_token,
+            }),
+        }))
     }
 
     /// Welcome bytes to deliver to the remote party to complete group establishment.
@@ -1777,8 +2050,118 @@ impl TwoMlsPqSession {
         }))
     }
 
+    /// Serialise the session for persistence; restore with `from_archive`.
+    ///
+    /// The bytes are **plaintext secret material** (group snapshots including signing
+    /// keys and epoch secrets, plus the PSK ledger) — seal them before persisting
+    /// (`apq::archive::seal` is the provided tool; the key belongs in the platform
+    /// keystore). An archive is a **move, not a copy**: any further use of the live
+    /// session (or of a second restore) rewinds the sender ratchet, which re-derives
+    /// AEAD keys/nonces for new plaintexts. The caller owns single-use/latest-only
+    /// discipline, as with invitation archives.
+    ///
+    /// Fails `SessionNotReady` at the two non-quiescent points:
+    /// - mid-A.3 PQ round (the per-round KEM material is deliberately unserializable —
+    ///   persisting it would defeat the ratchet's forward secrecy); complete the round
+    ///   first. A.5 rekey rounds ARE archivable — their markers hold no secrets.
+    /// - a staged-but-uncommitted rotation (`stage_rotation` holds a second identity);
+    ///   archive before staging, or commit the rotation first.
     pub fn archive(&self) -> Result<Archive> {
-        Err(TwoMlsPqError::ArchiveInvalid)
+        use mls_rs::mls_rs_codec::{MlsEncode, MlsSize};
+
+        let mut inner = self.lock();
+        let pq_rekey_inflight = match &inner.pq_inflight {
+            Some(PqInflight::Initiating(_)) | Some(PqInflight::Responding(_)) => {
+                return Err(TwoMlsPqError::SessionNotReady)
+            }
+            Some(PqInflight::RekeyInitiated { rotating }) => Some(archive_wire::RekeyInflight {
+                initiated: true,
+                rotating: rotating.as_ref().map(|id| id.bytes.clone()),
+            }),
+            Some(PqInflight::RekeyResponded) => Some(archive_wire::RekeyInflight {
+                initiated: false,
+                rotating: None,
+            }),
+            None => None,
+        };
+        if inner.pending_new_client.is_some() {
+            return Err(TwoMlsPqError::SessionNotReady);
+        }
+
+        // Prune the listen map against the same retention window whose epochs the
+        // exported snapshots carry, so the archive is internally consistent.
+        inner.record_listen_rendezvous()?;
+
+        let group_entry = |state: apq::CombinerGroupState| archive_wire::GroupEntry {
+            classical: archive_wire::GroupBlob {
+                bytes: state.classical,
+            },
+            pq: state.pq.map(|bytes| archive_wire::GroupBlob { bytes }),
+        };
+        let send_group = group_entry(
+            inner
+                .send_group
+                .as_mut()
+                .ok_or(TwoMlsPqError::SessionNotReady)?
+                .export_state()?,
+        );
+        let recv_group = match inner.recv_group.as_mut() {
+            Some(recv) => Some(group_entry(recv.export_state()?)),
+            None => None,
+        };
+
+        let archive = archive_wire::SessionArchive {
+            session_id: inner.session_id.bytes.clone(),
+            my_state: wire_agent_state(&inner.my_state),
+            their_state: wire_agent_state(&inner.their_state),
+            pq_turn_mine: inner.pq_turn_mine,
+            spawn_token: inner.spawn_token.clone(),
+            send_group,
+            recv_group,
+            send_psk_ledger: inner
+                .send_psk_ledger
+                .iter()
+                .map(|(id, psk)| archive_wire::PskEntry {
+                    id: id.clone(),
+                    psk: psk.clone(),
+                })
+                .collect(),
+            retired_send_psks: inner.retired_send_psks.clone(),
+            listen_rendezvous: inner
+                .listen_rendezvous
+                .iter()
+                .map(|(&epoch, addr)| archive_wire::ListenEntry {
+                    epoch,
+                    addr: addr.clone(),
+                })
+                .collect(),
+            pending_outbound: inner.pending_outbound.clone(),
+            pending_proposal_hash: inner.pending_proposal_hash.clone(),
+            pending_commit_message: inner.pending_commit_message.clone(),
+            pending_proposal_message: inner.pending_proposal_message.clone(),
+            offered_proposal: inner.offered_proposal.as_ref().map(|(digest, proposal)| {
+                archive_wire::OfferedProposal {
+                    digest: digest.clone(),
+                    proposal: proposal.clone(),
+                }
+            }),
+            queued_proposal: inner.queued_proposal.clone(),
+            pending_pq_outbound: inner.pending_pq_outbound.clone(),
+            pq_rekey_inflight,
+        };
+
+        // Exact-size preallocation: a growing Vec would strand unwiped partial copies of
+        // the secrets in freed allocations. The final `Archive.bytes` handed across the
+        // FFI is an unwiped copy regardless — hence the sealing obligation above.
+        let mut out = Zeroizing::new(Vec::with_capacity(2 + archive.mls_encoded_len()));
+        out.push(SESSION_ARCHIVE_VERSION);
+        out.push(SESSION_ARCHIVE_PQ_MODE);
+        archive
+            .mls_encode(&mut out)
+            .map_err(|_| TwoMlsPqError::ArchiveInvalid)?;
+        Ok(Archive {
+            bytes: out.to_vec(),
+        })
     }
 
     /// Approve the peer's stapled Upd proposal (identified by its digest). The proposal
@@ -1888,6 +2271,7 @@ mod tests {
     use super::TwoMlsPqSession;
     use crate::{
         assert_err, assert_ok, assert_some,
+        key_packages::TwoMlsPqIdentity,
         test_utils::{establish_sessions, make_client, make_combiner_kp},
         AgentState, TwoMlsPqError,
     };
@@ -2847,10 +3231,363 @@ mod tests {
         );
     }
 
+    /// `establish_sessions`, but returning the identities so restore tests can present
+    /// the right (or deliberately wrong) client.
+    fn establish_with_clients() -> (
+        Arc<TwoMlsPqIdentity>,
+        Arc<TwoMlsPqIdentity>,
+        Arc<TwoMlsPqSession>,
+        Arc<TwoMlsPqSession>,
+    ) {
+        let alice = make_client();
+        let bob = make_client();
+        let alice_kp = make_combiner_kp(&alice);
+        let bob_kp = make_combiner_kp(&bob);
+        let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp));
+        let welcome_a = assert_some!(alice_session.pending_outbound());
+        let bob_session = assert_ok!(TwoMlsPqSession::accept(
+            Arc::clone(&bob),
+            welcome_a,
+            alice_kp
+        ));
+        let welcome_b = assert_some!(bob_session.pending_outbound());
+        assert_ok!(alice_session.process_incoming(welcome_b));
+        (alice, bob, alice_session, bob_session)
+    }
+
+    /// One plain application round: `sender` encrypts, `receiver` decrypts, payload matches.
+    fn message_round(
+        sender: &Arc<TwoMlsPqSession>,
+        receiver: &Arc<TwoMlsPqSession>,
+        payload: &[u8],
+    ) {
+        assert_ok!(sender.prepare_to_encrypt(None));
+        let enc = assert_ok!(sender.encrypt(payload.to_vec()));
+        let got = assert_some!(assert_ok!(receiver.process_incoming(enc.cipher_text)));
+        assert_eq!(
+            assert_some!(got.application_message).app_message_data,
+            payload
+        );
+    }
+
+    /// Archive `session` and restore it onto `client`.
+    fn round_trip(
+        session: &Arc<TwoMlsPqSession>,
+        client: Arc<TwoMlsPqIdentity>,
+    ) -> Arc<TwoMlsPqSession> {
+        let archive = assert_ok!(session.archive());
+        assert_ok!(TwoMlsPqSession::from_archive(archive, client))
+    }
+
+    /// A fresh identity with the same ClientId as `session`'s current agent but fresh
+    /// signing keys and empty stores — the app-restart shape of a restore. The restored
+    /// groups sign with their snapshot-embedded keys, so this must work.
+    fn fresh_identity_for(session: &Arc<TwoMlsPqSession>) -> Arc<TwoMlsPqIdentity> {
+        assert_ok!(TwoMlsPqIdentity::new(
+            session.my_agent_state().client_id().bytes
+        ))
+    }
+
     #[test]
-    fn test_archive_returns_archive_invalid() {
-        let (alice_session, _) = establish_sessions();
-        assert_err!(alice_session.archive(), TwoMlsPqError::ArchiveInvalid);
+    fn test_archive_round_trips_session_state() {
+        let (alice, _bob, alice_session, bob_session) = establish_with_clients();
+        message_round(&alice_session, &bob_session, b"before");
+
+        let session_id = alice_session.active_session_id();
+        let restored = round_trip(&alice_session, alice);
+        assert_eq!(restored.active_session_id(), session_id);
+
+        // Both directions keep flowing across the restore.
+        message_round(&restored, &bob_session, b"restored->bob");
+        message_round(&bob_session, &restored, b"bob->restored");
+    }
+
+    #[test]
+    fn test_archive_restores_onto_fresh_identity() {
+        let (_alice, _bob, alice_session, bob_session) = establish_with_clients();
+        message_round(&alice_session, &bob_session, b"before");
+
+        // Fresh keys, empty stores: only the ClientId matches.
+        let restored = round_trip(&alice_session, fresh_identity_for(&alice_session));
+        message_round(&restored, &bob_session, b"restored->bob");
+        message_round(&bob_session, &restored, b"bob->restored");
+    }
+
+    #[test]
+    fn test_archive_round_trips_fully_established_session() {
+        let (alice, _bob, alice_session, bob_session) = establish_with_clients();
+        let kp = assert_ok!(alice_session.pq_bootstrap_begin(None));
+        assert_ok!(bob_session.pq_bootstrap_respond(kp));
+        let bind = assert_some!(bob_session.pq_take_pending_outbound());
+        assert_ok!(alice_session.pq_bootstrap_apply(bind));
+        assert!(alice_session.is_fully_established());
+
+        let restored = round_trip(&alice_session, alice);
+        assert!(restored.is_fully_established());
+
+        // The PQ side-band still runs: a full A.3 ratchet round initiated by the
+        // restored side (Bob holds the turn after the bootstrap, so pass it back first).
+        let ek = assert_ok!(bob_session.pq_ratchet_begin());
+        assert_ok!(restored.pq_ratchet_respond(ek));
+        let ct = assert_some!(restored.pq_take_pending_outbound());
+        assert_ok!(bob_session.pq_ratchet_bind(ct, b"pq-after-restore".to_vec()));
+        let bind = assert_some!(bob_session.pq_take_pending_outbound());
+        assert_eq!(
+            assert_ok!(restored.pq_ratchet_apply(bind)),
+            b"pq-after-restore"
+        );
+        message_round(&restored, &bob_session, b"classical-after-pq");
+    }
+
+    #[test]
+    fn test_archive_preserves_listen_map() {
+        let (alice, _bob, alice_session, bob_session) = establish_with_clients();
+        // Advance the send epoch (full commit round) so the map holds several epochs.
+        message_round(&alice_session, &bob_session, b"staple");
+        message_round(&bob_session, &alice_session, b"staple-back");
+        let offered = {
+            assert_ok!(bob_session.prepare_to_encrypt(None));
+            let enc = assert_ok!(bob_session.encrypt(b"upd".to_vec()));
+            let got = assert_some!(assert_ok!(alice_session.process_incoming(enc.cipher_text)));
+            assert_some!(got.proposal)
+        };
+        assert_ok!(alice_session.queue_proposal(offered.digest));
+        assert!(assert_ok!(alice_session.prepare_to_encrypt(None)).did_commit);
+        let enc = assert_ok!(alice_session.encrypt(b"commit".to_vec()));
+        assert_some!(assert_ok!(bob_session.process_incoming(enc.cipher_text)));
+
+        let before = assert_ok!(alice_session.should_listen_on());
+        assert!(before.rendezvous_by_epoch.len() > 1);
+
+        let restored = round_trip(&alice_session, alice);
+        let after = assert_ok!(restored.should_listen_on());
+        assert_eq!(
+            before.send_group.classical.bytes,
+            after.send_group.classical.bytes
+        );
+        let pairs = |chans: &crate::ListenChannels| {
+            chans
+                .rendezvous_by_epoch
+                .iter()
+                .map(|e| (e.epoch, e.rendezvous_id.bytes.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(pairs(&before), pairs(&after));
+    }
+
+    #[test]
+    fn test_archive_preserves_spawn_token() {
+        let alice = make_client();
+        let bob = make_client();
+        let alice_kp = make_combiner_kp(&alice);
+        let bob_inv = assert_ok!(crate::key_packages::TwoMlsPqInvitation::new(assert_ok!(
+            bob.generate_invitation()
+        )));
+        let bob_kp = bob_inv.combiner_key_package();
+        let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp));
+        let welcome_a = assert_some!(alice_session.pending_outbound());
+        let token = b"spawn-token".to_vec();
+        let bob_session = assert_ok!(bob_inv.receive(welcome_a, alice_kp, token.clone()));
+
+        let restored = round_trip(&bob_session, fresh_identity_for(&bob_session));
+        assert!(assert_ok!(restored.forwarded(token)).is_none());
+        assert_err!(
+            restored.forwarded(b"other".to_vec()),
+            TwoMlsPqError::DecryptionFailed
+        );
+    }
+
+    /// The restored PSK ledger — not the (empty) stores of the restoring client — must
+    /// resolve the cross-party PSK a peer commit references: Bob's full commit binds the
+    /// PSK of Alice's send group at the epoch he last observed, and the restored Alice
+    /// runs on a fresh identity whose mls-rs secret stores hold nothing.
+    #[test]
+    fn test_archive_preserves_psk_ledger_for_peer_commit() {
+        let (_alice, _bob, alice_session, bob_session) = establish_with_clients();
+        // Alice staples an Upd for Bob to approve.
+        message_round(&alice_session, &bob_session, b"staple");
+        let offered = {
+            assert_ok!(alice_session.prepare_to_encrypt(None));
+            let enc = assert_ok!(alice_session.encrypt(b"upd".to_vec()));
+            let got = assert_some!(assert_ok!(bob_session.process_incoming(enc.cipher_text)));
+            assert_some!(got.proposal)
+        };
+        assert_ok!(bob_session.queue_proposal(offered.digest));
+        assert!(assert_ok!(bob_session.prepare_to_encrypt(None)).did_commit);
+        let crossing = assert_ok!(bob_session.encrypt(b"bound-commit".to_vec()));
+
+        // Alice archives before Bob's bound frame arrives; the restore lands on a fresh
+        // identity with empty PSK stores.
+        let restored = round_trip(&alice_session, fresh_identity_for(&alice_session));
+        let got = assert_some!(assert_ok!(restored.process_incoming(crossing.cipher_text)));
+        assert_eq!(
+            assert_some!(got.application_message).app_message_data,
+            b"bound-commit"
+        );
+    }
+
+    /// Prepared-but-unsent state survives: the staged proposal/commit emit after restore
+    /// and the peer accepts the frame.
+    #[test]
+    fn test_archive_preserves_prepared_encrypt_state() {
+        let (alice, _bob, alice_session, bob_session) = establish_with_clients();
+        assert_ok!(alice_session.prepare_to_encrypt(None));
+
+        let restored = round_trip(&alice_session, alice);
+        let enc = assert_ok!(restored.encrypt(b"prepared-before-archive".to_vec()));
+        let got = assert_some!(assert_ok!(bob_session.process_incoming(enc.cipher_text)));
+        assert_eq!(
+            assert_some!(got.application_message).app_message_data,
+            b"prepared-before-archive"
+        );
+    }
+
+    /// A committed-but-unconfirmed rotation (`my_state == Pending`) archives, restores
+    /// onto the NEW identity, and resolves to `Sync` once the peer's traffic confirms.
+    #[test]
+    fn test_archive_mid_rotation_restores_onto_new_client() {
+        let (_alice, _bob, alice_session, bob_session) = establish_with_clients();
+        message_round(&alice_session, &bob_session, b"before");
+
+        let new_alice = make_client();
+        assert_ok!(alice_session.stage_rotation(Arc::clone(&new_alice)));
+        assert_ok!(alice_session.prepare_to_encrypt(Some(new_alice.client_id())));
+        let rotation = assert_ok!(alice_session.encrypt(b"rotate".to_vec()));
+        assert!(matches!(
+            alice_session.my_agent_state(),
+            AgentState::Pending { .. }
+        ));
+
+        let restored = round_trip(&alice_session, new_alice);
+        assert!(matches!(
+            restored.my_agent_state(),
+            AgentState::Pending { .. }
+        ));
+
+        // Peer processes the rotation commit, replies; the reply resolves Pending → Sync.
+        assert_some!(assert_ok!(
+            bob_session.process_incoming(rotation.cipher_text)
+        ));
+        message_round(&bob_session, &restored, b"confirm");
+        assert!(matches!(restored.my_agent_state(), AgentState::Sync { .. }));
+    }
+
+    /// A parked responder side-band frame (turn already flipped) survives the round trip;
+    /// dropping it would desync the side-band permanently.
+    #[test]
+    fn test_archive_preserves_parked_pq_frame() {
+        let (_alice, _bob, alice_session, bob_session) = establish_with_clients();
+        let kp = assert_ok!(alice_session.pq_bootstrap_begin(None));
+        assert_ok!(bob_session.pq_bootstrap_respond(kp));
+        let bind = assert_some!(bob_session.pq_take_pending_outbound());
+        assert_ok!(alice_session.pq_bootstrap_apply(bind));
+
+        // Bob initiates a ratchet round; Alice responds and parks the ct frame.
+        let ek = assert_ok!(bob_session.pq_ratchet_begin());
+        assert_ok!(alice_session.pq_ratchet_respond(ek));
+        // Responding holds the raw round secret — not archivable.
+        assert_err!(alice_session.archive(), TwoMlsPqError::SessionNotReady);
+        let ct = assert_some!(alice_session.pq_take_pending_outbound());
+        assert_ok!(bob_session.pq_ratchet_bind(ct.clone(), b"pq-msg".to_vec()));
+
+        // Bob's bind is parked with his turn already flipped: archive him and make sure
+        // the frame is still deliverable from the restored session.
+        // (Bob consumed his Initiating slot at bind, so he IS archivable here.)
+        let restored_bob = {
+            let archive = assert_ok!(bob_session.archive());
+            assert_ok!(TwoMlsPqSession::from_archive(
+                archive,
+                fresh_identity_for(&bob_session)
+            ))
+        };
+        let bind = assert_some!(restored_bob.pq_take_pending_outbound());
+        // Alice holds Responding and cannot restore from an archive — she completes live.
+        assert_eq!(assert_ok!(alice_session.pq_ratchet_apply(bind)), b"pq-msg");
+    }
+
+    /// A.5 rekey markers hold no secrets and archive on both sides mid-round.
+    #[test]
+    fn test_archive_mid_rekey_round_completes_after_restore() {
+        let (alice, _bob, alice_session, bob_session) = establish_with_clients();
+        let kp = assert_ok!(alice_session.pq_bootstrap_begin(None));
+        assert_ok!(bob_session.pq_bootstrap_respond(kp));
+        let bind = assert_some!(bob_session.pq_take_pending_outbound());
+        assert_ok!(alice_session.pq_bootstrap_apply(bind));
+
+        // Bob holds the turn: he initiates the rekey, then archives mid-round.
+        let upd = assert_ok!(bob_session.pq_rekey_begin(None));
+        let restored_bob = round_trip(&bob_session, fresh_identity_for(&bob_session));
+
+        assert!(assert_ok!(alice_session.pq_rekey_respond(upd)).is_none());
+        // Alice archives mid-round too (RekeyResponded, parked reply survives).
+        let restored_alice = round_trip(&alice_session, alice);
+
+        let reply = assert_some!(restored_alice.pq_take_pending_outbound());
+        assert!(assert_ok!(restored_bob.pq_rekey_apply(reply)));
+        let fin = assert_some!(restored_bob.pq_take_pending_outbound());
+        assert!(!assert_ok!(restored_alice.pq_rekey_apply(fin)));
+    }
+
+    #[test]
+    fn test_archive_refused_mid_pq_round_and_staged_rotation() {
+        let (_alice, _bob, alice_session, bob_session) = establish_with_clients();
+        let kp = assert_ok!(alice_session.pq_bootstrap_begin(None));
+        assert_ok!(bob_session.pq_bootstrap_respond(kp));
+        let bind = assert_some!(bob_session.pq_take_pending_outbound());
+        assert_ok!(alice_session.pq_bootstrap_apply(bind));
+
+        // Initiating: the per-round KEM decapsulation key is unserializable by design.
+        let _ek = assert_ok!(bob_session.pq_ratchet_begin());
+        assert_err!(bob_session.archive(), TwoMlsPqError::SessionNotReady);
+
+        // A staged-but-uncommitted rotation holds a second identity.
+        let new_alice = make_client();
+        assert_ok!(alice_session.stage_rotation(new_alice));
+        assert_err!(alice_session.archive(), TwoMlsPqError::SessionNotReady);
+    }
+
+    #[test]
+    fn test_from_archive_rejects_wrong_client() {
+        let (_alice, bob, alice_session, _bob_session) = establish_with_clients();
+        let archive = assert_ok!(alice_session.archive());
+        assert_err!(
+            TwoMlsPqSession::from_archive(archive, bob),
+            TwoMlsPqError::ArchiveInvalid
+        );
+    }
+
+    #[test]
+    fn test_from_archive_rejects_malformed_bytes() {
+        let (alice, _bob, alice_session, _bob_session) = establish_with_clients();
+        let archive = assert_ok!(alice_session.archive());
+
+        // Wrong version byte.
+        let mut wrong_version = archive.bytes.clone();
+        wrong_version[0] ^= 0xFF;
+        assert_err!(
+            TwoMlsPqSession::from_archive(
+                crate::Archive {
+                    bytes: wrong_version
+                },
+                Arc::clone(&alice)
+            ),
+            TwoMlsPqError::ArchiveInvalid
+        );
+
+        // Truncated body.
+        let truncated = archive.bytes[..archive.bytes.len() - 1].to_vec();
+        assert_err!(
+            TwoMlsPqSession::from_archive(crate::Archive { bytes: truncated }, Arc::clone(&alice)),
+            TwoMlsPqError::ArchiveInvalid
+        );
+
+        // Trailing garbage.
+        let mut trailing = archive.bytes.clone();
+        trailing.push(0);
+        assert_err!(
+            TwoMlsPqSession::from_archive(crate::Archive { bytes: trailing }, alice),
+            TwoMlsPqError::ArchiveInvalid
+        );
     }
 
     #[test]
@@ -3301,10 +4038,6 @@ mod tests {
             b"world"
         );
     }
-
-    #[test]
-    #[ignore = "archive() is not yet implemented"]
-    fn test_archive_round_trips_session_state() {}
 
     #[test]
     fn test_psk_export_uses_correct_label_and_context() {
