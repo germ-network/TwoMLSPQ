@@ -10,13 +10,3 @@ scheduled work.
 
 Transport routing (`should_listen_on`, `send_rendezvous`, `forwarded`) — previously
 listed here — is implemented; see [Session Lifecycle](./session-lifecycle.md).
-
-Beyond the methods above, the roadmap includes:
-
-- **Classical-only session mode** — make the ML-KEM-768 half optional so a session can
-  run classical-only and upgrade to post-quantum later (needed for migrating existing
-  classical conversations).
-- **Legacy archive import** — a constructor that imports old classical group snapshots
-  from the previous app and emits a TwoMLSPQ archive.
-- **CommProtocol PQ suite** — adding the post-quantum suite at the routing layer so
-  TwoMLSPQ is reachable end-to-end.

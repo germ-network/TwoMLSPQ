@@ -51,8 +51,8 @@ The receiving side of a published key package — no live client required.
   from a remote initiator's welcome; rejects a repeat remote (`DuplicateWelcome`).
   `spawn_token` is an opaque, replay-stable identifier for the initial frame, keying
   the forward table.
-- `forward_group_id(spawn_token) -> Option<CombinerGroupId>` — resolve a replayed
-  initial frame to the spawned session's receive group.
+- `forward_group_id(spawn_token) -> Option<MlsGroupId>` — resolve a replayed
+  initial frame to the spawned session's receive group (its classical message-half id).
 - `hpke_open(kem_output, ciphertext, info, aad)` — decrypt data sealed to the
   invitation's key package (the initial routing-header pattern); the counterpart
   free function is `hpke_seal_to_key_package`.

@@ -92,7 +92,7 @@ fn demo_e2e_full_session() {
     assert!(alice_session.is_established() && bob_session.is_established());
     println!("[4] session established (both send + receive groups live; PSK chain bound)");
 
-    // Step 5 — partial commit (0x05): Alice -> Bob.
+    // Step 5 — routine round (0x05): Alice -> Bob (staples an Upd(self) proposal; no commit).
     assert_ok!(alice_session.prepare_to_encrypt(None));
     let enc = assert_ok!(alice_session.encrypt(b"hello bob".to_vec()));
     let got = assert_some!(assert_ok!(bob_session.process_incoming(enc.cipher_text)));
@@ -101,11 +101,12 @@ fn demo_e2e_full_session() {
         b"hello bob"
     );
     println!(
-        "[5] partial commit: alice -> bob \"hello bob\" (epoch {})",
+        "[5] routine round: alice -> bob \"hello bob\" (epoch {})",
         enc.epochs.classical_epoch
     );
 
-    // Step 6 — full commit (0x07): Bob proposes, Alice queues + commits with PSK refresh.
+    // Step 6 — full commit (send-group commit rides the 0x05 ratchet frame): Bob proposes,
+    // Alice queues + commits with PSK refresh.
     assert_ok!(bob_session.prepare_to_encrypt(None));
     let proposal = assert_ok!(bob_session.encrypt(b"bob update".to_vec()));
     let result = assert_some!(assert_ok!(
