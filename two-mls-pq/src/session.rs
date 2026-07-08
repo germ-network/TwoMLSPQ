@@ -1,6 +1,7 @@
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use mls_rs::{group::ReceivedMessage, MlsMessage};
+use mls_rs::{group::ReceivedMessage, GroupStateStorage, MlsMessage};
 
 #[cfg(not(feature = "cryptokit"))]
 use apq::create_group_with_member;
@@ -17,8 +18,8 @@ use crate::{
         ensure_pq_available, parse_mls_key_package, CombinerKeyPackage, TwoMlsPqClient,
     },
     AgentState, Archive, ClientId, CombinerGroupId, CommitResult, DecryptResult, EncryptResult,
-    ListenChannels, MlsGroupId, MlsSenderMessage, PrepareEncryptResult, RendezvousId, Result,
-    SessionId, TwoMlsPqDigest, TwoMlsPqError,
+    EpochRendezvous, ListenChannels, MlsGroupId, MlsSenderMessage, PrepareEncryptResult,
+    RendezvousId, Result, SessionId, TwoMlsPqDigest, TwoMlsPqError,
 };
 
 #[cfg(feature = "cryptokit")]
@@ -52,6 +53,13 @@ struct SessionInner {
     /// Whose move the PQ side-band is: the initiator owes the A.4 bootstrap; thereafter
     /// completing an operation passes the turn to the peer.
     pq_turn_mine: bool,
+    /// Per-epoch listen addresses derived from the send group's classical half
+    /// (`exportSecret("rendezvous", "TwoMLS", 32)` — the classical backend's convention).
+    /// Exporters are only derivable at the current epoch, so each value is captured when
+    /// its epoch is live: traffic posted at a prior epoch's address must still land.
+    /// Keyed by classical epoch; the window follows mls-rs's own epoch retention (see
+    /// `record_listen_rendezvous`) — current epoch + the prior epochs mls-rs retains.
+    listen_rendezvous: BTreeMap<u64, Vec<u8>>,
 }
 
 /// A TwoMLSPQ session holding two asymmetric Combiner send groups.
@@ -73,6 +81,12 @@ const PARTIAL_TAG: u8 = 0x05;
 // The acceptor staples its return APQWelcome onto its first app frame; the inner frame is an
 // ordinary tagged frame (0x05/0x07/0x03/raw). First round only — consumed after one send.
 const STAPLED_WELCOME_TAG: u8 = 0x09;
+// Rendezvous derivation, shared with the classical backend so both stacks address
+// transport channels the same way: exportSecret(label, context, 32) on a group's
+// classical half. Both members of a group derive identical values; outsiders cannot.
+const RENDEZVOUS_LABEL: &[u8] = b"rendezvous";
+const RENDEZVOUS_CONTEXT: &[u8] = b"TwoMLS";
+const RENDEZVOUS_LEN: usize = 32;
 // PQ ratchet (architecture-diagrams PR #2 §A.3), cryptokit only:
 // 0x0B carries the initiator's ML-KEM encapsulation key, 0x0D the responder's ciphertext,
 // 0x0F the bind = [pq partial-commit][classical commit][app], all length-prefixed.
@@ -253,6 +267,9 @@ impl TwoMlsPqSession {
         // Our operation is complete once the peer applies; the turn passes.
         inner.pq_turn_mine = false;
         inner.pending_pq_outbound = Some(encode_pq_bind(pq_commit, cl_commit, app_ct));
+        // The bind committed classically in our send group — capture the new
+        // epoch's listen address.
+        inner.record_listen_rendezvous()?;
         Ok(())
     }
 
@@ -367,6 +384,42 @@ fn sha256_digest(bytes: &[u8]) -> Result<TwoMlsPqDigest> {
 }
 
 impl SessionInner {
+    /// Capture the send group's classical-half rendezvous exporter at its current epoch.
+    /// Idempotent per epoch. Called wherever that epoch can advance — group creation,
+    /// the A.2/rotation commits in `prepare_to_encrypt`, the A.3 bind — and from
+    /// `should_listen_on` as a backstop.
+    ///
+    /// The listen window follows mls-rs's own epoch retention rather than a second,
+    /// invented knob: on each new epoch the group is flushed (`write_to_storage`,
+    /// which applies mls-rs's `max_epoch_retention` trim) and addresses whose epoch
+    /// the injected group-state storage no longer retains are dropped with it.
+    fn record_listen_rendezvous(&mut self) -> Result<()> {
+        let Some(send) = self.send_group.as_mut() else {
+            return Ok(());
+        };
+        let group = send.message_group();
+        let epoch = group.current_epoch();
+        if self.listen_rendezvous.contains_key(&epoch) {
+            return Ok(());
+        }
+        let secret = group
+            .export_secret(RENDEZVOUS_LABEL, RENDEZVOUS_CONTEXT, RENDEZVOUS_LEN)
+            .map_err(|_| TwoMlsPqError::Mls)?;
+        self.listen_rendezvous
+            .insert(epoch, secret.as_bytes().to_vec());
+
+        send.message_group_mut()
+            .write_to_storage()
+            .map_err(|_| TwoMlsPqError::Mls)?;
+        let group_id = send.message_group().group_id().to_vec();
+        // Read the storage handle we injected at client construction (clones share
+        // one map), not one pulled back off the session's group objects.
+        let storage = self.client.combiner().classical_group_storage();
+        self.listen_rendezvous
+            .retain(|&e, _| e == epoch || matches!(storage.epoch(&group_id, e), Ok(Some(_))));
+        Ok(())
+    }
+
     /// Transition `my_state` from `Pending { old, new }` to `Sync { new }`.
     /// Called when any message is successfully decrypted from the recv group,
     /// confirming the peer has processed our rotation commit.
@@ -561,6 +614,7 @@ fn build_session(
             },
             pq_turn_mine: initiated,
             pending_pq_outbound: None,
+            listen_rendezvous: BTreeMap::new(),
         }),
     })
 }
@@ -595,7 +649,7 @@ impl TwoMlsPqSession {
             client.combiner(),
         )?;
 
-        Ok(build_session(
+        let session = build_session(
             client,
             Some(send_group),
             None,
@@ -603,7 +657,9 @@ impl TwoMlsPqSession {
             session_id,
             their_id,
             true,
-        ))
+        );
+        session.lock().record_listen_rendezvous()?;
+        Ok(session)
     }
 
     /// Join a session from an APQWelcome produced by the remote `initiate`.
@@ -630,7 +686,7 @@ impl TwoMlsPqSession {
         )?;
         let apq_welcome = encode_apq_welcome(classical_welcome, Vec::new());
 
-        Ok(build_session(
+        let session = build_session(
             client,
             Some(send_group),
             Some(recv_group),
@@ -638,7 +694,9 @@ impl TwoMlsPqSession {
             session_id,
             their_id,
             false,
-        ))
+        );
+        session.lock().record_listen_rendezvous()?;
+        Ok(session)
     }
 
     /// Restore a session from a serialised archive.
@@ -828,10 +886,14 @@ impl TwoMlsPqSession {
     /// - Otherwise → recv self-Update only, `did_commit: false`
     pub fn prepare_to_encrypt(&self, proposing: Option<ClientId>) -> Result<PrepareEncryptResult> {
         let mut inner = self.lock();
-        if let Some(new_id) = proposing {
-            return inner.prepare_rotation(new_id);
-        }
-        inner.prepare_ratchet_commit()
+        let result = match proposing {
+            Some(new_id) => inner.prepare_rotation(new_id),
+            None => inner.prepare_ratchet_commit(),
+        }?;
+        // A committing round advanced the send group's classical epoch — capture
+        // the new epoch's listen address.
+        inner.record_listen_rendezvous()?;
+        Ok(result)
     }
 
     /// Encrypt `app_message` using the PQ send group.
@@ -1195,8 +1257,22 @@ impl TwoMlsPqSession {
         })
     }
 
+    /// Where to post outbound frames: the recv group's classical-half exporter at its
+    /// current epoch. The recv group *is* the peer's send group, so this value appears
+    /// in the peer's `should_listen_on` set. `None` until the recv group exists (the
+    /// initiator pre-return-welcome delivers via the invitation channel instead).
     pub fn send_rendezvous(&self) -> Result<Option<RendezvousId>> {
-        Err(TwoMlsPqError::SessionNotReady)
+        let inner = self.lock();
+        let Some(recv) = inner.recv_group.as_ref() else {
+            return Ok(None);
+        };
+        let secret = recv
+            .message_group()
+            .export_secret(RENDEZVOUS_LABEL, RENDEZVOUS_CONTEXT, RENDEZVOUS_LEN)
+            .map_err(|_| TwoMlsPqError::Mls)?;
+        Ok(Some(RendezvousId {
+            bytes: secret.as_bytes().to_vec(),
+        }))
     }
 
     pub fn archive(&self) -> Result<Archive> {
@@ -1246,8 +1322,45 @@ impl TwoMlsPqSession {
         Err(TwoMlsPqError::SessionNotReady)
     }
 
+    /// The combiner group ids and per-epoch rendezvous addresses the transport should
+    /// listen on. Addresses derive from the send group's classical half, one per
+    /// classical epoch, retained across epochs so traffic posted at a prior epoch's
+    /// address still lands. The peer derives its post address from its recv group —
+    /// the same MLS group — so the values align by construction.
     pub fn should_listen_on(&self) -> Result<ListenChannels> {
-        Err(TwoMlsPqError::SessionNotReady)
+        let mut inner = self.lock();
+        inner.record_listen_rendezvous()?;
+        let send = inner
+            .send_group
+            .as_ref()
+            .ok_or(TwoMlsPqError::SessionNotReady)?;
+        let send_group = CombinerGroupId {
+            classical: MlsGroupId {
+                bytes: send.classical.group_id().to_vec(),
+            },
+            // Empty until the deferred PQ half is bootstrapped (A.4).
+            pq: MlsGroupId {
+                bytes: send
+                    .pq
+                    .as_ref()
+                    .map(|pq| pq.group_id().to_vec())
+                    .unwrap_or_default(),
+            },
+        };
+        let rendezvous_by_epoch = inner
+            .listen_rendezvous
+            .iter()
+            .map(|(epoch, bytes)| EpochRendezvous {
+                epoch: *epoch,
+                rendezvous_id: RendezvousId {
+                    bytes: bytes.clone(),
+                },
+            })
+            .collect();
+        Ok(ListenChannels {
+            send_group,
+            rendezvous_by_epoch,
+        })
     }
 }
 
@@ -1367,6 +1480,182 @@ mod tests {
             alice_session.is_established(),
             "alice should be established"
         );
+    }
+
+    #[test]
+    fn test_routing_available_from_birth_post_after_establishment() {
+        let alice = make_client();
+        let bob = make_client();
+        let alice_kp = make_combiner_kp(&alice);
+        let bob_kp = make_combiner_kp(&bob);
+
+        // Initiator: listening works immediately (send group @ classical epoch 1);
+        // nowhere to post until the return welcome stands up the recv group.
+        let alice_s = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp));
+        let listen_a = assert_ok!(alice_s.should_listen_on());
+        assert!(!listen_a.send_group.classical.bytes.is_empty());
+        assert!(!listen_a.send_group.pq.bytes.is_empty());
+        assert_eq!(listen_a.rendezvous_by_epoch.len(), 1);
+        assert_eq!(listen_a.rendezvous_by_epoch[0].epoch, 1);
+        assert_eq!(
+            listen_a.rendezvous_by_epoch[0].rendezvous_id.bytes.len(),
+            32
+        );
+        assert!(assert_ok!(alice_s.send_rendezvous()).is_none());
+
+        // Acceptor: posts immediately — its recv group is the initiator's send
+        // group, so its post address is the initiator's listen address verbatim.
+        let welcome_a = assert_some!(alice_s.pending_outbound());
+        let bob_s = assert_ok!(TwoMlsPqSession::accept(bob, welcome_a, alice_kp));
+        let bob_post = assert_some!(assert_ok!(bob_s.send_rendezvous()));
+        assert_eq!(
+            bob_post.bytes,
+            listen_a.rendezvous_by_epoch[0].rendezvous_id.bytes
+        );
+        // The acceptor's own send group listens too — classical-only pre-A.4.
+        let listen_b = assert_ok!(bob_s.should_listen_on());
+        assert!(!listen_b.send_group.classical.bytes.is_empty());
+        assert!(listen_b.send_group.pq.bytes.is_empty());
+        assert_eq!(listen_b.rendezvous_by_epoch.len(), 1);
+
+        // Initiator joins in-band from the stapled return welcome and can post;
+        // its address is in the acceptor's listen set.
+        let welcome_b = assert_some!(bob_s.pending_outbound());
+        assert_ok!(alice_s.process_incoming(welcome_b));
+        let alice_post = assert_some!(assert_ok!(alice_s.send_rendezvous()));
+        assert!(listen_b
+            .rendezvous_by_epoch
+            .iter()
+            .any(|e| e.rendezvous_id.bytes == alice_post.bytes));
+    }
+
+    /// One approved A.2 round: `peer` staples an Upd(self); `committer` approves it and
+    /// its next send commits — advancing the committer's send-group classical epoch.
+    fn approved_commit_round(committer: &Arc<TwoMlsPqSession>, peer: &Arc<TwoMlsPqSession>) {
+        assert_ok!(peer.prepare_to_encrypt(None));
+        let upd = assert_ok!(peer.encrypt(b"upd".to_vec()));
+        let got = assert_some!(assert_ok!(committer.process_incoming(upd.cipher_text)));
+        let offered = assert_some!(got.proposal);
+        assert_ok!(committer.queue_proposal(offered.digest));
+        let prepared = assert_ok!(committer.prepare_to_encrypt(None));
+        assert!(prepared.did_commit);
+        let frame = assert_ok!(committer.encrypt(b"commit".to_vec()));
+        assert_some!(assert_ok!(peer.process_incoming(frame.cipher_text)));
+    }
+
+    #[test]
+    fn test_listen_window_follows_mls_rs_epoch_retention() {
+        let (alice, bob) = establish_sessions();
+        // Five committed rounds: alice's send group moves from epoch 1 to epoch 6.
+        for _ in 0..5 {
+            approved_commit_round(&alice, &bob);
+        }
+        let listen = assert_ok!(alice.should_listen_on());
+        let epochs: Vec<u64> = listen.rendezvous_by_epoch.iter().map(|e| e.epoch).collect();
+        // The window is NOT all six epochs — it follows the injected group-state
+        // storage's retention: current + mls-rs's retained prior epochs (mls-rs
+        // in-memory default max_epoch_retention = 3).
+        assert_eq!(epochs, vec![3, 4, 5, 6]);
+        // Bob's post address still lands inside the retained window.
+        let post = assert_some!(assert_ok!(bob.send_rendezvous()));
+        assert!(listen
+            .rendezvous_by_epoch
+            .iter()
+            .any(|e| e.rendezvous_id.bytes == post.bytes));
+    }
+
+    #[test]
+    fn test_commit_round_mints_new_listen_address_and_retains_old() {
+        let (alice, bob) = establish_sessions();
+        let listen_a0 = assert_ok!(alice.should_listen_on());
+        let bob_post0 = assert_some!(assert_ok!(bob.send_rendezvous()));
+
+        // Routine (non-committing) rounds don't move epochs or addresses.
+        assert_ok!(bob.prepare_to_encrypt(None));
+        let upd_frame = assert_ok!(bob.encrypt(b"upd".to_vec()));
+        let got = assert_some!(assert_ok!(alice.process_incoming(upd_frame.cipher_text)));
+        assert_eq!(
+            assert_ok!(alice.should_listen_on())
+                .rendezvous_by_epoch
+                .len(),
+            listen_a0.rendezvous_by_epoch.len()
+        );
+
+        // Full A.2 round: alice approves bob's stapled Upd; her next send commits
+        // it, advancing her send group's classical epoch and minting a new address.
+        let offered = assert_some!(got.proposal);
+        assert_ok!(alice.queue_proposal(offered.digest));
+        let prepared = assert_ok!(alice.prepare_to_encrypt(None));
+        assert!(prepared.did_commit);
+        let commit_frame = assert_ok!(alice.encrypt(b"commit".to_vec()));
+
+        let listen_a1 = assert_ok!(alice.should_listen_on());
+        assert_eq!(
+            listen_a1.rendezvous_by_epoch.len(),
+            listen_a0.rendezvous_by_epoch.len() + 1
+        );
+
+        // Bob applies the commit: his post address migrates to the new epoch's
+        // channel — present in alice's set — while the old address stays listed.
+        assert_some!(assert_ok!(bob.process_incoming(commit_frame.cipher_text)));
+        let bob_post1 = assert_some!(assert_ok!(bob.send_rendezvous()));
+        assert_ne!(bob_post1.bytes, bob_post0.bytes);
+        assert!(listen_a1
+            .rendezvous_by_epoch
+            .iter()
+            .any(|e| e.rendezvous_id.bytes == bob_post1.bytes));
+        assert!(listen_a1
+            .rendezvous_by_epoch
+            .iter()
+            .any(|e| e.rendezvous_id.bytes == bob_post0.bytes));
+    }
+
+    #[test]
+    #[cfg(feature = "cryptokit")]
+    fn test_pq_ratchet_bind_mints_new_listen_address() {
+        let (alice, bob) = establish_sessions();
+        let before = assert_ok!(alice.should_listen_on())
+            .rendezvous_by_epoch
+            .len();
+
+        // A.3: the bind's classical commit advances alice's send-group epoch.
+        let ek = assert_ok!(alice.pq_ratchet_begin());
+        assert_ok!(bob.pq_ratchet_respond(ek));
+        let ct = assert_some!(bob.pq_take_pending_outbound());
+        assert_ok!(alice.pq_ratchet_bind(ct, b"bind".to_vec()));
+        let listen_a = assert_ok!(alice.should_listen_on());
+        assert_eq!(listen_a.rendezvous_by_epoch.len(), before + 1);
+
+        // Bob applies the bind; his post address lands on the new epoch's channel.
+        let bind = assert_some!(alice.pq_take_pending_outbound());
+        assert_eq!(assert_ok!(bob.pq_ratchet_apply(bind)), b"bind");
+        let bob_post = assert_some!(assert_ok!(bob.send_rendezvous()));
+        assert!(listen_a
+            .rendezvous_by_epoch
+            .iter()
+            .any(|e| e.rendezvous_id.bytes == bob_post.bytes));
+    }
+
+    #[test]
+    #[cfg(feature = "cryptokit")]
+    fn test_a4_bootstrap_mints_no_listen_addresses_but_advertises_pq_id() {
+        let (alice, bob) = establish_sessions();
+        let bob_before = assert_ok!(bob.should_listen_on());
+        assert!(bob_before.send_group.pq.bytes.is_empty());
+
+        let kp = assert_ok!(alice.pq_bootstrap_begin());
+        assert_ok!(bob.pq_bootstrap_respond(kp));
+        let bind = assert_some!(bob.pq_take_pending_outbound());
+        assert_ok!(alice.pq_bootstrap_apply(bind));
+
+        // A.4 is PQ-groups-only: no classical commit, no new listen addresses —
+        // but the acceptor's send group now advertises its PQ half.
+        let bob_after = assert_ok!(bob.should_listen_on());
+        assert_eq!(
+            bob_after.rendezvous_by_epoch.len(),
+            bob_before.rendezvous_by_epoch.len()
+        );
+        assert!(!bob_after.send_group.pq.bytes.is_empty());
     }
 
     #[test]
@@ -1704,20 +1993,26 @@ mod tests {
     }
 
     #[test]
-    fn test_send_rendezvous_returns_session_not_ready() {
-        let (alice_session, _) = establish_sessions();
-        assert_err!(
-            alice_session.send_rendezvous(),
-            TwoMlsPqError::SessionNotReady
-        );
+    fn test_send_rendezvous_none_without_recv_group() {
+        let alice = make_client();
+        let bob = make_client();
+        let bob_kp = make_combiner_kp(&bob);
+        // Initiator pre-return-welcome: no recv group, nowhere to post.
+        let session = assert_ok!(TwoMlsPqSession::initiate(alice, bob_kp));
+        assert!(assert_ok!(session.send_rendezvous()).is_none());
     }
 
     #[test]
-    fn test_should_listen_on_returns_session_not_ready() {
-        let (alice_session, _) = establish_sessions();
-        assert_err!(
-            alice_session.should_listen_on(),
-            TwoMlsPqError::SessionNotReady
+    fn test_should_listen_on_derivation_is_shared_not_random() {
+        // Both members of the same group derive the same address independently:
+        // alice's listen address at epoch 1 equals bob's post address, computed
+        // from each side's own group state.
+        let (alice_session, bob_session) = establish_sessions();
+        let listen = assert_ok!(alice_session.should_listen_on());
+        let post = assert_some!(assert_ok!(bob_session.send_rendezvous()));
+        assert_eq!(
+            listen.rendezvous_by_epoch[0].rendezvous_id.bytes,
+            post.bytes
         );
     }
 
@@ -2042,16 +2337,8 @@ mod tests {
     fn test_archive_round_trips_session_state() {}
 
     #[test]
-    #[ignore = "should_listen_on() is not yet implemented"]
-    fn test_should_listen_on_returns_correct_group_and_epochs() {}
-
-    #[test]
     #[ignore = "forwarded() is not yet implemented"]
     fn test_forwarded_decrypts_inner_payload() {}
-
-    #[test]
-    #[ignore = "send_rendezvous() is not yet implemented"]
-    fn test_send_rendezvous_returns_current_epoch_channel() {}
 
     #[test]
     fn test_psk_export_uses_correct_label_and_context() {
