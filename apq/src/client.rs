@@ -54,6 +54,21 @@ impl ApqMode {
     }
 }
 
+/// An archived signing identity for [`CombinerClient::from_key_packages`]: the ClientId
+/// plus each half's signing key and key-package store. Named fields on purpose — the
+/// former five-positional-argument form let the two signing keys (or the two stores,
+/// both same-typed) be transposed without a type error.
+pub struct ArchivedIdentity<S> {
+    /// Opaque identity bytes (the Basic Credential).
+    pub client_id: Vec<u8>,
+    pub classical_signing_key: Zeroizing<Vec<u8>>,
+    /// Pass an empty store for a bare identity restore, or one preloaded with this
+    /// identity's key package(s) to make a receiving (invitation) client.
+    pub classical_kp_store: S,
+    pub pq_signing_key: Zeroizing<Vec<u8>>,
+    pub pq_kp_store: S,
+}
+
 /// The injected crypto providers and APQ mode for a [`CombinerClient`]: `classical` backs
 /// the classical half (must supply `CURVE25519_CHACHA`), `pq` backs the PQ half (must
 /// supply the mode's PQ suite). One concrete provider type may serve both roles (aws-lc
@@ -189,19 +204,20 @@ where
         })
     }
 
-    /// Restore a `CombinerClient` from an archived signing identity (ClientId + each half's
-    /// signing key), installing the caller-provided key-package store(s). Pass empty stores
-    /// for a bare identity restore, or stores preloaded with this identity's key package(s)
-    /// to make a receiving (invitation) client whose join can find them. Public keys are
-    /// re-derived from the signing keys — each half through its own suite's provider.
+    /// Restore a `CombinerClient` from an [`ArchivedIdentity`] (ClientId + each half's
+    /// signing key and key-package store). Public keys are re-derived from the signing
+    /// keys — each half through its own suite's provider.
     pub fn from_key_packages(
-        client_id: Vec<u8>,
-        classical_signing_key: Zeroizing<Vec<u8>>,
-        classical_kp_store: S,
-        pq_signing_key: Zeroizing<Vec<u8>>,
-        pq_kp_store: S,
+        identity: ArchivedIdentity<S>,
         crypto: CryptoConfig<C, P>,
     ) -> Result<Self> {
+        let ArchivedIdentity {
+            client_id,
+            classical_signing_key,
+            classical_kp_store,
+            pq_signing_key,
+            pq_kp_store,
+        } = identity;
         let classical_cs = crypto
             .classical
             .cipher_suite_provider(CLASSICAL_SUITE)

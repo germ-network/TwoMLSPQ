@@ -1,8 +1,11 @@
 //! AEAD sealing for session archives. The caller supplies the cipher-suite provider that
 //! runs the AEAD (a *classical* suite — the canonical choice is `CURVE25519_CHACHA`) and a
 //! key of that suite's AEAD key size (held by the platform keystore); the sealed blob is
-//! `nonce || AEAD(key, plaintext, aad = ARCHIVE_AAD)`. The blob format is provider-
-//! independent: any provider implementing the same suite opens another's blobs.
+//! `nonce || AEAD(key, plaintext, aad = ARCHIVE_AAD || u16-BE suite)`. The AAD binds the
+//! sealing suite, so a blob only opens under the suite that sealed it — a suite mismatch
+//! fails authentication instead of silently attempting a cross-suite open. The blob
+//! format is provider-independent: any provider implementing the same suite opens
+//! another's blobs.
 //!
 //! Sealing is independent of the combiner construction, so it lives beside the storage
 //! provider rather than in the session layer.
@@ -13,6 +16,14 @@ use zeroize::Zeroizing;
 use crate::{CombinerError, Result};
 
 const ARCHIVE_AAD: &[u8] = b"twomlspq-archive-v1";
+
+/// The AAD for one seal/open: the domain tag plus the sealing suite's u16 value, so the
+/// suite is authenticated into the blob.
+fn archive_aad<CS: CipherSuiteProvider>(cs: &CS) -> Vec<u8> {
+    let mut aad = ARCHIVE_AAD.to_vec();
+    aad.extend_from_slice(&u16::from(cs.cipher_suite()).to_be_bytes());
+    aad
+}
 
 /// Length of the caller-supplied sealing key for the canonical `CURVE25519_CHACHA` suite
 /// (ChaCha20-Poly1305 key size). `seal`/`open` validate against the supplied suite's actual
@@ -32,7 +43,7 @@ pub fn seal<CS: CipherSuiteProvider>(
     let mut out = vec![0u8; n];
     cs.random_bytes(&mut out).map_err(|_| CombinerError::Mls)?;
     let ct = cs
-        .aead_seal(seal_key, plaintext, Some(ARCHIVE_AAD), &out)
+        .aead_seal(seal_key, plaintext, Some(&archive_aad(cs)), &out)
         .map_err(|_| CombinerError::Mls)?;
     out.reserve_exact(ct.len());
     out.extend_from_slice(&ct);
@@ -55,7 +66,7 @@ pub fn open<CS: CipherSuiteProvider>(
         return Err(CombinerError::ArchiveInvalid);
     }
     let (nonce, ct) = blob.split_at(n);
-    cs.aead_open(seal_key, ct, Some(ARCHIVE_AAD), nonce)
+    cs.aead_open(seal_key, ct, Some(&archive_aad(cs)), nonce)
         .map_err(|_| CombinerError::DecryptionFailed)
 }
 
@@ -104,5 +115,28 @@ mod tests {
     #[test]
     fn test_seal_rejects_wrong_key_length() {
         assert!(seal(&suite(), &[0u8; 16], b"x").is_err());
+    }
+
+    #[test]
+    fn test_open_under_different_suite_fails() {
+        // CURVE25519_AES128 and P256_AES128 share the AEAD (AES-128-GCM) and key size, so
+        // without the suite bound into the AAD this cross-suite open would SUCCEED.
+        let seal_cs = AwsLcCryptoProvider::new()
+            .cipher_suite_provider(mls_rs::CipherSuite::CURVE25519_AES128)
+            .unwrap();
+        let open_cs = AwsLcCryptoProvider::new()
+            .cipher_suite_provider(mls_rs::CipherSuite::P256_AES128)
+            .unwrap();
+        let key = vec![7u8; seal_cs.aead_key_size()];
+        let blob = seal(&seal_cs, &key, b"suite-bound").unwrap();
+        assert!(matches!(
+            open(&open_cs, &key, &blob),
+            Err(CombinerError::DecryptionFailed)
+        ));
+        // Same suite still opens.
+        assert_eq!(
+            open(&seal_cs, &key, &blob).unwrap().to_vec(),
+            b"suite-bound"
+        );
     }
 }

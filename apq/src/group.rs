@@ -564,11 +564,13 @@ mod tests {
         drop(bob);
 
         let bob2 = TestClient::from_key_packages(
-            bob_id,
-            bob_classical_key,
-            Default::default(),
-            bob_pq_key,
-            Default::default(),
+            crate::ArchivedIdentity {
+                client_id: bob_id,
+                classical_signing_key: bob_classical_key,
+                classical_kp_store: Default::default(),
+                pq_signing_key: bob_pq_key,
+                pq_kp_store: Default::default(),
+            },
             crypto(),
         )
         .unwrap();

@@ -36,7 +36,9 @@ pub fn version() -> String {
 // v2 (2026-07-07): TwoMlsPqDigest removed — digests are raw 32-byte SHA-256 values
 // (`Vec<u8>` fields on PrepareEncryptResult / QueuedRemoteProposal and in the
 // queue_proposal / proposal_context signatures).
-const BINDING_CONTRACT_VERSION: u64 = 2;
+// v3 (2026-07-07): TwoMlsPqError gained `UnsupportedCipherSuite` (an injected crypto
+// provider cannot supply a required cipher suite; surfaces at client construction).
+const BINDING_CONTRACT_VERSION: u64 = 3;
 
 /// See `BINDING_CONTRACT_VERSION`. Exported so the Swift layer can verify the
 /// binding it was generated with matches the binary it loaded.
@@ -290,6 +292,11 @@ pub enum TwoMlsPqError {
     ArchiveInvalid,
     #[error("welcome already consumed for this remote")]
     DuplicateWelcome,
+    /// The build's crypto provider cannot supply a required cipher suite — a build or
+    /// provider-configuration bug caught at client construction (see
+    /// `two-mls-pq/src/providers.rs`), never a runtime condition of a healthy binary.
+    #[error("crypto provider does not support the required cipher suite")]
+    UnsupportedCipherSuite,
 }
 
 /// SHA-256 over `bytes` — the single hashing primitive behind every digest this
@@ -334,11 +341,7 @@ impl From<apq::CombinerError> for TwoMlsPqError {
             apq::CombinerError::MissingWelcome => TwoMlsPqError::MissingWelcome,
             apq::CombinerError::DecryptionFailed => TwoMlsPqError::DecryptionFailed,
             apq::CombinerError::ArchiveInvalid => TwoMlsPqError::ArchiveInvalid,
-            // A provider that cannot supply a required cipher suite is a build/provider
-            // configuration bug caught at client construction — unreachable in a correctly
-            // built binary (providers.rs pins matching providers). Folded into `Mls`
-            // rather than growing the FFI error enum (a binding-contract shape change).
-            apq::CombinerError::UnsupportedCipherSuite => TwoMlsPqError::Mls,
+            apq::CombinerError::UnsupportedCipherSuite => TwoMlsPqError::UnsupportedCipherSuite,
         }
     }
 }

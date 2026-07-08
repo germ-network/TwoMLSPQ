@@ -182,11 +182,15 @@ pub(crate) fn generate_combiner_invitation(client: &CombinerClient) -> Result<Co
 /// so a subsequent join/`accept` finds it.
 pub(crate) fn combiner_from_invitation(inv: &CombinerInvitation) -> Result<CombinerClient> {
     apq::CombinerClient::from_key_packages(
-        inv.client_id.clone(),
-        inv.classical_signing_key.clone(),
-        SyntheticKeyPackageStore::for_invitation([inv.classical_kpd.clone()]),
-        inv.pq_signing_key.clone(),
-        SyntheticKeyPackageStore::for_invitation([inv.pq_kpd.clone()]),
+        apq::ArchivedIdentity {
+            client_id: inv.client_id.clone(),
+            classical_signing_key: inv.classical_signing_key.clone(),
+            classical_kp_store: SyntheticKeyPackageStore::for_invitation([inv
+                .classical_kpd
+                .clone()]),
+            pq_signing_key: inv.pq_signing_key.clone(),
+            pq_kp_store: SyntheticKeyPackageStore::for_invitation([inv.pq_kpd.clone()]),
+        },
         crate::providers::crypto_config(),
     )
     .map_err(Into::into)

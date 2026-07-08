@@ -25,7 +25,8 @@ pub mod pq_ratchet;
 pub mod storage;
 
 pub use client::{
-    ApqMode, CombinerClient, CryptoConfig, MlsClient, OurConfig, PqConfig, PqMlsClient,
+    ApqMode, ArchivedIdentity, CombinerClient, CryptoConfig, MlsClient, OurConfig, PqConfig,
+    PqMlsClient,
 };
 
 pub use group::{
