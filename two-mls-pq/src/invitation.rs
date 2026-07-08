@@ -25,13 +25,10 @@ const INVITATION_VERSION: u8 = 2;
 /// app's combined-welcome digest, but any replay-stable byte string works).
 pub(crate) type SpawnedGroups = BTreeMap<Vec<u8>, Vec<u8>>;
 
-// Tags whether the PQ half is real ML-KEM (`cryptokit`) or a classical simulation (default
-// build). Baked into the archive so a mismatched build fails loudly at decode rather than
-// silently misinterpreting the PQ signing key / key package.
-#[cfg(feature = "cryptokit")]
+// Tags the PQ half as real ML-KEM. Mode 0 was the retired simulated-PQ build (classical
+// placeholder half); its archives are rejected at decode. Kept as a header byte so any
+// future PQ-mode change (e.g. conf+auth) still fails loudly across builds.
 const PQ_MODE: u8 = 1;
-#[cfg(not(feature = "cryptokit"))]
-const PQ_MODE: u8 = 0;
 
 // In its own module because the derive-generated impls reference the std `Result`, which the
 // crate-local `Result` alias imported above would shadow.
@@ -41,9 +38,8 @@ mod wire {
 
     use crate::key_package_store::KeyPackageSecret;
 
-    /// A self-contained combiner invitation. The two halves' signing keys and key packages are
-    /// always present; under the default build (no real PQ) the PQ half mirrors the classical
-    /// one, so the archive shape is uniform across builds (distinguished by `PQ_MODE`).
+    /// A self-contained combiner invitation. The two halves' signing keys and key packages
+    /// are always present (distinguished by the `PQ_MODE` header byte).
     ///
     /// The derived codec embeds each `KeyPackageData` via its own canonical MLS encoding — no
     /// field-by-field surgery, so it stays correct if mls-rs evolves the (non_exhaustive) struct.
@@ -162,23 +158,12 @@ pub(crate) fn generate_combiner_invitation(client: &CombinerClient) -> Result<Co
         client.generate_classical_key_package()
     })?;
 
-    #[cfg(feature = "cryptokit")]
     let ((pq_public, pq_kpd), pq_signing_key) = (
         capture(client.pq_kp_store(), || client.generate_pq_key_package())?,
         Zeroizing::new(client.pq_signing_key().to_vec()),
     );
-    // Without real PQ, the PQ half is a second classical key package on the classical
-    // client, and the PQ signing key mirrors the classical one.
-    #[cfg(not(feature = "cryptokit"))]
-    let ((pq_public, pq_kpd), pq_signing_key) = (
-        capture(client.classical_kp_store(), || {
-            client.generate_classical_key_package()
-        })?,
-        Zeroizing::new(client.classical_signing_key().to_vec()),
-    );
 
     client.classical_kp_store().purge_all();
-    #[cfg(feature = "cryptokit")]
     client.pq_kp_store().purge_all();
 
     Ok(CombinerInvitation {
@@ -196,23 +181,19 @@ pub(crate) fn generate_combiner_invitation(client: &CombinerClient) -> Result<Co
 /// preload each half's key-package store with the invitation's captured `KeyPackageData`,
 /// so a subsequent join/`accept` finds it.
 pub(crate) fn combiner_from_invitation(inv: &CombinerInvitation) -> Result<CombinerClient> {
-    // With real PQ each half serves its own KP; otherwise the classical store serves both
-    // (the simulated PQ half is a classical key package on the classical client).
-    #[cfg(feature = "cryptokit")]
-    let client = apq::CombinerClient::from_key_packages(
-        inv.client_id.clone(),
-        inv.classical_signing_key.clone(),
-        SyntheticKeyPackageStore::for_invitation([inv.classical_kpd.clone()]),
-        inv.pq_signing_key.clone(),
-        SyntheticKeyPackageStore::for_invitation([inv.pq_kpd.clone()]),
-    )?;
-    #[cfg(not(feature = "cryptokit"))]
-    let client = apq::CombinerClient::from_key_packages(
-        inv.client_id.clone(),
-        inv.classical_signing_key.clone(),
-        SyntheticKeyPackageStore::for_invitation([inv.classical_kpd.clone(), inv.pq_kpd.clone()]),
-    )?;
-    Ok(client)
+    apq::CombinerClient::from_key_packages(
+        apq::ArchivedIdentity {
+            client_id: inv.client_id.clone(),
+            classical_signing_key: inv.classical_signing_key.clone(),
+            classical_kp_store: SyntheticKeyPackageStore::for_invitation([inv
+                .classical_kpd
+                .clone()]),
+            pq_signing_key: inv.pq_signing_key.clone(),
+            pq_kp_store: SyntheticKeyPackageStore::for_invitation([inv.pq_kpd.clone()]),
+        },
+        crate::providers::crypto_config(),
+    )
+    .map_err(Into::into)
 }
 
 /// Run a key-package generation while capturing, returning the public bytes plus the single

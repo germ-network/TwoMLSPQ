@@ -35,13 +35,15 @@ use mls_rs::KeyPackageStorage;
 /// A captured (storage id, private key package) pair.
 pub(crate) type KeyPackageSecret = (Vec<u8>, KeyPackageData);
 
-/// The generic `apq` combiner specialised to the synthetic (capture/serve) store.
-pub(crate) type CombinerClient = apq::CombinerClient<SyntheticKeyPackageStore>;
-pub(crate) type CombinerGroup = apq::CombinerGroup<SyntheticKeyPackageStore>;
-pub(crate) type MlsClient = apq::MlsClient<SyntheticKeyPackageStore>;
-pub(crate) type MlsGroup = apq::MlsGroup<SyntheticKeyPackageStore>;
-#[cfg(feature = "cryptokit")]
-pub(crate) type PqMlsClient = apq::PqMlsClient<SyntheticKeyPackageStore>;
+use crate::providers::{Classical, Pq};
+
+/// The generic `apq` combiner specialised to the synthetic (capture/serve) store and the
+/// build's pinned crypto providers (see `crate::providers`).
+pub(crate) type CombinerClient = apq::CombinerClient<SyntheticKeyPackageStore, Classical, Pq>;
+pub(crate) type CombinerGroup = apq::CombinerGroup<SyntheticKeyPackageStore, Classical, Pq>;
+pub(crate) type MlsClient = apq::MlsClient<SyntheticKeyPackageStore, Classical>;
+pub(crate) type MlsGroup = apq::MlsGroup<SyntheticKeyPackageStore, Classical>;
+pub(crate) type PqMlsClient = apq::PqMlsClient<SyntheticKeyPackageStore, Pq>;
 
 #[derive(Clone, Default)]
 pub struct SyntheticKeyPackageStore {

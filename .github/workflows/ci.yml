@@ -11,7 +11,10 @@ on:
       - ".cargo/**"
       - "deny.toml"
       - ".github/workflows/ci.yml"
+      - "two-mls-pq/book/**"
   pull_request:
+  # Manual runs, so a branch can get a full CI pass before a PR exists.
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -48,25 +51,50 @@ jobs:
       - name: Check Rust formatting
         run: cargo fmt --all -- --check
 
-      # `cryptokit` is Apple-only (linted/tested in the macos-cryptokit job); on Linux we
-      # lint every other feature. `--features benchmark_util` keeps the default `rustcrypto`
-      # plus the bench targets while leaving `cryptokit` off.
-      - name: Clippy
-        run: cargo clippy --all-targets --features benchmark_util -- -D warnings
+      # aws-lc is the portable provider (both halves, real ML-KEM-768); `cryptokit` is
+      # Apple-only and linted/tested in the macos-cryptokit job.
+      - name: Clippy (awslc)
+        run: cargo clippy --all-targets --features awslc,benchmark_util -- -D warnings
 
-      # The `cryptokit` feature must not build off-Apple (guarded by a compile_error! in the
-      # crate). Assert the build fails, so a regression that makes it build on Linux is
-      # caught here rather than silently "working".
+      # The `cryptokit` feature must not build off-Apple (guarded by a compile_error! in
+      # providers.rs). Assert the build fails, so a regression that makes it build on
+      # Linux is caught here rather than silently "working".
       - name: cryptokit must not build on Linux (expected failure)
         run: |
-          if cargo build -p two-mls-pq --no-default-features --features cryptokit 2>/dev/null; then
+          if cargo build -p two-mls-pq --features cryptokit 2>/dev/null; then
             echo "::error::cryptokit unexpectedly built on Linux; it is Apple-only"
             exit 1
           fi
           echo "cryptokit correctly fails to build on Linux"
 
-      - name: Clippy (default features / rustcrypto, no cryptokit)
-        run: cargo clippy --all-targets --no-default-features --features rustcrypto -- -D warnings
+      # No provider feature selected must fail loudly (providers.rs compile_error!), so a
+      # consumer that forgets to pick one gets the intended diagnosis.
+      - name: no-provider build must fail (expected failure)
+        run: |
+          if cargo build -p two-mls-pq 2>/dev/null; then
+            echo "::error::two-mls-pq unexpectedly built without a crypto provider feature"
+            exit 1
+          fi
+          echo "no-provider build correctly fails"
+
+      # apq itself is provider-free: it must build and lint with no provider anywhere.
+      - name: Clippy (apq, no providers)
+        run: cargo clippy -p apq --all-targets -- -D warnings
+
+  book:
+    name: Book
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install mdbook
+        run: |
+          curl -fsSL https://github.com/rust-lang/mdBook/releases/download/v0.4.40/mdbook-v0.4.40-x86_64-unknown-linux-gnu.tar.gz \
+            | tar -xz -C /usr/local/bin
+          chmod +x /usr/local/bin/mdbook
+
+      - name: Build book
+        run: mdbook build two-mls-pq/book
 
   deny:
     name: Deny
@@ -99,13 +127,10 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml') }}
 
-      # `cryptokit` is Apple-only; the macos-cryptokit job runs the real ML-KEM-768 tests.
-      # Here we run everything else (default `rustcrypto` + bench fixtures).
-      - name: Test
-        run: cargo test --features benchmark_util
-
-      - name: Test (default features / rustcrypto, no cryptokit)
-        run: cargo test --no-default-features --features rustcrypto
+      # The FULL suite — including every PQ (ML-KEM-768) path — on the portable aws-lc
+      # provider. The macos-cryptokit job runs the same suite on Apple CryptoKit.
+      - name: Test (awslc)
+        run: cargo test --features awslc,benchmark_util
 
   bindgen-check:
     name: UniFFI bindgen check
@@ -125,8 +150,10 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml') }}
 
-      - name: Build two-mls-pq (default features)
-        run: cargo build --package two-mls-pq
+      # awslc here: the UniFFI surface is provider-independent, and macos-latest may lag
+      # behind the macOS 26 SDK the cryptokit bridge needs (see macos-cryptokit).
+      - name: Build two-mls-pq (awslc)
+        run: cargo build -p two-mls-pq --features awslc
 
       - name: Run uniffi-bindgen (swift)
         run: |
@@ -137,7 +164,7 @@ jobs:
             --out-dir /tmp/bindings
 
   msrv:
-    name: MSRV (1.85, default features)
+    name: MSRV (1.85, awslc)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -154,10 +181,10 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-msrv-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml') }}
 
-      # Default (rustcrypto) only: avoids the awslc native build, which is heavy and not the MSRV
-      # surface we care about. Catches accidental use of newer-than-1.85 language/stdlib features.
-      - name: cargo check (rustcrypto, no cryptokit)
-        run: cargo check --no-default-features --features rustcrypto
+      # Catches accidental use of newer-than-1.85 language/stdlib features across both
+      # crates and the aws-lc dependency subtree (whose tightest member pins exactly 1.85).
+      - name: cargo check (awslc)
+        run: cargo check --features awslc
 
   macos-cryptokit:
     name: CryptoKit (macOS)
@@ -179,8 +206,28 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-cryptokit-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml') }}
 
-      - name: Clippy (cryptokit)
-        run: cargo clippy -p two-mls-pq --all-targets --features cryptokit -- -D warnings
+      # --all-features also proves the cryptokit-beats-awslc precedence in providers.rs
+      # (the combination a dev's `just lint` uses on an Apple machine).
+      - name: Clippy (all features)
+        run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Test (cryptokit)
         run: cargo test -p two-mls-pq --features cryptokit
+
+      # Both provider flags in one build: providers.rs resolves the dual-feature build to
+      # CryptoKit (the precedence a dev's --all-features hits), and the tests must still
+      # pass under it — not merely compile.
+      - name: Test (dual-provider build, cryptokit precedence)
+        run: cargo test -p two-mls-pq --features cryptokit,awslc
+
+      - name: Test (apq)
+        run: cargo test -p apq --lib
+
+      # CryptoKit ↔ awslc interop as its own gate: raw ML-KEM encap/decap, mixed-provider
+      # MLS groups, archive blobs, the HPKE envelope, and — since the generic
+      # CombinerClient lets one binary instantiate both provider stacks, no harness —
+      # full cross-provider combiner sessions (establishment, APQ-PSK bind, messaging)
+      # plus an A.3 PQ ratchet round, all in both directions. This is what keeps a
+      # Linux/awslc peer wire-compatible with an Apple/CryptoKit peer.
+      - name: Cross-provider interop (cryptokit <-> awslc)
+        run: cargo test -p apq --test provider_interop

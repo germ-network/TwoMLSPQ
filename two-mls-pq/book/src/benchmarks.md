@@ -3,11 +3,11 @@
 Criterion benchmarks live in `benches/`, gated behind the `benchmark_util` feature.
 
 ```sh
-# Simulated PQ half (RustCrypto) — measures Combiner-machinery overhead
+# Real ML-KEM-768 on aws-lc (any platform)
 just bench
-# or: cargo bench -p two-mls-pq --features benchmark_util
+# or: cargo bench -p two-mls-pq --features "benchmark_util awslc"
 
-# Real ML-KEM-768 (AWS-LC, macOS)
+# Real ML-KEM-768 on Apple CryptoKit (macOS 26+)
 just bench-pq
 # or: cargo bench -p two-mls-pq --features "benchmark_util cryptokit"
 ```
@@ -25,8 +25,8 @@ open target/criterion/report/index.html   # macOS
 
 `target/` is gitignored, so reports stay local.
 
-`BenchmarkId`s are labelled with the active suite (`simulated` vs `ml_kem_768`) so the
-two runs are distinguishable in reports.
+`BenchmarkId`s are labelled with the active suite and provider (`ml_kem_768/awslc` vs
+`ml_kem_768/cryptokit`) so the two runs are distinguishable in reports.
 
 ## Groups
 

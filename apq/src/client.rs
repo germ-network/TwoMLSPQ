@@ -1,9 +1,9 @@
 //! MLS client plumbing for the combiner: cipher-suite configs, the client builder, and the
-//! `CombinerClient` that holds the agent identity and the classical (+ optional PQ) MLS
-//! clients. The key-package storage type `S` is a parameter — exactly as mls-rs's own
-//! `Client<C>` is generic over its config — so the concrete store (e.g. the capture/serve
-//! store used to build invitations) is chosen by the caller (`two-mls-pq`), keeping `apq`
-//! store-agnostic.
+//! `CombinerClient` that holds the agent identity and the two MLS clients. The key-package
+//! storage type `S` is a parameter — exactly as mls-rs's own `Client<C>` is generic over its
+//! config — and so are the crypto providers: `C` backs the classical half, `P` the PQ half.
+//! The concrete store and providers are chosen by the caller (`two-mls-pq`), keeping `apq`
+//! store- and provider-agnostic.
 
 use mls_rs::{
     client::Client,
@@ -15,127 +15,180 @@ use mls_rs::{
         basic::{BasicCredential, BasicIdentityProvider},
         SigningIdentity,
     },
-    CipherSuiteProvider, CryptoProvider, ExtensionList, KeyPackageStorage,
+    CipherSuite, CipherSuiteProvider, CryptoProvider, ExtensionList, KeyPackageStorage,
 };
-use mls_rs_crypto_rustcrypto::RustCryptoProvider;
-
-#[cfg(feature = "cryptokit")]
-use mls_rs_crypto_cryptokit::CryptoKitMlKemProvider;
 use zeroize::Zeroizing;
 
 use crate::storage::PersistableGroupStorage;
 use crate::{CombinerError, Result};
 
-/// ML-KEM-768 cipher suite value (0xFDEA, FIPS 203) in the MLS private-use range.
-#[cfg(feature = "cryptokit")]
+/// ML-KEM-768 cipher suite value (0xFDEA, FIPS 203) in the MLS private-use range. Every PQ
+/// provider must implement the suite under this exact value (CryptoKit and aws-lc agree).
 const ML_KEM_768: u16 = 0xFDEA;
+
+/// The classical half's cipher suite.
+const CLASSICAL_SUITE: CipherSuite = CipherSuite::CURVE25519_CHACHA;
+
+/// Which APQ variant the PQ half runs (draft-ietf-mls-combiner). The mode selects the PQ
+/// group's cipher suite, and with it the PQ half's signature scheme.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ApqMode {
+    /// APQ confidentiality-only: ML-KEM-768 for the PQ group with classical (Ed25519)
+    /// signing keys in both groups.
+    ///
+    /// The draft's confidentiality + authentication variant (PQ signing keys for the PQ
+    /// group) is anticipated but not implemented: it needs a cipher suite composing
+    /// ML-KEM-768 with a PQ signature scheme in the providers. Adding it is a new variant
+    /// here plus a suite mapping below — no API break.
+    #[default]
+    ConfidentialityOnly,
+}
+
+impl ApqMode {
+    /// The PQ half's MLS cipher suite for this mode.
+    pub fn pq_cipher_suite(self) -> CipherSuite {
+        match self {
+            ApqMode::ConfidentialityOnly => CipherSuite::new(ML_KEM_768),
+        }
+    }
+}
+
+/// An archived signing identity for [`CombinerClient::from_key_packages`]: the ClientId
+/// plus each half's signing key and key-package store. Named fields on purpose — the
+/// former five-positional-argument form let the two signing keys (or the two stores,
+/// both same-typed) be transposed without a type error.
+pub struct ArchivedIdentity<S> {
+    /// Opaque identity bytes (the Basic Credential).
+    pub client_id: Vec<u8>,
+    pub classical_signing_key: Zeroizing<Vec<u8>>,
+    /// Pass an empty store for a bare identity restore, or one preloaded with this
+    /// identity's key package(s) to make a receiving (invitation) client.
+    pub classical_kp_store: S,
+    pub pq_signing_key: Zeroizing<Vec<u8>>,
+    pub pq_kp_store: S,
+}
+
+/// The injected crypto providers and APQ mode for a [`CombinerClient`]: `classical` backs
+/// the classical half (must supply `CURVE25519_CHACHA`), `pq` backs the PQ half (must
+/// supply the mode's PQ suite). One concrete provider type may serve both roles (aws-lc
+/// does); Apple splits them (`CryptoKitProvider` / `CryptoKitMlKemProvider`).
+#[derive(Clone, Debug, Default)]
+pub struct CryptoConfig<C, P> {
+    pub classical: C,
+    pub pq: P,
+    pub mode: ApqMode,
+}
 
 // Group state lives in a `PersistableGroupStorage` (same shared-map in-memory semantics as
 // mls-rs's default provider) so a group's record can be exported per group for session
 // archival, and so the caller can hold a handle to it: clones share one map, letting
 // session code inspect which prior epochs are still retained (the storage's retention
 // trim) — e.g. to expire per-epoch rendezvous addresses in lockstep with that window.
-pub type OurConfig<S> = WithGroupStateStorage<
+pub type OurConfig<S, C> = WithGroupStateStorage<
     PersistableGroupStorage,
     WithKeyPackageRepo<
         S,
-        WithIdentityProvider<
-            BasicIdentityProvider,
-            WithCryptoProvider<RustCryptoProvider, BaseConfig>,
-        >,
+        WithIdentityProvider<BasicIdentityProvider, WithCryptoProvider<C, BaseConfig>>,
     >,
 >;
-pub type MlsClient<S> = Client<OurConfig<S>>;
+pub type MlsClient<S, C> = Client<OurConfig<S, C>>;
 
-#[cfg(feature = "cryptokit")]
-pub type PqConfig<S> = WithGroupStateStorage<
-    PersistableGroupStorage,
-    WithKeyPackageRepo<
-        S,
-        WithIdentityProvider<
-            BasicIdentityProvider,
-            WithCryptoProvider<CryptoKitMlKemProvider, BaseConfig>,
-        >,
-    >,
->;
-#[cfg(feature = "cryptokit")]
-pub type PqMlsClient<S> = Client<PqConfig<S>>;
+/// The PQ half's config is the same shape as the classical one — only the provider (and
+/// the suite it is asked for) differs.
+pub type PqConfig<S, P> = OurConfig<S, P>;
+pub type PqMlsClient<S, P> = Client<PqConfig<S, P>>;
 
-/// Holds an agent identity (ClientId) and the MLS client(s) that manage its key packages
-/// and groups, parameterised by the key-package storage `S`. The ClientId is opaque,
-/// caller-supplied bytes carried as the Basic Credential. Each MLS half owns its *own*
-/// signing key (classical and PQ are independent); the keys are retained here so the signing
-/// identity can be archived and restored. The signing keys' public components are NOT the
-/// ClientId.
-pub struct CombinerClient<S: KeyPackageStorage + Clone> {
+/// Holds an agent identity (ClientId) and the two MLS clients that manage its key packages
+/// and groups, parameterised by the key-package storage `S` and the crypto providers
+/// (`C` classical, `P` PQ). The ClientId is opaque, caller-supplied bytes carried as the
+/// Basic Credential. Each MLS half owns its *own* signing key (classical and PQ are
+/// independent); the keys are retained here so the signing identity can be archived and
+/// restored. The signing keys' public components are NOT the ClientId.
+pub struct CombinerClient<S, C, P>
+where
+    S: KeyPackageStorage + Clone,
+    C: CryptoProvider + Clone,
+    P: CryptoProvider + Clone,
+{
     client_id: Vec<u8>,
     classical_signing_key: Zeroizing<Vec<u8>>,
-    classical: MlsClient<S>,
+    classical: MlsClient<S, C>,
     classical_kp_store: S,
     /// The injected classical group-state storage; shares its map with the clone
     /// handed to the client builder, so it reflects the storage's epoch retention.
     classical_group_storage: PersistableGroupStorage,
-    #[cfg(feature = "cryptokit")]
     pq_signing_key: Zeroizing<Vec<u8>>,
     /// The PQ signing key's public half, kept from construction so the rekey
     /// credential handoff never re-derives it.
-    #[cfg(feature = "cryptokit")]
     pq_signing_public: mls_rs::crypto::SignaturePublicKey,
-    #[cfg(feature = "cryptokit")]
-    pq: PqMlsClient<S>,
-    #[cfg(feature = "cryptokit")]
+    pq: PqMlsClient<S, P>,
     pq_kp_store: S,
-    #[cfg(feature = "cryptokit")]
     pq_group_storage: PersistableGroupStorage,
 }
 
-impl<S: KeyPackageStorage + Clone> CombinerClient<S> {
+impl<S, C, P> CombinerClient<S, C, P>
+where
+    S: KeyPackageStorage + Clone,
+    C: CryptoProvider + Clone,
+    P: CryptoProvider + Clone,
+{
     /// Build a `CombinerClient` for the given ClientId with a fresh, independent signing key
     /// per half and empty (default) key-package stores. `client_id` is opaque identity bytes
     /// (the Basic Credential), independent of the generated signing keys.
-    pub fn new(client_id: Vec<u8>) -> Result<Self>
+    ///
+    /// Fails with [`CombinerError::UnsupportedCipherSuite`] if `crypto.classical` cannot
+    /// supply the classical suite or `crypto.pq` cannot supply the mode's PQ suite.
+    pub fn new(client_id: Vec<u8>, crypto: CryptoConfig<C, P>) -> Result<Self>
     where
         S: Default,
     {
-        let crypto = RustCryptoProvider::new();
-        let suite = mls_rs::CipherSuite::CURVE25519_CHACHA;
-        let cs = crypto
-            .cipher_suite_provider(suite)
-            .ok_or(CombinerError::Mls)?;
+        let classical_cs = crypto
+            .classical
+            .cipher_suite_provider(CLASSICAL_SUITE)
+            .ok_or(CombinerError::UnsupportedCipherSuite)?;
+        let pq_suite = crypto.mode.pq_cipher_suite();
+        let pq_cs = crypto
+            .pq
+            .cipher_suite_provider(pq_suite)
+            .ok_or(CombinerError::UnsupportedCipherSuite)?;
 
-        let (classical_sk, classical_pk) = cs
+        let (classical_sk, classical_pk) = classical_cs
             .signature_key_generate()
             .map_err(|_| CombinerError::Mls)?;
         let classical_signing_key = Zeroizing::new(classical_sk.as_bytes().to_vec());
         let classical_kp_store = S::default();
         let classical_group_storage = PersistableGroupStorage::new();
         let classical = build_client(
+            crypto.classical,
             client_id.clone(),
             classical_sk,
             classical_pk,
-            suite,
+            CLASSICAL_SUITE,
             classical_kp_store.clone(),
             classical_group_storage.clone(),
         );
 
-        #[cfg(feature = "cryptokit")]
-        let (pq_signing_key, pq_signing_public, pq, pq_kp_store, pq_group_storage) = {
-            let (pq_sk, pq_pk) = cs
-                .signature_key_generate()
-                .map_err(|_| CombinerError::Mls)?;
-            let bytes = Zeroizing::new(pq_sk.as_bytes().to_vec());
-            let store = S::default();
-            let group_storage = PersistableGroupStorage::new();
-            let client = build_pq_client(
-                client_id.clone(),
-                pq_sk,
-                pq_pk.clone(),
-                mls_rs::CipherSuite::from(ML_KEM_768),
-                store.clone(),
-                group_storage.clone(),
-            );
-            (bytes, pq_pk, client, store, group_storage)
-        };
+        // The PQ half's signing key comes from the PQ suite's own provider: under
+        // ConfidentialityOnly this is Ed25519 (same scheme as the classical half, but an
+        // independent key); under a future conf+auth mode it becomes a PQ scheme with no
+        // change here.
+        let (pq_sk, pq_pk) = pq_cs
+            .signature_key_generate()
+            .map_err(|_| CombinerError::Mls)?;
+        let pq_signing_key = Zeroizing::new(pq_sk.as_bytes().to_vec());
+        let pq_signing_public = pq_pk.clone();
+        let pq_kp_store = S::default();
+        let pq_group_storage = PersistableGroupStorage::new();
+        let pq = build_client(
+            crypto.pq,
+            client_id.clone(),
+            pq_sk,
+            pq_pk,
+            pq_suite,
+            pq_kp_store.clone(),
+            pq_group_storage.clone(),
+        );
 
         Ok(Self {
             client_id,
@@ -143,68 +196,68 @@ impl<S: KeyPackageStorage + Clone> CombinerClient<S> {
             classical,
             classical_kp_store,
             classical_group_storage,
-            #[cfg(feature = "cryptokit")]
             pq_signing_key,
-            #[cfg(feature = "cryptokit")]
             pq_signing_public,
-            #[cfg(feature = "cryptokit")]
             pq,
-            #[cfg(feature = "cryptokit")]
             pq_kp_store,
-            #[cfg(feature = "cryptokit")]
             pq_group_storage,
         })
     }
 
-    /// Restore a `CombinerClient` from an archived signing identity (ClientId + each half's
-    /// signing key), installing the caller-provided key-package store(s). Pass empty stores
-    /// for a bare identity restore, or stores preloaded with this identity's key package(s)
-    /// to make a receiving (invitation) client whose join can find them. Public keys are
-    /// re-derived from the signing keys.
+    /// Restore a `CombinerClient` from an [`ArchivedIdentity`] (ClientId + each half's
+    /// signing key and key-package store). Public keys are re-derived from the signing
+    /// keys — each half through its own suite's provider.
     pub fn from_key_packages(
-        client_id: Vec<u8>,
-        classical_signing_key: Zeroizing<Vec<u8>>,
-        classical_kp_store: S,
-        #[cfg(feature = "cryptokit")] pq_signing_key: Zeroizing<Vec<u8>>,
-        #[cfg(feature = "cryptokit")] pq_kp_store: S,
+        identity: ArchivedIdentity<S>,
+        crypto: CryptoConfig<C, P>,
     ) -> Result<Self> {
-        let crypto = RustCryptoProvider::new();
-        let suite = mls_rs::CipherSuite::CURVE25519_CHACHA;
-        let cs = crypto
-            .cipher_suite_provider(suite)
-            .ok_or(CombinerError::Mls)?;
+        let ArchivedIdentity {
+            client_id,
+            classical_signing_key,
+            classical_kp_store,
+            pq_signing_key,
+            pq_kp_store,
+        } = identity;
+        let classical_cs = crypto
+            .classical
+            .cipher_suite_provider(CLASSICAL_SUITE)
+            .ok_or(CombinerError::UnsupportedCipherSuite)?;
+        let pq_suite = crypto.mode.pq_cipher_suite();
+        let pq_cs = crypto
+            .pq
+            .cipher_suite_provider(pq_suite)
+            .ok_or(CombinerError::UnsupportedCipherSuite)?;
 
         let classical_sk = mls_rs::crypto::SignatureSecretKey::new(classical_signing_key.to_vec());
-        let classical_pk = cs
+        let classical_pk = classical_cs
             .signature_key_derive_public(&classical_sk)
             .map_err(|_| CombinerError::Mls)?;
         let classical_group_storage = PersistableGroupStorage::new();
         let classical = build_client(
+            crypto.classical,
             client_id.clone(),
             classical_sk,
             classical_pk,
-            suite,
+            CLASSICAL_SUITE,
             classical_kp_store.clone(),
             classical_group_storage.clone(),
         );
 
-        #[cfg(feature = "cryptokit")]
-        let (pq_signing_public, pq, pq_group_storage) = {
-            let pq_sk = mls_rs::crypto::SignatureSecretKey::new(pq_signing_key.to_vec());
-            let pq_pk = cs
-                .signature_key_derive_public(&pq_sk)
-                .map_err(|_| CombinerError::Mls)?;
-            let group_storage = PersistableGroupStorage::new();
-            let client = build_pq_client(
-                client_id.clone(),
-                pq_sk,
-                pq_pk.clone(),
-                mls_rs::CipherSuite::from(ML_KEM_768),
-                pq_kp_store.clone(),
-                group_storage.clone(),
-            );
-            (pq_pk, client, group_storage)
-        };
+        let pq_sk = mls_rs::crypto::SignatureSecretKey::new(pq_signing_key.to_vec());
+        let pq_pk = pq_cs
+            .signature_key_derive_public(&pq_sk)
+            .map_err(|_| CombinerError::Mls)?;
+        let pq_signing_public = pq_pk.clone();
+        let pq_group_storage = PersistableGroupStorage::new();
+        let pq = build_client(
+            crypto.pq,
+            client_id.clone(),
+            pq_sk,
+            pq_pk,
+            pq_suite,
+            pq_kp_store.clone(),
+            pq_group_storage.clone(),
+        );
 
         Ok(Self {
             client_id,
@@ -212,15 +265,10 @@ impl<S: KeyPackageStorage + Clone> CombinerClient<S> {
             classical,
             classical_kp_store,
             classical_group_storage,
-            #[cfg(feature = "cryptokit")]
             pq_signing_key,
-            #[cfg(feature = "cryptokit")]
             pq_signing_public,
-            #[cfg(feature = "cryptokit")]
             pq,
-            #[cfg(feature = "cryptokit")]
             pq_kp_store,
-            #[cfg(feature = "cryptokit")]
             pq_group_storage,
         })
     }
@@ -236,7 +284,6 @@ impl<S: KeyPackageStorage + Clone> CombinerClient<S> {
     }
 
     /// The PQ half's signing key bytes — part of the archivable signing identity.
-    #[cfg(feature = "cryptokit")]
     pub fn pq_signing_key(&self) -> &[u8] {
         self.pq_signing_key.as_slice()
     }
@@ -244,7 +291,6 @@ impl<S: KeyPackageStorage + Clone> CombinerClient<S> {
     /// The PQ half's signature keypair (secret from storage, public kept from
     /// construction). Used to hand a PQ group's leaf to this agent during an A.5
     /// rekey credential rotation.
-    #[cfg(feature = "cryptokit")]
     pub fn pq_signature_keypair(
         &self,
     ) -> (
@@ -257,12 +303,11 @@ impl<S: KeyPackageStorage + Clone> CombinerClient<S> {
         )
     }
 
-    pub fn classical(&self) -> &MlsClient<S> {
+    pub fn classical(&self) -> &MlsClient<S, C> {
         &self.classical
     }
 
-    #[cfg(feature = "cryptokit")]
-    pub fn pq(&self) -> &PqMlsClient<S> {
+    pub fn pq(&self) -> &PqMlsClient<S, P> {
         &self.pq
     }
 
@@ -272,7 +317,6 @@ impl<S: KeyPackageStorage + Clone> CombinerClient<S> {
     }
 
     /// The PQ half's key-package store handle.
-    #[cfg(feature = "cryptokit")]
     pub fn pq_kp_store(&self) -> &S {
         &self.pq_kp_store
     }
@@ -287,7 +331,6 @@ impl<S: KeyPackageStorage + Clone> CombinerClient<S> {
     }
 
     /// The PQ half's group-state storage handle.
-    #[cfg(feature = "cryptokit")]
     pub fn pq_group_storage(&self) -> &PersistableGroupStorage {
         &self.pq_group_storage
     }
@@ -301,8 +344,8 @@ impl<S: KeyPackageStorage + Clone> CombinerClient<S> {
         msg.to_bytes().map_err(|_| CombinerError::Mls)
     }
 
-    /// Generate a fresh ML-KEM-768 (0xFDEA) KeyPackage, MLS-encoded for publication.
-    #[cfg(feature = "cryptokit")]
+    /// Generate a fresh PQ (mode suite, e.g. ML-KEM-768/0xFDEA) KeyPackage, MLS-encoded for
+    /// publication.
     pub fn generate_pq_key_package(&self) -> Result<Vec<u8>> {
         let msg = self
             .pq
@@ -312,38 +355,19 @@ impl<S: KeyPackageStorage + Clone> CombinerClient<S> {
     }
 }
 
-fn build_client<S: KeyPackageStorage + Clone>(
+fn build_client<S: KeyPackageStorage + Clone, C: CryptoProvider + Clone>(
+    provider: C,
     client_id: Vec<u8>,
     secret_key: mls_rs::crypto::SignatureSecretKey,
     public_key: mls_rs::crypto::SignaturePublicKey,
-    suite: mls_rs::CipherSuite,
+    suite: CipherSuite,
     key_package_store: S,
     group_storage: PersistableGroupStorage,
-) -> MlsClient<S> {
+) -> MlsClient<S, C> {
     let credential = BasicCredential::new(client_id);
     let signing_identity = SigningIdentity::new(credential.into_credential(), public_key);
     client_builder::ClientBuilder::new()
-        .crypto_provider(RustCryptoProvider::new())
-        .identity_provider(BasicIdentityProvider::new())
-        .key_package_repo(key_package_store)
-        .group_state_storage(group_storage)
-        .signing_identity(signing_identity, secret_key, suite)
-        .build()
-}
-
-#[cfg(feature = "cryptokit")]
-fn build_pq_client<S: KeyPackageStorage + Clone>(
-    client_id: Vec<u8>,
-    secret_key: mls_rs::crypto::SignatureSecretKey,
-    public_key: mls_rs::crypto::SignaturePublicKey,
-    suite: mls_rs::CipherSuite,
-    key_package_store: S,
-    group_storage: PersistableGroupStorage,
-) -> PqMlsClient<S> {
-    let credential = BasicCredential::new(client_id);
-    let signing_identity = SigningIdentity::new(credential.into_credential(), public_key);
-    client_builder::ClientBuilder::new()
-        .crypto_provider(CryptoKitMlKemProvider)
+        .crypto_provider(provider)
         .identity_provider(BasicIdentityProvider::new())
         .key_package_repo(key_package_store)
         .group_state_storage(group_storage)

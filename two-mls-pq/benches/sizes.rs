@@ -1,5 +1,5 @@
 // Ciphertext-size report (not a timing benchmark — prints a table and exits).
-//   cargo bench -p two-mls-pq --features benchmark_util --bench sizes
+//   cargo bench -p two-mls-pq --features "benchmark_util awslc" --bench sizes
 //   cargo bench -p two-mls-pq --features "benchmark_util cryptokit" --bench sizes
 // Captures the on-wire size of each frame type for a fixed payload, so we can track the
 // effect of the APQ↔TwoMLS rework (dropping per-round PQ) and by-ref proposals.
@@ -49,8 +49,7 @@ fn main() {
     alice_s.prepare_to_encrypt(Some(new_id)).unwrap();
     let rotation = alice_s.encrypt(payload.to_vec()).unwrap().cipher_text;
 
-    // PQ ratchet (architecture-diagrams PR #2 §A.3) — fresh session pair; cryptokit only.
-    #[cfg(feature = "cryptokit")]
+    // PQ ratchet (architecture-diagrams PR #2 §A.3) — fresh session pair.
     let (pq_ek, pq_ct, pq_bind, pq_commit_len, cl_commit_len, pq_app_len) = {
         let a = client();
         let b = client();
@@ -94,7 +93,6 @@ fn main() {
         rotation.len() - payload.len(),
     );
 
-    #[cfg(feature = "cryptokit")]
     {
         println!("--- PQ ratchet (architecture-diagrams PR #2 §A.3) ---");
         println!("PQ EK message (0x0B)         : {:>6} B", pq_ek);
@@ -104,7 +102,16 @@ fn main() {
         println!("  classical commit           : {:>6} B", cl_commit_len);
         println!("  app                        : {:>6} B", pq_app_len);
 
-        let old_full = apq::pq_ratchet::full_pq_updatepath_commit_size();
+        #[cfg(feature = "cryptokit")]
+        let old_full = apq::pq_ratchet::full_pq_updatepath_commit_size(
+            mls_rs_crypto_cryptokit::CryptoKitMlKemProvider,
+            mls_rs::CipherSuite::from(0xFDEA),
+        );
+        #[cfg(all(feature = "awslc", not(feature = "cryptokit")))]
+        let old_full = apq::pq_ratchet::full_pq_updatepath_commit_size(
+            mls_rs_crypto_awslc::AwsLcCryptoProvider::new(),
+            mls_rs::CipherSuite::from(0xFDEA),
+        );
         println!("--- per-round PQ commit: OLD (APQ-faithful) vs NEW (ratchet) ---");
         println!("OLD full PQ updatePath commit: {:>6} B", old_full);
         println!(

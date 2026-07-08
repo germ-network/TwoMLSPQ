@@ -26,10 +26,10 @@ the peer (`my_pq_turn()`), and only one operation may be in flight at a time.
   critical path: Alice sends her PQ key package; Bob creates Group_B.pq around it and
   returns its Welcome. Both send groups are then full APQ pairs
   (`is_fully_established()`).
-- **PQ ratchet** (`0x0B`/`0x0D`/`0x0F`, `cryptokit` builds) — injects fresh ML-KEM
+- **PQ ratchet** (`0x0B`/`0x0D`/`0x0F`) — injects fresh ML-KEM
   entropy into a send group's PQ half via a pathless PSK commit and re-binds the
   exported APQ-PSK into the classical half in the same round.
-- **PQ re-key** (`0x15`/`0x17`, `cryptokit` builds) — updatePath commits run on the
+- **PQ re-key** (`0x15`/`0x17`) — updatePath commits run on the
   two PQ groups **alone**, so the classical ratchet is never blocked behind a large
   ML-KEM updatePath: the initiator proposes `Upd'(self)` into the peer's send-PQ
   (`pq_rekey_begin`), the responder commits it and counter-proposes

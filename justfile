@@ -21,13 +21,16 @@ format:
 test:
     cargo test --all-features
 
+# NB: the --all-features recipes above assume an Apple host (cryptokit is Apple-only and
+# wins the provider precedence there); on Linux use explicit `--features awslc,…` instead.
+
 bench:
-    cargo bench -p two-mls-pq --features benchmark_util
+    cargo bench -p two-mls-pq --features "benchmark_util awslc"
 
 bench-pq:
     cargo bench -p two-mls-pq --features "benchmark_util cryptokit"
 bindgen:
-    cargo build --package two-mls-pq
+    cargo build --package two-mls-pq --features cryptokit
     cargo run --package uniffi-bindgen -- generate \
         target/debug/libtwo_mls_pq.dylib \
         --library --language swift --out-dir bindings

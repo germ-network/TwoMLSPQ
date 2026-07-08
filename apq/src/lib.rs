@@ -10,26 +10,24 @@
 //! This crate is deliberately UniFFI-free: it takes MLS clients and key-package bytes as
 //! primitives, and reports failures as `CombinerError` (the two-mls layer maps these onto
 //! its FFI error enum).
-
-// The `cryptokit` feature's PQ provider is Apple CryptoKit (`mls-rs-crypto-cryptokit`),
-// which is gated to Apple platforms and compiles to nothing elsewhere. Enabling the feature
-// off-Apple can't work, so fail loudly here instead of with an opaque unresolved-import error.
-#[cfg(all(
-    feature = "cryptokit",
-    not(any(target_os = "macos", target_os = "ios"))
-))]
-compile_error!("the `cryptokit` feature requires a macOS or iOS target");
+//!
+//! It is also crypto-provider agnostic: no concrete provider is compiled in. The consumer
+//! injects a classical and a PQ `CryptoProvider` (see [`CryptoConfig`]) — e.g. CryptoKit on
+//! Apple targets, aws-lc elsewhere — and both are required: APQ always has a PQ half. A
+//! provider that cannot supply a required cipher suite (the PQ suite is chosen by
+//! [`ApqMode`]) fails at client construction with
+//! [`CombinerError::UnsupportedCipherSuite`].
 
 pub mod archive;
 mod client;
 mod group;
-#[cfg(feature = "cryptokit")]
 pub mod pq_ratchet;
 pub mod storage;
 
-pub use client::{CombinerClient, MlsClient, OurConfig};
-#[cfg(feature = "cryptokit")]
-pub use client::{PqConfig, PqMlsClient};
+pub use client::{
+    ApqMode, ArchivedIdentity, CombinerClient, CryptoConfig, MlsClient, OurConfig, PqConfig,
+    PqMlsClient,
+};
 
 pub use group::{
     create_bound_classical_send_group, create_bound_combiner_send_group,
@@ -37,11 +35,6 @@ pub use group::{
     export_and_register_psk, export_psk, forget_psk, forget_psk_stores, join_combiner_group,
     join_group_from_welcome, load_combiner_group, register_psk, register_psk_stores,
     sender_client_id, CombinerGroup, CombinerGroupState, MlsGroup, PqMlsGroup, APQ_TAG,
-};
-#[cfg(feature = "cryptokit")]
-pub use group::{
-    export_and_register_psk_pq, export_psk_pq, pq_create_group_with_member,
-    pq_join_group_from_welcome,
 };
 
 /// Failure categories for the combiner layer. The two-mls layer maps these onto its
@@ -62,6 +55,11 @@ pub enum CombinerError {
     /// of a sealed blob (wrong key or tampered ciphertext).
     #[error("invalid archive")]
     ArchiveInvalid,
+    /// An injected crypto provider cannot supply a required cipher suite — e.g. a PQ
+    /// provider built without ML-KEM support. Surfaces at client construction, not deep
+    /// in a session.
+    #[error("crypto provider does not support the required cipher suite")]
+    UnsupportedCipherSuite,
 }
 
 pub type Result<T> = std::result::Result<T, CombinerError>;

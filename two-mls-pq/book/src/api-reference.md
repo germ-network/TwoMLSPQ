@@ -85,7 +85,7 @@ invitation's forward table).
 
 PQ side-band (see [Session Lifecycle](./session-lifecycle.md)): `my_pq_turn`,
 `pq_take_pending_outbound`, `pq_bootstrap_begin(rotating)` / `pq_bootstrap_respond` /
-`pq_bootstrap_apply`, and on `cryptokit` builds `pq_ratchet_begin` /
+`pq_bootstrap_apply`, and `pq_ratchet_begin` /
 `pq_ratchet_respond` / `pq_ratchet_bind` / `pq_ratchet_apply` and
 `pq_rekey_begin(rotating)` / `pq_rekey_respond` / `pq_rekey_apply`. The `rotating`
 parameters carry the agent credential handoff and must name the session's current

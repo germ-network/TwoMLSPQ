@@ -3,6 +3,7 @@ uniffi::setup_scaffolding!();
 mod invitation;
 mod key_package_store;
 pub mod key_packages;
+mod providers;
 mod psk;
 pub mod session;
 #[cfg(test)]
@@ -35,7 +36,9 @@ pub fn version() -> String {
 // v2 (2026-07-07): TwoMlsPqDigest removed — digests are raw 32-byte SHA-256 values
 // (`Vec<u8>` fields on PrepareEncryptResult / QueuedRemoteProposal and in the
 // queue_proposal / proposal_context signatures).
-const BINDING_CONTRACT_VERSION: u64 = 2;
+// v3 (2026-07-07): TwoMlsPqError gained `UnsupportedCipherSuite` (an injected crypto
+// provider cannot supply a required cipher suite; surfaces at client construction).
+const BINDING_CONTRACT_VERSION: u64 = 3;
 
 /// See `BINDING_CONTRACT_VERSION`. Exported so the Swift layer can verify the
 /// binding it was generated with matches the binary it loaded.
@@ -52,8 +55,6 @@ pub struct ClientId {
 
 /// The APQ epoch pair for the send group: the PQ side-band epoch and the classical
 /// (traditional) message epoch. Zeros until the corresponding group exists.
-/// NB: in non-`cryptokit` builds the PQ half is a classical placeholder, so `pq_epoch`
-/// does not describe a real ML-KEM group — see the BUG note on `ensure_pq_available`.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct ApqEpochs {
     pub pq_epoch: u64,
@@ -291,6 +292,11 @@ pub enum TwoMlsPqError {
     ArchiveInvalid,
     #[error("welcome already consumed for this remote")]
     DuplicateWelcome,
+    /// The build's crypto provider cannot supply a required cipher suite — a build or
+    /// provider-configuration bug caught at client construction (see
+    /// `two-mls-pq/src/providers.rs`), never a runtime condition of a healthy binary.
+    #[error("crypto provider does not support the required cipher suite")]
+    UnsupportedCipherSuite,
 }
 
 /// SHA-256 over `bytes` — the single hashing primitive behind every digest this
@@ -335,6 +341,7 @@ impl From<apq::CombinerError> for TwoMlsPqError {
             apq::CombinerError::MissingWelcome => TwoMlsPqError::MissingWelcome,
             apq::CombinerError::DecryptionFailed => TwoMlsPqError::DecryptionFailed,
             apq::CombinerError::ArchiveInvalid => TwoMlsPqError::ArchiveInvalid,
+            apq::CombinerError::UnsupportedCipherSuite => TwoMlsPqError::UnsupportedCipherSuite,
         }
     }
 }

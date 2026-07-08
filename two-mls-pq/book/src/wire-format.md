@@ -10,13 +10,13 @@ have no tag (they are raw MLS ciphertext starting with the MLS version bytes).
 | `PARTIAL_TAG` | `0x05` | A.2 ratchet frame: optional send-group commit + stapled `Upd(sender)` proposal + app |
 | — | `0x07` | Retired (the pre-A.2 full-bundle frame); reserved so old frames are rejected |
 | `STAPLED_WELCOME_TAG` | `0x09` | Return APQWelcome stapled onto the acceptor's first app frame |
-| `PQ_EK_TAG` | `0x0B` | PQ ratchet: ML-KEM encapsulation key (`cryptokit` builds) |
-| `PQ_CT_TAG` | `0x0D` | PQ ratchet: ML-KEM ciphertext (`cryptokit` builds) |
-| `PQ_BIND_TAG` | `0x0F` | PQ ratchet bind: PQ partial commit + classical commit + app (`cryptokit` builds) |
+| `PQ_EK_TAG` | `0x0B` | PQ ratchet: ML-KEM encapsulation key |
+| `PQ_CT_TAG` | `0x0D` | PQ ratchet: ML-KEM ciphertext |
+| `PQ_BIND_TAG` | `0x0F` | PQ ratchet bind: PQ partial commit + classical commit + app |
 | `PQ_BOOTSTRAP_KP_TAG` | `0x11` | Bootstrap: PQ key package for the deferred send-group half |
 | `PQ_BOOTSTRAP_BIND_TAG` | `0x13` | Bootstrap: the new PQ group's Welcome |
-| `PQ_REKEY_UPD_TAG` | `0x15` | PQ re-key: initiator's `Upd'` proposal (`cryptokit` builds) |
-| `PQ_REKEY_COMMIT_TAG` | `0x17` | PQ re-key: `[Commit'][counter-Upd'-or-empty]` (`cryptokit` builds) |
+| `PQ_REKEY_UPD_TAG` | `0x15` | PQ re-key: initiator's `Upd'` proposal |
+| `PQ_REKEY_COMMIT_TAG` | `0x17` | PQ re-key: `[Commit'][counter-Upd'-or-empty]` |
 
 All tags are **odd**. Each tagged frame uses a `u32`-LE length prefix per embedded
 field. For example, the APQ Welcome is:

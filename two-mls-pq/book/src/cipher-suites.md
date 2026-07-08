@@ -21,11 +21,13 @@ group bound to the ML-KEM-768 group via PSK).
 
 | Flag | Meaning |
 |------|---------|
-| `rustcrypto` (default) | Both halves use `mls-rs-crypto-rustcrypto` (X25519/ChaCha). The PQ half is **simulated** — no real ML-KEM. Good for fast cross-platform tests. |
-| `cryptokit` | The PQ half uses real **ML-KEM-768** (FIPS 203). macOS/iOS. |
+| `cryptokit` | Apple CryptoKit backs **both halves** (classical suites + native ML-KEM-768, FIPS 203). macOS 26 / iOS 26+ only. The shipped configuration. |
+| `awslc` | aws-lc backs both halves. Portable (Linux CI runs the full suite with it) and wire-compatible with `cryptokit`. |
 | `benchmark_util` | Gates the `benches/*` targets and their fixtures. |
 
-The crypto provider is an implementation detail: TwoMLSPQ only requires ML-KEM-768
-for the PQ half. Under the default build the PQ half is X25519/ChaCha so a normal test
-run exercises the Combiner machinery without needing ML-KEM available; real ML-KEM-768
-numbers require `--features cryptokit`.
+Exactly one provider feature must be selected — there is **no default**, and a build
+with neither fails with an explicit `compile_error!`. When both are enabled
+(`--all-features` on an Apple machine), `cryptokit` wins. The PQ half is always real
+ML-KEM-768: the crypto provider is an implementation detail pinned in
+`two-mls-pq/src/providers.rs`, and the `apq` crate compiles no provider at all — the
+concrete providers are injected as generic parameters (`apq::CryptoConfig`).
