@@ -4,7 +4,7 @@
 //! package's private material — everything needed to receive a welcome and HPKE-decrypt,
 //! with no live client. It is the Rust analogue of the classical `MLSInvitationClientV2`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use mls_rs::mls_rs_codec::{MlsDecode, MlsEncode};
 use mls_rs::storage_provider::KeyPackageData;
@@ -13,7 +13,17 @@ use zeroize::Zeroizing;
 use crate::key_package_store::{CombinerClient, KeyPackageSecret, SyntheticKeyPackageStore};
 use crate::{Result, TwoMlsPqError};
 
-const INVITATION_VERSION: u8 = 1;
+// The version byte covers the WHOLE archive layout (blob + trailing sections), not just
+// the invitation blob it sits in. v2 (increment C, 2026-07-07) added the spawned-group
+// forward table after the consumed set; v1 archives are rejected — regenerate the
+// invitation (pre-release, no migration).
+const INVITATION_VERSION: u8 = 2;
+
+/// The spawned-group forward table: an opaque caller-supplied spawn token → the spawned
+/// session's receive-group ids (classical, pq). The token is whatever the caller passed
+/// to `receive` — this library never interprets it (the Swift adapter uses the app's
+/// combined-welcome digest, but any replay-stable byte string works).
+pub(crate) type SpawnedGroups = BTreeMap<Vec<u8>, (Vec<u8>, Vec<u8>)>;
 
 // Tags whether the PQ half is real ML-KEM (`cryptokit`) or a classical simulation (default
 // build). Baked into the archive so a mismatched build fails loudly at decode rather than
@@ -79,29 +89,52 @@ impl CombinerInvitation {
 }
 
 /// The single encoder for a `TwoMlsPqInvitation`'s persisted form: the framed invitation
-/// blob followed by the consumed-remote ids. `BTreeSet` gives a deterministic byte order.
-/// Used by both `generate_invitation` (empty set) and `archive`; `decode_archive` is the
-/// sole reader, so the layout lives in exactly one place.
+/// blob, the counted consumed-remote ids, then the spawned-group forward table to the
+/// end. `BTreeSet`/`BTreeMap` give a deterministic byte order. Used by both
+/// `generate_invitation` (empty sets) and `archive`; `decode_archive` is the sole
+/// reader, so the layout lives in exactly one place.
 pub(crate) fn encode_archive(
     invitation: &CombinerInvitation,
     consumed: &BTreeSet<Vec<u8>>,
+    spawned: &SpawnedGroups,
 ) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     put_bytes(&mut out, &invitation.encode()?)?;
+    let count = u32::try_from(consumed.len()).map_err(|_| TwoMlsPqError::ArchiveInvalid)?;
+    out.extend_from_slice(&count.to_le_bytes());
     for id in consumed {
         put_bytes(&mut out, id)?;
+    }
+    for (token, (classical, pq)) in spawned {
+        put_bytes(&mut out, token)?;
+        put_bytes(&mut out, classical)?;
+        put_bytes(&mut out, pq)?;
     }
     Ok(out)
 }
 
-pub(crate) fn decode_archive(bytes: &[u8]) -> Result<(CombinerInvitation, BTreeSet<Vec<u8>>)> {
+pub(crate) fn decode_archive(
+    bytes: &[u8],
+) -> Result<(CombinerInvitation, BTreeSet<Vec<u8>>, SpawnedGroups)> {
     let mut rest = bytes;
     let invitation = CombinerInvitation::decode(&take_bytes(&mut rest)?)?;
+    if rest.len() < 4 {
+        return Err(TwoMlsPqError::ArchiveInvalid);
+    }
+    let count = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
+    rest = &rest[4..];
     let mut consumed = BTreeSet::new();
-    while !rest.is_empty() {
+    for _ in 0..count {
         consumed.insert(take_bytes(&mut rest)?);
     }
-    Ok((invitation, consumed))
+    let mut spawned = SpawnedGroups::new();
+    while !rest.is_empty() {
+        let token = take_bytes(&mut rest)?;
+        let classical = take_bytes(&mut rest)?;
+        let pq = take_bytes(&mut rest)?;
+        spawned.insert(token, (classical, pq));
+    }
+    Ok((invitation, consumed, spawned))
 }
 
 /// Generate a combiner key package on `client` and capture its private material into a
