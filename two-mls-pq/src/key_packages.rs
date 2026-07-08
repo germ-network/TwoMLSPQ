@@ -289,6 +289,13 @@ pub(crate) fn ensure_pq_available(their_kp: &CombinerKeyPackage) -> Result<()> {
     Ok(())
 }
 
+// BUG(known, fix pending elsewhere): without `cryptokit` there is no real PQ provider —
+// the "PQ" half is a classical placeholder group — yet this no-op lets sessions
+// construct and claim APQ pairing (and report a fake `ApqEpochs.pq_epoch`). The intended
+// behavior is to REJECT: this variant (and the kp-generation / invitation / bootstrap
+// fallbacks that simulate the PQ half) should return `Err(TwoMlsPqError::PqNotAvailable)`,
+// with the non-cryptokit test suite re-gated accordingly. Until then, non-cryptokit
+// builds are for CI lint/unit coverage only — never a functional deployment.
 #[cfg(not(feature = "cryptokit"))]
 pub(crate) fn ensure_pq_available(_their_kp: &CombinerKeyPackage) -> Result<()> {
     Ok(())

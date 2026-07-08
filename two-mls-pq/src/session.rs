@@ -383,6 +383,16 @@ fn sha256_digest(bytes: &[u8]) -> Result<TwoMlsPqDigest> {
     })
 }
 
+/// The APQ epoch pair for a combiner group: the PQ side-band epoch (0 while that
+/// half is deferred) and the classical message epoch. Single home for the
+/// pq-zero-when-deferred rule, shared by `epochs()` and `encrypt()`.
+fn apq_epochs(group: &CombinerGroup) -> crate::ApqEpochs {
+    crate::ApqEpochs {
+        pq_epoch: group.pq.as_ref().map(|p| p.current_epoch()).unwrap_or(0),
+        classical_epoch: group.classical.current_epoch(),
+    }
+}
+
 impl SessionInner {
     /// Capture the send group's classical-half rendezvous exporter at its current epoch.
     /// Idempotent per epoch. Called wherever that epoch can advance — group creation,
@@ -737,20 +747,14 @@ impl TwoMlsPqSession {
     /// Zeros until the corresponding group exists.
     pub fn epochs(&self) -> crate::ApqEpochs {
         let inner = self.lock();
-        let (pq_epoch, classical_epoch) = inner
+        inner
             .send_group
             .as_ref()
-            .map(|g| {
-                (
-                    g.pq.as_ref().map(|p| p.current_epoch()).unwrap_or(0),
-                    g.classical.current_epoch(),
-                )
+            .map(apq_epochs)
+            .unwrap_or(crate::ApqEpochs {
+                pq_epoch: 0,
+                classical_epoch: 0,
             })
-            .unwrap_or((0, 0));
-        crate::ApqEpochs {
-            pq_epoch,
-            classical_epoch,
-        }
     }
 
     /// A.4 initiator — emit this side's PQ key package (tag 0x11) so the peer can stand
@@ -908,7 +912,7 @@ impl TwoMlsPqSession {
             .take()
             .ok_or(TwoMlsPqError::SessionNotReady)?;
 
-        let (app_bytes, epoch) = {
+        let (app_bytes, epochs) = {
             let send = inner
                 .send_group
                 .as_mut()
@@ -919,9 +923,9 @@ impl TwoMlsPqSession {
                 .encrypt_application_message(&app_message, proposal_hash.digest)
                 .map_err(|_| TwoMlsPqError::Mls)?;
 
-            let epoch = send.message_group().current_epoch();
+            let epochs = apq_epochs(send);
             let bytes = cipher_msg.to_bytes().map_err(|_| TwoMlsPqError::Mls)?;
-            (bytes, epoch)
+            (bytes, epochs)
         };
 
         let cipher_text = match (
@@ -958,7 +962,7 @@ impl TwoMlsPqSession {
             cipher_text,
             sender,
             recipient,
-            epoch,
+            epochs,
         })
     }
 
@@ -1562,6 +1566,50 @@ mod tests {
             .rendezvous_by_epoch
             .iter()
             .any(|e| e.rendezvous_id.bytes == post.bytes));
+    }
+
+    #[test]
+    fn test_encrypt_result_reports_apq_epoch_pair() {
+        let (alice, bob) = establish_sessions();
+
+        // Acceptor pre-A.4: classical-only send group — pq epoch 0, not a
+        // duplicate of the classical epoch.
+        assert_ok!(bob.prepare_to_encrypt(None));
+        let upd = assert_ok!(bob.encrypt(b"upd".to_vec()));
+        assert_eq!(upd.epochs.pq_epoch, 0);
+        assert_eq!(upd.epochs.classical_epoch, 1);
+
+        // Initiator commit round: full APQ pair from birth — pq stays 1 while
+        // the commit advances classical to 2 — matching the session's own view.
+        let got = assert_some!(assert_ok!(alice.process_incoming(upd.cipher_text)));
+        assert_ok!(alice.queue_proposal(assert_some!(got.proposal).digest));
+        assert_ok!(alice.prepare_to_encrypt(None));
+        let committed = assert_ok!(alice.encrypt(b"commit".to_vec()));
+        assert_eq!(committed.epochs.pq_epoch, 1);
+        assert_eq!(committed.epochs.classical_epoch, 2);
+        let session_view = alice.epochs();
+        assert_eq!(committed.epochs.pq_epoch, session_view.pq_epoch);
+        assert_eq!(
+            committed.epochs.classical_epoch,
+            session_view.classical_epoch
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "cryptokit")]
+    fn test_encrypt_epochs_diverge_post_bootstrap() {
+        let (alice, bob) = establish_full();
+        // Post-A.4 the acceptor's send group has its PQ half (epoch 1); a commit
+        // round moves classical to 2 while pq stays 1 — the pair diverges and
+        // encrypt reports it faithfully.
+        assert_ok!(alice.prepare_to_encrypt(None));
+        let upd = assert_ok!(alice.encrypt(b"upd".to_vec()));
+        let got = assert_some!(assert_ok!(bob.process_incoming(upd.cipher_text)));
+        assert_ok!(bob.queue_proposal(assert_some!(got.proposal).digest));
+        assert_ok!(bob.prepare_to_encrypt(None));
+        let committed = assert_ok!(bob.encrypt(b"pq-live".to_vec()));
+        assert_eq!(committed.epochs.pq_epoch, 1);
+        assert_eq!(committed.epochs.classical_epoch, 2);
     }
 
     #[test]
