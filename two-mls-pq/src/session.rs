@@ -92,7 +92,7 @@ const PARTIAL_TAG: u8 = 0x05;
 // stays reserved so old frames are rejected rather than misparsed.
 // Stapled welcome: [0x09 tag][u32-LE welcome-len][APQWelcome bytes][inner frame bytes].
 // The acceptor staples its return APQWelcome onto its first app frame; the inner frame is an
-// ordinary tagged frame (0x05/0x07/0x03/raw). First round only — consumed after one send.
+// ordinary tagged frame (0x05/0x03/raw). First round only — consumed after one send.
 const STAPLED_WELCOME_TAG: u8 = 0x09;
 // Rendezvous derivation, shared with the classical backend so both stacks address
 // transport channels the same way: exportSecret(label, context, 32) on a group's
@@ -456,7 +456,7 @@ impl SessionInner {
         }
     }
 
-    /// Phase 8: encode a rotation commit on send_group.pq with `new_id` in authenticated_data.
+    /// Phase 8: encode a rotation commit on the classical send group with `new_id` in authenticated_data.
     fn prepare_rotation(&mut self, new_id: ClientId) -> Result<crate::PrepareEncryptResult> {
         let new_client = self
             .pending_new_client
