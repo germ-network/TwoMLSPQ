@@ -28,8 +28,9 @@ and a session holds the client backing its groups (plus the successor client sta
 by an agent rotation) — but those are hidden plumbing, never handed to the app.
 
 The consequence is that persistence is **per-object, not per-client**: each object
-serialises what it owns (`TwoMlsPqInvitation.archive()` today; session archives are
-[planned work](./planned-features.md)). There is no mls-rs-style "restore the
+serialises what it owns (`TwoMlsPqInvitation.archive()` and
+`TwoMlsPqSession.archive()`; see the [API Reference](./api-reference.md) for the
+session archive's single-use contract). There is no mls-rs-style "restore the
 client and find your groups again" path — you restore an invitation or a session.
 
 Concretely, a session archives by **enumerating its groups**: each of its (up to
@@ -46,9 +47,9 @@ group actually resolves from, immediately before building or processing the comm
 that references them; retired and one-shot entries are deleted afterwards, so the
 mls-rs secret stores are ephemeral plumbing that holds nothing the session doesn't.
 The ledger resolves frames that crossed one of our commits (which reference an epoch
-mls-rs can no longer export), and it must be included in the session archive when
-that lands (it is session-owned state; see
-[planned features](./planned-features.md)).
+mls-rs can no longer export), and — being session-owned state — it rides in the
+session archive, so a restored session (whose fresh client's stores are empty)
+still resolves them.
 
 ## Two asymmetric send groups
 

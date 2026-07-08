@@ -2,6 +2,8 @@
 /buildIos
 /buildIosFramework
 /bindings
+# SwiftPM scratch dir left by `swift package compute-checksum` (buildIosDynamic.sh)
+/.build
 Cargo.lock
 *.xcframework
 *.a
