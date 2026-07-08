@@ -11,12 +11,12 @@
 
 use mls_rs::crypto::{HpkePublicKey, HpkeSecretKey};
 use mls_rs::psk::{ExternalPskId, PreSharedKey};
+use mls_rs::storage_provider::in_memory::InMemoryPreSharedKeyStorage;
 use mls_rs::{KeyPackageStorage, MlsMessage};
 use mls_rs_crypto_cryptokit::ml_kem::MlKem768Kem;
 use mls_rs_crypto_traits::KemType;
 
-use crate::client::CombinerClient;
-use crate::group::{export_and_register_psk_pq, injected_secret_psk_id, PqMlsGroup};
+use crate::group::{export_psk_pq, injected_secret_psk_id, CombinerGroup, PqMlsGroup};
 use crate::{CombinerError, Result};
 
 /// Apple CryptoKit's ML-KEM-768 KEM (kem id 0xFDEA). Infallible to construct — it is the only
@@ -65,40 +65,41 @@ fn injected_psk_id<S: KeyPackageStorage + Clone>(group: &PqMlsGroup<S>) -> Exter
     injected_secret_psk_id(group.current_epoch(), group.group_id())
 }
 
-/// Holds an injected secret S registered in the PQ secret store and removes it on drop, so the
+/// Holds an injected secret S registered in a PQ secret store and removes it on drop, so the
 /// per-round ML-KEM entropy is cleared on **every** exit path — including early `?` returns — not
 /// just the happy path. This is what gives the ratchet forward secrecy: a later state compromise
-/// cannot recover S. `id` is reused for the commit's `add_external_psk` proposal.
-struct InjectedSecret<'a, S: KeyPackageStorage + Clone> {
+/// cannot recover S. `id` is reused for the commit's `add_external_psk` proposal. The store is
+/// the group-captured handle (the store the PQ half actually resolves from — the session's
+/// current client is the wrong target after an agent rotation).
+struct InjectedSecret {
     id: ExternalPskId,
-    client: &'a CombinerClient<S>,
+    store: InMemoryPreSharedKeyStorage,
 }
 
-impl<'a, S: KeyPackageStorage + Clone> InjectedSecret<'a, S> {
-    fn register(group: &PqMlsGroup<S>, s: &[u8], client: &'a CombinerClient<S>) -> Self {
-        let id = injected_psk_id(group);
-        let mut pq = client.pq().secret_store();
-        pq.insert(id.clone(), PreSharedKey::new(s.to_vec()));
-        Self { id, client }
+impl InjectedSecret {
+    fn register(id: ExternalPskId, s: &[u8], mut store: InMemoryPreSharedKeyStorage) -> Self {
+        store.insert(id.clone(), PreSharedKey::new(s.to_vec()));
+        Self { id, store }
     }
 }
 
-impl<S: KeyPackageStorage + Clone> Drop for InjectedSecret<'_, S> {
+impl Drop for InjectedSecret {
     fn drop(&mut self) {
-        let mut pq = self.client.pq().secret_store();
-        pq.delete(&self.id);
+        self.store.delete(&self.id);
     }
 }
 
-/// Initiator (committer) — inject S into `pq_group` via a pathless PSK commit, apply it, and
-/// re-export the `apq_psk` from the new PQ epoch (registered for the classical bind).
-/// Returns `(pq_commit_bytes, apq_psk_id)`.
+/// Initiator (committer) — inject S into `send`'s PQ half via a pathless PSK commit, apply it,
+/// and re-export the `apq_psk` from the new PQ epoch, registered into the stores `send`'s
+/// halves resolve from (the classical bind commit reads the captured classical store).
+/// Returns `(pq_commit_bytes, apq_psk_id)`. Errors if the PQ half is deferred.
 pub fn inject_and_commit<S: KeyPackageStorage + Clone>(
-    pq_group: &mut PqMlsGroup<S>,
+    send: &mut CombinerGroup<S>,
     s: &[u8],
-    client: &CombinerClient<S>,
 ) -> Result<(Vec<u8>, ExternalPskId)> {
-    let secret = InjectedSecret::register(pq_group, s, client);
+    let store = send.pq_psk_store();
+    let pq_group = send.pq.as_mut().ok_or(CombinerError::Mls)?;
+    let secret = InjectedSecret::register(injected_psk_id(pq_group), s, store);
     let out = pq_group
         .commit_builder()
         .add_external_psk(secret.id.clone())
@@ -110,30 +111,35 @@ pub fn inject_and_commit<S: KeyPackageStorage + Clone>(
         .map_err(|_| CombinerError::Mls)?;
     // S is now folded into the new epoch; wipe it from the store before re-exporting.
     drop(secret);
-    let apq_psk_id = export_and_register_psk_pq(pq_group, client)?;
     let bytes = out
         .commit_message
         .to_bytes()
         .map_err(|_| CombinerError::Mls)?;
+    let (apq_psk_id, apq_psk) = export_psk_pq(send.pq.as_ref().ok_or(CombinerError::Mls)?)?;
+    send.register_psk(&apq_psk_id, &apq_psk);
     Ok((bytes, apq_psk_id))
 }
 
 /// Responder (applier) — register S (held since `encapsulate`), apply the initiator's pathless PQ
-/// commit, and re-export the same `apq_psk` from the new PQ epoch.
+/// commit on `recv`'s PQ half, and re-export the same `apq_psk` from the new PQ epoch into the
+/// stores `recv`'s halves resolve from. Errors if the PQ half is deferred.
 pub fn apply_injected_commit<S: KeyPackageStorage + Clone>(
-    pq_group: &mut PqMlsGroup<S>,
+    recv: &mut CombinerGroup<S>,
     s: &[u8],
     pq_commit: &[u8],
-    client: &CombinerClient<S>,
 ) -> Result<ExternalPskId> {
-    let secret = InjectedSecret::register(pq_group, s, client);
+    let store = recv.pq_psk_store();
+    let pq_group = recv.pq.as_mut().ok_or(CombinerError::Mls)?;
+    let secret = InjectedSecret::register(injected_psk_id(pq_group), s, store);
     let msg = MlsMessage::from_bytes(pq_commit).map_err(|_| CombinerError::Mls)?;
     pq_group
         .process_incoming_message(msg)
         .map_err(|_| CombinerError::Mls)?;
     // S is now folded into the new epoch; wipe it before re-exporting.
     drop(secret);
-    export_and_register_psk_pq(pq_group, client)
+    let (apq_psk_id, apq_psk) = export_psk_pq(recv.pq.as_ref().ok_or(CombinerError::Mls)?)?;
+    recv.register_psk(&apq_psk_id, &apq_psk);
+    Ok(apq_psk_id)
 }
 
 /// Benchmark fixture (never enabled in production): the "old" APQ-faithful per-round PQ cost — a
@@ -245,8 +251,7 @@ mod tests {
         assert_eq!(s_alice, s_bob);
 
         // Alice binds: pathless PQ commit injecting S, then a classical commit importing apq_psk.
-        let (pq_commit, apq_psk_id) =
-            inject_and_commit(asg.pq.as_mut().unwrap(), &s_alice, &alice).unwrap();
+        let (pq_commit, apq_psk_id) = inject_and_commit(&mut asg, &s_alice).unwrap();
         let cl_out = asg
             .classical
             .commit_builder()
@@ -258,8 +263,7 @@ mod tests {
         let cl_commit = cl_out.commit_message.to_bytes().unwrap();
 
         // Bob applies the stapled commits.
-        let apq_psk_id_bob =
-            apply_injected_commit(bob_recv.pq.as_mut().unwrap(), &s_bob, &pq_commit, &bob).unwrap();
+        let apq_psk_id_bob = apply_injected_commit(&mut bob_recv, &s_bob, &pq_commit).unwrap();
         bob_recv
             .classical
             .process_incoming_message(MlsMessage::from_bytes(&cl_commit).unwrap())
@@ -314,7 +318,7 @@ mod tests {
         let eph = generate_ephemeral().unwrap();
         let (_s_bob, ct) = encapsulate(&eph.encapsulation_key()).unwrap();
         let s = decapsulate(&eph, &ct).unwrap();
-        inject_and_commit(asg.pq.as_mut().unwrap(), &s, &alice).unwrap();
+        inject_and_commit(&mut asg, &s).unwrap();
 
         // Forward secrecy: the per-round ML-KEM secret is gone from the store after the bind.
         assert!(alice.pq().secret_store().get(&s_id).is_none());

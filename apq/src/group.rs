@@ -2,10 +2,13 @@
 
 use mls_rs::{
     psk::{ExternalPskId, PreSharedKey},
+    storage_provider::in_memory::InMemoryPreSharedKeyStorage,
     ExtensionList, Group, KeyPackageStorage, MlsMessage,
 };
+use zeroize::Zeroizing;
 
 use crate::client::{CombinerClient, MlsClient, OurConfig};
+use crate::storage::PersistableGroupStorage;
 use crate::{CombinerError, Result};
 
 #[cfg(feature = "cryptokit")]
@@ -26,9 +29,101 @@ pub struct CombinerGroup<S: KeyPackageStorage + Clone> {
     /// `None` while the PQ half is deferred: an acceptor's send group before the A.4
     /// bootstrap, and the initiator's recv group mirroring it.
     pub pq: Option<PqMlsGroup<S>>,
+    // Group-state and PSK storage handles of the client that created/joined each half. An
+    // mls-rs group reads and writes through the config of its originating client, so
+    // archival pulls (and PSK injection lands) through these captured handles — a later
+    // client swap (agent rotation) must not redirect where an existing group's state or
+    // PSK lookups resolve.
+    classical_storage: PersistableGroupStorage,
+    pq_storage: PersistableGroupStorage,
+    classical_psks: InMemoryPreSharedKeyStorage,
+    pq_psks: InMemoryPreSharedKeyStorage,
+}
+
+/// One Combiner group's exported state: a per-group blob per half, produced by
+/// [`CombinerGroup::export_state`] and consumed by [`load_combiner_group`]. The blobs are
+/// plaintext secret material (see `storage::PersistableGroupStorage::export_group`); callers
+/// must seal them (e.g. with [`crate::archive::seal`]) before persisting.
+pub struct CombinerGroupState {
+    pub classical: Zeroizing<Vec<u8>>,
+    pub pq: Option<Zeroizing<Vec<u8>>>,
 }
 
 impl<S: KeyPackageStorage + Clone> CombinerGroup<S> {
+    /// Assemble a Combiner group from halves that were created/joined by `client`, capturing
+    /// the client's storage handles for later per-group archival.
+    pub fn from_client(
+        client: &CombinerClient<S>,
+        classical: MlsGroup<S>,
+        pq: Option<PqMlsGroup<S>>,
+    ) -> Self {
+        Self {
+            classical,
+            pq,
+            classical_storage: client.classical_group_storage().clone(),
+            pq_storage: pq_storage_of(client).clone(),
+            classical_psks: client.classical().secret_store(),
+            pq_psks: pq_psks_of(client),
+        }
+    }
+
+    /// Attach a deferred (A.4) PQ half that was created/joined by `client`, capturing the
+    /// storage handles it resolves through. The classical half's handles are untouched —
+    /// they stay with the client that originally produced that half.
+    pub fn set_pq(&mut self, pq: PqMlsGroup<S>, client: &CombinerClient<S>) {
+        self.pq = Some(pq);
+        self.pq_storage = pq_storage_of(client).clone();
+        self.pq_psks = pq_psks_of(client);
+    }
+
+    /// Inject a PSK into the secret stores this group's halves resolve from (the
+    /// originating client's), immediately before building or processing a commit that
+    /// references it. Injecting via the current session client instead would miss after an
+    /// agent rotation — the group keeps reading the store it was born with.
+    pub fn register_psk(&self, psk_id: &ExternalPskId, psk: &PreSharedKey) {
+        let mut classical = self.classical_psks.clone();
+        classical.insert(psk_id.clone(), psk.clone());
+        let mut pq = self.pq_psks.clone();
+        pq.insert(psk_id.clone(), psk.clone());
+    }
+
+    /// Remove a PSK from the stores this group's halves resolve from, once the commit that
+    /// referenced it has been applied/processed (or the session has retired it). Keeps the
+    /// stores' contents bounded by what the caller still vouches for.
+    pub fn forget_psk(&self, psk_id: &ExternalPskId) {
+        let mut classical = self.classical_psks.clone();
+        classical.delete(psk_id);
+        let mut pq = self.pq_psks.clone();
+        pq.delete(psk_id);
+    }
+
+    /// The PQ half's captured secret-store handle, for the PQ side-band flows that manage
+    /// a short-lived PSK themselves (insert *and* delete, see `pq_ratchet::InjectedSecret`).
+    #[cfg(feature = "cryptokit")]
+    pub(crate) fn pq_psk_store(&self) -> InMemoryPreSharedKeyStorage {
+        self.pq_psks.clone()
+    }
+
+    /// Flush both halves and export each half's state + retained epoch secrets, pulled
+    /// through the storage handles captured at construction (so this works regardless of
+    /// which client the session currently holds).
+    pub fn export_state(&mut self) -> Result<CombinerGroupState> {
+        self.classical
+            .write_to_storage()
+            .map_err(|_| CombinerError::Mls)?;
+        let classical = self
+            .classical_storage
+            .export_group(self.classical.group_id())?;
+        let pq = match self.pq.as_mut() {
+            Some(pq) => {
+                pq.write_to_storage().map_err(|_| CombinerError::Mls)?;
+                Some(self.pq_storage.export_group(pq.group_id())?)
+            }
+            None => None,
+        };
+        Ok(CombinerGroupState { classical, pq })
+    }
+
     // Application messages ride the classical group; the pq group is the side channel that
     // injects PQ secrecy via the APQ-PSK and only ratchets on a full (queued-proposal) round.
     pub fn message_group(&self) -> &MlsGroup<S> {
@@ -37,6 +132,63 @@ impl<S: KeyPackageStorage + Clone> CombinerGroup<S> {
     pub fn message_group_mut(&mut self) -> &mut MlsGroup<S> {
         &mut self.classical
     }
+}
+
+/// The storage the PQ half writes through: the PQ client's under `cryptokit`, otherwise the
+/// classical client's (the simulated PQ half is a classical group on the classical client).
+fn pq_storage_of<S: KeyPackageStorage + Clone>(
+    client: &CombinerClient<S>,
+) -> &PersistableGroupStorage {
+    #[cfg(feature = "cryptokit")]
+    {
+        client.pq_group_storage()
+    }
+    #[cfg(not(feature = "cryptokit"))]
+    {
+        client.classical_group_storage()
+    }
+}
+
+/// The secret store the PQ half resolves PSKs from (see [`pq_storage_of`]).
+fn pq_psks_of<S: KeyPackageStorage + Clone>(
+    client: &CombinerClient<S>,
+) -> InMemoryPreSharedKeyStorage {
+    #[cfg(feature = "cryptokit")]
+    {
+        client.pq().secret_store()
+    }
+    #[cfg(not(feature = "cryptokit"))]
+    {
+        client.classical().secret_store()
+    }
+}
+
+/// Rebuild a [`CombinerGroup`] on `client` from exported state: import each half's record
+/// into the client's storage, then load the group from it. The loaded groups write through
+/// `client`'s storage from here on.
+pub fn load_combiner_group<S: KeyPackageStorage + Clone>(
+    client: &CombinerClient<S>,
+    state: &CombinerGroupState,
+) -> Result<CombinerGroup<S>> {
+    let classical_id = client
+        .classical_group_storage()
+        .import_group(&state.classical)?;
+    let classical = client
+        .classical()
+        .load_group(&classical_id)
+        .map_err(|_| CombinerError::Mls)?;
+    let pq = match &state.pq {
+        Some(bytes) => {
+            let pq_id = pq_storage_of(client).import_group(bytes)?;
+            #[cfg(feature = "cryptokit")]
+            let pq = client.pq().load_group(&pq_id);
+            #[cfg(not(feature = "cryptokit"))]
+            let pq = client.classical().load_group(&pq_id);
+            Some(pq.map_err(|_| CombinerError::Mls)?)
+        }
+        None => None,
+    };
+    Ok(CombinerGroup::from_client(client, classical, pq))
 }
 
 /// Encode the two-welcome APQ envelope (classical + pq).
@@ -102,26 +254,78 @@ pub(crate) fn injected_secret_psk_id(epoch: u64, group_id: &[u8]) -> ExternalPsk
     ExternalPskId::new(id)
 }
 
-/// Export 32 bytes from `group` via exportSecret and register them in the client's PSK store.
-/// Both parties derive the same value from the same epoch, enabling independent PSK registration.
-/// Registers in both classical and PQ stores so both halves can use the PSK for group binding.
-pub fn export_and_register_psk<S: KeyPackageStorage + Clone>(
+/// Derive the exportable PSK for `group`'s current epoch: 32 bytes via exportSecret, with
+/// id = LE epoch || group_id. Pure derivation — no store side-effect. Both parties derive
+/// the same value from the same epoch. Pair with [`register_psk`]: durable PSK material
+/// belongs to the caller (session orchestration), which injects just-in-time before the
+/// commit that references it.
+pub fn export_psk<S: KeyPackageStorage + Clone>(
     group: &MlsGroup<S>,
-    client: &CombinerClient<S>,
-) -> Result<ExternalPskId> {
+) -> Result<(ExternalPskId, PreSharedKey)> {
     let secret = group
         .export_secret(b"exportSecret", b"derive", 32)
         .map_err(|_| CombinerError::Mls)?;
-    let psk_id = make_psk_id(group.current_epoch(), group.group_id());
-    let psk = PreSharedKey::new(secret.as_bytes().to_vec());
+    Ok((
+        make_psk_id(group.current_epoch(), group.group_id()),
+        PreSharedKey::new(secret.as_bytes().to_vec()),
+    ))
+}
+
+/// Inject a PSK into the client's secret store(s) — both halves, so either can resolve it —
+/// immediately before building or processing the commit that references it. The stores are
+/// ephemeral plumbing; they are not archived and hold nothing the caller doesn't.
+pub fn register_psk<S: KeyPackageStorage + Clone>(
+    client: &CombinerClient<S>,
+    psk_id: &ExternalPskId,
+    psk: &PreSharedKey,
+) {
     let mut store = client.classical().secret_store();
     store.insert(psk_id.clone(), psk.clone());
     #[cfg(feature = "cryptokit")]
     {
         let mut pq_store = client.pq().secret_store();
-        pq_store.insert(psk_id.clone(), psk);
+        pq_store.insert(psk_id.clone(), psk.clone());
     }
+}
+
+/// Remove a PSK from a client's secret store(s) — the counterpart of [`register_psk`], for
+/// entries the caller has retired.
+pub fn forget_psk<S: KeyPackageStorage + Clone>(
+    client: &CombinerClient<S>,
+    psk_id: &ExternalPskId,
+) {
+    let mut store = client.classical().secret_store();
+    store.delete(psk_id);
+    #[cfg(feature = "cryptokit")]
+    {
+        let mut pq_store = client.pq().secret_store();
+        pq_store.delete(psk_id);
+    }
+}
+
+/// [`export_psk`] + [`register_psk`] for derive-and-use-immediately sites (establishment,
+/// where the PSK is consumed by a join/commit in the same call).
+pub fn export_and_register_psk<S: KeyPackageStorage + Clone>(
+    group: &MlsGroup<S>,
+    client: &CombinerClient<S>,
+) -> Result<ExternalPskId> {
+    let (psk_id, psk) = export_psk(group)?;
+    register_psk(client, &psk_id, &psk);
     Ok(psk_id)
+}
+
+/// [`export_psk`] for a PQ group, which is a distinct type when `cryptokit` is on.
+#[cfg(feature = "cryptokit")]
+pub fn export_psk_pq<S: KeyPackageStorage + Clone>(
+    group: &PqMlsGroup<S>,
+) -> Result<(ExternalPskId, PreSharedKey)> {
+    let secret = group
+        .export_secret(b"exportSecret", b"derive", 32)
+        .map_err(|_| CombinerError::Mls)?;
+    Ok((
+        make_psk_id(group.current_epoch(), group.group_id()),
+        PreSharedKey::new(secret.as_bytes().to_vec()),
+    ))
 }
 
 /// Export and register PSK from a PQ group. Identical to `export_and_register_psk` but
@@ -131,17 +335,8 @@ pub fn export_and_register_psk_pq<S: KeyPackageStorage + Clone>(
     group: &PqMlsGroup<S>,
     client: &CombinerClient<S>,
 ) -> Result<ExternalPskId> {
-    let secret = group
-        .export_secret(b"exportSecret", b"derive", 32)
-        .map_err(|_| CombinerError::Mls)?;
-    let psk_id = make_psk_id(group.current_epoch(), group.group_id());
-    let psk = PreSharedKey::new(secret.as_bytes().to_vec());
-    let mut store = client.classical().secret_store();
-    store.insert(psk_id.clone(), psk.clone());
-    {
-        let mut pq_store = client.pq().secret_store();
-        pq_store.insert(psk_id.clone(), psk);
-    }
+    let (psk_id, psk) = export_psk_pq(group)?;
+    register_psk(client, &psk_id, &psk);
     Ok(psk_id)
 }
 
@@ -262,10 +457,7 @@ pub fn create_combiner_send_group<S: KeyPackageStorage + Clone>(
         create_group_with_member(client.classical(), classical_kp, &[apq_psk])?;
     let apq = encode_apq_welcome(classical_welcome, pq_welcome);
     Ok((
-        CombinerGroup {
-            classical: classical_group,
-            pq: Some(pq_group),
-        },
+        CombinerGroup::from_client(client, classical_group, Some(pq_group)),
         apq,
     ))
 }
@@ -288,10 +480,7 @@ pub fn join_combiner_group<S: KeyPackageStorage + Clone>(
     #[cfg(not(feature = "cryptokit"))]
     export_and_register_psk(&pq, client)?;
     let classical = join_group_from_welcome(client.classical(), &classical_welcome)?;
-    Ok(CombinerGroup {
-        classical,
-        pq: Some(pq),
-    })
+    Ok(CombinerGroup::from_client(client, classical, Some(pq)))
 }
 
 /// Create the acceptor's bound send group (Group_B) with the PQ half deferred (A.4):
@@ -306,10 +495,7 @@ pub fn create_bound_classical_send_group<S: KeyPackageStorage + Clone>(
     let (classical_group, classical_welcome) =
         create_group_with_member(client.classical(), classical_kp, &[psk_cross])?;
     Ok((
-        CombinerGroup {
-            classical: classical_group,
-            pq: None,
-        },
+        CombinerGroup::from_client(client, classical_group, None),
         classical_welcome,
     ))
 }
@@ -340,10 +526,7 @@ pub fn create_bound_combiner_send_group<S: KeyPackageStorage + Clone>(
         create_group_with_member(client.classical(), classical_kp, &[psk_cross, psk_apq])?;
     let apq = encode_apq_welcome(classical_welcome, pq_welcome);
     Ok((
-        CombinerGroup {
-            classical: classical_group,
-            pq: Some(pq_group),
-        },
+        CombinerGroup::from_client(client, classical_group, Some(pq_group)),
         apq,
     ))
 }
@@ -402,6 +585,95 @@ mod tests {
         {
             c.generate_classical_key_package().unwrap()
         }
+    }
+
+    /// The adopted persistence pattern end-to-end: archive per group through the group
+    /// objects, restore onto a client rebuilt from the archived signing identity, and keep
+    /// messaging. The restored side must decrypt both a pre-archive in-flight message and
+    /// messages sent after the restore.
+    #[test]
+    fn test_combiner_group_state_survives_client_rebuild() {
+        use mls_rs::group::ReceivedMessage;
+        use zeroize::Zeroizing;
+
+        let alice = client();
+        let bob_id = client_id();
+        let bob = TestClient::new(bob_id.clone()).unwrap();
+        // The archivable signing identity, captured as an invitation-style archive would.
+        let bob_classical_key = Zeroizing::new(bob.classical_signing_key().to_vec());
+        #[cfg(feature = "cryptokit")]
+        let bob_pq_key = Zeroizing::new(bob.pq_signing_key().to_vec());
+
+        let (mut alice_send, welcome) = create_combiner_send_group(
+            &bob.generate_classical_key_package().unwrap(),
+            &pq_kp(&bob),
+            &alice,
+        )
+        .unwrap();
+        let mut bob_recv = join_combiner_group(&welcome, &bob).unwrap();
+
+        // A message decrypted before archival, and one still in flight across the restart.
+        let m1 = alice_send
+            .classical
+            .encrypt_application_message(b"before archive", vec![])
+            .unwrap()
+            .to_bytes()
+            .unwrap();
+        bob_recv
+            .classical
+            .process_incoming_message(MlsMessage::from_bytes(&m1).unwrap())
+            .unwrap();
+        let in_flight = alice_send
+            .classical
+            .encrypt_application_message(b"in flight", vec![])
+            .unwrap()
+            .to_bytes()
+            .unwrap();
+
+        // Bob archives his recv group and "restarts": a fresh CombinerClient rebuilt from
+        // the archived signing identity, with empty stores.
+        let state = bob_recv.export_state().unwrap();
+        let classical_gid = bob_recv.classical.group_id().to_vec();
+        drop(bob_recv);
+        drop(bob);
+
+        #[cfg(feature = "cryptokit")]
+        let bob2 = TestClient::from_key_packages(
+            bob_id,
+            bob_classical_key,
+            Default::default(),
+            bob_pq_key,
+            Default::default(),
+        )
+        .unwrap();
+        #[cfg(not(feature = "cryptokit"))]
+        let bob2 =
+            TestClient::from_key_packages(bob_id, bob_classical_key, Default::default()).unwrap();
+
+        let mut restored = load_combiner_group(&bob2, &state).unwrap();
+        assert_eq!(restored.classical.group_id(), classical_gid.as_slice());
+        assert!(restored.pq.is_some());
+
+        let decrypt = |restored: &mut CombinerGroup<_>, bytes: &[u8]| match restored
+            .classical
+            .process_incoming_message(MlsMessage::from_bytes(bytes).unwrap())
+            .unwrap()
+        {
+            ReceivedMessage::ApplicationMessage(m) => m.data().to_vec(),
+            _ => Vec::new(),
+        };
+
+        // The in-flight message decrypts after the restore…
+        assert_eq!(decrypt(&mut restored, &in_flight), b"in flight");
+
+        // …and so do messages sent afterwards.
+        let m3 = alice_send
+            .classical
+            .encrypt_application_message(b"after restore", vec![])
+            .unwrap()
+            .to_bytes()
+            .unwrap();
+        assert_eq!(decrypt(&mut restored, &m3), b"after restore");
     }
 
     #[test]

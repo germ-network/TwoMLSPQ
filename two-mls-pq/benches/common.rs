@@ -8,7 +8,7 @@ use std::sync::Arc;
 use mls_rs::{CipherSuiteProvider, CryptoProvider};
 use mls_rs_crypto_rustcrypto::RustCryptoProvider;
 use two_mls_pq::{
-    key_packages::{CombinerKeyPackage, TwoMlsPqClient},
+    key_packages::{CombinerKeyPackage, TwoMlsPqIdentity},
     session::TwoMlsPqSession,
     MlsCipherSuite,
 };
@@ -23,11 +23,11 @@ pub fn client_id() -> Vec<u8> {
     secret.as_bytes().to_vec()
 }
 
-pub fn client() -> Arc<TwoMlsPqClient> {
-    TwoMlsPqClient::new(client_id()).unwrap()
+pub fn client() -> Arc<TwoMlsPqIdentity> {
+    TwoMlsPqIdentity::new(client_id()).unwrap()
 }
 
-pub fn combiner_kp(client: &TwoMlsPqClient) -> CombinerKeyPackage {
+pub fn combiner_kp(client: &TwoMlsPqIdentity) -> CombinerKeyPackage {
     #[cfg(feature = "cryptokit")]
     {
         client.generate_combiner_key_package().unwrap()

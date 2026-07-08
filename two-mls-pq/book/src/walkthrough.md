@@ -11,8 +11,8 @@ cargo test -p two-mls-pq --features cryptokit demo_ -- --nocapture
 
 The narrative, step by step:
 
-1. **Clients** — Alice and Bob each build a `TwoMlsPqClient` from their agent signing
-   key; the public component is the `ClientId`.
+1. **Identities** — Alice and Bob each build a `TwoMlsPqIdentity` for their `ClientId`
+   (opaque identity bytes); the MLS signing key is generated internally.
 2. **Key packages** — each generates a `CombinerKeyPackage` (classical + ML-KEM-768
    halves, same `ClientId`).
 3. **Parsing** — the peer's halves parse to `MlsKeyPackage`s; the classical suite is

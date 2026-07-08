@@ -1,5 +1,55 @@
 # Concepts
 
+## The object model: one mls-rs client vs. three TwoMLSPQ objects
+
+mls-rs centralizes everything behind one long-lived `Client` per credential: it
+generates key packages, creates and joins groups, and owns the storage providers
+(key packages, group state, PSKs) that every operation reads and writes. Persisting
+an mls-rs application means persisting that one client's providers, and all
+operations for a credential funnel through the one object.
+
+TwoMLSPQ deliberately breaks this up into three app-facing objects, each owning
+exactly the state its job needs:
+
+- **`TwoMlsPqIdentity`** — the agent identity. Its job is minting key packages and
+  invitations and holding their private material only until it is captured into an
+  invitation (`generate_invitation` purges the identity's own copies). It is not a
+  hub for group operations.
+- **`TwoMlsPqInvitation`** — a self-contained receiving capability: one published
+  combiner key package's private material, the signing identity, and the
+  consumed-remote replay guard. It turns welcomes into sessions with no live client
+  and survives restarts through its own archive.
+- **`TwoMlsPqSession`** — one established pairwise channel: the two Combiner
+  send/receive group pairs and the per-round state.
+
+Internally the invitation and the session still drive mls-rs clients — the
+invitation rebuilds a stateless one from its captured material on each `receive`,
+and a session holds the client backing its groups (plus the successor client staged
+by an agent rotation) — but those are hidden plumbing, never handed to the app.
+
+The consequence is that persistence is **per-object, not per-client**: each object
+serialises what it owns (`TwoMlsPqInvitation.archive()` today; session archives are
+[planned work](./planned-features.md)). There is no mls-rs-style "restore the
+client and find your groups again" path — you restore an invitation or a session.
+
+Concretely, a session archives by **enumerating its groups**: each of its (up to
+four) MLS groups is exported per group through the group object and the storage
+handle captured when that group was created or joined (`apq`'s
+`CombinerGroup::export_state` / `load_combiner_group`), never by snapshotting a
+client's whole store. This keeps archival correct across agent rotation — rotation
+swaps the session's internal client, and a group's state keeps flowing through the
+handle it was born with.
+
+The same ownership rule covers PSKs: the session keeps a small ledger of its send
+group's recent cross-party TwoMLS-PSKs and **live-injects** them into the stores a
+group actually resolves from, immediately before building or processing the commit
+that references them; retired and one-shot entries are deleted afterwards, so the
+mls-rs secret stores are ephemeral plumbing that holds nothing the session doesn't.
+The ledger resolves frames that crossed one of our commits (which reference an epoch
+mls-rs can no longer export), and it must be included in the session archive when
+that lands (it is session-owned state; see
+[planned features](./planned-features.md)).
+
 ## Two asymmetric send groups
 
 A classical MLS group is symmetric: every member can commit. TwoMLSPQ instead gives

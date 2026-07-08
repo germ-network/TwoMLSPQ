@@ -1,20 +1,22 @@
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
+use mls_rs::psk::{ExternalPskId, PreSharedKey};
 use mls_rs::{group::ReceivedMessage, MlsMessage};
 
 #[cfg(not(feature = "cryptokit"))]
 use apq::create_group_with_member;
 use apq::{
     create_bound_classical_send_group, create_combiner_send_group, decode_apq_welcome,
-    encode_apq_welcome, export_and_register_psk, join_combiner_group, join_group_from_welcome,
-    sender_client_id, APQ_TAG,
+    encode_apq_welcome, export_psk, forget_psk, join_combiner_group, join_group_from_welcome,
+    register_psk, sender_client_id, APQ_TAG,
 };
 
 use crate::key_package_store::CombinerGroup;
 
 use crate::{
     key_packages::{
-        ensure_pq_available, parse_mls_key_package, CombinerKeyPackage, TwoMlsPqClient,
+        ensure_pq_available, parse_mls_key_package, CombinerKeyPackage, TwoMlsPqIdentity,
     },
     AgentState, Archive, ClientId, CombinerGroupId, CommitResult, DecryptResult, EncryptResult,
     ListenChannels, MlsGroupId, MlsSenderMessage, PrepareEncryptResult, RendezvousId, Result,
@@ -27,7 +29,7 @@ use apq::{export_and_register_psk_pq, pq_create_group_with_member, pq_join_group
 use zeroize::Zeroizing;
 
 struct SessionInner {
-    client: Arc<TwoMlsPqClient>,
+    client: Arc<TwoMlsPqIdentity>,
     send_group: Option<CombinerGroup>,
     recv_group: Option<CombinerGroup>,
     pending_outbound: Option<Vec<u8>>,
@@ -40,7 +42,7 @@ struct SessionInner {
     /// enters our send group's proposal cache only via `queue_proposal`.
     offered_proposal: Option<(TwoMlsPqDigest, Vec<u8>)>,
     queued_proposal: Option<TwoMlsPqDigest>,
-    pending_new_client: Option<Arc<TwoMlsPqClient>>,
+    pending_new_client: Option<Arc<TwoMlsPqIdentity>>,
     #[cfg(feature = "cryptokit")]
     pq_inflight: Option<PqInflight>,
     session_id: SessionId,
@@ -52,7 +54,28 @@ struct SessionInner {
     /// Whose move the PQ side-band is: the initiator owes the A.4 bootstrap; thereafter
     /// completing an operation passes the turn to the peer.
     pq_turn_mine: bool,
+    /// Cross-party TwoMLS-PSKs of OUR send group's recent epochs, owned by the session
+    /// (destined for the session archive; the mls-rs secret stores are ephemeral plumbing,
+    /// filled just-in-time by `inject_send_psks`). The peer binds the PSK of our send
+    /// group's epoch *as they last observed it*, so a frame that crossed one of our
+    /// commits can reference an epoch mls-rs can no longer export — the ledger keeps a
+    /// window instead of re-deriving at the current epoch only.
+    send_psk_ledger: VecDeque<(ExternalPskId, PreSharedKey)>,
+    /// PSK ids evicted from the ledger (or consumed one-shot) but possibly still present in
+    /// the mls-rs secret stores from an earlier injection; the next `inject_send_psks`
+    /// deletes them so the stores never resolve PSKs the session no longer vouches for.
+    retired_send_psks: Vec<ExternalPskId>,
 }
+
+/// Ledger depth for `send_psk_ledger`: one entry per send-group epoch. The peer references
+/// the epoch it last observed, so the window must cover every unilateral send-group commit
+/// (queued-proposal ratchet, agent rotation, PQ bind) that can cross one in-flight peer
+/// frame. That count is protocol-unbounded in principle — a host looping rotations while a
+/// peer frame is in transit can outrun any fixed window and permanently desync the
+/// direction (the failed frame is a commit, so there is no recovery) — but each entry is
+/// one 32-byte secret, so we keep a generous window and rely on hosts not committing
+/// unboundedly between peer frames.
+const SEND_PSK_WINDOW: usize = 8;
 
 /// A TwoMLSPQ session holding two asymmetric Combiner send groups.
 #[derive(uniffi::Object)]
@@ -217,29 +240,33 @@ impl TwoMlsPqSession {
         if inner.pending_pq_outbound.is_some() {
             return Err(TwoMlsPqError::SessionNotReady);
         }
+        // Capture the departing epoch's PSK before the classical bind commit below.
+        inner.remember_send_psk()?;
         let eph = match inner.pq_inflight.take() {
             Some(PqInflight::Initiating(eph)) => eph,
             _ => return Err(TwoMlsPqError::SessionNotReady),
         };
         let s = Zeroizing::new(apq::pq_ratchet::decapsulate(&eph, ct)?);
-        let client = inner.client.clone();
         let send = inner
             .send_group
             .as_mut()
             .ok_or(TwoMlsPqError::SessionNotReady)?;
-        let send_pq = send.pq.as_mut().ok_or(TwoMlsPqError::SessionNotReady)?;
-        let (pq_commit, apq_psk_id) =
-            apq::pq_ratchet::inject_and_commit(send_pq, &s, client.combiner())?;
+        if send.pq.is_none() {
+            return Err(TwoMlsPqError::SessionNotReady);
+        }
+        let (pq_commit, apq_psk_id) = apq::pq_ratchet::inject_and_commit(send, &s)?;
         let cl_out = send
             .classical
             .commit_builder()
-            .add_external_psk(apq_psk_id)
+            .add_external_psk(apq_psk_id.clone())
             .map_err(|_| TwoMlsPqError::Mls)?
             .build()
             .map_err(|_| TwoMlsPqError::Mls)?;
         send.classical
             .apply_pending_commit()
             .map_err(|_| TwoMlsPqError::Mls)?;
+        // The bind consumed the one-shot apq PSK; drop it from the store.
+        send.forget_psk(&apq_psk_id);
         let cl_commit = cl_out
             .commit_message
             .to_bytes()
@@ -250,6 +277,8 @@ impl TwoMlsPqSession {
             .map_err(|_| TwoMlsPqError::Mls)?
             .to_bytes()
             .map_err(|_| TwoMlsPqError::Mls)?;
+        // Our send group advanced: record the new epoch's PSK in the session ledger.
+        inner.remember_send_psk()?;
         // Our operation is complete once the peer applies; the turn passes.
         inner.pq_turn_mine = false;
         inner.pending_pq_outbound = Some(encode_pq_bind(pq_commit, cl_commit, app_ct));
@@ -265,17 +294,20 @@ impl TwoMlsPqSession {
             Some(PqInflight::Responding(s)) => s,
             _ => return Err(TwoMlsPqError::SessionNotReady),
         };
-        let client = inner.client.clone();
         let recv = inner
             .recv_group
             .as_mut()
             .ok_or(TwoMlsPqError::SessionNotReady)?;
-        let recv_pq = recv.pq.as_mut().ok_or(TwoMlsPqError::SessionNotReady)?;
-        apq::pq_ratchet::apply_injected_commit(recv_pq, &s, &pq_commit, client.combiner())?;
+        if recv.pq.is_none() {
+            return Err(TwoMlsPqError::SessionNotReady);
+        }
+        let apq_psk_id = apq::pq_ratchet::apply_injected_commit(recv, &s, &pq_commit)?;
         let cl = MlsMessage::from_bytes(&cl_commit).map_err(|_| TwoMlsPqError::Mls)?;
         recv.classical
             .process_incoming_message(cl)
             .map_err(|_| TwoMlsPqError::Mls)?;
+        // The bind consumed the one-shot apq PSK; drop it from the store.
+        recv.forget_psk(&apq_psk_id);
         let app = MlsMessage::from_bytes(&app_ct).map_err(|_| TwoMlsPqError::Mls)?;
         let out = match recv
             .classical
@@ -378,7 +410,65 @@ impl SessionInner {
         }
     }
 
-    /// Phase 8: encode a rotation commit on send_group.pq with `new_id` in authenticated_data.
+    /// Record the cross-party TwoMLS-PSK for our send group's current epoch in the
+    /// session-owned ledger. Called after every commit we apply on the send group (and
+    /// lazily from `inject_send_psks`), so the ledger always covers the epochs the peer
+    /// might still reference.
+    fn remember_send_psk(&mut self) -> Result<()> {
+        let send = self
+            .send_group
+            .as_ref()
+            .ok_or(TwoMlsPqError::SessionNotReady)?;
+        let (psk_id, psk) = export_psk(&send.classical)?;
+        if !self
+            .send_psk_ledger
+            .iter()
+            .any(|(known, _)| *known == psk_id)
+        {
+            self.send_psk_ledger.push_back((psk_id, psk));
+            while self.send_psk_ledger.len() > SEND_PSK_WINDOW {
+                if let Some((evicted, _)) = self.send_psk_ledger.pop_front() {
+                    self.retired_send_psks.push(evicted);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Live-inject the session's PSK ledger, immediately before processing a frame whose
+    /// commit may reference one of these PSKs. Injection targets the stores each live
+    /// group actually resolves from (captured at the group's creation — the current
+    /// client's stores are the wrong target after an agent rotation), plus the current
+    /// client's stores for joins that are about to create a group. Retired ids are then
+    /// deleted from the same targets, so the stores' contents stay bounded by the ledger
+    /// and nothing remains resolvable that the session no longer vouches for.
+    fn inject_send_psks(&mut self) -> Result<()> {
+        self.remember_send_psk()?;
+        for (psk_id, psk) in &self.send_psk_ledger {
+            register_psk(self.client.combiner(), psk_id, psk);
+            if let Some(recv) = &self.recv_group {
+                recv.register_psk(psk_id, psk);
+            }
+            if let Some(send) = &self.send_group {
+                send.register_psk(psk_id, psk);
+            }
+        }
+        for psk_id in self.retired_send_psks.drain(..) {
+            forget_psk(self.client.combiner(), &psk_id);
+            if let Some(recv) = &self.recv_group {
+                recv.forget_psk(&psk_id);
+            }
+            if let Some(send) = &self.send_group {
+                send.forget_psk(&psk_id);
+            }
+        }
+        Ok(())
+    }
+
+    /// Phase 8: encode a rotation commit on the CLASSICAL send group with `new_id` in
+    /// authenticated_data (the PQ side-band is untouched; its epoch advances only on A.3/A.4
+    /// rounds). This advances the classical send epoch, which is why the PSK ledger brackets
+    /// the commit below.
     fn prepare_rotation(&mut self, new_id: ClientId) -> Result<crate::PrepareEncryptResult> {
         let new_client = self
             .pending_new_client
@@ -388,6 +478,10 @@ impl SessionInner {
         if new_client.client_id() != new_id {
             return Err(TwoMlsPqError::SessionNotReady);
         }
+
+        // Capture the departing epoch's PSK before committing past it: a peer frame in
+        // flight may reference it, and mls-rs can only export the current epoch.
+        self.remember_send_psk()?;
 
         let commit_output = {
             let send = self
@@ -409,6 +503,9 @@ impl SessionInner {
                 .apply_pending_commit()
                 .map_err(|_| TwoMlsPqError::Mls)?;
         }
+
+        // Our send group advanced: record the new epoch's PSK in the session ledger.
+        self.remember_send_psk()?;
 
         let commit_bytes = commit_output
             .commit_message
@@ -450,7 +547,6 @@ impl SessionInner {
     /// the commit consumes it and additionally refreshes the cross-party TwoMLS-PSK
     /// exported from the recv group (the peer derives the same PSK from its send group).
     fn prepare_ratchet_commit(&mut self) -> Result<crate::PrepareEncryptResult> {
-        let client = self.client.clone();
         let did_commit = self.queued_proposal.take().is_some();
 
         // Commit our send group only when consuming the peer's approved Upd (cached via
@@ -458,12 +554,26 @@ impl SessionInner {
         // invalidate the peer's epoch-bound proposal). The commit also refreshes the
         // cross-party TwoMLS-PSK exported from the recv group.
         if did_commit {
+            // Capture the departing epoch's PSK before committing past it: a peer frame in
+            // flight may reference it, and mls-rs can only export the current epoch.
+            self.remember_send_psk()?;
+
+            // Cross-party TwoMLS-PSK from our recv group. The durable copy is the peer's
+            // problem (it is THEIR send-group PSK, held in their ledger); we derive and
+            // live-inject into the send group's stores (which the commit build resolves
+            // from) immediately before the commit that references it.
             let psk_id = {
                 let recv = self
                     .recv_group
                     .as_ref()
                     .ok_or(TwoMlsPqError::SessionNotReady)?;
-                export_and_register_psk(&recv.classical, client.combiner())?
+                let (psk_id, psk) = export_psk(&recv.classical)?;
+                let send = self
+                    .send_group
+                    .as_ref()
+                    .ok_or(TwoMlsPqError::SessionNotReady)?;
+                send.register_psk(&psk_id, &psk);
+                psk_id
             };
             let commit_output = {
                 let send = self
@@ -472,7 +582,7 @@ impl SessionInner {
                     .ok_or(TwoMlsPqError::SessionNotReady)?;
                 send.classical
                     .commit_builder()
-                    .add_external_psk(psk_id)
+                    .add_external_psk(psk_id.clone())
                     .map_err(|_| TwoMlsPqError::Mls)?
                     .build()
                     .map_err(|_| TwoMlsPqError::Mls)?
@@ -485,7 +595,11 @@ impl SessionInner {
                 send.classical
                     .apply_pending_commit()
                     .map_err(|_| TwoMlsPqError::Mls)?;
+                // The commit consumed the one-shot recv-group PSK; drop it from the store.
+                send.forget_psk(&psk_id);
             }
+            // Our send group advanced: record the new epoch's PSK in the session ledger.
+            self.remember_send_psk()?;
             self.pending_commit_message = Some(
                 commit_output
                     .commit_message
@@ -531,7 +645,7 @@ impl SessionInner {
 }
 
 fn build_session(
-    client: Arc<TwoMlsPqClient>,
+    client: Arc<TwoMlsPqIdentity>,
     send_group: Option<CombinerGroup>,
     recv_group: Option<CombinerGroup>,
     pending_outbound: Option<Vec<u8>>,
@@ -561,6 +675,8 @@ fn build_session(
             },
             pq_turn_mine: initiated,
             pending_pq_outbound: None,
+            send_psk_ledger: VecDeque::new(),
+            retired_send_psks: Vec::new(),
         }),
     })
 }
@@ -581,7 +697,7 @@ impl TwoMlsPqSession {
     /// Retrieve the outbound APQWelcome bytes via `pending_outbound`.
     #[uniffi::constructor]
     pub fn initiate(
-        client: Arc<TwoMlsPqClient>,
+        client: Arc<TwoMlsPqIdentity>,
         their_key_package: CombinerKeyPackage,
     ) -> Result<Arc<Self>> {
         ensure_pq_available(&their_key_package)?;
@@ -595,7 +711,7 @@ impl TwoMlsPqSession {
             client.combiner(),
         )?;
 
-        Ok(build_session(
+        let session = build_session(
             client,
             Some(send_group),
             None,
@@ -603,14 +719,17 @@ impl TwoMlsPqSession {
             session_id,
             their_id,
             true,
-        ))
+        );
+        // Seed the PSK ledger with the send group's establishment epoch.
+        session.lock().remember_send_psk()?;
+        Ok(session)
     }
 
     /// Join a session from an APQWelcome produced by the remote `initiate`.
     /// Retrieve this party's return Welcome via `pending_outbound`.
     #[uniffi::constructor]
     pub fn accept(
-        client: Arc<TwoMlsPqClient>,
+        client: Arc<TwoMlsPqIdentity>,
         welcome: Vec<u8>,
         their_key_package: CombinerKeyPackage,
     ) -> Result<Arc<Self>> {
@@ -630,7 +749,7 @@ impl TwoMlsPqSession {
         )?;
         let apq_welcome = encode_apq_welcome(classical_welcome, Vec::new());
 
-        Ok(build_session(
+        let session = build_session(
             client,
             Some(send_group),
             Some(recv_group),
@@ -638,12 +757,15 @@ impl TwoMlsPqSession {
             session_id,
             their_id,
             false,
-        ))
+        );
+        // Seed the PSK ledger with the send group's establishment epoch.
+        session.lock().remember_send_psk()?;
+        Ok(session)
     }
 
     /// Restore a session from a serialised archive.
     #[uniffi::constructor]
-    pub fn from_archive(_archive: Archive, _client: Arc<TwoMlsPqClient>) -> Result<Arc<Self>> {
+    pub fn from_archive(_archive: Archive, _client: Arc<TwoMlsPqIdentity>) -> Result<Arc<Self>> {
         Err(TwoMlsPqError::ArchiveInvalid)
     }
 
@@ -749,7 +871,7 @@ impl TwoMlsPqSession {
             // PQ-groups-only (spec A.4): no classical bind here. The new PQ half's
             // secrecy reaches ASG-cl at the next A.3 ratchet; until then ASG-cl keeps
             // the PQ-derived security chained in at establishment.
-            send.pq = Some(pq_group);
+            send.set_pq(pq_group, client.combiner());
             encode_bootstrap_bind(pq_welcome)
         };
         inner.pq_turn_mine = true;
@@ -776,7 +898,7 @@ impl TwoMlsPqSession {
             let pq = pq_join_group_from_welcome(client.pq(), &pq_welcome)?;
             #[cfg(not(feature = "cryptokit"))]
             let pq = join_group_from_welcome(client.classical(), &pq_welcome)?;
-            recv.pq = Some(pq);
+            recv.set_pq(pq, client.combiner());
         }
         inner.pq_turn_mine = false;
         Ok(())
@@ -924,9 +1046,10 @@ impl TwoMlsPqSession {
             let mut inner = self.lock();
             let client = inner.client.clone();
 
-            // Re-derive the cross-party TwoMLS-PSK from our own send group (Group_A classical).
-            if let Some(sg) = &inner.send_group {
-                export_and_register_psk(&sg.classical, client.combiner())?;
+            // Live-inject the session-held cross-party TwoMLS-PSKs (our send group's
+            // recent epochs) before joining the peer's bound groups.
+            if inner.send_group.is_some() {
+                inner.inject_send_psks()?;
             }
 
             let (classical_welcome, pq_welcome) = decode_apq_welcome(&ciphertext)?;
@@ -934,10 +1057,11 @@ impl TwoMlsPqSession {
             // classical group only; the PQ half arrives with the bootstrap flow.
             if pq_welcome.is_empty() {
                 let classical = join_group_from_welcome(client.classical(), &classical_welcome)?;
-                inner.recv_group = Some(CombinerGroup {
+                inner.recv_group = Some(CombinerGroup::from_client(
+                    client.combiner(),
                     classical,
-                    pq: None,
-                });
+                    None,
+                ));
                 return Ok(None);
             }
             // Join the PQ group first, then re-derive the intra-party APQ-PSK from it.
@@ -948,14 +1072,15 @@ impl TwoMlsPqSession {
             #[cfg(feature = "cryptokit")]
             export_and_register_psk_pq(&pq, client.combiner())?;
             #[cfg(not(feature = "cryptokit"))]
-            export_and_register_psk(&pq, client.combiner())?;
+            apq::export_and_register_psk(&pq, client.combiner())?;
             // Join the classical group (bound with the cross-party + APQ PSKs).
             let classical = join_group_from_welcome(client.classical(), &classical_welcome)?;
 
-            inner.recv_group = Some(CombinerGroup {
+            inner.recv_group = Some(CombinerGroup::from_client(
+                client.combiner(),
                 classical,
-                pq: Some(pq),
-            });
+                Some(pq),
+            ));
             return Ok(None);
         }
 
@@ -969,12 +1094,12 @@ impl TwoMlsPqSession {
                 MlsMessage::from_bytes(&app_bytes).map_err(|_| TwoMlsPqError::DecryptionFailed)?;
 
             let mut inner = self.lock();
-            let client = inner.client.clone();
 
-            // The sender's commit may bind the cross-party TwoMLS-PSK, which we derive
-            // from our own send group at its current epoch.
-            if let Some(sg) = &inner.send_group {
-                export_and_register_psk(&sg.classical, client.combiner())?;
+            // The sender's commit may bind the cross-party TwoMLS-PSK of our send group —
+            // possibly at an epoch we've since moved past (their frame can cross one of
+            // our commits). Live-inject the session-held ledger before processing.
+            if inner.send_group.is_some() {
+                inner.inject_send_psks()?;
             }
 
             let (app_data, sender_id, epoch, group_id) = {
@@ -1235,7 +1360,7 @@ impl TwoMlsPqSession {
 
     /// Register a new agent client for the next rotation commit.
     /// Call before `prepare_to_encrypt(Some(new_client.client_id()))`.
-    pub fn stage_rotation(&self, new_client: Arc<TwoMlsPqClient>) -> Result<()> {
+    pub fn stage_rotation(&self, new_client: Arc<TwoMlsPqIdentity>) -> Result<()> {
         let mut inner = self.lock();
         inner.pending_new_client = Some(new_client);
         Ok(())
@@ -1381,6 +1506,39 @@ mod tests {
         let bind = assert_some!(alice.pq_take_pending_outbound());
         let got = assert_ok!(bob.pq_ratchet_apply(bind));
         assert_eq!(got, b"hello-pq");
+    }
+
+    /// The PQ side-band must survive an agent rotation: the injected-secret and apq PSKs
+    /// have to land in the stores the group halves actually resolve from (captured at
+    /// group creation), not the rotated-in client's stores — otherwise Alice's bind and
+    /// Bob's apply both fail to find their PSKs after the client swap.
+    #[test]
+    #[cfg(feature = "cryptokit")]
+    fn test_pq_ratchet_completes_after_agent_rotation() {
+        let (alice, bob) = establish_sessions();
+
+        // Rotate both agents, delivering each rotation commit so the peer's recv group
+        // tracks the new epoch.
+        let new_alice = make_client();
+        assert_ok!(alice.stage_rotation(Arc::clone(&new_alice)));
+        assert_ok!(alice.prepare_to_encrypt(Some(new_alice.client_id())));
+        let enc = assert_ok!(alice.encrypt(b"alice-rotated".to_vec()));
+        assert_some!(assert_ok!(bob.process_incoming(enc.cipher_text)));
+
+        let new_bob = make_client();
+        assert_ok!(bob.stage_rotation(Arc::clone(&new_bob)));
+        assert_ok!(bob.prepare_to_encrypt(Some(new_bob.client_id())));
+        let enc = assert_ok!(bob.encrypt(b"bob-rotated".to_vec()));
+        assert_some!(assert_ok!(alice.process_incoming(enc.cipher_text)));
+
+        // A full A.3 round after both rotations: Alice injects on her send group's PQ half
+        // and binds into its classical half; Bob applies on his recv halves.
+        let ek = assert_ok!(alice.pq_ratchet_begin());
+        assert_ok!(bob.pq_ratchet_respond(ek));
+        let ct = assert_some!(bob.pq_take_pending_outbound());
+        assert_ok!(alice.pq_ratchet_bind(ct, b"pq-after-rotation".to_vec()));
+        let bind = assert_some!(alice.pq_take_pending_outbound());
+        assert_eq!(assert_ok!(bob.pq_ratchet_apply(bind)), b"pq-after-rotation");
     }
 
     /// Complete the A.4 bootstrap after establishment so both directions are full
@@ -1899,6 +2057,86 @@ mod tests {
         assert_err!(
             alice_session.prepare_to_encrypt(Some(new_alice.client_id())),
             TwoMlsPqError::SessionNotReady
+        );
+    }
+
+    /// A frame that crossed one of our commits references our send group's *previous*
+    /// epoch. The session's PSK ledger must still resolve it — live derivation cannot,
+    /// because mls-rs only exports the current epoch. Choreography: alice's full-commit
+    /// frame binds the PSK of bob's send group at epoch E; bob rotates (E → E+1) before
+    /// processing alice's frame.
+    #[test]
+    fn test_psk_ledger_resolves_frame_that_crossed_a_commit() {
+        let (alice_session, bob_session) = establish_sessions();
+
+        // Bob opens a routine round whose stapled Upd alice approves.
+        assert_ok!(bob_session.prepare_to_encrypt(None));
+        let enc = assert_ok!(bob_session.encrypt(b"proposal".to_vec()));
+        let result = assert_some!(assert_ok!(alice_session.process_incoming(enc.cipher_text)));
+        assert_ok!(alice_session.queue_proposal(assert_some!(result.proposal).digest));
+
+        // Alice's full commit binds the PSK of bob's send group at its current epoch.
+        assert_ok!(alice_session.prepare_to_encrypt(None));
+        let crossing = assert_ok!(alice_session.encrypt(b"crossed".to_vec()));
+
+        // Before processing alice's frame, bob rotates — his send group leaves the epoch
+        // alice's commit references.
+        let new_bob = make_client();
+        assert_ok!(bob_session.stage_rotation(Arc::clone(&new_bob)));
+        assert_ok!(bob_session.prepare_to_encrypt(Some(new_bob.client_id())));
+
+        // The crossed frame still processes: the ledger held the departed epoch's PSK.
+        let result = assert_some!(assert_ok!(
+            bob_session.process_incoming(crossing.cipher_text)
+        ));
+        assert_eq!(
+            assert_some!(result.application_message).app_message_data,
+            b"crossed"
+        );
+    }
+
+    /// One-shot PSKs (the recv-group export a full commit binds) are removed from the
+    /// mls-rs secret stores once the commit is applied — the stores hold nothing the
+    /// session doesn't currently vouch for.
+    #[test]
+    fn test_consumed_one_shot_psk_is_forgotten_from_stores() {
+        let alice = make_client();
+        let bob = make_client();
+        let alice_kp = make_combiner_kp(&alice);
+        let bob_kp = make_combiner_kp(&bob);
+        let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp));
+        let welcome_a = assert_some!(alice_session.pending_outbound());
+        let bob_session = assert_ok!(TwoMlsPqSession::accept(
+            Arc::clone(&bob),
+            welcome_a,
+            alice_kp
+        ));
+        let welcome_b = assert_some!(bob_session.pending_outbound());
+        assert_ok!(alice_session.process_incoming(welcome_b));
+
+        // Full-commit round: bob proposes, alice queues and commits. Alice's commit binds
+        // the one-shot PSK exported from her recv group (bob's send group) at its current
+        // epoch (1: established, no commits on it yet).
+        assert_ok!(bob_session.prepare_to_encrypt(None));
+        let enc = assert_ok!(bob_session.encrypt(b"proposal".to_vec()));
+        let result = assert_some!(assert_ok!(alice_session.process_incoming(enc.cipher_text)));
+        assert_ok!(alice_session.queue_proposal(assert_some!(result.proposal).digest));
+        let recv_gid = assert_some!(alice_session.receive_group_id())
+            .classical
+            .bytes;
+        assert_ok!(alice_session.prepare_to_encrypt(None));
+
+        let mut id_bytes = 1u64.to_le_bytes().to_vec();
+        id_bytes.extend_from_slice(&recv_gid);
+        let one_shot = mls_rs::psk::ExternalPskId::new(id_bytes);
+        assert!(
+            alice
+                .combiner()
+                .classical()
+                .secret_store()
+                .get(&one_shot)
+                .is_none(),
+            "one-shot recv-group PSK must be dropped after the commit is applied"
         );
     }
 
