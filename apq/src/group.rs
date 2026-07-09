@@ -410,10 +410,25 @@ where
     P: CryptoProvider + Clone,
 {
     let (classical_welcome, pq_welcome) = decode_apq_welcome(apq_welcome)?;
-    let pq = join_group_from_welcome(client.pq(), &pq_welcome)?;
+    join_combiner_group_from_halves(&classical_welcome, &pq_welcome, client)
+}
+
+/// Join both halves of a Combiner group from the already-decoded APQWelcome halves — for callers
+/// that have decoded (and validated) the envelope, so it is not decoded a second time.
+pub fn join_combiner_group_from_halves<S, C, P>(
+    classical_welcome: &[u8],
+    pq_welcome: &[u8],
+    client: &CombinerClient<S, C, P>,
+) -> Result<CombinerGroup<S, C, P>>
+where
+    S: KeyPackageStorage + Clone,
+    C: CryptoProvider + Clone,
+    P: CryptoProvider + Clone,
+{
+    let pq = join_group_from_welcome(client.pq(), pq_welcome)?;
     // Re-derive the same APQ-PSK the creator used to bind the classical group.
     export_and_register_psk(&pq, client)?;
-    let classical = join_group_from_welcome(client.classical(), &classical_welcome)?;
+    let classical = join_group_from_welcome(client.classical(), classical_welcome)?;
     Ok(CombinerGroup::from_client(client, classical, Some(pq)))
 }
 

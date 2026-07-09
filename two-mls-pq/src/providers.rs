@@ -68,7 +68,7 @@ pub(crate) use selected::{classical, pq, pq_kem, Classical, Pq};
 /// `suite.validate()?` guard at every `CombinerClient` construction and asserted in tests.
 pub(crate) const APQ_SUITE: apq::ApqCipherSuite = apq::ApqCipherSuite {
     classical: mls_rs::CipherSuite::CURVE25519_CHACHA,
-    pq: mls_rs::CipherSuite::new(0xFDEA),
+    pq: mls_rs::CipherSuite::ML_KEM_768,
 };
 
 /// The PQ half's cipher suite under [`APQ_SUITE`].

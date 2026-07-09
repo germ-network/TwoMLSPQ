@@ -12,8 +12,9 @@ use mls_rs::{
 
 use apq::{
     create_bound_classical_send_group, create_combiner_send_group, create_group_with_member,
-    decode_apq_welcome, encode_apq_welcome, export_psk, forget_psk, join_combiner_group,
-    join_group_from_welcome, register_psk, sender_client_id, APQ_TAG,
+    decode_apq_welcome, encode_apq_welcome, export_psk, forget_psk,
+    join_combiner_group_from_halves, join_group_from_welcome, register_psk, sender_client_id,
+    APQ_TAG,
 };
 
 use crate::key_package_store::CombinerGroup;
@@ -1277,13 +1278,6 @@ fn validate_welcome_halves(
     Ok(())
 }
 
-/// Decode an APQ welcome envelope and validate its halves — for callers holding only the
-/// envelope bytes (e.g. `accept`).
-fn validate_welcome_suites(expected: apq::ApqCipherSuite, welcome: &[u8]) -> Result<()> {
-    let (classical_welcome, pq_welcome) = decode_apq_welcome(welcome)?;
-    validate_welcome_halves(expected, &classical_welcome, &pq_welcome)
-}
-
 impl TwoMlsPqSession {
     /// Lock the session state, recovering from a poisoned mutex rather than propagating a panic.
     /// A poisoned lock means a prior holder panicked mid-update; we surface the inner state and let
@@ -1350,10 +1344,14 @@ impl TwoMlsPqSession {
         let their_id = their_parsed.client_id;
         let session_id = crate::derive_session_id(client.client_id(), their_id.clone())?;
 
-        // Validate the incoming welcome's cipher suite(s) before joining, so a suite mismatch
-        // fails early and clearly rather than deep inside mls-rs as an opaque Mls error.
-        validate_welcome_suites(client.combiner().cipher_suite(), &welcome)?;
-        let recv_group = join_combiner_group(&welcome, client.combiner())?;
+        // Decode the incoming welcome once; validate its cipher suite(s) before joining, so a
+        // mismatch fails early and clearly rather than deep inside mls-rs — then join the
+        // already-decoded halves (no second decode). Same pattern as the `process_incoming`
+        // receive path.
+        let (recv_classical, recv_pq) = decode_apq_welcome(&welcome)?;
+        validate_welcome_halves(client.combiner().cipher_suite(), &recv_classical, &recv_pq)?;
+        let recv_group =
+            join_combiner_group_from_halves(&recv_classical, &recv_pq, client.combiner())?;
         // A.4: the send group's PQ half is deferred — classical only, bound to the
         // cross-party PSK. The bootstrap flow stands it up off the critical path, so the
         // return welcome carries an empty PQ slot.

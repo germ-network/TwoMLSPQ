@@ -24,9 +24,13 @@ use crate::{CombinerError, Result};
 
 /// ML-KEM-768 cipher suite value (0xFDEA, FIPS 203) in the MLS private-use range. This is the
 /// wire value TwoMLSPQ pins for the PQ half; every PQ provider must implement the suite under
-/// it (CryptoKit and aws-lc agree). A construction-time assert checks it still equals
-/// mls-rs-core's `CipherSuite::ML_KEM_768`, so a fork renumber cannot silently diverge.
+/// it (CryptoKit and aws-lc agree).
 const ML_KEM_768: u16 = 0xFDEA;
+
+// Compile-time drift guard: our pinned wire value must stay what mls-rs-core names ML-KEM-768. A
+// fork renumber — or accidentally pointing at the ML_KEM_768_X25519 = 65100 sibling — fails the
+// build here instead of silently diverging at runtime.
+const _: () = assert!(CipherSuite::ML_KEM_768.raw_value() == ML_KEM_768);
 
 /// Whether a recognized suite's KEM and signature scheme are post-quantum. MLS cipher suites
 /// are monolithic (RFC 9420 §17.1): one id fixes KEM + AEAD + hash + signature together, so
@@ -243,14 +247,11 @@ where
         S: Default,
     {
         let suite = crypto.suite;
-        // The suite pair is the source of truth: it must be a coherent APQ combination (derive
-        // a known mode) before anything is built. Also assert our pinned PQ wire value still
-        // equals mls-rs-core's named constant, so a fork renumber (or the ML_KEM_768_X25519 =
-        // 65100 sibling) can't silently diverge.
+        // The suite pair is the source of truth: it must be a coherent APQ combination (classical
+        // KEM in the classical slot, PQ KEM in the PQ slot) before anything is built. (The pinned
+        // wire value is checked against mls-rs-core's constant at compile time; see the const
+        // assert near ML_KEM_768.)
         suite.validate()?;
-        if CipherSuite::new(ML_KEM_768) != CipherSuite::ML_KEM_768 {
-            return Err(CombinerError::UnsupportedCipherSuite);
-        }
         let classical_cs = crypto
             .classical
             .cipher_suite_provider(suite.classical)
@@ -552,13 +553,6 @@ mod tests {
         assert!(ApqCipherSuite::new(unknown, pq).is_err());
         // The canonical pair is accepted.
         assert!(ApqCipherSuite::new(classical, pq).is_ok());
-    }
-
-    #[test]
-    fn drift_guard_pinned_pq_value_equals_core_constant() {
-        // The construction-time guard relies on this: our pinned wire value must still be what
-        // mls-rs-core names ML-KEM-768. If a fork renumber breaks it, this fails loudly.
-        assert_eq!(CipherSuite::new(ML_KEM_768), CipherSuite::ML_KEM_768);
     }
 
     #[test]
