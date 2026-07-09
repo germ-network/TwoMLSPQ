@@ -35,10 +35,12 @@ truth. The **APQ mode is derived from that pair**, not the other way around:
   the private-range `0xFDEA` — it would be pinned to a hardcoded private-range value, added
   to the suite classifier, and given a new mode variant.
 
-The derivation is a small classifier (in `apq`) that reads each half's KEM/signature nature
-off the §17.1 table: both halves must be recognised, the classical half a classical KEM and
-the PQ half an ML-KEM KEM, sharing one signature family. A pair that doesn't classify
-coherently is rejected as `CipherSuiteMismatch`.
+A small classifier (in `apq`) reads each half's KEM/signature nature off the §17.1 table.
+`ApqCipherSuite::new` enforces the slot invariant — the classical half must be a classical
+KEM and the PQ half a post-quantum (ML-KEM) KEM, both recognised — rejecting anything else
+with `CipherSuiteMismatch`. Given a valid pair, `mode()` is total: it reads the PQ half's
+signature scheme, yielding `ConfidentialityOnly` for a classical (Ed25519) signature and
+`ConfidentialityAndAuthenticity` for a post-quantum one.
 
 The suite pair is a **fixed, stored property** of a session: captured at construction,
 persisted in the session and invitation archives, and validated up front. A peer key

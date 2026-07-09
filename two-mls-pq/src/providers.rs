@@ -64,10 +64,12 @@ pub(crate) use selected::{classical, pq, pq_kem, Classical, Pq};
 
 /// The cipher-suite pair this crate pins for every session: Curve25519/ChaCha classical +
 /// ML-KEM-768 PQ (confidentiality-only). The APQ mode is derived from it (`ApqCipherSuite::mode`).
-pub(crate) const APQ_SUITE: apq::ApqCipherSuite = apq::ApqCipherSuite::new(
-    mls_rs::CipherSuite::CURVE25519_CHACHA,
-    mls_rs::CipherSuite::new(0xFDEA),
-);
+/// A struct literal (not the fallible `new`) so it is a `const`; its coherence is enforced by the
+/// `suite.validate()?` guard at every `CombinerClient` construction and asserted in tests.
+pub(crate) const APQ_SUITE: apq::ApqCipherSuite = apq::ApqCipherSuite {
+    classical: mls_rs::CipherSuite::CURVE25519_CHACHA,
+    pq: mls_rs::CipherSuite::new(0xFDEA),
+};
 
 /// The PQ half's cipher suite under [`APQ_SUITE`].
 pub(crate) fn pq_cipher_suite() -> mls_rs::CipherSuite {

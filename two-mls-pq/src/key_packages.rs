@@ -276,11 +276,12 @@ pub(crate) fn validate_combiner_kp(
     their_kp: &CombinerKeyPackage,
 ) -> Result<()> {
     let parsed = parse_combiner_key_package(their_kp.clone())?;
-    let observed = apq::ApqCipherSuite::new(
-        mls_rs::CipherSuite::new(parsed.classical_suite.value()),
-        mls_rs::CipherSuite::new(parsed.pq_suite.value()),
-    );
-    if observed == expected {
+    // Compare the observed suite values directly against the session's pinned pair (rather than
+    // constructing a checked `ApqCipherSuite`, which would reject an incoherent peer pair before
+    // we can pick the right diagnostic).
+    let classical = mls_rs::CipherSuite::new(parsed.classical_suite.value());
+    let pq = mls_rs::CipherSuite::new(parsed.pq_suite.value());
+    if classical == expected.classical && pq == expected.pq {
         return Ok(());
     }
     // Neither half is the post-quantum suite → the peer offers no PQ protection at all (any

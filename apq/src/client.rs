@@ -79,32 +79,42 @@ impl Default for ApqCipherSuite {
 }
 
 impl ApqCipherSuite {
-    pub const fn new(classical: CipherSuite, pq: CipherSuite) -> Self {
-        Self { classical, pq }
+    /// Construct a validated pair. Enforces the slot invariant — the classical half must be a
+    /// classical (non-PQ) KEM suite and the PQ half a post-quantum (ML-KEM) KEM suite, both
+    /// recognized by [`class`] — returning [`CombinerError::CipherSuiteMismatch`] otherwise.
+    pub fn new(classical: CipherSuite, pq: CipherSuite) -> Result<Self> {
+        let pair = Self { classical, pq };
+        pair.validate()?;
+        Ok(pair)
     }
 
-    /// Derive the APQ mode from the suite pair, or report why the pair is not a valid APQ
-    /// combination. Rules: both halves recognized; the classical half a classical KEM and the
-    /// PQ half an ML-KEM KEM; both halves sharing one signature family (the combiner carries a
-    /// single identity across both). A classical signature yields
-    /// [`ApqMode::ConfidentialityOnly`]; a PQ signature would be confidentiality+authentication,
-    /// which has no `ApqMode` variant yet (a PQ-signature suite must be added to `class` first),
-    /// so it currently reports [`CombinerError::CipherSuiteMismatch`].
-    pub fn mode(self) -> Result<ApqMode> {
+    /// `Ok(())` iff the pair satisfies the slot invariant: both halves recognized, the classical
+    /// half a classical KEM, the PQ half a post-quantum KEM. The signature scheme is *not*
+    /// constrained here — it selects the [`mode`](Self::mode), not validity.
+    pub fn validate(self) -> Result<()> {
         let classical = class(self.classical).ok_or(CombinerError::CipherSuiteMismatch)?;
         let pq = class(self.pq).ok_or(CombinerError::CipherSuiteMismatch)?;
-        if classical.kem_pq || !pq.kem_pq || classical.sig_pq != pq.sig_pq {
+        if classical.kem_pq {
+            // The classical slot holds a post-quantum KEM suite.
             return Err(CombinerError::CipherSuiteMismatch);
         }
-        if classical.sig_pq {
+        if !pq.kem_pq {
+            // The PQ slot holds a classical KEM suite (no post-quantum protection).
             return Err(CombinerError::CipherSuiteMismatch);
         }
-        Ok(ApqMode::ConfidentialityOnly)
+        Ok(())
     }
 
-    /// `Ok(())` iff the pair is a valid, recognized APQ combination.
-    pub fn validate(self) -> Result<()> {
-        self.mode().map(|_| ())
+    /// The APQ mode this pair runs, read off the PQ half's signature scheme (MLS suites are
+    /// monolithic, so the signature is fixed by the suite id): a classical signature is
+    /// [`ApqMode::ConfidentialityOnly`], a post-quantum signature is
+    /// [`ApqMode::ConfidentialityAndAuthenticity`]. Total — a validly-constructed pair always has
+    /// a recognized PQ half; an unrecognized one falls back to confidentiality-only.
+    pub fn mode(self) -> ApqMode {
+        match class(self.pq) {
+            Some(c) if c.sig_pq => ApqMode::ConfidentialityAndAuthenticity,
+            _ => ApqMode::ConfidentialityOnly,
+        }
     }
 
     /// Persist as classical-then-pq big-endian u16s.
@@ -128,15 +138,15 @@ impl ApqCipherSuite {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ApqMode {
-    /// APQ confidentiality-only: ML-KEM-768 for the PQ group with classical (Ed25519) signing
-    /// keys in both halves — post-quantum confidentiality, classical authentication.
-    ///
-    /// The draft's confidentiality + authentication variant (a PQ signature scheme) is
-    /// anticipated but not implemented. Because MLS suites are monolithic and no PQ-signature
-    /// suite has an IANA assignment, adding it means a hardcoded private-range suite value (as
-    /// ML-KEM-768 uses 0xFDEA), a new entry in `class`, and a new variant here.
+    /// APQ confidentiality-only: a post-quantum KEM for the PQ group with classical (Ed25519)
+    /// signing keys in both halves — post-quantum confidentiality, classical authentication.
     #[default]
     ConfidentialityOnly,
+    /// APQ confidentiality + authentication: the PQ half additionally uses a post-quantum
+    /// signature scheme. Reachable once a PQ-signature suite is added to `class` (with a
+    /// hardcoded private-range value, as ML-KEM-768 uses 0xFDEA, since no such suite has an IANA
+    /// assignment); no such suite is defined yet, so `mode()` never returns this today.
+    ConfidentialityAndAuthenticity,
 }
 
 /// An archived signing identity for [`CombinerClient::from_key_packages`]: the ClientId
@@ -386,10 +396,9 @@ where
         self.suite
     }
 
-    /// The APQ mode, derived from the suite pair. Infallible here: construction already
-    /// validated the pair, so the derivation cannot fail.
+    /// The APQ mode, derived from the suite pair.
     pub fn mode(&self) -> ApqMode {
-        self.suite.mode().unwrap_or_default()
+        self.suite.mode()
     }
 
     /// The classical half's signing key bytes — part of the archivable signing identity.
@@ -496,10 +505,9 @@ mod tests {
 
     #[test]
     fn default_pair_derives_confidentiality_only() {
-        assert_eq!(
-            ApqCipherSuite::default().mode().unwrap(),
-            ApqMode::ConfidentialityOnly
-        );
+        let suite = ApqCipherSuite::default();
+        assert!(suite.validate().is_ok());
+        assert_eq!(suite.mode(), ApqMode::ConfidentialityOnly);
     }
 
     #[test]
@@ -529,19 +537,21 @@ mod tests {
     }
 
     #[test]
-    fn mode_rejects_incoherent_pairs() {
+    fn new_rejects_incoherent_pairs() {
         let classical = CipherSuite::CURVE25519_CHACHA;
         let pq = CipherSuite::new(ML_KEM_768);
         let unknown = CipherSuite::new(0x0008); // just past the RFC 9420 §17.1 range
                                                 // Swapped: PQ suite in the classical slot, classical in the PQ slot.
-        assert!(ApqCipherSuite::new(pq, classical).mode().is_err());
+        assert!(ApqCipherSuite::new(pq, classical).is_err());
         // Both classical: the PQ slot is not a PQ KEM.
-        assert!(ApqCipherSuite::new(classical, classical).mode().is_err());
+        assert!(ApqCipherSuite::new(classical, classical).is_err());
         // Both PQ: the classical slot must be a classical KEM.
-        assert!(ApqCipherSuite::new(pq, pq).mode().is_err());
+        assert!(ApqCipherSuite::new(pq, pq).is_err());
         // An unrecognized suite in either slot.
-        assert!(ApqCipherSuite::new(classical, unknown).mode().is_err());
-        assert!(ApqCipherSuite::new(unknown, pq).mode().is_err());
+        assert!(ApqCipherSuite::new(classical, unknown).is_err());
+        assert!(ApqCipherSuite::new(unknown, pq).is_err());
+        // The canonical pair is accepted.
+        assert!(ApqCipherSuite::new(classical, pq).is_ok());
     }
 
     #[test]
