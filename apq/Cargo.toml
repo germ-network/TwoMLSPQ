@@ -19,7 +19,10 @@ benchmark_util = []
 # aws-lc, …) are injected by the consumer as generic parameters — see `CryptoConfig`.
 [dependencies]
 mls-rs = { workspace = true }
-mls-rs-core = { workspace = true }
+# `post-quantum` exposes the named PQ cipher-suite constants (e.g. `CipherSuite::ML_KEM_768`)
+# — metadata only, no crypto — so the suite classifier and the construction-time drift guard
+# can reference them instead of raw literals.
+mls-rs-core = { workspace = true, features = ["post-quantum"] }
 mls-rs-crypto-traits = { workspace = true }
 thiserror = { workspace = true }
 zeroize = { workspace = true }
