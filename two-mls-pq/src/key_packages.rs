@@ -124,9 +124,15 @@ impl TwoMlsPqIdentity {
     /// self-contained [`TwoMlsPqInvitation`] archive. The identity keeps no key-package
     /// private data — the Invitation owns it. Publish the invitation's `combinerKeyPackage`
     /// and reconstruct the receiving side with `TwoMlsPqInvitation(archive:)`.
-    pub fn generate_invitation(&self) -> Result<Vec<u8>> {
+    ///
+    /// `last_resort` chooses the key package's lifetime, which TwoMLS manages itself rather
+    /// than via mls-rs's on-the-wire last-resort extension: `true` retains the key package so
+    /// the invitation can accept many welcomes; `false` makes it single-use (consumed, and its
+    /// secret material dropped from the archive, after the first accepted session — a later
+    /// `receive` then fails `InvitationSpent`).
+    pub fn generate_invitation(&self, last_resort: bool) -> Result<Vec<u8>> {
         encode_archive(
-            &generate_combiner_invitation(&self.inner)?,
+            &generate_combiner_invitation(&self.inner, last_resort)?,
             &BTreeSet::new(),
             &SpawnedGroups::new(),
         )
@@ -316,11 +322,17 @@ pub(crate) fn ensure_pq_available(their_kp: &CombinerKeyPackage) -> Result<()> {
 /// Rust analogue of the classical `MLSInvitationClientV2`.
 ///
 /// The private key-package material lives here (not in a `TwoMlsPqIdentity`); each `receive`
-/// rebuilds a stateless client from the archived invitation, so one invitation can service
-/// multiple welcomes. A remote whose welcome has already been consumed is rejected.
+/// rebuilds a stateless client from the archived invitation. A *last-resort* invitation can
+/// service multiple welcomes (its key package is retained), bounded only by the per-remote
+/// at-most-once guard; a *single-use* invitation accepts exactly one welcome, then drops its
+/// key package (a later `receive` fails `InvitationSpent`). A remote whose welcome has
+/// already been consumed is rejected with `DuplicateWelcome`.
 #[derive(uniffi::Object)]
 pub struct TwoMlsPqInvitation {
-    invitation: CombinerInvitation,
+    // Behind a `Mutex` because a single-use invitation mutates it: the captured key package
+    // is claimed at the start of `receive` and either kept consumed (success) or restored
+    // (failure). A last-resort invitation never mutates the key-package material.
+    invitation: Mutex<CombinerInvitation>,
     // Remote client ids already turned into a session — the transport at-most-once guard.
     // Persisted in `archive()` (a `BTreeSet` for deterministic encoding) so the guard
     // survives a restore.
@@ -340,33 +352,50 @@ impl TwoMlsPqInvitation {
     pub fn new(archive: Vec<u8>) -> Result<Arc<Self>> {
         let (invitation, consumed, spawned) = decode_archive(&archive)?;
         Ok(Arc::new(Self {
-            invitation,
+            invitation: Mutex::new(invitation),
             consumed: Mutex::new(consumed),
             spawned: Mutex::new(spawned),
         }))
     }
 
-    /// Serialise the invitation's signing identity + key-package private material, plus the
-    /// consumed-remote set and the spawned-group forward table so the transport dedup
-    /// guard and replay routing survive a restore.
+    /// Serialise the invitation's signing identity + key-package private material (or, once a
+    /// single-use invitation is spent, the absence of it), plus the consumed-remote set and
+    /// the spawned-group forward table so the transport dedup guard and replay routing survive
+    /// a restore.
+    ///
+    /// Each field is cloned out under its own lock and released before encoding, so no two of
+    /// the invitation's locks are ever held at once — this keeps a consistent global lock
+    /// order with `receive` and rules out a lock-order inversion.
     pub fn archive(&self) -> Result<Vec<u8>> {
-        let consumed = self.consumed.lock().unwrap_or_else(|e| e.into_inner());
-        let spawned = self.spawned.lock().unwrap_or_else(|e| e.into_inner());
-        encode_archive(&self.invitation, &consumed, &spawned)
+        let invitation = self.lock_invitation().clone();
+        let consumed = self
+            .consumed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let spawned = self
+            .spawned
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        encode_archive(&invitation, &consumed, &spawned)
     }
 
     /// The agent's ClientId.
     pub fn client_id(&self) -> ClientId {
         ClientId {
-            bytes: self.invitation.client_id.clone(),
+            bytes: self.lock_invitation().client_id.clone(),
         }
     }
 
-    /// The published (public) combiner key package to hand to a remote initiator.
+    /// The published (public) combiner key package to hand to a remote initiator. Still
+    /// available after a single-use invitation is spent (the published key package is public);
+    /// only the private material is dropped on consume.
     pub fn combiner_key_package(&self) -> CombinerKeyPackage {
+        let invitation = self.lock_invitation();
         CombinerKeyPackage {
-            classical: self.invitation.classical_public.clone(),
-            pq: self.invitation.pq_public.clone(),
+            classical: invitation.classical_public.clone(),
+            pq: invitation.pq_public.clone(),
         }
     }
 
@@ -388,18 +417,40 @@ impl TwoMlsPqInvitation {
     ) -> Result<Arc<TwoMlsPqSession>> {
         let their_id = parse_mls_key_package(their_key_package.classical.clone())?.client_id;
 
-        // Atomically reserve this remote up front so two concurrent welcomes from it can't
-        // both establish; `insert` returns false if it was already consumed (a replay).
+        // Claim this invitation's captured key package for the attempt. This is the single-use
+        // gate: under the lock we take a snapshot to build the client from, and for a
+        // single-use invitation we null out the stored material *now* so a concurrent or later
+        // `receive` (from any remote) sees it spent and cannot reuse the key package. A
+        // last-resort invitation leaves the material in place (retained for reuse). A snapshot
+        // whose material is already `None` means a single-use invitation was already consumed.
+        let snapshot = {
+            let mut invitation = self.lock_invitation();
+            if invitation.classical_kpd.is_none() {
+                return Err(TwoMlsPqError::InvitationSpent);
+            }
+            let snapshot = invitation.clone();
+            if !invitation.last_resort {
+                invitation.classical_kpd = None;
+                invitation.pq_kpd = None;
+            }
+            snapshot
+        };
+
+        // Reserve this remote so two concurrent welcomes from it can't both establish;
+        // `insert` returns false if it was already consumed (a replay). For a last-resort
+        // invitation this is the reuse bound; for a single-use one the key-package claim above
+        // is already decisive, but the reservation keeps the forward-table bookkeeping honest.
         if !self
             .consumed
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(their_id.bytes.clone())
         {
+            self.restore_claim(&snapshot);
             return Err(TwoMlsPqError::DuplicateWelcome);
         }
 
-        match TwoMlsPqIdentity::from_combiner_invitation(&self.invitation)
+        match TwoMlsPqIdentity::from_combiner_invitation(&snapshot)
             .and_then(|client| TwoMlsPqSession::accept(client, welcome, their_key_package))
             .and_then(|session| {
                 // Enter the spawn in the forward table; the acceptor always has a
@@ -415,11 +466,13 @@ impl TwoMlsPqInvitation {
             }) {
             Ok(session) => Ok(session),
             Err(e) => {
-                // Establishment failed — release the reservation so a valid retry can proceed.
+                // Establishment failed — release the remote reservation and, for a single-use
+                // invitation, put the claimed key package back so a valid retry can proceed.
                 self.consumed
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .remove(&their_id.bytes);
+                self.restore_claim(&snapshot);
                 Err(e)
             }
         }
@@ -454,19 +507,25 @@ impl TwoMlsPqInvitation {
         use mls_rs::crypto::HpkeCiphertext;
         use mls_rs::CipherSuiteProvider;
 
+        let invitation = self.lock_invitation();
+
         // Public init key: published in the PQ key package (spec A.1: the envelope is
         // sealed to the PQ EK in KP'). Matching secret: the invitation's captured PQ
-        // KeyPackageData.
-        let key_package = mls_rs::MlsMessage::from_bytes(&self.invitation.pq_public)
+        // KeyPackageData — absent once a single-use invitation has been consumed.
+        let key_package = mls_rs::MlsMessage::from_bytes(&invitation.pq_public)
             .map_err(|_| TwoMlsPqError::InvalidKeyPackage)?
             .into_key_package()
             .ok_or(TwoMlsPqError::InvalidKeyPackage)?;
         let public = key_package.hpke_init_key;
-        let secret = &self.invitation.pq_kpd.1.init_key;
+        let pq_kpd = invitation
+            .pq_kpd
+            .as_ref()
+            .ok_or(TwoMlsPqError::InvitationSpent)?;
+        let secret = &pq_kpd.1.init_key;
 
         let cs = crate::providers::pq_envelope_suite()?;
 
-        let info = info.unwrap_or_else(|| self.invitation.client_id.clone());
+        let info = info.unwrap_or_else(|| invitation.client_id.clone());
         let ciphertext = HpkeCiphertext {
             kem_output,
             ciphertext,
@@ -475,6 +534,26 @@ impl TwoMlsPqInvitation {
             .hpke_open(&ciphertext, secret, &public, &info, aad.as_deref())
             .map_err(|_| TwoMlsPqError::DecryptionFailed)?;
         Ok(plaintext.to_vec())
+    }
+}
+
+impl TwoMlsPqInvitation {
+    /// Lock the invitation state, recovering from a poisoned mutex (the guarded data is plain
+    /// records; a panic mid-update can't leave it torn).
+    fn lock_invitation(&self) -> std::sync::MutexGuard<'_, CombinerInvitation> {
+        self.invitation.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Put a single-use invitation's claimed key package back after a failed `receive`, so a
+    /// valid retry can proceed. A no-op for a last-resort invitation (its material was never
+    /// taken) and for the already-spent snapshot (its material is `None`).
+    fn restore_claim(&self, snapshot: &CombinerInvitation) {
+        if snapshot.last_resort {
+            return;
+        }
+        let mut invitation = self.lock_invitation();
+        invitation.classical_kpd = snapshot.classical_kpd.clone();
+        invitation.pq_kpd = snapshot.pq_kpd.clone();
     }
 }
 
@@ -588,7 +667,7 @@ mod tests {
 
         // Bob publishes an invitation instead of retaining key-package state on the client.
         let bob_inv = assert_ok!(super::TwoMlsPqInvitation::new(assert_ok!(
-            bob.generate_invitation()
+            bob.generate_invitation(true)
         )));
         let bob_kp = bob_inv.combiner_key_package();
 
@@ -615,7 +694,7 @@ mod tests {
         let alice_kp = make_combiner_kp(&alice);
 
         let bob_inv = assert_ok!(super::TwoMlsPqInvitation::new(assert_ok!(
-            bob.generate_invitation()
+            bob.generate_invitation(true)
         )));
         let bob_kp = bob_inv.combiner_key_package();
 
@@ -637,7 +716,7 @@ mod tests {
 
         let bob = make_client();
         let bob_inv = assert_ok!(super::TwoMlsPqInvitation::new(assert_ok!(
-            bob.generate_invitation()
+            bob.generate_invitation(true)
         )));
 
         // Seal with an explicit info equal to the recipient's ClientId; opening with
@@ -661,7 +740,7 @@ mod tests {
 
         let bob = make_client();
         let bob_inv = assert_ok!(super::TwoMlsPqInvitation::new(assert_ok!(
-            bob.generate_invitation()
+            bob.generate_invitation(true)
         )));
 
         // Sender side: seal to the published key package with the default info
@@ -690,7 +769,7 @@ mod tests {
         let alice_kp = make_combiner_kp(&alice);
 
         let bob_inv = assert_ok!(super::TwoMlsPqInvitation::new(assert_ok!(
-            bob.generate_invitation()
+            bob.generate_invitation(true)
         )));
         let bob_kp = bob_inv.combiner_key_package();
 
@@ -733,7 +812,7 @@ mod tests {
         let alice_kp = make_combiner_kp(&alice);
 
         let bob_inv = assert_ok!(super::TwoMlsPqInvitation::new(assert_ok!(
-            bob.generate_invitation()
+            bob.generate_invitation(true)
         )));
         let bob_kp = bob_inv.combiner_key_package();
 
@@ -774,7 +853,7 @@ mod tests {
         let alice_kp = make_combiner_kp(&alice);
 
         let bob_inv = assert_ok!(super::TwoMlsPqInvitation::new(assert_ok!(
-            bob.generate_invitation()
+            bob.generate_invitation(true)
         )));
         let bob_kp = bob_inv.combiner_key_package();
 
@@ -845,7 +924,7 @@ mod tests {
         let alice_kp = make_combiner_kp(&alice);
 
         let bob_inv = assert_ok!(super::TwoMlsPqInvitation::new(assert_ok!(
-            bob.generate_invitation()
+            bob.generate_invitation(true)
         )));
         let bob_kp = bob_inv.combiner_key_package();
 
@@ -862,12 +941,149 @@ mod tests {
         assert_ok!(bob_inv.receive(welcome_a, alice_kp, b"token".to_vec()));
     }
 
+    /// A single-use (not last-resort) invitation accepts exactly one welcome; afterwards its
+    /// key package is spent — a fresh remote is refused with `InvitationSpent`, proving the
+    /// limit is on the key package itself, not merely a per-remote replay guard.
+    #[test]
+    fn test_invitation_single_use_consumes_key_package() {
+        use crate::session::TwoMlsPqSession;
+        use crate::test_utils::{make_client, make_combiner_kp};
+        use std::sync::Arc;
+
+        let alice = make_client();
+        let carol = make_client();
+        let bob = make_client();
+        let alice_kp = make_combiner_kp(&alice);
+        let carol_kp = make_combiner_kp(&carol);
+
+        let bob_inv = assert_ok!(super::TwoMlsPqInvitation::new(assert_ok!(
+            bob.generate_invitation(false)
+        )));
+        let bob_kp = bob_inv.combiner_key_package();
+
+        let alice_session = assert_ok!(TwoMlsPqSession::initiate(
+            Arc::clone(&alice),
+            bob_kp.clone()
+        ));
+        let welcome_a = assert_some!(alice_session.pending_outbound());
+        assert_ok!(bob_inv.receive(welcome_a, alice_kp, b"token-a".to_vec()));
+
+        let carol_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&carol), bob_kp));
+        let welcome_c = assert_some!(carol_session.pending_outbound());
+        assert_err!(
+            bob_inv.receive(welcome_c, carol_kp, b"token-c".to_vec()),
+            crate::TwoMlsPqError::InvitationSpent
+        );
+    }
+
+    /// A single-use invitation's spent state (its key package dropped from the archive)
+    /// survives archive/restore: the restored invitation still refuses to accept and can no
+    /// longer HPKE-open, because the private material is gone.
+    #[test]
+    fn test_invitation_single_use_archive_drops_key_package() {
+        use crate::session::TwoMlsPqSession;
+        use crate::test_utils::{make_client, make_combiner_kp};
+        use std::sync::Arc;
+
+        let alice = make_client();
+        let carol = make_client();
+        let bob = make_client();
+        let alice_kp = make_combiner_kp(&alice);
+        let carol_kp = make_combiner_kp(&carol);
+
+        let bob_inv = assert_ok!(super::TwoMlsPqInvitation::new(assert_ok!(
+            bob.generate_invitation(false)
+        )));
+        let bob_kp = bob_inv.combiner_key_package();
+
+        let alice_session = assert_ok!(TwoMlsPqSession::initiate(
+            Arc::clone(&alice),
+            bob_kp.clone()
+        ));
+        let welcome_a = assert_some!(alice_session.pending_outbound());
+        assert_ok!(bob_inv.receive(welcome_a, alice_kp, b"token-a".to_vec()));
+
+        let restored = assert_ok!(super::TwoMlsPqInvitation::new(
+            assert_ok!(bob_inv.archive())
+        ));
+        let carol_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&carol), bob_kp));
+        let welcome_c = assert_some!(carol_session.pending_outbound());
+        assert_err!(
+            restored.receive(welcome_c, carol_kp, b"token-c".to_vec()),
+            crate::TwoMlsPqError::InvitationSpent
+        );
+        assert_err!(
+            restored.hpke_open(vec![0u8; 32], vec![0u8; 16], None, None),
+            crate::TwoMlsPqError::InvitationSpent
+        );
+    }
+
+    /// A failed accept on a single-use invitation must put the claimed key package back, so a
+    /// subsequent valid welcome still establishes (the claim is rolled back like the remote
+    /// reservation). If restoration were broken the retry would fail `InvitationSpent`.
+    #[test]
+    fn test_invitation_single_use_rollback_restores_key_package() {
+        use crate::session::TwoMlsPqSession;
+        use crate::test_utils::{make_client, make_combiner_kp};
+        use std::sync::Arc;
+
+        let alice = make_client();
+        let bob = make_client();
+        let alice_kp = make_combiner_kp(&alice);
+
+        let bob_inv = assert_ok!(super::TwoMlsPqInvitation::new(assert_ok!(
+            bob.generate_invitation(false)
+        )));
+        let bob_kp = bob_inv.combiner_key_package();
+
+        let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp));
+        let welcome_a = assert_some!(alice_session.pending_outbound());
+
+        assert!(bob_inv
+            .receive(b"not-a-welcome".to_vec(), alice_kp.clone(), b"bad".to_vec())
+            .is_err());
+        // The key package was restored, so a valid welcome still establishes.
+        assert_ok!(bob_inv.receive(welcome_a, alice_kp, b"token".to_vec()));
+    }
+
+    /// The defining last-resort behavior: the same published key package accepts welcomes from
+    /// two *distinct* remotes (the material is retained across joins, bounded only by the
+    /// per-remote guard).
+    #[test]
+    fn test_last_resort_invitation_reuses_across_distinct_remotes() {
+        use crate::session::TwoMlsPqSession;
+        use crate::test_utils::{make_client, make_combiner_kp};
+        use std::sync::Arc;
+
+        let alice = make_client();
+        let carol = make_client();
+        let bob = make_client();
+        let alice_kp = make_combiner_kp(&alice);
+        let carol_kp = make_combiner_kp(&carol);
+
+        let bob_inv = assert_ok!(super::TwoMlsPqInvitation::new(assert_ok!(
+            bob.generate_invitation(true)
+        )));
+        let bob_kp = bob_inv.combiner_key_package();
+
+        let alice_session = assert_ok!(TwoMlsPqSession::initiate(
+            Arc::clone(&alice),
+            bob_kp.clone()
+        ));
+        let welcome_a = assert_some!(alice_session.pending_outbound());
+        assert_ok!(bob_inv.receive(welcome_a, alice_kp, b"token-a".to_vec()));
+
+        let carol_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&carol), bob_kp));
+        let welcome_c = assert_some!(carol_session.pending_outbound());
+        assert_ok!(bob_inv.receive(welcome_c, carol_kp, b"token-c".to_vec()));
+    }
+
     #[test]
     fn test_invitation_rejects_wrong_pq_mode() {
         use crate::test_utils::make_client;
 
         let bob = make_client();
-        let mut archive = assert_ok!(bob.generate_invitation());
+        let mut archive = assert_ok!(bob.generate_invitation(true));
         // Layout: [varint len][version][PQ_MODE]…; the MLS varint's top two bits give the
         // header width. Flip the PQ_MODE byte to mimic an archive from the other build.
         let header = match archive[0] >> 6 {

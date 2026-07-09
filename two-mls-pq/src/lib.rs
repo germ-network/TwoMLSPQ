@@ -38,7 +38,10 @@ pub fn version() -> String {
 // queue_proposal / proposal_context signatures).
 // v3 (2026-07-07): TwoMlsPqError gained `UnsupportedCipherSuite` (an injected crypto
 // provider cannot supply a required cipher suite; surfaces at client construction).
-const BINDING_CONTRACT_VERSION: u64 = 3;
+// v4 (2026-07-09): TwoMlsPqError gained `InvitationSpent` (a single-use invitation's key
+// package has already been consumed; `generate_invitation` also gained a `last_resort` flag,
+// but that function-signature change is caught by uniffi's own load-time checksum).
+const BINDING_CONTRACT_VERSION: u64 = 4;
 
 /// See `BINDING_CONTRACT_VERSION`. Exported so the Swift layer can verify the
 /// binding it was generated with matches the binary it loaded.
@@ -292,6 +295,12 @@ pub enum TwoMlsPqError {
     ArchiveInvalid,
     #[error("welcome already consumed for this remote")]
     DuplicateWelcome,
+    /// A single-use (not last-resort) invitation whose key package has already been consumed
+    /// by an accepted session. Distinct from `DuplicateWelcome` (a per-remote replay guard):
+    /// a spent invitation rejects *every* further `receive`, from any remote. The app should
+    /// discard it. A last-resort invitation never reports this.
+    #[error("single-use invitation key package already consumed")]
+    InvitationSpent,
     /// The build's crypto provider cannot supply a required cipher suite — a build or
     /// provider-configuration bug caught at client construction (see
     /// `two-mls-pq/src/providers.rs`), never a runtime condition of a healthy binary.

@@ -15,9 +15,11 @@ use crate::{Result, TwoMlsPqError};
 // The version byte covers the WHOLE archive layout, not just the invitation blob it sits
 // in. v2 (2026-07-07): field framing moved from bespoke u32-LE length prefixes to
 // `mls_rs_codec`, and the archive gained the spawned-group forward table (increment C)
-// after the consumed set; v1 archives are rejected as `ArchiveInvalid` — regenerate the
-// invitation (pre-release, no migration).
-const INVITATION_VERSION: u8 = 2;
+// after the consumed set. v3 (2026-07-09): the invitation gained a `last_resort` flag and
+// its captured key-package material became optional (`None` once a single-use invitation is
+// consumed). Older archives are rejected as `ArchiveInvalid` — regenerate the invitation
+// (pre-release, no migration).
+const INVITATION_VERSION: u8 = 3;
 
 /// The spawned-group forward table: an opaque caller-supplied spawn token → the spawned
 /// session's receive-group classical (message-half) id. The token is whatever the caller
@@ -38,12 +40,18 @@ mod wire {
 
     use crate::key_package_store::KeyPackageSecret;
 
-    /// A self-contained combiner invitation. The two halves' signing keys and key packages
-    /// are always present (distinguished by the `PQ_MODE` header byte).
+    /// A self-contained combiner invitation. The two halves' signing keys and (published)
+    /// key packages are always present (distinguished by the `PQ_MODE` header byte).
+    ///
+    /// `last_resort` records the caller-chosen key-package lifetime: a last-resort invitation
+    /// may accept many welcomes (its captured material is retained), while a single-use one is
+    /// consumed after the first accept — at which point `classical_kpd`/`pq_kpd` are set to
+    /// `None` so the archive no longer carries the spent secret material. See
+    /// `two-mls-pq/src/key_packages.rs` for the consume/retain logic.
     ///
     /// The derived codec embeds each `KeyPackageData` via its own canonical MLS encoding — no
     /// field-by-field surgery, so it stays correct if mls-rs evolves the (non_exhaustive) struct.
-    #[derive(MlsSize, MlsEncode, MlsDecode)]
+    #[derive(Clone, MlsSize, MlsEncode, MlsDecode)]
     pub(crate) struct CombinerInvitation {
         #[mls_codec(with = "mls_rs_codec::byte_vec")]
         pub client_id: Vec<u8>,
@@ -56,9 +64,13 @@ mod wire {
         pub classical_public: Vec<u8>,
         #[mls_codec(with = "mls_rs_codec::byte_vec")]
         pub pq_public: Vec<u8>,
+        /// Whether this invitation's key package is last-resort (retained across welcomes)
+        /// rather than single-use (consumed after the first accept).
+        pub last_resort: bool,
         /// Captured private key-package material for each half: (storage id, KeyPackageData).
-        pub classical_kpd: KeyPackageSecret,
-        pub pq_kpd: KeyPackageSecret,
+        /// `None` once a single-use invitation has been consumed.
+        pub classical_kpd: Option<KeyPackageSecret>,
+        pub pq_kpd: Option<KeyPackageSecret>,
     }
 
     /// The persisted form of a `TwoMlsPqInvitation`: the framed invitation blob (kept framed
@@ -151,9 +163,13 @@ pub(crate) fn decode_archive(
 }
 
 /// Generate a combiner key package on `client` and capture its private material into a
-/// self-contained [`CombinerInvitation`]. Afterwards the client retains no key-package
-/// private data — its capture stores are purged.
-pub(crate) fn generate_combiner_invitation(client: &CombinerClient) -> Result<CombinerInvitation> {
+/// self-contained [`CombinerInvitation`]. `last_resort` fixes the key package's lifetime
+/// (retained across welcomes vs. consumed after the first accept). Afterwards the client
+/// retains no key-package private data — its capture stores are purged.
+pub(crate) fn generate_combiner_invitation(
+    client: &CombinerClient,
+    last_resort: bool,
+) -> Result<CombinerInvitation> {
     let (classical_public, classical_kpd) = capture(client.classical_kp_store(), || {
         client.generate_classical_key_package()
     })?;
@@ -172,24 +188,34 @@ pub(crate) fn generate_combiner_invitation(client: &CombinerClient) -> Result<Co
         pq_signing_key,
         classical_public,
         pq_public,
-        classical_kpd,
-        pq_kpd,
+        last_resort,
+        classical_kpd: Some(classical_kpd),
+        pq_kpd: Some(pq_kpd),
     })
 }
 
 /// Rebuild a stateless combiner client from an invitation: restore the signing identity and
 /// preload each half's key-package store with the invitation's captured `KeyPackageData`,
-/// so a subsequent join/`accept` finds it.
+/// so a subsequent join/`accept` finds it. Each store carries the invitation's `last_resort`
+/// flag, so mls-rs's post-join delete is ignored for a last-resort invitation. Fails with
+/// `InvitationSpent` if the captured material has already been consumed (a spent single-use
+/// invitation).
 pub(crate) fn combiner_from_invitation(inv: &CombinerInvitation) -> Result<CombinerClient> {
+    let classical_kpd = inv
+        .classical_kpd
+        .clone()
+        .ok_or(TwoMlsPqError::InvitationSpent)?;
+    let pq_kpd = inv.pq_kpd.clone().ok_or(TwoMlsPqError::InvitationSpent)?;
     apq::CombinerClient::from_key_packages(
         apq::ArchivedIdentity {
             client_id: inv.client_id.clone(),
             classical_signing_key: inv.classical_signing_key.clone(),
-            classical_kp_store: SyntheticKeyPackageStore::for_invitation([inv
-                .classical_kpd
-                .clone()]),
+            classical_kp_store: SyntheticKeyPackageStore::for_invitation(
+                [classical_kpd],
+                inv.last_resort,
+            ),
             pq_signing_key: inv.pq_signing_key.clone(),
-            pq_kp_store: SyntheticKeyPackageStore::for_invitation([inv.pq_kpd.clone()]),
+            pq_kp_store: SyntheticKeyPackageStore::for_invitation([pq_kpd], inv.last_resort),
         },
         crate::providers::crypto_config(),
     )

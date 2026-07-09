@@ -51,21 +51,39 @@ pub struct SyntheticKeyPackageStore {
     // `Some` while a capture is in progress; inserts are recorded here as well as stored,
     // so the caller can pull out exactly what a single generate call produced.
     capture: Arc<Mutex<Option<Vec<KeyPackageSecret>>>>,
+    // When true, `delete` is a no-op: this store serves a *last-resort* invitation, so
+    // mls-rs's automatic post-join key-package delete must not remove the single key package
+    // it holds (the KP has to remain available to service further welcomes). Set once at
+    // construction and never mutated, so a plain bool is fine across the Arc-shared clones.
+    // Because an invitation serves exactly one key package, this is a single flag rather than
+    // a per-id map. Defaults false (capture/identity-restore stores honor mls-rs's delete).
+    last_resort: bool,
 }
 
 impl SyntheticKeyPackageStore {
-    /// A store preloaded with a fixed set of key packages (an Invitation's KP(s)).
+    /// A store preloaded with a fixed set of key packages (an Invitation's KP(s)), honoring
+    /// mls-rs's delete (single-use). Use [`for_invitation`](Self::for_invitation) to opt a
+    /// last-resort invitation's store out of that delete.
     pub fn preloaded(entries: impl IntoIterator<Item = KeyPackageSecret>) -> Self {
         Self {
             entries: Arc::new(Mutex::new(entries.into_iter().collect())),
             capture: Arc::new(Mutex::new(None)),
+            last_resort: false,
         }
     }
 
-    /// The **invitation** role: a store fixed to the invitation's own key package(s), which
-    /// mls-rs `get`s when joining a welcome.
-    pub fn for_invitation(entries: impl IntoIterator<Item = KeyPackageSecret>) -> Self {
-        Self::preloaded(entries)
+    /// The **invitation** role: a store fixed to the invitation's own key package, which
+    /// mls-rs `get`s when joining a welcome. When `last_resort` is set the store ignores
+    /// mls-rs's post-join `delete`, so the key package survives to service further welcomes;
+    /// otherwise the delete is honored (the classic single-use key package).
+    pub fn for_invitation(
+        entries: impl IntoIterator<Item = KeyPackageSecret>,
+        last_resort: bool,
+    ) -> Self {
+        Self {
+            last_resort,
+            ..Self::preloaded(entries)
+        }
     }
 
     /// Begin recording inserts. Pairs with [`stop_capture`](Self::stop_capture). Note the
@@ -141,6 +159,13 @@ impl SyntheticKeyPackageStore {
     }
 
     fn do_delete(&self, id: &[u8]) {
+        // A last-resort invitation's store retains its single key package across joins:
+        // ignore mls-rs's automatic post-join delete so the KP can service further welcomes.
+        // Single-use lifetime is enforced one level up (the invitation drops its captured
+        // key-package material after the first accept); see `two-mls-pq/src/key_packages.rs`.
+        if self.last_resort {
+            return;
+        }
         self.entries
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -165,5 +190,43 @@ impl KeyPackageStorage for SyntheticKeyPackageStore {
 
     fn get(&self, id: &[u8]) -> Result<Option<KeyPackageData>, Self::Error> {
         Ok(self.do_get(id))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A dummy key package with distinct secret-key bytes so `get` can confirm identity.
+    fn dummy(id: &[u8]) -> KeyPackageSecret {
+        let pkg = KeyPackageData::new(id.to_vec(), vec![0xAA; 32].into(), vec![0xBB; 32].into(), 0);
+        (id.to_vec(), pkg)
+    }
+
+    #[test]
+    fn single_use_store_honors_mls_rs_delete() {
+        let id = b"kp".to_vec();
+        let mut store = SyntheticKeyPackageStore::for_invitation([dummy(&id)], false);
+        assert!(store.get(&id).unwrap().is_some());
+        // mls-rs deletes a used key package after a successful join.
+        store.delete(&id).unwrap();
+        assert!(
+            store.get(&id).unwrap().is_none(),
+            "a single-use invitation store must drop the used key package"
+        );
+    }
+
+    #[test]
+    fn last_resort_store_ignores_mls_rs_delete() {
+        let id = b"kp".to_vec();
+        let mut store = SyntheticKeyPackageStore::for_invitation([dummy(&id)], true);
+        assert!(store.get(&id).unwrap().is_some());
+        // The same automatic delete must be a no-op for a last-resort store, so the key
+        // package stays available to service further welcomes.
+        store.delete(&id).unwrap();
+        assert!(
+            store.get(&id).unwrap().is_some(),
+            "a last-resort invitation store must retain its key package across joins"
+        );
     }
 }

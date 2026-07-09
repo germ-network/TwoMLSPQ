@@ -3570,7 +3570,7 @@ mod tests {
         let bob = make_client();
         let alice_kp = make_combiner_kp(&alice);
         let bob_inv = assert_ok!(crate::key_packages::TwoMlsPqInvitation::new(assert_ok!(
-            bob.generate_invitation()
+            bob.generate_invitation(true)
         )));
         let bob_kp = bob_inv.combiner_key_package();
         let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp));

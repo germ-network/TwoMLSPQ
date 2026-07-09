@@ -35,9 +35,12 @@ hub for group operations (see [Concepts](./concepts.md)).
 - `generate_key_package(suite) -> Vec<u8>` — one MLS key package.
 - `generate_combiner_key_package() -> CombinerKeyPackage` — paired classical +
   ML-KEM-768 key packages sharing one `ClientId`.
-- `generate_invitation() -> Vec<u8>` — capture a combiner key package's private
-  material, with the signing identity, into a self-contained invitation archive,
-  purging the identity's own copies.
+- `generate_invitation(last_resort) -> Vec<u8>` — capture a combiner key package's
+  private material, with the signing identity, into a self-contained invitation archive,
+  purging the identity's own copies. `last_resort` picks the key package's lifetime,
+  which TwoMLS manages itself rather than via mls-rs's on-the-wire last-resort extension:
+  `true` retains the key package so the invitation accepts many welcomes; `false` makes
+  it single-use (consumed after the first accepted session).
 
 ## `TwoMlsPqInvitation`
 
@@ -48,9 +51,10 @@ The receiving side of a published key package — no live client required.
   spawned-group forward table.
 - `client_id()`, `combiner_key_package()` — what to publish.
 - `receive(welcome, their_key_package, spawn_token) -> TwoMlsPqSession` — establish
-  from a remote initiator's welcome; rejects a repeat remote (`DuplicateWelcome`).
-  `spawn_token` is an opaque, replay-stable identifier for the initial frame, keying
-  the forward table.
+  from a remote initiator's welcome; rejects a repeat remote (`DuplicateWelcome`) and,
+  for a single-use invitation whose key package has already been consumed, any further
+  welcome (`InvitationSpent`). `spawn_token` is an opaque, replay-stable identifier for
+  the initial frame, keying the forward table.
 - `forward_group_id(spawn_token) -> Option<MlsGroupId>` — resolve a replayed
   initial frame to the spawned session's receive group (its classical message-half id).
 - `hpke_open(kem_output, ciphertext, info, aad)` — decrypt data sealed to the
