@@ -183,12 +183,9 @@ enum PqInflight {
     RekeyResponded,
 }
 
-// The session archive layout version. The byte covers the WHOLE layout; any change to the
-// wire struct below bumps it, and older archives are rejected as `ArchiveInvalid`
-// (pre-release, no migration).
-// v2: total archivability — the archive now carries the current signing identity (restore
-// is self-contained), a staged-but-uncommitted rotation, and the full PQ round state
-// (mid-A.3 `Initiating`/`Responding`), so `archive` never refuses.
+// The session archive layout version. The byte covers the WHOLE layout. Still pre-release, so
+// a layout change need not bump it — an archive from an older/other build simply fails to
+// decode (`ArchiveInvalid`) and is regenerated; no migration.
 // The header carries the concrete `ApqCipherSuite` pair (4 bytes, classical then pq,
 // big-endian) in place of the old PQ-mode byte: the suite is a stored session property, and a
 // restored archive whose pair differs from this build's pinned suite fails loudly.
@@ -1510,6 +1507,14 @@ impl TwoMlsPqSession {
 
     /// Join a session from an APQWelcome produced by the remote `initiate`.
     /// Retrieve this party's return Welcome via `pending_outbound`.
+    ///
+    /// `client` must be dedicated to the acceptor role: `accept` clears its key-package store
+    /// once the join has consumed the invitation key package (so nothing migrates into the
+    /// session archive). Do NOT reuse one `TwoMlsPqIdentity` for both `initiate` and a direct
+    /// `accept` — `initiate` retains its return-group key package in that same store for the
+    /// peer's return welcome, and this clear would drop it. The normal entry point,
+    /// `TwoMlsPqInvitation::receive`, always builds a fresh invitation-derived client, so this
+    /// only concerns direct callers of `accept`.
     #[uniffi::constructor]
     pub fn accept(
         client: Arc<TwoMlsPqIdentity>,
@@ -1529,6 +1534,17 @@ impl TwoMlsPqSession {
         validate_welcome_halves(client.combiner().cipher_suite(), &recv_classical, &recv_pq)?;
         let recv_group =
             join_combiner_group_from_halves(&recv_classical, &recv_pq, client.combiner())?;
+        // The invitation's key package has served its one purpose: mls-rs obtained it to join
+        // the receive group. The store is only that serving interface, so drop the acceptor's
+        // key-package material now — nothing migrates from the invitation into the session (or
+        // its archive). This is what actually clears it: mls-rs's own post-join delete is
+        // deferred to the group's next `write_to_storage`, which is after `accept` returns.
+        // It clears the WHOLE store, which is why `client` must be dedicated to accepting (see
+        // the fn docs); `initiate` deliberately does NOT purge, since it must retain its
+        // return-group key package. Last-resort reuse is unaffected: it lives on the invitation,
+        // which keeps its own captured material and rebuilds a fresh serving store per `receive`.
+        client.combiner().classical_kp_store().purge_all();
+        client.combiner().pq_kp_store().purge_all();
         // A.4: the send group's PQ half is deferred — classical only, bound to the
         // cross-party PSK. The bootstrap flow stands it up off the critical path, so the
         // return welcome carries an empty PQ slot.
@@ -3663,7 +3679,7 @@ mod tests {
         let bob = make_client();
         let alice_kp = make_combiner_kp(&alice);
         let bob_inv = assert_ok!(crate::key_packages::TwoMlsPqInvitation::new(assert_ok!(
-            bob.generate_invitation()
+            bob.generate_invitation(true)
         )));
         let bob_kp = bob_inv.combiner_key_package();
         let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp));
@@ -3920,14 +3936,6 @@ mod tests {
             TwoMlsPqSession::from_archive(crate::Archive {
                 bytes: wrong_version
             }),
-            TwoMlsPqError::ArchiveInvalid
-        );
-
-        // A version-1 archive (the pre-total layout) rejects: no migration, pre-release.
-        let mut version_one = archive.bytes.clone();
-        version_one[0] = 1;
-        assert_err!(
-            TwoMlsPqSession::from_archive(crate::Archive { bytes: version_one }),
             TwoMlsPqError::ArchiveInvalid
         );
 

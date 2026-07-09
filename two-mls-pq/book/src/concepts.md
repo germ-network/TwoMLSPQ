@@ -18,7 +18,11 @@ exactly the state its job needs:
 - **`TwoMlsPqInvitation`** — a self-contained receiving capability: one published
   combiner key package's private material, the signing identity, and the
   consumed-remote replay guard. It turns welcomes into sessions with no live client
-  and survives restarts through its own archive.
+  and survives restarts through its own archive. TwoMLS manages the key package's
+  lifetime itself rather than via mls-rs's on-the-wire last-resort extension: a
+  *last-resort* invitation retains its key package to accept many welcomes, while a
+  *single-use* one consumes it (dropping the private material from the archive) after
+  the first accepted session.
 - **`TwoMlsPqSession`** — one established pairwise channel: the two Combiner
   send/receive group pairs and the per-round state.
 

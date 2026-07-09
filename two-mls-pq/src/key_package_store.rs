@@ -7,8 +7,17 @@
 //!     call in `capture()` (`start_capture` / `stop_capture`, the "divert") hands back
 //!     exactly the key package(s) produced, so the private material can be moved into an
 //!     Invitation instead of lingering in the client, which then `purge_all`s.
-//!   * **serve** (invitation side, via `for_invitation`): built `preloaded` with a fixed
-//!     set of key packages so mls-rs can `get` them back when joining a welcome.
+//!   * **serve** (invitation side, via `for_invitation`): built `preloaded` with the
+//!     invitation's key package purely so mls-rs can `get` it while joining a welcome. It is
+//!     only that serving interface — but note the store is NOT what clears the key package
+//!     afterwards: mls-rs's post-join `delete` is deferred (it fires on the group's next
+//!     `write_to_storage`, after `accept` has already returned), so `accept` explicitly
+//!     `purge_all`s the acceptor's stores once the join is done. That purge is what keeps the
+//!     invitation's key package from lingering in (or migrating into the archive of) the
+//!     session client — do not mistake the store's own `delete` handling for making it
+//!     redundant. Key-package lifetime (single-use vs last-resort reuse) lives on the
+//!     invitation, which retains its own captured material and rebuilds a fresh serving store
+//!     on each `receive`.
 //!
 //! All clones share the same backing state (interior mutability), so a handle retained by
 //! `CombinerClient` observes the entries mls-rs inserts through its own clone.
@@ -62,8 +71,10 @@ impl SyntheticKeyPackageStore {
         }
     }
 
-    /// The **invitation** role: a store fixed to the invitation's own key package(s), which
-    /// mls-rs `get`s when joining a welcome.
+    /// The **invitation** role: a store fixed to the invitation's own key package, which
+    /// mls-rs `get`s while joining a welcome and `delete`s once it has consumed it. It is a
+    /// serving interface, nothing more — the invitation, not this store, owns key-package
+    /// lifetime (see `two-mls-pq/src/key_packages.rs`).
     pub fn for_invitation(entries: impl IntoIterator<Item = KeyPackageSecret>) -> Self {
         Self::preloaded(entries)
     }
@@ -165,5 +176,30 @@ impl KeyPackageStorage for SyntheticKeyPackageStore {
 
     fn get(&self, id: &[u8]) -> Result<Option<KeyPackageData>, Self::Error> {
         Ok(self.do_get(id))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A dummy key package with distinct secret-key bytes so `get` can confirm identity.
+    fn dummy(id: &[u8]) -> KeyPackageSecret {
+        let pkg = KeyPackageData::new(id.to_vec(), vec![0xAA; 32].into(), vec![0xBB; 32].into(), 0);
+        (id.to_vec(), pkg)
+    }
+
+    #[test]
+    fn serving_store_honors_mls_rs_delete() {
+        let id = b"kp".to_vec();
+        let mut store = SyntheticKeyPackageStore::for_invitation([dummy(&id)]);
+        assert!(store.get(&id).unwrap().is_some());
+        // The store is a serving interface: mls-rs deletes a key package once it has joined
+        // with it, and the store honors that so nothing lingers to migrate into the session.
+        store.delete(&id).unwrap();
+        assert!(
+            store.get(&id).unwrap().is_none(),
+            "the serving store must drop a key package mls-rs has consumed"
+        );
     }
 }
