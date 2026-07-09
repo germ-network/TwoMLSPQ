@@ -401,7 +401,8 @@ impl TwoMlsPqInvitation {
 
     /// Receive a remote initiator's APQWelcome and establish the session using this
     /// invitation's captured key package. Rejects a second welcome from the same remote
-    /// (`DuplicateWelcome`).
+    /// (`DuplicateWelcome`); a single-use invitation whose key package has already been
+    /// consumed rejects every further welcome, from any remote (`InvitationSpent`).
     ///
     /// `spawn_token` is an opaque, caller-chosen, replay-stable identifier for the
     /// initial frame this welcome arrived in (the Swift adapter passes the app's
@@ -496,7 +497,9 @@ impl TwoMlsPqInvitation {
     /// HPKE-decrypt data sealed to this invitation's (classical) key package init key — the
     /// initial routing-header pattern from classical TwoMLS. `info` defaults to the
     /// ClientId; `kem_output` and `ciphertext` are the two components of the HPKE ciphertext
-    /// (kept separate so this stays agnostic to any outer wire framing).
+    /// (kept separate so this stays agnostic to any outer wire framing). Fails with
+    /// `InvitationSpent` once a single-use invitation has been consumed — its captured PQ
+    /// key-package material, and thus the init key this opens with, is then gone.
     pub fn hpke_open(
         &self,
         kem_output: Vec<u8>,
