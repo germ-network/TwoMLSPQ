@@ -8,11 +8,16 @@
 //!     exactly the key package(s) produced, so the private material can be moved into an
 //!     Invitation instead of lingering in the client, which then `purge_all`s.
 //!   * **serve** (invitation side, via `for_invitation`): built `preloaded` with the
-//!     invitation's key package purely so mls-rs can `get` it while joining a welcome. The
-//!     store is only that serving interface — it honors mls-rs's post-join `delete` like any
-//!     store, so no key package lingers in (or migrates out of) the session client. Key-package
-//!     lifetime (single-use vs last-resort reuse) lives on the invitation, which retains its
-//!     own captured material and rebuilds a fresh serving store on each `receive`.
+//!     invitation's key package purely so mls-rs can `get` it while joining a welcome. It is
+//!     only that serving interface — but note the store is NOT what clears the key package
+//!     afterwards: mls-rs's post-join `delete` is deferred (it fires on the group's next
+//!     `write_to_storage`, after `accept` has already returned), so `accept` explicitly
+//!     `purge_all`s the acceptor's stores once the join is done. That purge is what keeps the
+//!     invitation's key package from lingering in (or migrating into the archive of) the
+//!     session client — do not mistake the store's own `delete` handling for making it
+//!     redundant. Key-package lifetime (single-use vs last-resort reuse) lives on the
+//!     invitation, which retains its own captured material and rebuilds a fresh serving store
+//!     on each `receive`.
 //!
 //! All clones share the same backing state (interior mutability), so a handle retained by
 //! `CombinerClient` observes the entries mls-rs inserts through its own clone.
