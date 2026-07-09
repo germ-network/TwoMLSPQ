@@ -48,7 +48,7 @@ that references them; retired and one-shot entries are deleted afterwards, so th
 mls-rs secret stores are ephemeral plumbing that holds nothing the session doesn't.
 The ledger resolves frames that crossed one of our commits (which reference an epoch
 mls-rs can no longer export), and — being session-owned state — it rides in the
-session archive, so a restored session (whose fresh client's stores are empty)
+session archive, so a restored session (whose rebuilt client's stores are empty)
 still resolves them.
 
 ## Two asymmetric send groups

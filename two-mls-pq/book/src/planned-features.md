@@ -10,7 +10,8 @@ scheduled work.
 Session archive/restore and transport routing (`should_listen_on`,
 `send_rendezvous`, `forwarded`) — previously listed here — are implemented; see the
 [API Reference](./api-reference.md) for the archive contract (plaintext, single-use,
-quiescence) and [Session Lifecycle](./session-lifecycle.md) for routing.
+total — a session is always archivable) and [Session Lifecycle](./session-lifecycle.md)
+for routing.
 
 Beyond the methods above, the roadmap includes:
 
