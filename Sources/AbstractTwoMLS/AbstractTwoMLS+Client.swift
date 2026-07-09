@@ -20,6 +20,15 @@ public enum AbstractTwoMLS {
 	//should be 32 bytes
 	public typealias RendezvousID = Data
 
+	/// The per-credential entry point: a factory for `Invitation`s and sessions.
+	///
+	/// Terminology bridge. This is the single 1:1 entity that **CommProtocol** calls an
+	/// **Agent** (delegated from its `Identity` / `Anchor`) and that the **TwoMLSPQ** backend
+	/// exposes as a **`TwoMlsPqPrincipal`**. AbstractTwoMLS abstracts over the backend and
+	/// historically named this protocol `Client`; the concept is the agent / principal, 1:1
+	/// with the MLS Basic Credential — i.e. `Agent ↔ Principal`. TwoMLSPQ stays
+	/// CommProtocol-agnostic and never says "agent"; CommProtocol never says "principal";
+	/// this layer is where the two vocabularies meet.
 	public protocol Client {
 		associatedtype Invitation: AbstractTwoMLS.Invitation where Invitation.Client == Self
 
