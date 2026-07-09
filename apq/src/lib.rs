@@ -62,8 +62,8 @@ pub enum CombinerError {
     #[error("crypto provider does not support the required cipher suite")]
     UnsupportedCipherSuite,
     /// An observed cipher-suite pair does not match the session's expected [`ApqCipherSuite`],
-    /// or is not a coherent APQ combination (unrecognized suite, a classical suite in the PQ
-    /// slot, mismatched signature families). Distinct from [`UnsupportedCipherSuite`](Self::UnsupportedCipherSuite),
+    /// or is not a coherent APQ combination (unrecognized suite, or a classical suite in the PQ
+    /// slot). Distinct from [`UnsupportedCipherSuite`](Self::UnsupportedCipherSuite),
     /// which is a local provider-capability gap.
     #[error("cipher suite mismatch")]
     CipherSuiteMismatch,

@@ -66,6 +66,10 @@ pub(crate) use selected::{classical, pq, pq_kem, Classical, Pq};
 /// ML-KEM-768 PQ (confidentiality-only). The APQ mode is derived from it (`ApqCipherSuite::mode`).
 /// A struct literal (not the fallible `new`) so it is a `const`; its coherence is enforced by the
 /// `suite.validate()?` guard at every `CombinerClient` construction and asserted in tests.
+///
+/// `CipherSuite::ML_KEM_768` is the named constant `apq` unlocks via `mls-rs-core/post-quantum`;
+/// it reaches us here through Cargo feature unification (`apq` is a required dependency, so the
+/// feature is always on). The pinned wire value is asserted against it in `apq::client`.
 pub(crate) const APQ_SUITE: apq::ApqCipherSuite = apq::ApqCipherSuite {
     classical: mls_rs::CipherSuite::CURVE25519_CHACHA,
     pq: mls_rs::CipherSuite::ML_KEM_768,

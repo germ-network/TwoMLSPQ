@@ -329,9 +329,6 @@ where
         } = identity;
         let suite = crypto.suite;
         suite.validate()?;
-        if CipherSuite::new(ML_KEM_768) != CipherSuite::ML_KEM_768 {
-            return Err(CombinerError::UnsupportedCipherSuite);
-        }
         let classical_cs = crypto
             .classical
             .cipher_suite_provider(suite.classical)
