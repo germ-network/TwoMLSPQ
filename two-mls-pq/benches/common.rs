@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use two_mls_pq::{
-    key_packages::{CombinerKeyPackage, TwoMlsPqIdentity},
+    key_packages::{CombinerKeyPackage, TwoMlsPqPrincipal},
     session::TwoMlsPqSession,
     MlsCipherSuite,
 };
@@ -24,11 +24,11 @@ pub fn client_id() -> Vec<u8> {
     format!("bench-client-{n}-{t}").into_bytes()
 }
 
-pub fn client() -> Arc<TwoMlsPqIdentity> {
-    TwoMlsPqIdentity::new(client_id()).unwrap()
+pub fn client() -> Arc<TwoMlsPqPrincipal> {
+    TwoMlsPqPrincipal::new(client_id()).unwrap()
 }
 
-pub fn combiner_kp(client: &TwoMlsPqIdentity) -> CombinerKeyPackage {
+pub fn combiner_kp(client: &TwoMlsPqPrincipal) -> CombinerKeyPackage {
     client.generate_combiner_key_package().unwrap()
 }
 

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use mls_rs::{CipherSuiteProvider, CryptoProvider};
 
 use crate::{
-    key_packages::{CombinerKeyPackage, TwoMlsPqIdentity},
+    key_packages::{CombinerKeyPackage, TwoMlsPqPrincipal},
     session::TwoMlsPqSession,
 };
 
@@ -16,11 +16,11 @@ pub(crate) fn test_client_id() -> Vec<u8> {
     secret.as_bytes().to_vec()
 }
 
-pub(crate) fn make_client() -> Arc<TwoMlsPqIdentity> {
-    assert_ok!(TwoMlsPqIdentity::new(test_client_id()))
+pub(crate) fn make_client() -> Arc<TwoMlsPqPrincipal> {
+    assert_ok!(TwoMlsPqPrincipal::new(test_client_id()))
 }
 
-pub(crate) fn make_combiner_kp(client: &TwoMlsPqIdentity) -> CombinerKeyPackage {
+pub(crate) fn make_combiner_kp(client: &TwoMlsPqPrincipal) -> CombinerKeyPackage {
     assert_ok!(client.generate_combiner_key_package())
 }
 

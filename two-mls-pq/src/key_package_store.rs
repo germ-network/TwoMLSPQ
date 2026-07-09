@@ -27,7 +27,7 @@
 //! The client (capture) and invitation (serve) roles are behaviourally distinct, so a
 //! `CaptureKeyPackageStore` + `FixedKeyPackageStore` split is tempting. We deliberately use
 //! ONE type: the roles differ only in how the same map is populated and drained, not in the
-//! `KeyPackageStorage` contract. Two types would pin `TwoMlsPqIdentity` and
+//! `KeyPackageStorage` contract. Two types would pin `TwoMlsPqPrincipal` and
 //! `TwoMlsPqInvitation` to two *different* `apq::CombinerClient<S>` instantiations,
 //! complicating the shared session/group plumbing for no behavioural gain. The Swift
 //! reference (`ManagedKeyPackageStore`) is likewise a single class (one `storage` dict + a

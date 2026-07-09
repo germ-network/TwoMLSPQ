@@ -23,12 +23,12 @@ practice **raw 32-byte values**: SHA-256 over the stated object.
 That is this library's own wire convention; the app layer wraps them in whatever
 typed-digest encoding it uses — no app-layer type tags appear on this surface.
 
-## `TwoMlsPqIdentity`
+## `TwoMlsPqPrincipal`
 
-The agent identity and key-package/invitation mint — deliberately *not* an mls-rs-style
+The principal and key-package/invitation mint — deliberately *not* an mls-rs-style
 hub for group operations (see [Concepts](./concepts.md)).
 
-- `new(client_id) -> Arc<TwoMlsPqIdentity>` — build an identity for opaque `ClientId`
+- `new(client_id) -> Arc<TwoMlsPqPrincipal>` — build an identity for opaque `ClientId`
   bytes (carried as the Basic Credential); the MLS signing keys are generated
   internally and are independent of it.
 - `client_id() -> ClientId` — the identity bytes.
@@ -79,7 +79,7 @@ internally (no client argument), byte-exact in ClientId and signing keys. The re
 groups still sign with the keys embedded in their snapshots.
 
 State: `is_established`, `is_fully_established`, `has_receive_group`,
-`active_session_id`, `receive_group_id`, `my_agent_state`, `their_agent_state`,
+`active_session_id`, `receive_group_id`, `my_principal_state`, `their_principal_state`,
 `pending_outbound`, `epochs`.
 
 Messaging: `prepare_to_encrypt`, `encrypt`, `process_incoming`, `proposal_context`,
@@ -95,8 +95,8 @@ PQ side-band (see [Session Lifecycle](./session-lifecycle.md)): `my_pq_turn`,
 `pq_bootstrap_apply`, and `pq_ratchet_begin` /
 `pq_ratchet_respond` / `pq_ratchet_bind` / `pq_ratchet_apply` and
 `pq_rekey_begin(rotating)` / `pq_rekey_respond` / `pq_rekey_apply`. The `rotating`
-parameters carry the agent credential handoff and must name the session's current
-agent.
+parameters carry the principal credential handoff and must name the session's current
+principal.
 
 Persistence: `archive() -> Archive` is **total** — a session is always archivable, in
 any state, so it never refuses. It serialises the full session — the current signing

@@ -162,12 +162,12 @@ pub struct CommitResult {
 /// Credential state for one send direction. `Pending` means a rotation commit
 /// was sent but the opposing side has not yet committed their half.
 #[derive(Debug, Clone, uniffi::Enum)]
-pub enum AgentState {
+pub enum PrincipalState {
     Sync { client_id: ClientId },
     Pending { old: ClientId, new: ClientId },
 }
 
-impl AgentState {
+impl PrincipalState {
     /// The current active client ID: the live identity for `Sync`, the pre-rotation one for `Pending`.
     pub fn client_id(&self) -> ClientId {
         match self {

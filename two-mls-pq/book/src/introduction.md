@@ -18,10 +18,13 @@ iOS App
                  └─ crypto       X25519/ChaCha (classical) · ML-KEM-768 (PQ)
 ```
 
-CommProtocol owns identity (DIDs, anchor keys) and hands TwoMLSPQ an **agent
-signing key**; that key's public component is the MLS `ClientId` (a Basic
-Credential — there is no Authentication Service). Everything above the agent key
-is outside this library's boundary.
+CommProtocol owns identity (DIDs, anchor keys) and hands TwoMLSPQ a signing key for one
+of its **agents**. TwoMLSPQ has no notion of agents; it wraps that key as a
+**`TwoMlsPqPrincipal`** — *principal* is this library's CommProtocol-agnostic name for the
+credential-scoped signer CommProtocol calls an agent (the `Agent ↔ Principal` mapping is
+documented at the AbstractTwoMLS boundary). That key's public component is the MLS
+`ClientId` (a Basic Credential — there is no Authentication Service). Everything above that
+key is outside this library's boundary.
 
 ## How a session is built
 

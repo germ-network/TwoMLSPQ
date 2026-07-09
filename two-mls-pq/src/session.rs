@@ -20,11 +20,11 @@ use crate::key_package_store::CombinerGroup;
 
 use crate::{
     key_packages::{
-        ensure_pq_available, parse_mls_key_package, CombinerKeyPackage, TwoMlsPqIdentity,
+        ensure_pq_available, parse_mls_key_package, CombinerKeyPackage, TwoMlsPqPrincipal,
     },
-    AgentState, Archive, ClientId, CombinerGroupId, CommitResult, DecryptResult, EncryptResult,
+    Archive, ClientId, CombinerGroupId, CommitResult, DecryptResult, EncryptResult,
     EpochRendezvous, ListenChannels, MlsGroupId, MlsSenderMessage, PrepareEncryptResult,
-    RendezvousId, Result, SessionId, TwoMlsPqError,
+    PrincipalState, RendezvousId, Result, SessionId, TwoMlsPqError,
 };
 
 use zeroize::Zeroizing;
@@ -32,7 +32,7 @@ use zeroize::Zeroizing;
 use crate::providers;
 
 struct SessionInner {
-    client: Arc<TwoMlsPqIdentity>,
+    client: Arc<TwoMlsPqPrincipal>,
     send_group: Option<CombinerGroup>,
     recv_group: Option<CombinerGroup>,
     pending_outbound: Option<Vec<u8>>,
@@ -45,11 +45,11 @@ struct SessionInner {
     /// enters our send group's proposal cache only via `queue_proposal`.
     offered_proposal: Option<(Vec<u8>, Vec<u8>)>,
     queued_proposal: Option<Vec<u8>>,
-    pending_new_client: Option<Arc<TwoMlsPqIdentity>>,
+    pending_new_client: Option<Arc<TwoMlsPqPrincipal>>,
     pq_inflight: Option<PqInflight>,
     session_id: SessionId,
-    my_state: AgentState,
-    their_state: AgentState,
+    my_state: PrincipalState,
+    their_state: PrincipalState,
     /// Responder-side side-band frame awaiting pickup by `pq_take_pending_outbound`.
     /// Single slot: responder operations refuse to start while a frame is waiting.
     pending_pq_outbound: Option<Vec<u8>>,
@@ -77,7 +77,7 @@ struct SessionInner {
     /// The group-state storage backing the send group's classical half, captured from
     /// the client that CONSTRUCTED the session. The retention probe must read this
     /// handle, not one reached through `self.client`: a Phase 8 rotation replaces
-    /// `self.client` with the new agent's client (whose injected storage is a fresh,
+    /// `self.client` with the new principal's client (whose injected storage is a fresh,
     /// empty map), while the send group keeps flushing into the storage it was built
     /// with — probing the new client's handle would prune every prior epoch's listen
     /// address right after rotation.
@@ -85,7 +85,7 @@ struct SessionInner {
     /// Every PSK store backing one of this session's group configs: the constructing
     /// client's stores, plus the stores of any later client that joins or stands up a
     /// group half (the A.4 bootstrap and the return-welcome join run on the CURRENT
-    /// agent, which a Phase 8 rotation may have replaced since construction). External
+    /// principal, which a Phase 8 rotation may have replaced since construction). External
     /// PSKs are registered into ALL of these (`register_psk`): an mls-rs group resolves
     /// PSKs from the store of the client that created it, so registering only through
     /// `self.client` would strand every group created before the latest rotation.
@@ -93,7 +93,7 @@ struct SessionInner {
     /// The client whose PSK stores `psk_stores` last absorbed — the dedup key for
     /// `track_psk_stores` (compared by Arc identity, so re-tracking the same client
     /// is free and only a rotation-installed client grows the registry).
-    psk_stores_from: Arc<TwoMlsPqIdentity>,
+    psk_stores_from: Arc<TwoMlsPqPrincipal>,
     /// The opaque spawn token this acceptor session was created under (see
     /// `TwoMlsPqInvitation::receive`); `None` on initiator sessions. `forwarded`
     /// matches replayed initial frames against it. Opaque — this library never
@@ -104,7 +104,7 @@ struct SessionInner {
 
 /// Ledger depth for `send_psk_ledger`: one entry per send-group epoch. The peer references
 /// the epoch it last observed, so the window must cover every unilateral send-group commit
-/// (queued-proposal ratchet, agent rotation, PQ bind) that can cross one in-flight peer
+/// (queued-proposal ratchet, principal rotation, PQ bind) that can cross one in-flight peer
 /// frame. That count is protocol-unbounded in principle — a host looping rotations while a
 /// peer frame is in transit can outrun any fixed window and permanently desync the
 /// direction (the failed frame is a commit, so there is no recovery) — but each entry is
@@ -120,7 +120,7 @@ pub struct TwoMlsPqSession {
 
 // APQWelcome wire format (0x01) + encode/decode live in the `apq` crate (imported above).
 // Rotation commit+app: [0x03 tag][u32-LE commit-len][commit][u32-LE app-len][app]
-// Used only for Phase 8 agent rotation (no PSK refresh).
+// Used only for Phase 8 principal rotation (no PSK refresh).
 const BUNDLED_TAG: u8 = 0x03;
 // A.2 ratchet frame: [0x05 tag][send-commit][Upd(sender) proposal][app], each section
 // u32-LE length-prefixed (see encode_ratchet; sections may be empty — routine rounds
@@ -172,7 +172,7 @@ enum PqInflight {
     Responding(Zeroizing<Vec<u8>>),
     /// A.5 initiator awaiting the responder's Commit' (+ counter-Upd'). `rotating`
     /// carries the credential-handoff ClientId from `pq_rekey_begin` so the final
-    /// commit also hands our own send-PQ leaf to the new agent's signing key.
+    /// commit also hands our own send-PQ leaf to the new principal's signing key.
     RekeyInitiated { rotating: Option<ClientId> },
     /// A.5 responder awaiting the initiator's final Commit'.
     RekeyResponded,
@@ -230,10 +230,10 @@ mod archive_wire {
         pub(super) addr: Vec<u8>,
     }
 
-    /// `AgentState` on the wire: `Sync { client_id: active }` when `pending_new` is
+    /// `PrincipalState` on the wire: `Sync { client_id: active }` when `pending_new` is
     /// `None`, else `Pending { old: active, new: pending_new }`.
     #[derive(MlsSize, MlsEncode, MlsDecode)]
-    pub(super) struct WireAgentState {
+    pub(super) struct WirePrincipalState {
         #[mls_codec(with = "mls_rs_codec::byte_vec")]
         pub(super) active: Vec<u8>,
         pub(super) pending_new: Option<Vec<u8>>,
@@ -325,8 +325,8 @@ mod archive_wire {
         /// The session's current client signing identity, rebuilt byte-exact on restore
         /// so restore is self-contained (no client argument).
         pub(super) client: SigningIdentityBlob,
-        pub(super) my_state: WireAgentState,
-        pub(super) their_state: WireAgentState,
+        pub(super) my_state: WirePrincipalState,
+        pub(super) their_state: WirePrincipalState,
         pub(super) pq_turn_mine: bool,
         pub(super) spawn_token: Option<Vec<u8>>,
         /// Required: every constructor creates a send group, so its absence marks a
@@ -350,27 +350,27 @@ mod archive_wire {
     }
 }
 
-/// `AgentState` → its wire form.
-fn wire_agent_state(state: &AgentState) -> archive_wire::WireAgentState {
+/// `PrincipalState` → its wire form.
+fn wire_principal_state(state: &PrincipalState) -> archive_wire::WirePrincipalState {
     match state {
-        AgentState::Sync { client_id } => archive_wire::WireAgentState {
+        PrincipalState::Sync { client_id } => archive_wire::WirePrincipalState {
             active: client_id.bytes.clone(),
             pending_new: None,
         },
-        AgentState::Pending { old, new } => archive_wire::WireAgentState {
+        PrincipalState::Pending { old, new } => archive_wire::WirePrincipalState {
             active: old.bytes.clone(),
             pending_new: Some(new.bytes.clone()),
         },
     }
 }
 
-/// Wire form → `AgentState`.
-fn agent_state_from_wire(wire: archive_wire::WireAgentState) -> AgentState {
+/// Wire form → `PrincipalState`.
+fn principal_state_from_wire(wire: archive_wire::WirePrincipalState) -> PrincipalState {
     match wire.pending_new {
-        None => AgentState::Sync {
+        None => PrincipalState::Sync {
             client_id: ClientId { bytes: wire.active },
         },
-        Some(new) => AgentState::Pending {
+        Some(new) => PrincipalState::Pending {
             old: ClientId { bytes: wire.active },
             new: ClientId { bytes: new },
         },
@@ -379,7 +379,7 @@ fn agent_state_from_wire(wire: archive_wire::WireAgentState) -> AgentState {
 
 /// A client's signing identity → its wire form (ClientId + each half's signing key).
 /// The signing keys are session-owned state; the archive rebuilds the client from them.
-fn signing_identity_blob(identity: &TwoMlsPqIdentity) -> archive_wire::SigningIdentityBlob {
+fn signing_identity_blob(identity: &TwoMlsPqPrincipal) -> archive_wire::SigningIdentityBlob {
     let client = identity.combiner();
     archive_wire::SigningIdentityBlob {
         client_id: client.client_id().to_vec(),
@@ -392,10 +392,10 @@ fn signing_identity_blob(identity: &TwoMlsPqIdentity) -> archive_wire::SigningId
     }
 }
 
-/// A signing-identity blob → a rebuilt session-owned `TwoMlsPqIdentity` with its key-package
+/// A signing-identity blob → a rebuilt session-owned `TwoMlsPqPrincipal` with its key-package
 /// stores preloaded from the blob (empty for a bare identity, e.g. a staged successor).
-fn identity_from_wire(blob: archive_wire::SigningIdentityBlob) -> Result<Arc<TwoMlsPqIdentity>> {
-    TwoMlsPqIdentity::from_signing_keys(
+fn principal_from_wire(blob: archive_wire::SigningIdentityBlob) -> Result<Arc<TwoMlsPqPrincipal>> {
+    TwoMlsPqPrincipal::from_signing_keys(
         blob.client_id,
         blob.classical_signing_key,
         blob.classical_kps,
@@ -705,11 +705,11 @@ impl TwoMlsPqSession {
     /// responder commits.
     ///
     /// `rotating` is the A.5 credential handoff: it must name the session's CURRENT
-    /// agent (a Phase 8 rotation has already swapped `self.client` to it), and the Upd'
-    /// then moves our leaf's signing key to that agent, announcing its ClientId in the
+    /// principal (a Phase 8 rotation has already swapped `self.client` to it), and the Upd'
+    /// then moves our leaf's signing key to that principal, announcing its ClientId in the
     /// proposal's authenticated_data — the same announcement convention as the Phase 8
     /// classical rotation commit. The leaf's credential BYTES stay what they were:
-    /// `BasicIdentityProvider` requires a stable identity across leaf updates, so agent
+    /// `BasicIdentityProvider` requires a stable identity across leaf updates, so principal
     /// identity travels at the announcement level, not in the Basic Credential.
     pub fn pq_rekey_begin(&self, rotating: Option<ClientId>) -> Result<Vec<u8>> {
         let mut inner = self.lock();
@@ -772,9 +772,9 @@ impl TwoMlsPqSession {
     /// Returns the ClientId the initiator announced in the Upd's authenticated_data when
     /// this rekey carries an A.5 credential handoff (see `pq_rekey_begin`), else `None`.
     /// By the time this returns, the initiator's leaf in our send-PQ has already moved
-    /// to the new agent's signing key. The classical Phase 8 commit remains the
+    /// to the new principal's signing key. The classical Phase 8 commit remains the
     /// authoritative identity-rotation channel — this reports the PQ half catching up
-    /// and does not touch the session's agent state.
+    /// and does not touch the session's principal state.
     pub fn pq_rekey_respond(&self, upd_msg: Vec<u8>) -> Result<Option<ClientId>> {
         let (&tag, proposal_bytes) = upd_msg.split_first().ok_or(TwoMlsPqError::Mls)?;
         if tag != PQ_REKEY_UPD_TAG {
@@ -903,7 +903,7 @@ impl TwoMlsPqSession {
                 inner.register_psk(&psk_id, &psk);
                 // Commit the counter-Upd' on our own send-PQ. If this rekey carries a
                 // credential handoff, the commit's updatePath also moves OUR committer
-                // leaf to the new agent's signing key (the Upd' in `pq_rekey_begin`
+                // leaf to the new principal's signing key (the Upd' in `pq_rekey_begin`
                 // covered our leaf in the peer's send-PQ; this covers the other group).
                 let handoff = match &rotating {
                     Some(new_id) => {
@@ -1085,7 +1085,7 @@ impl SessionInner {
     /// this client creates or joins for the session (A.4 bootstrap, return-welcome join).
     /// Idempotent per client: the common paths re-track the construction client, and
     /// only a Phase 8 rotation actually introduces new stores.
-    fn track_psk_stores(&mut self, client: &Arc<TwoMlsPqIdentity>) {
+    fn track_psk_stores(&mut self, client: &Arc<TwoMlsPqPrincipal>) {
         if Arc::ptr_eq(client, &self.psk_stores_from) {
             return;
         }
@@ -1122,7 +1122,7 @@ impl SessionInner {
         let group_id = send.message_group().group_id().to_vec();
         // Probe the storage captured at session construction — the one the send group
         // actually flushes into. NOT `self.client`'s: after a Phase 8 rotation that is
-        // the new agent's client with a fresh, empty storage, and probing it would
+        // the new principal's client with a fresh, empty storage, and probing it would
         // prune every prior epoch's listen address (dropping in-flight traffic).
         let storage = &self.send_group_storage;
         self.listen_rendezvous
@@ -1134,8 +1134,8 @@ impl SessionInner {
     /// Called when any message is successfully decrypted from the recv group,
     /// confirming the peer has processed our rotation commit.
     fn resolve_pending_rotation(&mut self) {
-        if let AgentState::Pending { new, .. } = &self.my_state {
-            self.my_state = AgentState::Sync {
+        if let PrincipalState::Pending { new, .. } = &self.my_state {
+            self.my_state = PrincipalState::Sync {
                 client_id: new.clone(),
             };
         }
@@ -1169,7 +1169,7 @@ impl SessionInner {
     /// Live-inject the session's PSK ledger, immediately before processing a frame whose
     /// commit may reference one of these PSKs. Injection targets the stores each live
     /// group actually resolves from (captured at the group's creation — the current
-    /// client's stores are the wrong target after an agent rotation), plus the current
+    /// client's stores are the wrong target after a principal rotation), plus the current
     /// client's stores for joins that are about to create a group. Retired ids are then
     /// deleted from the same targets, so the stores' contents stay bounded by the ledger
     /// and nothing remains resolvable that the session no longer vouches for.
@@ -1249,7 +1249,7 @@ impl SessionInner {
         self.pending_commit_message = Some(commit_bytes);
 
         let old_id = self.my_state.client_id();
-        self.my_state = AgentState::Pending {
+        self.my_state = PrincipalState::Pending {
             old: old_id,
             new: new_id,
         };
@@ -1361,7 +1361,7 @@ impl SessionInner {
 }
 
 fn build_session(
-    client: Arc<TwoMlsPqIdentity>,
+    client: Arc<TwoMlsPqPrincipal>,
     send_group: Option<CombinerGroup>,
     recv_group: Option<CombinerGroup>,
     pending_outbound: Option<Vec<u8>>,
@@ -1390,8 +1390,8 @@ fn build_session(
             pending_new_client: None,
             pq_inflight: None,
             session_id,
-            my_state: AgentState::Sync { client_id: my_id },
-            their_state: AgentState::Sync {
+            my_state: PrincipalState::Sync { client_id: my_id },
+            their_state: PrincipalState::Sync {
                 client_id: their_id,
             },
             pq_turn_mine: initiated,
@@ -1410,7 +1410,7 @@ fn build_session(
 impl TwoMlsPqSession {
     /// Lock the session state, recovering from a poisoned mutex rather than propagating a panic.
     /// A poisoned lock means a prior holder panicked mid-update; we surface the inner state and let
-    /// the normal `Option`/`AgentState` checks reject any half-applied operation. Used everywhere so
+    /// the normal `Option`/`PrincipalState` checks reject any half-applied operation. Used everywhere so
     /// the lock policy is uniform and panic-free (the crate denies `unwrap`/`expect`/`panic`).
     fn lock(&self) -> std::sync::MutexGuard<'_, SessionInner> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
@@ -1430,7 +1430,7 @@ impl TwoMlsPqSession {
     /// Retrieve the outbound APQWelcome bytes via `pending_outbound`.
     #[uniffi::constructor]
     pub fn initiate(
-        client: Arc<TwoMlsPqIdentity>,
+        client: Arc<TwoMlsPqPrincipal>,
         their_key_package: CombinerKeyPackage,
     ) -> Result<Arc<Self>> {
         ensure_pq_available(&their_key_package)?;
@@ -1465,14 +1465,14 @@ impl TwoMlsPqSession {
     ///
     /// `client` must be dedicated to the acceptor role: `accept` clears its key-package store
     /// once the join has consumed the invitation key package (so nothing migrates into the
-    /// session archive). Do NOT reuse one `TwoMlsPqIdentity` for both `initiate` and a direct
+    /// session archive). Do NOT reuse one `TwoMlsPqPrincipal` for both `initiate` and a direct
     /// `accept` — `initiate` retains its return-group key package in that same store for the
     /// peer's return welcome, and this clear would drop it. The normal entry point,
     /// `TwoMlsPqInvitation::receive`, always builds a fresh invitation-derived client, so this
     /// only concerns direct callers of `accept`.
     #[uniffi::constructor]
     pub fn accept(
-        client: Arc<TwoMlsPqIdentity>,
+        client: Arc<TwoMlsPqPrincipal>,
         welcome: Vec<u8>,
         their_key_package: CombinerKeyPackage,
     ) -> Result<Arc<Self>> {
@@ -1568,15 +1568,15 @@ impl TwoMlsPqSession {
             return Err(TwoMlsPqError::ArchiveInvalid);
         }
 
-        let my_state = agent_state_from_wire(wire.my_state);
-        let their_state = agent_state_from_wire(wire.their_state);
+        let my_state = principal_state_from_wire(wire.my_state);
+        let their_state = principal_state_from_wire(wire.their_state);
 
         // Rebuild the session's current client byte-exact from its archived signing
         // identity, and re-mint any staged-but-uncommitted rotation successor. All group
         // storage and PSK plumbing below re-homes onto this client.
-        let client = identity_from_wire(wire.client)?;
+        let client = principal_from_wire(wire.client)?;
         let pending_new_client = match wire.pending_new_client {
-            Some(blob) => Some(identity_from_wire(blob)?),
+            Some(blob) => Some(principal_from_wire(blob)?),
             None => None,
         };
         let pq_inflight = wire.pq_inflight.map(pq_inflight_from_wire).transpose()?;
@@ -1691,7 +1691,7 @@ impl TwoMlsPqSession {
     /// up its deferred send-group PQ half. The key package's private material is retained
     /// in this client, so the returned welcome can be joined by `pq_bootstrap_apply`.
     ///
-    /// `rotating` must name the session's CURRENT agent (like `pq_rekey_begin`); the KP'
+    /// `rotating` must name the session's CURRENT principal (like `pq_rekey_begin`); the KP'
     /// below is generated by that client, so the new leaf carries its credential without
     /// further work — the check is all a bootstrap-time handoff needs.
     pub fn pq_bootstrap_begin(&self, rotating: Option<ClientId>) -> Result<Vec<u8>> {
@@ -1733,7 +1733,7 @@ impl TwoMlsPqSession {
         }
         let client = inner.client.clone();
         // The new PQ half resolves PSKs from the CURRENT client's stores (A.4 runs on
-        // the agent a Phase 8 rotation may have installed) — track them.
+        // the principal a Phase 8 rotation may have installed) — track them.
         inner.track_psk_stores(&client);
         let frame = {
             let send = inner
@@ -1792,11 +1792,11 @@ impl TwoMlsPqSession {
         self.lock().session_id.clone()
     }
 
-    pub fn my_agent_state(&self) -> AgentState {
+    pub fn my_principal_state(&self) -> PrincipalState {
         self.lock().my_state.clone()
     }
 
-    pub fn their_agent_state(&self) -> AgentState {
+    pub fn their_principal_state(&self) -> PrincipalState {
         self.lock().their_state.clone()
     }
 
@@ -2084,7 +2084,7 @@ impl TwoMlsPqSession {
             };
 
             // Detect key rotation: a non-empty commit authenticated_data carries
-            // the new agent's ClientId bytes (set in prepare_to_encrypt Phase 8).
+            // the new principal's ClientId bytes (set in prepare_to_encrypt Phase 8).
             let new_sender = if commit_auth_data.is_empty() {
                 None
             } else {
@@ -2094,7 +2094,7 @@ impl TwoMlsPqSession {
             };
 
             if let Some(ref new_id) = new_sender {
-                inner.their_state = AgentState::Sync {
+                inner.their_state = PrincipalState::Sync {
                     client_id: new_id.clone(),
                 };
             }
@@ -2270,8 +2270,8 @@ impl TwoMlsPqSession {
         let archive = archive_wire::SessionArchive {
             session_id: inner.session_id.bytes.clone(),
             client,
-            my_state: wire_agent_state(&inner.my_state),
-            their_state: wire_agent_state(&inner.their_state),
+            my_state: wire_principal_state(&inner.my_state),
+            their_state: wire_principal_state(&inner.their_state),
             pq_turn_mine: inner.pq_turn_mine,
             spawn_token: inner.spawn_token.clone(),
             send_group,
@@ -2353,7 +2353,7 @@ impl TwoMlsPqSession {
         Ok(())
     }
 
-    /// Stage a new agent identity for the next rotation commit, minting its signing keys
+    /// Stage a new principal for the next rotation commit, minting its signing keys
     /// internally: the MLS signing keys are session-owned state, so the app supplies only
     /// the opaque ClientId. Call before `prepare_to_encrypt(Some(new_client_id))`, which
     /// commits the handoff.
@@ -2370,7 +2370,7 @@ impl TwoMlsPqSession {
         {
             return Ok(());
         }
-        inner.pending_new_client = Some(TwoMlsPqIdentity::new(new_client_id)?);
+        inner.pending_new_client = Some(TwoMlsPqPrincipal::new(new_client_id)?);
         Ok(())
     }
 
@@ -2444,7 +2444,7 @@ mod tests {
     use crate::{
         assert_err, assert_ok, assert_some,
         test_utils::{establish_sessions, make_client, make_combiner_kp},
-        AgentState, TwoMlsPqError,
+        PrincipalState, TwoMlsPqError,
     };
 
     #[test]
@@ -2665,7 +2665,7 @@ mod tests {
         approved_commit_round(&alice, &bob);
         assert_eq!(epochs(&alice), vec![1, 2]);
 
-        // Phase 8 rotation: commit the new agent on alice's send group. The
+        // Phase 8 rotation: commit the new principal on alice's send group. The
         // prior epochs must survive the client swap.
         let new_client = make_client();
         assert_ok!(alice.stage_rotation(new_client.client_id().bytes));
@@ -2912,7 +2912,7 @@ mod tests {
     }
 
     /// The session's own leaf signature public keys in (send-PQ, recv-PQ) — the two
-    /// leaves an A.5 credential handoff must move to the new agent.
+    /// leaves an A.5 credential handoff must move to the new principal.
     fn own_pq_leaf_signature_keys(session: &Arc<TwoMlsPqSession>) -> (Vec<u8>, Vec<u8>) {
         let inner = session.lock();
         let send = inner
@@ -2939,11 +2939,11 @@ mod tests {
     }
 
     #[test]
-    fn test_pq_rekey_rotation_hands_pq_leaves_to_new_agent() {
+    fn test_pq_rekey_rotation_hands_pq_leaves_to_new_principal() {
         let (alice, bob) = establish_full();
 
         // Phase 8 first: the classical rotation swaps the session client to the new
-        // agent (whose signing keys `stage_rotation` minted internally) and announces the
+        // principal (whose signing keys `stage_rotation` minted internally) and announces the
         // ClientId to the peer.
         let new_bob_id = make_client().client_id();
         assert_ok!(bob.stage_rotation(new_bob_id.bytes.clone()));
@@ -2963,7 +2963,7 @@ mod tests {
                 .as_bytes()
                 .to_vec()
         };
-        // The PQ leaves still sign as the old agent until the A.5 handoff.
+        // The PQ leaves still sign as the old principal until the A.5 handoff.
         let before = own_pq_leaf_signature_keys(&bob);
         assert_ne!(before.0, new_key);
         assert_ne!(before.1, new_key);
@@ -2979,7 +2979,7 @@ mod tests {
         let fin = assert_some!(bob.pq_take_pending_outbound());
         assert!(!assert_ok!(alice.pq_rekey_apply(fin)));
 
-        // Both of Bob's PQ leaves now sign with the new agent's key.
+        // Both of Bob's PQ leaves now sign with the new principal's key.
         let after = own_pq_leaf_signature_keys(&bob);
         assert_eq!(after.0, new_key);
         assert_eq!(after.1, new_key);
@@ -3048,7 +3048,7 @@ mod tests {
     fn test_pq_rekey_begin_rotating_requires_current_agent() {
         let (_alice, bob) = establish_full();
         // Bob holds the turn, but no Phase 8 rotation has run: a handoff to an
-        // arbitrary agent is refused, and the slot stays free for a plain rekey.
+        // arbitrary principal is refused, and the slot stays free for a plain rekey.
         let stranger = make_client();
         assert_err!(
             bob.pq_rekey_begin(Some(stranger.client_id())),
@@ -3067,7 +3067,7 @@ mod tests {
         );
 
         // After a Phase 8 rotation the bootstrap accepts the handoff id, and the
-        // KP' it emits — generated by the new agent — completes A.4 as usual.
+        // KP' it emits — generated by the new principal — completes A.4 as usual.
         let new_alice = make_client();
         let new_alice_id = new_alice.client_id();
         assert_ok!(alice.stage_rotation(new_alice.client_id().bytes));
@@ -3116,15 +3116,15 @@ mod tests {
         assert_eq!(got, b"hello-pq");
     }
 
-    /// The PQ side-band must survive an agent rotation: the injected-secret and apq PSKs
+    /// The PQ side-band must survive a principal rotation: the injected-secret and apq PSKs
     /// have to land in the stores the group halves actually resolve from (captured at
     /// group creation), not the rotated-in client's stores — otherwise Alice's bind and
     /// Bob's apply both fail to find their PSKs after the client swap.
     #[test]
-    fn test_pq_ratchet_completes_after_agent_rotation() {
+    fn test_pq_ratchet_completes_after_principal_rotation() {
         let (alice, bob) = establish_sessions();
 
-        // Rotate both agents, delivering each rotation commit so the peer's recv group
+        // Rotate both principals, delivering each rotation commit so the peer's recv group
         // tracks the new epoch.
         let new_alice = make_client();
         assert_ok!(alice.stage_rotation(new_alice.client_id().bytes));
@@ -3353,7 +3353,10 @@ mod tests {
         assert_ok!(alice_session.prepare_to_encrypt(None));
         let result = assert_ok!(alice_session.encrypt(b"hello world".to_vec()));
         assert!(!result.cipher_text.is_empty());
-        assert_eq!(result.sender, alice_session.my_agent_state().client_id());
+        assert_eq!(
+            result.sender,
+            alice_session.my_principal_state().client_id()
+        );
     }
 
     #[test]
@@ -3380,7 +3383,7 @@ mod tests {
         assert_eq!(app_msg.app_message_data, b"secret");
         assert_eq!(
             app_msg.sender_client_id,
-            alice_session.my_agent_state().client_id()
+            alice_session.my_principal_state().client_id()
         );
     }
 
@@ -3414,7 +3417,7 @@ mod tests {
     }
 
     #[test]
-    fn test_join_send_group_with_my_agent_succeeds() {
+    fn test_join_send_group_with_my_principal_succeeds() {
         let alice = make_client();
         let bob = make_client();
         let alice_kp = make_combiner_kp(&alice);
@@ -3649,28 +3652,28 @@ mod tests {
     }
 
     /// A committed-but-unconfirmed rotation (`my_state == Pending`) archives, restores
-    /// self-contained (the archive rebuilds the NEW agent's client — parameterless
+    /// self-contained (the archive rebuilds the NEW principal's client — parameterless
     /// restore), and resolves to `Sync` once the peer's traffic confirms.
     #[test]
     fn test_archive_mid_rotation_restores_onto_new_client() {
         let (alice_session, bob_session) = establish_sessions();
         message_round(&alice_session, &bob_session, b"before");
 
-        // A fresh opaque ClientId for the successor agent (the app owns only the id; the
+        // A fresh opaque ClientId for the successor principal (the app owns only the id; the
         // signing keys are minted internally by `stage_rotation`).
         let new_id = make_client().client_id();
         assert_ok!(alice_session.stage_rotation(new_id.bytes.clone()));
         assert_ok!(alice_session.prepare_to_encrypt(Some(new_id.clone())));
         let rotation = assert_ok!(alice_session.encrypt(b"rotate".to_vec()));
         assert!(matches!(
-            alice_session.my_agent_state(),
-            AgentState::Pending { .. }
+            alice_session.my_principal_state(),
+            PrincipalState::Pending { .. }
         ));
 
         let restored = round_trip(&alice_session);
         assert!(matches!(
-            restored.my_agent_state(),
-            AgentState::Pending { .. }
+            restored.my_principal_state(),
+            PrincipalState::Pending { .. }
         ));
 
         // Peer processes the rotation commit, replies; the reply resolves Pending → Sync.
@@ -3678,7 +3681,10 @@ mod tests {
             bob_session.process_incoming(rotation.cipher_text)
         ));
         message_round(&bob_session, &restored, b"confirm");
-        assert!(matches!(restored.my_agent_state(), AgentState::Sync { .. }));
+        assert!(matches!(
+            restored.my_principal_state(),
+            PrincipalState::Sync { .. }
+        ));
     }
 
     /// A parked responder side-band frame (turn already flipped) survives the round trip;
@@ -3740,8 +3746,8 @@ mod tests {
         let new_id = make_client().client_id();
         assert_ok!(alice_session.stage_rotation(new_id.bytes.clone()));
         assert!(matches!(
-            alice_session.my_agent_state(),
-            AgentState::Sync { .. }
+            alice_session.my_principal_state(),
+            PrincipalState::Sync { .. }
         ));
 
         let restored = round_trip(&alice_session);
@@ -4022,7 +4028,7 @@ mod tests {
         assert_eq!(app.app_message_data, b"pq hello");
         assert_eq!(
             app.sender_client_id,
-            alice_session.my_agent_state().client_id()
+            alice_session.my_principal_state().client_id()
         );
     }
 
@@ -4031,7 +4037,7 @@ mod tests {
     fn test_concurrent_sessions_same_did_pair_both_valid() {}
 
     #[test]
-    fn test_agent_rotation_migrates_session_to_new_agent() {
+    fn test_principal_rotation_migrates_session_to_new_principal() {
         let (alice_session, bob_session) = establish_sessions();
 
         let new_alice = make_client();
@@ -4054,11 +4060,14 @@ mod tests {
             assert_some!(result.application_message).app_message_data,
             b"rotated"
         );
-        assert_eq!(bob_session.their_agent_state().client_id(), new_alice_id);
+        assert_eq!(
+            bob_session.their_principal_state().client_id(),
+            new_alice_id
+        );
     }
 
     #[test]
-    fn test_agent_rotation_resolves_pending_state_after_peer_reply() {
+    fn test_principal_rotation_resolves_pending_state_after_peer_reply() {
         let (alice_session, bob_session) = establish_sessions();
 
         let new_alice = make_client();
@@ -4071,8 +4080,8 @@ mod tests {
 
         // Alice's state is Pending until she receives a message from Bob.
         assert!(matches!(
-            alice_session.my_agent_state(),
-            AgentState::Pending { .. }
+            alice_session.my_principal_state(),
+            PrincipalState::Pending { .. }
         ));
 
         // Bob replies; Alice's state must resolve to Sync { new }.
@@ -4081,10 +4090,13 @@ mod tests {
         assert_some!(assert_ok!(alice_session.process_incoming(reply.cipher_text)));
 
         assert!(
-            matches!(alice_session.my_agent_state(), AgentState::Sync { .. }),
+            matches!(
+                alice_session.my_principal_state(),
+                PrincipalState::Sync { .. }
+            ),
             "Pending must resolve to Sync after peer reply"
         );
-        assert_eq!(alice_session.my_agent_state().client_id(), new_alice_id);
+        assert_eq!(alice_session.my_principal_state().client_id(), new_alice_id);
     }
 
     #[test]
@@ -4461,26 +4473,29 @@ mod tests {
     }
 
     #[test]
-    fn test_my_agent_state_initial_is_sync() {
+    fn test_my_principal_state_initial_is_sync() {
         let alice = make_client();
         let alice_id = alice.client_id();
         let bob = make_client();
         let bob_kp = make_combiner_kp(&bob);
         let session = assert_ok!(TwoMlsPqSession::initiate(alice, bob_kp));
-        assert!(matches!(session.my_agent_state(), AgentState::Sync { .. }));
-        assert_eq!(session.my_agent_state().client_id(), alice_id);
+        assert!(matches!(
+            session.my_principal_state(),
+            PrincipalState::Sync { .. }
+        ));
+        assert_eq!(session.my_principal_state().client_id(), alice_id);
     }
 
     #[test]
-    fn test_my_agent_state_becomes_pending_after_rotation_commit() {
+    fn test_my_principal_state_becomes_pending_after_rotation_commit() {
         let (alice_session, _) = establish_sessions();
         let new_alice = make_client();
         let new_id = new_alice.client_id();
         assert_ok!(alice_session.stage_rotation(new_alice.client_id().bytes));
         assert_ok!(alice_session.prepare_to_encrypt(Some(new_id.clone())));
         assert!(matches!(
-            alice_session.my_agent_state(),
-            AgentState::Pending { .. }
+            alice_session.my_principal_state(),
+            PrincipalState::Pending { .. }
         ));
     }
 
@@ -4494,7 +4509,10 @@ mod tests {
 
         let proposal = assert_some!(result.proposal);
         assert!(!proposal.digest.is_empty());
-        assert_eq!(proposal.sender, alice_session.my_agent_state().client_id());
+        assert_eq!(
+            proposal.sender,
+            alice_session.my_principal_state().client_id()
+        );
     }
 
     #[test]
