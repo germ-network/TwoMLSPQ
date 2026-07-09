@@ -1,11 +1,13 @@
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
+use zeroize::Zeroizing;
+
 use crate::invitation::{
     combiner_from_invitation, decode_archive, encode_archive, generate_combiner_invitation,
     CombinerInvitation, SpawnedGroups,
 };
-use crate::key_package_store::{CombinerClient, MlsClient, PqMlsClient};
+use crate::key_package_store::{CombinerClient, MlsClient, PqMlsClient, SyntheticKeyPackageStore};
 use crate::session::TwoMlsPqSession;
 use crate::{ClientId, MlsCipherSuite, MlsGroupId, Result, TwoMlsPqError};
 
@@ -36,6 +38,29 @@ impl TwoMlsPqIdentity {
     /// package secrets (used by `TwoMlsPqInvitation::receive`).
     pub(crate) fn from_combiner_invitation(inv: &CombinerInvitation) -> Result<Arc<Self>> {
         let inner = combiner_from_invitation(inv)?;
+        Ok(Arc::new(Self { inner }))
+    }
+
+    /// Rebuild an identity from its archived signing keys (ClientId + each MLS half's
+    /// signing key), with empty key-package stores — a bare identity restore. Used by
+    /// session archive/restore, where the MLS signing keys are session-owned state (the
+    /// app owns only the opaque ClientId); the public halves are re-derived from the
+    /// signing keys inside `from_key_packages`, giving byte-exact client continuity.
+    pub(crate) fn from_signing_keys(
+        client_id: Vec<u8>,
+        classical_signing_key: Zeroizing<Vec<u8>>,
+        pq_signing_key: Zeroizing<Vec<u8>>,
+    ) -> Result<Arc<Self>> {
+        let inner = CombinerClient::from_key_packages(
+            apq::ArchivedIdentity {
+                client_id,
+                classical_signing_key,
+                classical_kp_store: SyntheticKeyPackageStore::default(),
+                pq_signing_key,
+                pq_kp_store: SyntheticKeyPackageStore::default(),
+            },
+            crate::providers::crypto_config(),
+        )?;
         Ok(Arc::new(Self { inner }))
     }
 

@@ -17,6 +17,7 @@ use mls_rs::psk::{ExternalPskId, PreSharedKey};
 use mls_rs::storage_provider::in_memory::InMemoryPreSharedKeyStorage;
 use mls_rs::{Group, MlsMessage};
 use mls_rs_crypto_traits::KemType;
+use zeroize::Zeroizing;
 
 use crate::group::{export_psk, injected_secret_psk_id};
 use crate::{CombinerError, Result};
@@ -31,6 +32,24 @@ pub struct PqEphemeral {
 impl PqEphemeral {
     pub fn encapsulation_key(&self) -> Vec<u8> {
         self.ek.as_ref().to_vec()
+    }
+
+    /// The decapsulation (secret) key bytes, kept `Zeroizing`. The one piece of held
+    /// state an initiator-side mid-round session archive must persist so
+    /// [`decapsulate`] still recovers S after the restore; pairs with
+    /// [`encapsulation_key`](Self::encapsulation_key) and [`from_bytes`](Self::from_bytes).
+    pub fn decapsulation_key(&self) -> Zeroizing<Vec<u8>> {
+        Zeroizing::new(self.dk.as_ref().to_vec())
+    }
+
+    /// Rebuild an ephemeral from its serialised decapsulation and encapsulation key
+    /// bytes (an initiator-side mid-A.3 archive restore). The bytes are wrapped, not
+    /// validated: a corrupt pair simply fails to recover the peer's S in [`decapsulate`].
+    pub fn from_bytes(dk: &[u8], ek: &[u8]) -> Self {
+        Self {
+            dk: HpkeSecretKey::from(dk.to_vec()),
+            ek: HpkePublicKey::from(ek.to_vec()),
+        }
     }
 }
 
