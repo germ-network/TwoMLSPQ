@@ -13,21 +13,18 @@ use crate::key_package_store::{CombinerClient, KeyPackageSecret, SyntheticKeyPac
 use crate::{Result, TwoMlsPqError};
 
 // The version byte covers the WHOLE archive layout, not just the invitation blob it sits in.
-// Pinned at 1 during pre-release development: format changes don't bump it, so an archive
-// from an older/other build simply fails to decode (`ArchiveInvalid`) and is regenerated —
-// no migration. Start incrementing on the first stable release.
-const INVITATION_VERSION: u8 = 1;
+// Still pre-release, so a layout change need not bump it — there are no persisted invitations
+// to reject; a mismatch just fails to decode (`ArchiveInvalid`) and is regenerated. The header
+// also carries the concrete `ApqCipherSuite` pair (4 bytes, classical then pq, big-endian),
+// matching the session archive; a pair differing from this build's pinned suite
+// (`providers::APQ_SUITE`) is rejected — the suite is an explicit, checked property.
+const INVITATION_VERSION: u8 = 2;
 
 /// The spawned-group forward table: an opaque caller-supplied spawn token → the spawned
 /// session's receive-group classical (message-half) id. The token is whatever the caller
 /// passed to `receive` — this library never interprets it (the Swift adapter uses the
 /// app's combined-welcome digest, but any replay-stable byte string works).
 pub(crate) type SpawnedGroups = BTreeMap<Vec<u8>, Vec<u8>>;
-
-// Tags the PQ half as real ML-KEM. Mode 0 was the retired simulated-PQ build (classical
-// placeholder half); its archives are rejected at decode. Kept as a header byte so any
-// future PQ-mode change (e.g. conf+auth) still fails loudly across builds.
-const PQ_MODE: u8 = 1;
 
 // In its own module because the derive-generated impls reference the std `Result`, which the
 // crate-local `Result` alias imported above would shadow.
@@ -37,8 +34,8 @@ mod wire {
 
     use crate::key_package_store::KeyPackageSecret;
 
-    /// A self-contained combiner invitation. The two halves' signing keys and (published)
-    /// key packages are always present (distinguished by the `PQ_MODE` header byte).
+    /// A self-contained combiner invitation. Both halves' signing keys and (published) key
+    /// packages are always present; the cipher-suite pair lives in the `encode`/`decode` header.
     ///
     /// `last_resort` records the caller-chosen key-package lifetime: a last-resort invitation
     /// may accept many welcomes (its captured material is retained), while a single-use one is
@@ -71,7 +68,7 @@ mod wire {
     }
 
     /// The persisted form of a `TwoMlsPqInvitation`: the framed invitation blob (kept framed
-    /// so the version/PQ-mode header stays where `CombinerInvitation::decode` expects it)
+    /// so the version/suite header stays where `CombinerInvitation::decode` expects it)
     /// followed by the consumed-remote ids and the spawned-group forward table.
     #[derive(MlsSize, MlsEncode, MlsDecode)]
     pub(super) struct InvitationArchive {
@@ -96,19 +93,27 @@ pub(crate) use wire::CombinerInvitation;
 use wire::{InvitationArchive, SpawnedEntry};
 
 impl CombinerInvitation {
-    /// Encode to an opaque blob: `[version][pq_mode]` header, then the MLS-codec fields.
+    /// Encode to an opaque blob: `[version][classical u16 BE][pq u16 BE]` header, then the
+    /// MLS-codec fields.
     pub fn encode(&self) -> Result<Vec<u8>> {
-        let mut out = vec![INVITATION_VERSION, PQ_MODE];
+        let mut out = vec![INVITATION_VERSION];
+        out.extend_from_slice(&crate::providers::APQ_SUITE.to_wire());
         self.mls_encode(&mut out)
             .map_err(|_| TwoMlsPqError::ArchiveInvalid)?;
         Ok(out)
     }
 
     /// Decode a blob produced by [`encode`](Self::encode). Rejects a wrong version or a
-    /// PQ-mode mismatch (an archive from the other build).
+    /// cipher-suite pair that differs from this build's pinned suite (an archive from another
+    /// build/suite).
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let mut rest = match bytes {
-            [INVITATION_VERSION, PQ_MODE, rest @ ..] => rest,
+            [INVITATION_VERSION, s0, s1, s2, s3, rest @ ..]
+                if apq::ApqCipherSuite::from_wire([*s0, *s1, *s2, *s3])
+                    == crate::providers::APQ_SUITE =>
+            {
+                rest
+            }
             _ => return Err(TwoMlsPqError::ArchiveInvalid),
         };
         Self::mls_decode(&mut rest).map_err(|_| TwoMlsPqError::ArchiveInvalid)

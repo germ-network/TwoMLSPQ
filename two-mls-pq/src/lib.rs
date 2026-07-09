@@ -38,10 +38,13 @@ pub fn version() -> String {
 // queue_proposal / proposal_context signatures).
 // v3 (2026-07-07): TwoMlsPqError gained `UnsupportedCipherSuite` (an injected crypto
 // provider cannot supply a required cipher suite; surfaces at client construction).
-// v4 (2026-07-09): TwoMlsPqError gained `InvitationSpent` (a single-use invitation's key
+// v4 (2026-07-08): TwoMlsPqError gained `CipherSuiteMismatch` (peer key package/welcome
+// suite pair does not match the session's fixed suite); `MlsCipherSuite::is_supported`
+// renamed to `is_combiner_pq` (the name always meant "is the PQ combiner suite").
+// v5 (2026-07-09): TwoMlsPqError gained `InvitationSpent` (a single-use invitation's key
 // package has already been consumed; `generate_invitation` also gained a `last_resort` flag,
 // but that function-signature change is caught by uniffi's own load-time checksum).
-const BINDING_CONTRACT_VERSION: u64 = 4;
+const BINDING_CONTRACT_VERSION: u64 = 5;
 
 /// See `BINDING_CONTRACT_VERSION`. Exported so the Swift layer can verify the
 /// binding it was generated with matches the binary it loaded.
@@ -255,10 +258,13 @@ impl MlsCipherSuite {
         self.value
     }
 
-    /// True if this suite is handled by TwoMLS as the PQ component of a session.
-    /// Use `is_combiner_classical` to identify the classical half of a Combiner pair
+    /// True if this suite is the post-quantum (ML-KEM-768) component of a Combiner pair — the
+    /// PQ half TwoMLS handles. Use `is_combiner_classical` to identify the classical half
     /// before routing — do not route a Combiner classical KP to mls-rs-uniffi-ios.
-    pub fn is_supported(&self) -> bool {
+    ///
+    /// (Renamed from `is_supported` in binding contract v4: the name always meant "is the PQ
+    /// combiner suite", not "is a supported suite".)
+    pub fn is_combiner_pq(&self) -> bool {
         self.value == Self::ML_KEM_768
     }
 
@@ -306,6 +312,12 @@ pub enum TwoMlsPqError {
     /// `two-mls-pq/src/providers.rs`), never a runtime condition of a healthy binary.
     #[error("crypto provider does not support the required cipher suite")]
     UnsupportedCipherSuite,
+    /// A peer key package or welcome carries a cipher-suite pair that does not match the
+    /// session's fixed suite (or is not a coherent APQ combination). Distinct from
+    /// `PqNotAvailable` (peer offers no PQ half at all) and `UnsupportedCipherSuite` (a local
+    /// provider gap): here the peer's suites are the wrong ones.
+    #[error("cipher suite mismatch")]
+    CipherSuiteMismatch,
 }
 
 /// SHA-256 over `bytes` — the single hashing primitive behind every digest this
@@ -351,6 +363,7 @@ impl From<apq::CombinerError> for TwoMlsPqError {
             apq::CombinerError::DecryptionFailed => TwoMlsPqError::DecryptionFailed,
             apq::CombinerError::ArchiveInvalid => TwoMlsPqError::ArchiveInvalid,
             apq::CombinerError::UnsupportedCipherSuite => TwoMlsPqError::UnsupportedCipherSuite,
+            apq::CombinerError::CipherSuiteMismatch => TwoMlsPqError::CipherSuiteMismatch,
         }
     }
 }
