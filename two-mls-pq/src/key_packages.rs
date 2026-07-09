@@ -1078,6 +1078,52 @@ mod tests {
         assert_ok!(bob_inv.receive(welcome_c, carol_kp, b"token-c".to_vec()));
     }
 
+    /// The key-package store is only a serving interface: once the acceptor's join has
+    /// consumed the invitation key package, nothing of the invitation may remain in the
+    /// session client (and thus its archive). Exercised for a last-resort invitation, the
+    /// case that previously retained — and leaked — the shared key package.
+    #[test]
+    fn test_accept_leaves_no_key_package_in_acceptor_session() {
+        use crate::invitation::generate_combiner_invitation;
+        use crate::session::TwoMlsPqSession;
+        use crate::test_utils::{make_client, make_combiner_kp};
+        use std::sync::Arc;
+
+        let alice = make_client();
+        let bob = make_client();
+        let alice_kp = make_combiner_kp(&alice);
+
+        let inv = assert_ok!(generate_combiner_invitation(bob.combiner(), true));
+        let bob_kp = super::CombinerKeyPackage {
+            classical: inv.classical_public.clone(),
+            pq: inv.pq_public.clone(),
+        };
+
+        // Rebuild the acceptor client and keep handles on its (Arc-shared) serving stores.
+        let bob_client = assert_ok!(super::TwoMlsPqIdentity::from_combiner_invitation(&inv));
+        let classical_store = bob_client.combiner().classical_kp_store().clone();
+        let pq_store = bob_client.combiner().pq_kp_store().clone();
+        assert!(
+            !classical_store.all_entries().is_empty() && !pq_store.all_entries().is_empty(),
+            "the serving store must hold the invitation key package before the join"
+        );
+
+        let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp));
+        let welcome_a = assert_some!(alice_session.pending_outbound());
+
+        let _bob_session = assert_ok!(TwoMlsPqSession::accept(bob_client, welcome_a, alice_kp));
+
+        // After the join the acceptor retains nothing — nothing migrates into the session archive.
+        assert!(
+            classical_store.all_entries().is_empty(),
+            "acceptor retains no classical key package after accept"
+        );
+        assert!(
+            pq_store.all_entries().is_empty(),
+            "acceptor retains no PQ key package after accept"
+        );
+    }
+
     #[test]
     fn test_invitation_rejects_wrong_pq_mode() {
         use crate::test_utils::make_client;

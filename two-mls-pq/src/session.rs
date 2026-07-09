@@ -1474,6 +1474,15 @@ impl TwoMlsPqSession {
         let session_id = crate::derive_session_id(client.client_id(), their_id.clone())?;
 
         let recv_group = join_combiner_group(&welcome, client.combiner())?;
+        // The invitation's key package has served its one purpose: mls-rs obtained it to join
+        // the receive group. The key-package store is only that serving interface, so the
+        // acceptor now retains no key-package material — nothing migrates from the invitation
+        // into the session (or its archive). Last-resort reuse is unaffected: it lives on the
+        // invitation, which keeps its own captured material and rebuilds a fresh serving store
+        // on each `receive`. (The initiator's `initiate` deliberately does NOT purge — it must
+        // retain its return-group key package for the peer's return welcome.)
+        client.combiner().classical_kp_store().purge_all();
+        client.combiner().pq_kp_store().purge_all();
         // A.4: the send group's PQ half is deferred — classical only, bound to the
         // cross-party PSK. The bootstrap flow stands it up off the critical path, so the
         // return welcome carries an empty PQ slot.

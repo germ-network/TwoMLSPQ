@@ -192,11 +192,11 @@ pub(crate) fn generate_combiner_invitation(
 }
 
 /// Rebuild a stateless combiner client from an invitation: restore the signing identity and
-/// preload each half's key-package store with the invitation's captured `KeyPackageData`,
-/// so a subsequent join/`accept` finds it. Each store carries the invitation's `last_resort`
-/// flag, so mls-rs's post-join delete is ignored for a last-resort invitation. Fails with
-/// `InvitationSpent` if the captured material has already been consumed (a spent single-use
-/// invitation).
+/// preload each half's key-package store with the invitation's captured `KeyPackageData` so
+/// mls-rs can `get` it while joining the welcome. The store is only that serving interface —
+/// `accept` clears it once the join has consumed the key package, so nothing migrates into the
+/// session. Fails with `InvitationSpent` if the captured material has already been consumed (a
+/// spent single-use invitation).
 pub(crate) fn combiner_from_invitation(inv: &CombinerInvitation) -> Result<CombinerClient> {
     let classical_kpd = inv
         .classical_kpd
@@ -207,12 +207,9 @@ pub(crate) fn combiner_from_invitation(inv: &CombinerInvitation) -> Result<Combi
         apq::ArchivedIdentity {
             client_id: inv.client_id.clone(),
             classical_signing_key: inv.classical_signing_key.clone(),
-            classical_kp_store: SyntheticKeyPackageStore::for_invitation(
-                [classical_kpd],
-                inv.last_resort,
-            ),
+            classical_kp_store: SyntheticKeyPackageStore::for_invitation([classical_kpd]),
             pq_signing_key: inv.pq_signing_key.clone(),
-            pq_kp_store: SyntheticKeyPackageStore::for_invitation([pq_kpd], inv.last_resort),
+            pq_kp_store: SyntheticKeyPackageStore::for_invitation([pq_kpd]),
         },
         crate::providers::crypto_config(),
     )
