@@ -11,10 +11,10 @@ operations for a credential funnel through the one object.
 TwoMLSPQ deliberately breaks this up into three app-facing objects, each owning
 exactly the state its job needs:
 
-- **`TwoMlsPqIdentity`** — the agent identity. Its job is minting key packages and
-  invitations and holding their private material only until it is captured into an
-  invitation (`generate_invitation` purges the identity's own copies). It is not a
-  hub for group operations.
+- **`TwoMlsPqPrincipal`** — the principal: a credential-scoped signing identity. Its job
+  is minting key packages and invitations and holding their private material only until it
+  is captured into an invitation (`generate_invitation` purges the principal's own copies).
+  It is not a hub for group operations.
 - **`TwoMlsPqInvitation`** — a self-contained receiving capability: one published
   combiner key package's private material, the signing identity, and the
   consumed-remote replay guard. It turns welcomes into sessions with no live client
@@ -26,10 +26,26 @@ exactly the state its job needs:
 - **`TwoMlsPqSession`** — one established pairwise channel: the two Combiner
   send/receive group pairs and the per-round state.
 
+### Naming
+
+TwoMLSPQ keeps its own vocabulary rather than borrowing mls-rs's `Client` (the invitation
+and session each *contain* mls-rs clients, so "client" would be ambiguous) or
+CommProtocol's `Agent` (this crate is CommProtocol-agnostic):
+
+| mls-rs | TwoMLSPQ | role |
+|---|---|---|
+| `Client` | **`TwoMlsPqPrincipal`** | credential-scoped signer; mints invitations & sessions |
+| `KeyPackage` | **`TwoMlsPqInvitation`** | one published key package's private material |
+| group | **`TwoMlsPqSession`** | one established pairwise channel |
+
+A *principal* is 1:1 with the MLS Basic Credential. CommProtocol calls the same entity an
+**agent** (delegated from its `Identity`/`Anchor`); that `Agent ↔ Principal` correspondence
+is documented at the AbstractTwoMLS boundary, so this layer never says "agent."
+
 Internally the invitation and the session still drive mls-rs clients — the
 invitation rebuilds a stateless one from its captured material on each `receive`,
 and a session holds the client backing its groups (plus the successor client staged
-by an agent rotation) — but those are hidden plumbing, never handed to the app.
+by a principal rotation) — but those are hidden plumbing, never handed to the app.
 
 The consequence is that persistence is **per-object, not per-client**: each object
 serialises what it owns (`TwoMlsPqInvitation.archive()` and
@@ -41,7 +57,7 @@ Concretely, a session archives by **enumerating its groups**: each of its (up to
 four) MLS groups is exported per group through the group object and the storage
 handle captured when that group was created or joined (`apq`'s
 `CombinerGroup::export_state` / `load_combiner_group`), never by snapshotting a
-client's whole store. This keeps archival correct across agent rotation — rotation
+client's whole store. This keeps archival correct across principal rotation — rotation
 swaps the session's internal client, and a group's state keeps flowing through the
 handle it was born with.
 
@@ -78,7 +94,7 @@ achieved at the group level. See [PSK Binding](./psk-binding.md).
 
 ## Basic credentials, no AS
 
-The MLS leaf identity is the agent's public signing key, wrapped in a Basic
+The MLS leaf identity is the principal's public signing key, wrapped in a Basic
 Credential. There is no Authentication Service. Because basic credentials carry no
 external trust, **CommProtocol cooperates on every encrypt and decrypt** — it decides
 which remote proposals to accept and binds a per-round proposal hash into the
@@ -87,7 +103,8 @@ trust decisions.
 
 ## The CommProtocol boundary
 
-TwoMLSPQ receives agent signing keys and returns key packages, ciphertexts, and
+TwoMLSPQ receives a principal's signing keys (what CommProtocol calls an *agent*'s keys)
+and returns key packages, ciphertexts, and
 structured results (`DecryptResult`, `PrepareEncryptResult`, …). Everything above —
 DIDs, anchor signatures, key discovery from a PDS, sequencing/ordering of proposals,
 transport — belongs to CommProtocol. Keeping that line sharp is why the API is

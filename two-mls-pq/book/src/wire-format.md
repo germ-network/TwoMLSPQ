@@ -6,7 +6,7 @@ have no tag (they are raw MLS ciphertext starting with the MLS version bytes).
 | Tag | Value | Meaning |
 |-----|-------|---------|
 | `APQ_TAG` | `0x01` | APQ Welcome (session establishment) |
-| `BUNDLED_TAG` | `0x03` | Rotation commit + app (agent rotation) |
+| `BUNDLED_TAG` | `0x03` | Rotation commit + app (principal rotation) |
 | `PARTIAL_TAG` | `0x05` | A.2 ratchet frame: optional send-group commit + stapled `Upd(sender)` proposal + app |
 | — | `0x07` | Retired (the pre-A.2 full-bundle frame); reserved so old frames are rejected |
 | `STAPLED_WELCOME_TAG` | `0x09` | Return APQWelcome stapled onto the acceptor's first app frame |

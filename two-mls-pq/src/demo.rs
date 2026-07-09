@@ -7,7 +7,7 @@ use std::sync::Arc;
 use crate::{
     key_packages::parse_mls_key_package,
     test_utils::{make_client, make_combiner_kp},
-    AgentState, MlsCipherSuite, TwoMlsPqSession,
+    MlsCipherSuite, PrincipalState, TwoMlsPqSession,
 };
 
 fn provider_label() -> &'static str {
@@ -139,7 +139,7 @@ fn demo_e2e_full_session() {
     );
     println!("[7] bidirectional messaging continues post-refresh");
 
-    // Step 8 — agent key rotation (0x03): Alice rotates to a new agent (its signing keys
+    // Step 8 — principal key rotation (0x03): Alice rotates to a new principal (its signing keys
     // are minted internally; the app supplies only the opaque ClientId).
     let new_alice_id = make_client().client_id();
     assert_ok!(alice_session.stage_rotation(new_alice_id.bytes.clone()));
@@ -152,10 +152,10 @@ fn demo_e2e_full_session() {
         new_alice_id
     );
     assert!(matches!(
-        alice_session.my_agent_state(),
-        AgentState::Pending { .. }
+        alice_session.my_principal_state(),
+        PrincipalState::Pending { .. }
     ));
-    println!("[8] agent rotation: bob observes alice's new identity; alice state = Pending");
+    println!("[8] principal rotation: bob observes alice's new identity; alice state = Pending");
 
     println!("\n=== walkthrough complete ===\n");
 }
