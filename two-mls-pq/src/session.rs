@@ -178,13 +178,11 @@ enum PqInflight {
     RekeyResponded,
 }
 
-// The session archive layout version. The byte covers the WHOLE layout; any change to the
-// wire struct below bumps it, and older archives are rejected as `ArchiveInvalid`
-// (pre-release, no migration).
-// v2: total archivability — the archive now carries the current signing identity (restore
-// is self-contained), a staged-but-uncommitted rotation, and the full PQ round state
-// (mid-A.3 `Initiating`/`Responding`), so `archive` never refuses.
-const SESSION_ARCHIVE_VERSION: u8 = 2;
+// The session archive layout version. The byte covers the WHOLE layout. Pinned at 1 during
+// pre-release development: format changes don't bump it, so an archive from an older/other
+// build simply fails to decode (`ArchiveInvalid`) and is regenerated — no migration. Start
+// incrementing on the first stable release.
+const SESSION_ARCHIVE_VERSION: u8 = 1;
 // Tags the PQ half as real ML-KEM, mirroring the invitation archive's header byte, so any
 // future PQ-mode change (e.g. conf+auth) fails loudly across builds instead of
 // misinterpreting group snapshots.
@@ -3827,14 +3825,6 @@ mod tests {
             TwoMlsPqSession::from_archive(crate::Archive {
                 bytes: wrong_version
             }),
-            TwoMlsPqError::ArchiveInvalid
-        );
-
-        // A version-1 archive (the pre-total layout) rejects: no migration, pre-release.
-        let mut version_one = archive.bytes.clone();
-        version_one[0] = 1;
-        assert_err!(
-            TwoMlsPqSession::from_archive(crate::Archive { bytes: version_one }),
             TwoMlsPqError::ArchiveInvalid
         );
 

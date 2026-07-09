@@ -12,14 +12,11 @@ use zeroize::Zeroizing;
 use crate::key_package_store::{CombinerClient, KeyPackageSecret, SyntheticKeyPackageStore};
 use crate::{Result, TwoMlsPqError};
 
-// The version byte covers the WHOLE archive layout, not just the invitation blob it sits
-// in. v2 (2026-07-07): field framing moved from bespoke u32-LE length prefixes to
-// `mls_rs_codec`, and the archive gained the spawned-group forward table (increment C)
-// after the consumed set. v3 (2026-07-09): the invitation gained a `last_resort` flag and
-// its captured key-package material became optional (`None` once a single-use invitation is
-// consumed). Older archives are rejected as `ArchiveInvalid` — regenerate the invitation
-// (pre-release, no migration).
-const INVITATION_VERSION: u8 = 3;
+// The version byte covers the WHOLE archive layout, not just the invitation blob it sits in.
+// Pinned at 1 during pre-release development: format changes don't bump it, so an archive
+// from an older/other build simply fails to decode (`ArchiveInvalid`) and is regenerated —
+// no migration. Start incrementing on the first stable release.
+const INVITATION_VERSION: u8 = 1;
 
 /// The spawned-group forward table: an opaque caller-supplied spawn token → the spawned
 /// session's receive-group classical (message-half) id. The token is whatever the caller
