@@ -159,7 +159,7 @@ pub struct ParsedCombinerKeyPackage {
 }
 
 /// Parse an MLS-encoded KeyPackage and extract its client identity and cipher suite.
-/// Use `is_supported` on the returned suite to decide which library should handle it.
+/// Use `is_combiner_pq` on the returned suite to decide which library should handle it.
 #[uniffi::export]
 pub fn parse_mls_key_package(bytes: Vec<u8>) -> Result<MlsKeyPackage> {
     let msg =
@@ -300,14 +300,30 @@ pub fn hpke_seal_to_key_package(
     })
 }
 
-/// Reject a peer combiner whose both halves are classical (no PQ protection).
-pub(crate) fn ensure_pq_available(their_kp: &CombinerKeyPackage) -> Result<()> {
-    let classical = parse_mls_key_package(their_kp.classical.clone())?;
-    let pq = parse_mls_key_package(their_kp.pq.clone())?;
-    if !classical.cipher_suite.is_supported() && !pq.cipher_suite.is_supported() {
+/// Validate a peer's combiner key package against the session's fixed cipher-suite pair. The
+/// observed `(classical, pq)` suites must equal `expected` exactly — which, since MLS suites are
+/// monolithic, also fixes the KEM/AEAD/hash and signature scheme. A peer whose both halves are
+/// classical (no PQ protection at all) keeps the specific `PqNotAvailable` diagnostic; any other
+/// mismatch is `CipherSuiteMismatch`.
+pub(crate) fn validate_combiner_kp(
+    expected: apq::ApqCipherSuite,
+    their_kp: &CombinerKeyPackage,
+) -> Result<()> {
+    let parsed = parse_combiner_key_package(their_kp.clone())?;
+    // Compare the observed suite values directly against the session's pinned pair (rather than
+    // constructing a checked `ApqCipherSuite`, which would reject an incoherent peer pair before
+    // we can pick the right diagnostic).
+    let classical = mls_rs::CipherSuite::new(parsed.classical_suite.value());
+    let pq = mls_rs::CipherSuite::new(parsed.pq_suite.value());
+    if classical == expected.classical && pq == expected.pq {
+        return Ok(());
+    }
+    // Neither half is the post-quantum suite → the peer offers no PQ protection at all (any
+    // classical suite, not just 0x0003) — the specific PqNotAvailable diagnostic.
+    if !parsed.classical_suite.is_combiner_pq() && !parsed.pq_suite.is_combiner_pq() {
         return Err(TwoMlsPqError::PqNotAvailable);
     }
-    Ok(())
+    Err(TwoMlsPqError::CipherSuiteMismatch)
 }
 
 /// The receiving/holding side of a published combiner key package: a self-contained
@@ -863,13 +879,14 @@ mod tests {
     }
 
     #[test]
-    fn test_invitation_rejects_wrong_pq_mode() {
+    fn test_invitation_rejects_wrong_suite() {
         use crate::test_utils::make_client;
 
         let bob = make_client();
         let mut archive = assert_ok!(bob.generate_invitation());
-        // Layout: [varint len][version][PQ_MODE]…; the MLS varint's top two bits give the
-        // header width. Flip the PQ_MODE byte to mimic an archive from the other build.
+        // Layout: [varint len][version][classical u16 BE][pq u16 BE]…; the MLS varint's top two
+        // bits give the header width. Flip a byte of the classical suite so the archived pair no
+        // longer equals this build's pinned suite (mimicking an archive from another build/suite).
         let header = match archive[0] >> 6 {
             0 => 1,
             1 => 2,

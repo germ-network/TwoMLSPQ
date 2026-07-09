@@ -218,7 +218,7 @@ where
 mod tests {
     use super::*;
     use crate::group::{create_combiner_send_group, join_combiner_group};
-    use crate::{ApqMode, CombinerClient, CryptoConfig};
+    use crate::{ApqCipherSuite, CombinerClient, CryptoConfig};
     use mls_rs::storage_provider::in_memory::InMemoryKeyPackageStorage;
     use mls_rs::{CipherSuiteProvider, CryptoProvider};
     use mls_rs_crypto_awslc::{AwsLcCryptoProvider, MlKemKem};
@@ -233,9 +233,9 @@ mod tests {
         CombinerClient::new(client_id.as_bytes().to_vec(), CryptoConfig::default()).unwrap()
     }
 
-    /// The test KEM: aws-lc's ML-KEM-768, matching the default mode's PQ suite.
+    /// The test KEM: aws-lc's ML-KEM-768, matching the default suite pair's PQ half.
     fn kem() -> MlKemKem {
-        MlKemKem::new(ApqMode::ConfidentialityOnly.pq_cipher_suite()).unwrap()
+        MlKemKem::new(ApqCipherSuite::default().pq).unwrap()
     }
 
     #[test]
