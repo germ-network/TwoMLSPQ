@@ -139,10 +139,10 @@ fn demo_e2e_full_session() {
     );
     println!("[7] bidirectional messaging continues post-refresh");
 
-    // Step 8 — agent key rotation (0x03): Alice rotates to a new agent.
-    let new_alice = make_client();
-    let new_alice_id = new_alice.client_id();
-    assert_ok!(alice_session.stage_rotation(Arc::clone(&new_alice)));
+    // Step 8 — agent key rotation (0x03): Alice rotates to a new agent (its signing keys
+    // are minted internally; the app supplies only the opaque ClientId).
+    let new_alice_id = make_client().client_id();
+    assert_ok!(alice_session.stage_rotation(new_alice_id.bytes.clone()));
     let prep = assert_ok!(alice_session.prepare_to_encrypt(Some(new_alice_id.clone())));
     assert!(prep.did_commit);
     let enc = assert_ok!(alice_session.encrypt(b"rotated".to_vec()));

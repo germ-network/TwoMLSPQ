@@ -101,6 +101,22 @@ impl SyntheticKeyPackageStore {
             .clear();
     }
 
+    /// Snapshot every stored key package as `(storage id, KeyPackageData)`, sorted by id for
+    /// a deterministic byte order. Used by session archival to carry the client's retained
+    /// key-package private material (e.g. an initiator's return-group key package, minted but
+    /// not yet consumed by the peer's return welcome) across a self-contained restore.
+    pub fn all_entries(&self) -> Vec<KeyPackageSecret> {
+        let mut entries: Vec<KeyPackageSecret> = self
+            .entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(id, pkg)| (id.clone(), pkg.clone()))
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        entries
+    }
+
     fn do_insert(&self, id: Vec<u8>, pkg: KeyPackageData) {
         if let Some(captured) = self
             .capture
