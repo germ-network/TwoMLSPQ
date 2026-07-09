@@ -183,12 +183,12 @@ enum PqInflight {
 }
 
 // The session archive layout version. The byte covers the WHOLE layout; any change to the
-// wire struct below bumps it, and older archives are rejected as `ArchiveInvalid`
-// (pre-release, no migration).
-// v2 (2026-07-08): the single PQ-mode byte became the concrete `ApqCipherSuite` pair (4 bytes,
-// classical then pq, big-endian) — the suite is now a stored session property, and a restored
-// archive whose pair differs from this build's pinned suite fails loudly.
-const SESSION_ARCHIVE_VERSION: u8 = 2;
+// wire struct below bumps it, and older archives are rejected as `ArchiveInvalid`. Still
+// pre-release, so a layout change need not bump this — there are no persisted archives to
+// reject. The header carries the concrete `ApqCipherSuite` pair (4 bytes, classical then pq,
+// big-endian): the suite is a stored session property, and a restored archive whose pair
+// differs from this build's pinned suite fails loudly.
+const SESSION_ARCHIVE_VERSION: u8 = 1;
 
 // In its own module because the derive-generated impls reference the std `Result`, which
 // the crate-local `Result` alias would shadow (same pattern as `invitation::wire`).

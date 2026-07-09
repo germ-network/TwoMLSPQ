@@ -17,11 +17,12 @@ use crate::{Result, TwoMlsPqError};
 // `mls_rs_codec`, and the archive gained the spawned-group forward table (increment C)
 // after the consumed set; v1 archives are rejected as `ArchiveInvalid` — regenerate the
 // invitation (pre-release, no migration).
-// v3 (2026-07-08): the single PQ-mode byte became the concrete `ApqCipherSuite` pair (4 bytes,
-// classical then pq, big-endian), matching the session archive; a pair differing from this
-// build's pinned suite (`providers::APQ_SUITE`) is rejected — the suite is now an explicit,
-// checked property rather than an opaque mode flag.
-const INVITATION_VERSION: u8 = 3;
+// The version byte covers the WHOLE archive layout. Still pre-release, so a layout change need
+// not bump this — there are no persisted invitations to reject. The header now carries the
+// concrete `ApqCipherSuite` pair (4 bytes, classical then pq, big-endian), matching the session
+// archive; a pair differing from this build's pinned suite (`providers::APQ_SUITE`) is rejected
+// — the suite is an explicit, checked property rather than an opaque mode flag.
+const INVITATION_VERSION: u8 = 2;
 
 /// The spawned-group forward table: an opaque caller-supplied spawn token → the spawned
 /// session's receive-group classical (message-half) id. The token is whatever the caller
