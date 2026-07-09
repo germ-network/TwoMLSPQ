@@ -37,24 +37,25 @@ struct SuiteClass {
     sig_pq: bool,
 }
 
-/// Classify a suite TwoMLSPQ recognizes, or `None` for anything else. This is the single place
-/// suites are recognized; extend it (per RFC 9420 §17.1, PQ values from the private-use range)
-/// to support more combinations.
+/// Classify a suite TwoMLSPQ recognizes, or `None` for an unassigned value. This is the single
+/// place suites are recognized; extend it (adding PQ values from the private-use range) to
+/// support more combinations.
 fn class(suite: CipherSuite) -> Option<SuiteClass> {
-    if suite == CipherSuite::CURVE25519_CHACHA {
-        // MLS_128_DHKEMX25519_CHACHA20POLY1305_SHA256_Ed25519: classical KEM, Ed25519 signature.
-        Some(SuiteClass {
+    match u16::from(suite) {
+        // RFC 9420 §17.1 base cipher suites (0x0001–0x0007): every one is a classical DHKEM with
+        // a classical signature scheme (Ed25519 / P-256 / Ed448 / P-521 / P-384).
+        0x0001..=0x0007 => Some(SuiteClass {
             kem_pq: false,
             sig_pq: false,
-        })
-    } else if suite == CipherSuite::new(ML_KEM_768) {
-        // MLS_128_ML_KEM_768_AES128GCM_SHA256_Ed25519: ML-KEM KEM, Ed25519 (classical) signature.
-        Some(SuiteClass {
+        }),
+        // MLS_128_ML_KEM_768_AES128GCM_SHA256_Ed25519 (private-use range): post-quantum KEM,
+        // classical Ed25519 signature.
+        ML_KEM_768 => Some(SuiteClass {
             kem_pq: true,
             sig_pq: false,
-        })
-    } else {
-        None
+        }),
+        // Unassigned / unrecognized.
+        _ => None,
     }
 }
 
@@ -502,14 +503,19 @@ mod tests {
     }
 
     #[test]
-    fn classifier_recognizes_only_the_supported_suites() {
-        assert_eq!(
-            class(CipherSuite::CURVE25519_CHACHA),
-            Some(SuiteClass {
-                kem_pq: false,
-                sig_pq: false
-            })
-        );
+    fn classifier_covers_rfc_suites_and_ml_kem() {
+        // Every RFC 9420 §17.1 base suite (0x0001–0x0007) is recognized as classical.
+        for v in 0x0001u16..=0x0007 {
+            assert_eq!(
+                class(CipherSuite::new(v)),
+                Some(SuiteClass {
+                    kem_pq: false,
+                    sig_pq: false
+                }),
+                "suite 0x{v:04X} should classify as classical"
+            );
+        }
+        // ML-KEM-768 is the one post-quantum KEM.
         assert_eq!(
             class(CipherSuite::new(ML_KEM_768)),
             Some(SuiteClass {
@@ -517,27 +523,25 @@ mod tests {
                 sig_pq: false
             })
         );
-        // An unrecognized suite (a classical suite we don't use) has no entry.
-        assert!(class(CipherSuite::P256_AES128).is_none());
+        // Unassigned values are unrecognized (just past the RFC range, and an unused private value).
+        assert!(class(CipherSuite::new(0x0008)).is_none());
+        assert!(class(CipherSuite::new(0xFFFF)).is_none());
     }
 
     #[test]
     fn mode_rejects_incoherent_pairs() {
         let classical = CipherSuite::CURVE25519_CHACHA;
         let pq = CipherSuite::new(ML_KEM_768);
-        // Swapped: PQ suite in the classical slot, classical in the PQ slot.
+        let unknown = CipherSuite::new(0x0008); // just past the RFC 9420 §17.1 range
+                                                // Swapped: PQ suite in the classical slot, classical in the PQ slot.
         assert!(ApqCipherSuite::new(pq, classical).mode().is_err());
         // Both classical: the PQ slot is not a PQ KEM.
         assert!(ApqCipherSuite::new(classical, classical).mode().is_err());
         // Both PQ: the classical slot must be a classical KEM.
         assert!(ApqCipherSuite::new(pq, pq).mode().is_err());
         // An unrecognized suite in either slot.
-        assert!(ApqCipherSuite::new(classical, CipherSuite::P256_AES128)
-            .mode()
-            .is_err());
-        assert!(ApqCipherSuite::new(CipherSuite::P256_AES128, pq)
-            .mode()
-            .is_err());
+        assert!(ApqCipherSuite::new(classical, unknown).mode().is_err());
+        assert!(ApqCipherSuite::new(unknown, pq).mode().is_err());
     }
 
     #[test]

@@ -283,7 +283,9 @@ pub(crate) fn validate_combiner_kp(
     if observed == expected {
         return Ok(());
     }
-    if parsed.classical_suite.is_combiner_classical() && parsed.pq_suite.is_combiner_classical() {
+    // Neither half is the post-quantum suite → the peer offers no PQ protection at all (any
+    // classical suite, not just 0x0003) — the specific PqNotAvailable diagnostic.
+    if !parsed.classical_suite.is_combiner_pq() && !parsed.pq_suite.is_combiner_pq() {
         return Err(TwoMlsPqError::PqNotAvailable);
     }
     Err(TwoMlsPqError::CipherSuiteMismatch)
