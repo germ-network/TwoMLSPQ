@@ -25,8 +25,8 @@ pub mod pq_ratchet;
 pub mod storage;
 
 pub use client::{
-    ApqMode, ArchivedIdentity, CombinerClient, CryptoConfig, MlsClient, OurConfig, PqConfig,
-    PqMlsClient,
+    ApqCipherSuite, ApqMode, ArchivedIdentity, CombinerClient, CryptoConfig, MlsClient, OurConfig,
+    PqConfig, PqMlsClient,
 };
 
 pub use group::{
@@ -60,6 +60,12 @@ pub enum CombinerError {
     /// in a session.
     #[error("crypto provider does not support the required cipher suite")]
     UnsupportedCipherSuite,
+    /// An observed cipher-suite pair does not match the session's expected [`ApqCipherSuite`],
+    /// or is not a coherent APQ combination (unrecognized suite, a classical suite in the PQ
+    /// slot, mismatched signature families). Distinct from [`UnsupportedCipherSuite`](Self::UnsupportedCipherSuite),
+    /// which is a local provider-capability gap.
+    #[error("cipher suite mismatch")]
+    CipherSuiteMismatch,
 }
 
 pub type Result<T> = std::result::Result<T, CombinerError>;

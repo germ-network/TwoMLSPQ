@@ -20,7 +20,7 @@ use crate::key_package_store::CombinerGroup;
 
 use crate::{
     key_packages::{
-        ensure_pq_available, parse_mls_key_package, CombinerKeyPackage, TwoMlsPqIdentity,
+        parse_mls_key_package, validate_combiner_kp, CombinerKeyPackage, TwoMlsPqIdentity,
     },
     AgentState, Archive, ClientId, CombinerGroupId, CommitResult, DecryptResult, EncryptResult,
     EpochRendezvous, ListenChannels, MlsGroupId, MlsSenderMessage, PrepareEncryptResult,
@@ -33,6 +33,10 @@ use crate::providers;
 
 struct SessionInner {
     client: Arc<TwoMlsPqIdentity>,
+    /// The cipher-suite pair this session is locked to — a fixed property, captured from the
+    /// constructing client. The APQ mode is derived from it (`ApqCipherSuite::mode`). Peer key
+    /// packages and welcomes are validated against it before any group is built or joined.
+    suite: apq::ApqCipherSuite,
     send_group: Option<CombinerGroup>,
     recv_group: Option<CombinerGroup>,
     pending_outbound: Option<Vec<u8>>,
@@ -181,11 +185,10 @@ enum PqInflight {
 // The session archive layout version. The byte covers the WHOLE layout; any change to the
 // wire struct below bumps it, and older archives are rejected as `ArchiveInvalid`
 // (pre-release, no migration).
-const SESSION_ARCHIVE_VERSION: u8 = 1;
-// Tags the PQ half as real ML-KEM, mirroring the invitation archive's header byte, so any
-// future PQ-mode change (e.g. conf+auth) fails loudly across builds instead of
-// misinterpreting group snapshots.
-const SESSION_ARCHIVE_PQ_MODE: u8 = 1;
+// v2 (2026-07-08): the single PQ-mode byte became the concrete `ApqCipherSuite` pair (4 bytes,
+// classical then pq, big-endian) — the suite is now a stored session property, and a restored
+// archive whose pair differs from this build's pinned suite fails loudly.
+const SESSION_ARCHIVE_VERSION: u8 = 2;
 
 // In its own module because the derive-generated impls reference the std `Result`, which
 // the crate-local `Result` alias would shadow (same pattern as `invitation::wire`).
@@ -1207,6 +1210,7 @@ fn build_session(
     initiated: bool,
 ) -> Arc<TwoMlsPqSession> {
     let my_id = client.client_id();
+    let suite = client.combiner().cipher_suite();
     let send_group_storage = client.combiner().classical_group_storage().clone();
     let psk_stores = vec![
         client.combiner().classical().secret_store(),
@@ -1216,6 +1220,7 @@ fn build_session(
     Arc::new(TwoMlsPqSession {
         inner: Mutex::new(SessionInner {
             client,
+            suite,
             send_group,
             recv_group,
             pending_outbound,
@@ -1244,6 +1249,41 @@ fn build_session(
     })
 }
 
+/// Validate one welcome half's cipher suite against the expected value. A Welcome carries its
+/// suite in cleartext (`MlsMessage::cipher_suite`), so this catches a mismatch before join.
+fn check_welcome_suite(welcome: &[u8], expected: mls_rs::CipherSuite) -> Result<()> {
+    let msg = mls_rs::MlsMessage::from_bytes(welcome).map_err(|_| TwoMlsPqError::Mls)?;
+    if msg.cipher_suite() == Some(expected) {
+        Ok(())
+    } else {
+        Err(TwoMlsPqError::CipherSuiteMismatch)
+    }
+}
+
+/// Validate the cipher suite(s) in an APQ welcome's already-decoded halves against the session's
+/// expected pair. An empty PQ half (the acceptor's A.4-deferred return welcome) validates the
+/// classical half only.
+fn validate_welcome_halves(
+    expected: apq::ApqCipherSuite,
+    classical_welcome: &[u8],
+    pq_welcome: &[u8],
+) -> Result<()> {
+    if !classical_welcome.is_empty() {
+        check_welcome_suite(classical_welcome, expected.classical)?;
+    }
+    if !pq_welcome.is_empty() {
+        check_welcome_suite(pq_welcome, expected.pq)?;
+    }
+    Ok(())
+}
+
+/// Decode an APQ welcome envelope and validate its halves — for callers holding only the
+/// envelope bytes (e.g. `accept`).
+fn validate_welcome_suites(expected: apq::ApqCipherSuite, welcome: &[u8]) -> Result<()> {
+    let (classical_welcome, pq_welcome) = decode_apq_welcome(welcome)?;
+    validate_welcome_halves(expected, &classical_welcome, &pq_welcome)
+}
+
 impl TwoMlsPqSession {
     /// Lock the session state, recovering from a poisoned mutex rather than propagating a panic.
     /// A poisoned lock means a prior holder panicked mid-update; we surface the inner state and let
@@ -1270,7 +1310,7 @@ impl TwoMlsPqSession {
         client: Arc<TwoMlsPqIdentity>,
         their_key_package: CombinerKeyPackage,
     ) -> Result<Arc<Self>> {
-        ensure_pq_available(&their_key_package)?;
+        validate_combiner_kp(client.combiner().cipher_suite(), &their_key_package)?;
         let their_parsed = parse_mls_key_package(their_key_package.classical.clone())?;
         let their_id = their_parsed.client_id;
         let session_id = crate::derive_session_id(client.client_id(), their_id.clone())?;
@@ -1305,11 +1345,14 @@ impl TwoMlsPqSession {
         welcome: Vec<u8>,
         their_key_package: CombinerKeyPackage,
     ) -> Result<Arc<Self>> {
-        ensure_pq_available(&their_key_package)?;
+        validate_combiner_kp(client.combiner().cipher_suite(), &their_key_package)?;
         let their_parsed = parse_mls_key_package(their_key_package.classical.clone())?;
         let their_id = their_parsed.client_id;
         let session_id = crate::derive_session_id(client.client_id(), their_id.clone())?;
 
+        // Validate the incoming welcome's cipher suite(s) before joining, so a suite mismatch
+        // fails early and clearly rather than deep inside mls-rs as an opaque Mls error.
+        validate_welcome_suites(client.combiner().cipher_suite(), &welcome)?;
         let recv_group = join_combiner_group(&welcome, client.combiner())?;
         // A.4: the send group's PQ half is deferred — classical only, bound to the
         // cross-party PSK. The bootstrap flow stands it up off the critical path, so the
@@ -1347,8 +1390,16 @@ impl TwoMlsPqSession {
     pub fn from_archive(archive: Archive, client: Arc<TwoMlsPqIdentity>) -> Result<Arc<Self>> {
         use mls_rs::mls_rs_codec::MlsDecode;
 
+        // Header: [version][classical u16 BE][pq u16 BE]. The archived suite pair must equal
+        // this build's pinned suite — fail loudly across builds rather than misinterpret the
+        // group snapshots (equality also confirms the pair is a coherent APQ combination).
         let mut rest = match archive.bytes.as_slice() {
-            [SESSION_ARCHIVE_VERSION, SESSION_ARCHIVE_PQ_MODE, rest @ ..] => rest,
+            [SESSION_ARCHIVE_VERSION, s0, s1, s2, s3, rest @ ..]
+                if apq::ApqCipherSuite::from_wire([*s0, *s1, *s2, *s3])
+                    == crate::providers::APQ_SUITE =>
+            {
+                rest
+            }
             _ => return Err(TwoMlsPqError::ArchiveInvalid),
         };
         let wire = archive_wire::SessionArchive::mls_decode(&mut rest)
@@ -1437,6 +1488,7 @@ impl TwoMlsPqSession {
         // existed only to serve groups born on pre-rotation clients, and those bindings
         // are dissolved by the import.
         let send_group_storage = client.combiner().classical_group_storage().clone();
+        let suite = client.combiner().cipher_suite();
         let psk_stores = vec![
             client.combiner().classical().secret_store(),
             client.combiner().pq().secret_store(),
@@ -1445,6 +1497,7 @@ impl TwoMlsPqSession {
         Ok(Arc::new(TwoMlsPqSession {
             inner: Mutex::new(SessionInner {
                 client,
+                suite,
                 send_group: Some(send_group),
                 recv_group,
                 pending_outbound: wire.pending_outbound,
@@ -1775,6 +1828,9 @@ impl TwoMlsPqSession {
             }
 
             let (classical_welcome, pq_welcome) = decode_apq_welcome(&ciphertext)?;
+            // Reject a welcome whose suite(s) don't match this session's fixed pair before
+            // joining — an early, clear failure instead of an opaque late mls-rs error.
+            validate_welcome_halves(inner.suite, &classical_welcome, &pq_welcome)?;
             // An empty PQ slot is the acceptor's deferred (A.4) return welcome: join the
             // classical group only; the PQ half arrives with the bootstrap flow.
             if pq_welcome.is_empty() {
@@ -2153,9 +2209,10 @@ impl TwoMlsPqSession {
         // Exact-size preallocation: a growing Vec would strand unwiped partial copies of
         // the secrets in freed allocations. The final `Archive.bytes` handed across the
         // FFI is an unwiped copy regardless — hence the sealing obligation above.
-        let mut out = Zeroizing::new(Vec::with_capacity(2 + archive.mls_encoded_len()));
+        // Header: [version][classical u16 BE][pq u16 BE] — 5 bytes.
+        let mut out = Zeroizing::new(Vec::with_capacity(5 + archive.mls_encoded_len()));
         out.push(SESSION_ARCHIVE_VERSION);
-        out.push(SESSION_ARCHIVE_PQ_MODE);
+        out.extend_from_slice(&inner.suite.to_wire());
         archive
             .mls_encode(&mut out)
             .map_err(|_| TwoMlsPqError::ArchiveInvalid)?;
@@ -4528,6 +4585,68 @@ mod tests {
         assert_err!(
             alice_session.process_incoming(fake),
             TwoMlsPqError::DecryptionFailed
+        );
+    }
+
+    #[test]
+    fn test_suite_mismatch_key_package_rejected_before_group_built() {
+        use crate::key_packages::CombinerKeyPackage;
+        use crate::MlsCipherSuite;
+
+        let alice = make_client();
+        let peer = make_client();
+
+        // Both halves classical (peer offers no PQ protection) → the specific PqNotAvailable.
+        let both_classical = CombinerKeyPackage {
+            classical: assert_ok!(peer.generate_key_package(MlsCipherSuite::x25519_chacha())),
+            pq: assert_ok!(peer.generate_key_package(MlsCipherSuite::x25519_chacha())),
+        };
+        assert_err!(
+            TwoMlsPqSession::initiate(Arc::clone(&alice), both_classical),
+            TwoMlsPqError::PqNotAvailable
+        );
+
+        // Halves swapped (PQ suite in the classical slot) → CipherSuiteMismatch, rejected
+        // before any send group is created.
+        let swapped = CombinerKeyPackage {
+            classical: assert_ok!(peer.generate_key_package(MlsCipherSuite::ml_kem_768())),
+            pq: assert_ok!(peer.generate_key_package(MlsCipherSuite::x25519_chacha())),
+        };
+        assert_err!(
+            TwoMlsPqSession::initiate(Arc::clone(&alice), swapped),
+            TwoMlsPqError::CipherSuiteMismatch
+        );
+    }
+
+    #[test]
+    fn test_welcome_with_swapped_suites_rejected_before_join() {
+        let alice = make_client();
+        let bob = make_client();
+        let bob_kp = make_combiner_kp(&bob);
+        let alice_s = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp));
+        let welcome = assert_some!(alice_s.pending_outbound());
+        // Swap the welcome's two halves so each slot's cleartext cipher suite is wrong for the
+        // acceptor's expected pair — caught pre-join, not as a late decrypt failure.
+        let (classical, pq) = assert_ok!(apq::decode_apq_welcome(&welcome));
+        let swapped = apq::encode_apq_welcome(pq, classical);
+        let alice_kp = make_combiner_kp(&alice);
+        assert_err!(
+            TwoMlsPqSession::accept(Arc::clone(&bob), swapped, alice_kp),
+            TwoMlsPqError::CipherSuiteMismatch
+        );
+    }
+
+    #[test]
+    fn test_archive_rejects_a_wrong_suite_header() {
+        let (alice, _bob, alice_session, _bob_session) = establish_with_clients();
+        let archive = assert_ok!(alice_session.archive());
+        let mut bytes = archive.bytes;
+        // Byte 0 is the version; byte 1 is the classical suite's high byte. Corrupt it so the
+        // archived pair no longer equals this build's pinned suite.
+        bytes[1] ^= 0x01;
+        assert_err!(
+            TwoMlsPqSession::from_archive(crate::Archive { bytes }, alice),
+            TwoMlsPqError::ArchiveInvalid
         );
     }
 }

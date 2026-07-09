@@ -29,20 +29,20 @@ fn demo_cipher_suite_constants() {
     println!("\n=== TwoMLSPQ cipher suites ===");
     println!("active provider : {}", provider_label());
     println!(
-        "classical       : 0x{:04X}  is_supported={}  is_combiner_classical={}",
+        "classical       : 0x{:04X}  is_combiner_pq={}  is_combiner_classical={}",
         classical.value(),
-        classical.is_supported(),
+        classical.is_combiner_pq(),
         classical.is_combiner_classical(),
     );
     println!(
-        "post-quantum    : 0x{:04X}  is_supported={}  (ML-KEM-768, FIPS 203)",
+        "post-quantum    : 0x{:04X}  is_combiner_pq={}  (ML-KEM-768, FIPS 203)",
         pq.value(),
-        pq.is_supported(),
+        pq.is_combiner_pq(),
     );
 
     assert_eq!(classical.value(), 0x0003);
     assert_eq!(pq.value(), 0xFDEA);
-    assert!(pq.is_supported());
+    assert!(pq.is_combiner_pq());
     assert!(classical.is_combiner_classical());
 }
 

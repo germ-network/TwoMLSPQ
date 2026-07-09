@@ -146,7 +146,7 @@ mod cryptokit_interop {
             CryptoConfig {
                 classical: CryptoKitProvider::default(),
                 pq: CryptoKitMlKemProvider,
-                mode: Default::default(),
+                suite: Default::default(),
             },
         )
         .unwrap()

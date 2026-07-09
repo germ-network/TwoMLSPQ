@@ -62,12 +62,16 @@ mod selected {
 // that follow it are noise — the compile_error message is the diagnosis.
 pub(crate) use selected::{classical, pq, pq_kem, Classical, Pq};
 
-/// The APQ mode this crate runs (confidentiality-only; see `apq::ApqMode`).
-pub(crate) const APQ_MODE: apq::ApqMode = apq::ApqMode::ConfidentialityOnly;
+/// The cipher-suite pair this crate pins for every session: Curve25519/ChaCha classical +
+/// ML-KEM-768 PQ (confidentiality-only). The APQ mode is derived from it (`ApqCipherSuite::mode`).
+pub(crate) const APQ_SUITE: apq::ApqCipherSuite = apq::ApqCipherSuite::new(
+    mls_rs::CipherSuite::CURVE25519_CHACHA,
+    mls_rs::CipherSuite::new(0xFDEA),
+);
 
-/// The PQ half's cipher suite under [`APQ_MODE`].
+/// The PQ half's cipher suite under [`APQ_SUITE`].
 pub(crate) fn pq_cipher_suite() -> mls_rs::CipherSuite {
-    APQ_MODE.pq_cipher_suite()
+    APQ_SUITE.pq
 }
 
 /// The provider bundle handed to every `apq::CombinerClient` construction.
@@ -75,7 +79,7 @@ pub(crate) fn crypto_config() -> apq::CryptoConfig<Classical, Pq> {
     apq::CryptoConfig {
         classical: classical(),
         pq: pq(),
-        mode: APQ_MODE,
+        suite: APQ_SUITE,
     }
 }
 

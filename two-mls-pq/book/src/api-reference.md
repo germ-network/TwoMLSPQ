@@ -64,7 +64,8 @@ The receiving side of a published key package — no live client required.
   share a `ClientId`.
 - `encode_combiner_key_package` / `decode_combiner_key_package` — the pair as one
   opaque blob for layers that carry it as a single value.
-- `MlsCipherSuite::is_supported()` / `is_combiner_classical()` — routing signals.
+- `MlsCipherSuite::is_combiner_pq()` / `is_combiner_classical()` — routing signals (true for
+  the PQ `0xFDEA` and classical `0x0003` halves respectively).
 - `derive_session_id(a, b) -> SessionId` — symmetric session identifier for a pair.
 
 ## `TwoMlsPqSession`
@@ -111,4 +112,8 @@ fine. Reconnect remains unimplemented — see
 All failures map to the flat `TwoMlsPqError` enum (`Mls`, `InvalidKeyPackage`,
 `MissingWelcome`, `PskBinding`, `PqNotAvailable`, `SessionNotEstablished`,
 `SessionNotReady`, `ProposalRejected`, `DecryptionFailed`, `DuplicateWelcome`,
-`ArchiveInvalid`). mls-rs error types never cross the FFI boundary.
+`ArchiveInvalid`, `UnsupportedCipherSuite`, `CipherSuiteMismatch`). mls-rs error types never
+cross the FFI boundary. `CipherSuiteMismatch` is raised when a peer key package or welcome
+carries a cipher-suite pair that isn't the session's fixed suite (`PqNotAvailable` when the
+peer offers no PQ half at all); `UnsupportedCipherSuite` is a local provider-capability gap
+at construction.

@@ -22,36 +22,120 @@ use zeroize::Zeroizing;
 use crate::storage::PersistableGroupStorage;
 use crate::{CombinerError, Result};
 
-/// ML-KEM-768 cipher suite value (0xFDEA, FIPS 203) in the MLS private-use range. Every PQ
-/// provider must implement the suite under this exact value (CryptoKit and aws-lc agree).
+/// ML-KEM-768 cipher suite value (0xFDEA, FIPS 203) in the MLS private-use range. This is the
+/// wire value TwoMLSPQ pins for the PQ half; every PQ provider must implement the suite under
+/// it (CryptoKit and aws-lc agree). A construction-time assert checks it still equals
+/// mls-rs-core's `CipherSuite::ML_KEM_768`, so a fork renumber cannot silently diverge.
 const ML_KEM_768: u16 = 0xFDEA;
 
-/// The classical half's cipher suite.
-const CLASSICAL_SUITE: CipherSuite = CipherSuite::CURVE25519_CHACHA;
+/// Whether a recognized suite's KEM and signature scheme are post-quantum. MLS cipher suites
+/// are monolithic (RFC 9420 §17.1): one id fixes KEM + AEAD + hash + signature together, so
+/// these axes are read off the suite id — mls-rs exposes no per-suite signature accessor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SuiteClass {
+    kem_pq: bool,
+    sig_pq: bool,
+}
 
-/// Which APQ variant the PQ half runs (draft-ietf-mls-combiner). The mode selects the PQ
-/// group's cipher suite, and with it the PQ half's signature scheme.
+/// Classify a suite TwoMLSPQ recognizes, or `None` for anything else. This is the single place
+/// suites are recognized; extend it (per RFC 9420 §17.1, PQ values from the private-use range)
+/// to support more combinations.
+fn class(suite: CipherSuite) -> Option<SuiteClass> {
+    if suite == CipherSuite::CURVE25519_CHACHA {
+        // MLS_128_DHKEMX25519_CHACHA20POLY1305_SHA256_Ed25519: classical KEM, Ed25519 signature.
+        Some(SuiteClass {
+            kem_pq: false,
+            sig_pq: false,
+        })
+    } else if suite == CipherSuite::new(ML_KEM_768) {
+        // MLS_128_ML_KEM_768_AES128GCM_SHA256_Ed25519: ML-KEM KEM, Ed25519 (classical) signature.
+        Some(SuiteClass {
+            kem_pq: true,
+            sig_pq: false,
+        })
+    } else {
+        None
+    }
+}
+
+/// The concrete pair of MLS cipher suites a session runs — its classical half and PQ half.
+/// This is the source of truth; the APQ *mode* is derived from it via [`ApqCipherSuite::mode`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ApqCipherSuite {
+    pub classical: CipherSuite,
+    pub pq: CipherSuite,
+}
+
+impl Default for ApqCipherSuite {
+    /// The shipped confidentiality-only pair: Curve25519/ChaCha classical + ML-KEM-768 PQ,
+    /// both Ed25519-signed.
+    fn default() -> Self {
+        Self {
+            classical: CipherSuite::CURVE25519_CHACHA,
+            pq: CipherSuite::new(ML_KEM_768),
+        }
+    }
+}
+
+impl ApqCipherSuite {
+    pub const fn new(classical: CipherSuite, pq: CipherSuite) -> Self {
+        Self { classical, pq }
+    }
+
+    /// Derive the APQ mode from the suite pair, or report why the pair is not a valid APQ
+    /// combination. Rules: both halves recognized; the classical half a classical KEM and the
+    /// PQ half an ML-KEM KEM; both halves sharing one signature family (the combiner carries a
+    /// single identity across both). A classical signature yields
+    /// [`ApqMode::ConfidentialityOnly`]; a PQ signature would be confidentiality+authentication,
+    /// which has no `ApqMode` variant yet (a PQ-signature suite must be added to `class` first),
+    /// so it currently reports [`CombinerError::CipherSuiteMismatch`].
+    pub fn mode(self) -> Result<ApqMode> {
+        let classical = class(self.classical).ok_or(CombinerError::CipherSuiteMismatch)?;
+        let pq = class(self.pq).ok_or(CombinerError::CipherSuiteMismatch)?;
+        if classical.kem_pq || !pq.kem_pq || classical.sig_pq != pq.sig_pq {
+            return Err(CombinerError::CipherSuiteMismatch);
+        }
+        if classical.sig_pq {
+            return Err(CombinerError::CipherSuiteMismatch);
+        }
+        Ok(ApqMode::ConfidentialityOnly)
+    }
+
+    /// `Ok(())` iff the pair is a valid, recognized APQ combination.
+    pub fn validate(self) -> Result<()> {
+        self.mode().map(|_| ())
+    }
+
+    /// Persist as classical-then-pq big-endian u16s.
+    pub fn to_wire(self) -> [u8; 4] {
+        let c = u16::from(self.classical).to_be_bytes();
+        let p = u16::from(self.pq).to_be_bytes();
+        [c[0], c[1], p[0], p[1]]
+    }
+
+    /// Inverse of [`to_wire`](Self::to_wire). The result still needs [`validate`](Self::validate).
+    pub fn from_wire(bytes: [u8; 4]) -> Self {
+        Self {
+            classical: CipherSuite::new(u16::from_be_bytes([bytes[0], bytes[1]])),
+            pq: CipherSuite::new(u16::from_be_bytes([bytes[2], bytes[3]])),
+        }
+    }
+}
+
+/// Which APQ variant the PQ half runs (draft-ietf-mls-combiner). This is *derived* from the
+/// concrete [`ApqCipherSuite`] (see [`ApqCipherSuite::mode`]), never the authority for it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ApqMode {
-    /// APQ confidentiality-only: ML-KEM-768 for the PQ group with classical (Ed25519)
-    /// signing keys in both groups.
+    /// APQ confidentiality-only: ML-KEM-768 for the PQ group with classical (Ed25519) signing
+    /// keys in both halves — post-quantum confidentiality, classical authentication.
     ///
-    /// The draft's confidentiality + authentication variant (PQ signing keys for the PQ
-    /// group) is anticipated but not implemented: it needs a cipher suite composing
-    /// ML-KEM-768 with a PQ signature scheme in the providers. Adding it is a new variant
-    /// here plus a suite mapping below — no API break.
+    /// The draft's confidentiality + authentication variant (a PQ signature scheme) is
+    /// anticipated but not implemented. Because MLS suites are monolithic and no PQ-signature
+    /// suite has an IANA assignment, adding it means a hardcoded private-range suite value (as
+    /// ML-KEM-768 uses 0xFDEA), a new entry in `class`, and a new variant here.
     #[default]
     ConfidentialityOnly,
-}
-
-impl ApqMode {
-    /// The PQ half's MLS cipher suite for this mode.
-    pub fn pq_cipher_suite(self) -> CipherSuite {
-        match self {
-            ApqMode::ConfidentialityOnly => CipherSuite::new(ML_KEM_768),
-        }
-    }
 }
 
 /// An archived signing identity for [`CombinerClient::from_key_packages`]: the ClientId
@@ -69,15 +153,16 @@ pub struct ArchivedIdentity<S> {
     pub pq_kp_store: S,
 }
 
-/// The injected crypto providers and APQ mode for a [`CombinerClient`]: `classical` backs
-/// the classical half (must supply `CURVE25519_CHACHA`), `pq` backs the PQ half (must
-/// supply the mode's PQ suite). One concrete provider type may serve both roles (aws-lc
-/// does); Apple splits them (`CryptoKitProvider` / `CryptoKitMlKemProvider`).
+/// The injected crypto providers and cipher-suite pair for a [`CombinerClient`]: `classical`
+/// backs the classical half, `pq` backs the PQ half, and `suite` is the concrete
+/// [`ApqCipherSuite`] they must support (the APQ mode is derived from it). One concrete
+/// provider type may serve both roles (aws-lc does); Apple splits them (`CryptoKitProvider` /
+/// `CryptoKitMlKemProvider`).
 #[derive(Clone, Debug, Default)]
 pub struct CryptoConfig<C, P> {
     pub classical: C,
     pub pq: P,
-    pub mode: ApqMode,
+    pub suite: ApqCipherSuite,
 }
 
 // Group state lives in a `PersistableGroupStorage` (same shared-map in-memory semantics as
@@ -112,6 +197,9 @@ where
     P: CryptoProvider + Clone,
 {
     client_id: Vec<u8>,
+    /// The cipher-suite pair this client's two halves were built for — the fixed, stored
+    /// property a session is locked to. The APQ mode is derived from it.
+    suite: ApqCipherSuite,
     classical_signing_key: Zeroizing<Vec<u8>>,
     classical: MlsClient<S, C>,
     classical_kp_store: S,
@@ -143,14 +231,22 @@ where
     where
         S: Default,
     {
+        let suite = crypto.suite;
+        // The suite pair is the source of truth: it must be a coherent APQ combination (derive
+        // a known mode) before anything is built. Also assert our pinned PQ wire value still
+        // equals mls-rs-core's named constant, so a fork renumber (or the ML_KEM_768_X25519 =
+        // 65100 sibling) can't silently diverge.
+        suite.validate()?;
+        if CipherSuite::new(ML_KEM_768) != CipherSuite::ML_KEM_768 {
+            return Err(CombinerError::UnsupportedCipherSuite);
+        }
         let classical_cs = crypto
             .classical
-            .cipher_suite_provider(CLASSICAL_SUITE)
+            .cipher_suite_provider(suite.classical)
             .ok_or(CombinerError::UnsupportedCipherSuite)?;
-        let pq_suite = crypto.mode.pq_cipher_suite();
         let pq_cs = crypto
             .pq
-            .cipher_suite_provider(pq_suite)
+            .cipher_suite_provider(suite.pq)
             .ok_or(CombinerError::UnsupportedCipherSuite)?;
 
         let (classical_sk, classical_pk) = classical_cs
@@ -164,7 +260,7 @@ where
             client_id.clone(),
             classical_sk,
             classical_pk,
-            CLASSICAL_SUITE,
+            suite.classical,
             classical_kp_store.clone(),
             classical_group_storage.clone(),
         );
@@ -185,13 +281,14 @@ where
             client_id.clone(),
             pq_sk,
             pq_pk,
-            pq_suite,
+            suite.pq,
             pq_kp_store.clone(),
             pq_group_storage.clone(),
         );
 
         Ok(Self {
             client_id,
+            suite,
             classical_signing_key,
             classical,
             classical_kp_store,
@@ -218,14 +315,18 @@ where
             pq_signing_key,
             pq_kp_store,
         } = identity;
+        let suite = crypto.suite;
+        suite.validate()?;
+        if CipherSuite::new(ML_KEM_768) != CipherSuite::ML_KEM_768 {
+            return Err(CombinerError::UnsupportedCipherSuite);
+        }
         let classical_cs = crypto
             .classical
-            .cipher_suite_provider(CLASSICAL_SUITE)
+            .cipher_suite_provider(suite.classical)
             .ok_or(CombinerError::UnsupportedCipherSuite)?;
-        let pq_suite = crypto.mode.pq_cipher_suite();
         let pq_cs = crypto
             .pq
-            .cipher_suite_provider(pq_suite)
+            .cipher_suite_provider(suite.pq)
             .ok_or(CombinerError::UnsupportedCipherSuite)?;
 
         let classical_sk = mls_rs::crypto::SignatureSecretKey::new(classical_signing_key.to_vec());
@@ -238,7 +339,7 @@ where
             client_id.clone(),
             classical_sk,
             classical_pk,
-            CLASSICAL_SUITE,
+            suite.classical,
             classical_kp_store.clone(),
             classical_group_storage.clone(),
         );
@@ -254,13 +355,14 @@ where
             client_id.clone(),
             pq_sk,
             pq_pk,
-            pq_suite,
+            suite.pq,
             pq_kp_store.clone(),
             pq_group_storage.clone(),
         );
 
         Ok(Self {
             client_id,
+            suite,
             classical_signing_key,
             classical,
             classical_kp_store,
@@ -276,6 +378,17 @@ where
     /// The agent's ClientId bytes (opaque Basic Credential identity).
     pub fn client_id(&self) -> &[u8] {
         &self.client_id
+    }
+
+    /// The cipher-suite pair this client runs (classical + PQ).
+    pub fn cipher_suite(&self) -> ApqCipherSuite {
+        self.suite
+    }
+
+    /// The APQ mode, derived from the suite pair. Infallible here: construction already
+    /// validated the pair, so the derivation cannot fail.
+    pub fn mode(&self) -> ApqMode {
+        self.suite.mode().unwrap_or_default()
     }
 
     /// The classical half's signing key bytes — part of the archivable signing identity.
@@ -373,4 +486,70 @@ fn build_client<S: KeyPackageStorage + Clone, C: CryptoProvider + Clone>(
         .group_state_storage(group_storage)
         .signing_identity(signing_identity, secret_key, suite)
         .build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{class, ApqCipherSuite, ApqMode, SuiteClass, ML_KEM_768};
+    use mls_rs::CipherSuite;
+
+    #[test]
+    fn default_pair_derives_confidentiality_only() {
+        assert_eq!(
+            ApqCipherSuite::default().mode().unwrap(),
+            ApqMode::ConfidentialityOnly
+        );
+    }
+
+    #[test]
+    fn classifier_recognizes_only_the_supported_suites() {
+        assert_eq!(
+            class(CipherSuite::CURVE25519_CHACHA),
+            Some(SuiteClass {
+                kem_pq: false,
+                sig_pq: false
+            })
+        );
+        assert_eq!(
+            class(CipherSuite::new(ML_KEM_768)),
+            Some(SuiteClass {
+                kem_pq: true,
+                sig_pq: false
+            })
+        );
+        // An unrecognized suite (a classical suite we don't use) has no entry.
+        assert!(class(CipherSuite::P256_AES128).is_none());
+    }
+
+    #[test]
+    fn mode_rejects_incoherent_pairs() {
+        let classical = CipherSuite::CURVE25519_CHACHA;
+        let pq = CipherSuite::new(ML_KEM_768);
+        // Swapped: PQ suite in the classical slot, classical in the PQ slot.
+        assert!(ApqCipherSuite::new(pq, classical).mode().is_err());
+        // Both classical: the PQ slot is not a PQ KEM.
+        assert!(ApqCipherSuite::new(classical, classical).mode().is_err());
+        // Both PQ: the classical slot must be a classical KEM.
+        assert!(ApqCipherSuite::new(pq, pq).mode().is_err());
+        // An unrecognized suite in either slot.
+        assert!(ApqCipherSuite::new(classical, CipherSuite::P256_AES128)
+            .mode()
+            .is_err());
+        assert!(ApqCipherSuite::new(CipherSuite::P256_AES128, pq)
+            .mode()
+            .is_err());
+    }
+
+    #[test]
+    fn drift_guard_pinned_pq_value_equals_core_constant() {
+        // The construction-time guard relies on this: our pinned wire value must still be what
+        // mls-rs-core names ML-KEM-768. If a fork renumber breaks it, this fails loudly.
+        assert_eq!(CipherSuite::new(ML_KEM_768), CipherSuite::ML_KEM_768);
+    }
+
+    #[test]
+    fn wire_round_trips() {
+        let suite = ApqCipherSuite::default();
+        assert_eq!(ApqCipherSuite::from_wire(suite.to_wire()), suite);
+    }
 }

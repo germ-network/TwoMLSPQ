@@ -709,7 +709,7 @@ mod tests {
             CryptoConfig {
                 classical: AwsLcCryptoProvider::new(),
                 pq: ClassicalOnly::default(),
-                mode: Default::default(),
+                suite: Default::default(),
             },
         );
         assert!(matches!(
