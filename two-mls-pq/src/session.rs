@@ -197,6 +197,8 @@ mod archive_wire {
     use mls_rs::psk::{ExternalPskId, PreSharedKey};
     use zeroize::Zeroizing;
 
+    use crate::key_package_store::KeyPackageSecret;
+
     /// One exported mls-rs group snapshot (plaintext secret material — the enclosing
     /// archive carries the sealing obligation, see [`super::TwoMlsPqSession::archive`]).
     /// A one-field struct so `Option<GroupBlob>` composes with the `byte_vec` framing
@@ -248,11 +250,14 @@ mod archive_wire {
         pub(super) proposal: Vec<u8>,
     }
 
-    /// A session-owned signing identity on the wire: the ClientId plus each MLS half's
-    /// signing key. Rebuilt via `apq::ArchivedIdentity` with empty key-package stores —
-    /// a bare identity restore (the signing keys ARE the identity; the app owns only the
-    /// opaque ClientId). Carries the session's current client and, when a rotation is
-    /// staged, the successor. `Zeroizing` wipes the decoded keys on drop.
+    /// A session-owned signing identity on the wire: the ClientId, each MLS half's signing
+    /// key, and each half's retained key packages. Rebuilt via `apq::ArchivedIdentity` with
+    /// the key-package stores preloaded from `*_kps` (the signing keys ARE the identity; the
+    /// app owns only the opaque ClientId). The key packages carry any minted-but-unconsumed
+    /// material — critically an initiator's return-group key package, which the peer's return
+    /// welcome addresses; a bare identity (empty `*_kps`) could not join it after restore.
+    /// Carries the session's current client and, when a rotation is staged, the successor
+    /// (whose stores are empty). `Zeroizing` wipes the decoded keys on drop.
     #[derive(MlsSize, MlsEncode, MlsDecode)]
     pub(super) struct SigningIdentityBlob {
         #[mls_codec(with = "mls_rs_codec::byte_vec")]
@@ -261,6 +266,11 @@ mod archive_wire {
         pub(super) classical_signing_key: Zeroizing<Vec<u8>>,
         #[mls_codec(with = "mls_rs_codec::byte_vec")]
         pub(super) pq_signing_key: Zeroizing<Vec<u8>>,
+        /// Retained key packages per half, `(storage id, KeyPackageData)`. Each half's
+        /// `KeyPackageData` embeds via its own canonical MLS encoding (as in the invitation
+        /// archive), so it stays correct if mls-rs evolves the (non_exhaustive) struct.
+        pub(super) classical_kps: Vec<KeyPackageSecret>,
+        pub(super) pq_kps: Vec<KeyPackageSecret>,
     }
 
     /// The initiator's held A.3 ephemeral (`PqInflight::Initiating`) on the wire: the
@@ -377,15 +387,22 @@ fn signing_identity_blob(identity: &TwoMlsPqIdentity) -> archive_wire::SigningId
         client_id: client.client_id().to_vec(),
         classical_signing_key: Zeroizing::new(client.classical_signing_key().to_vec()),
         pq_signing_key: Zeroizing::new(client.pq_signing_key().to_vec()),
+        // Carry the client's retained key packages so a restored initiator can still join
+        // its return welcome (its return-group key package rides here).
+        classical_kps: client.classical_kp_store().all_entries(),
+        pq_kps: client.pq_kp_store().all_entries(),
     }
 }
 
-/// A signing-identity blob → a rebuilt session-owned `TwoMlsPqIdentity` (empty stores).
+/// A signing-identity blob → a rebuilt session-owned `TwoMlsPqIdentity` with its key-package
+/// stores preloaded from the blob (empty for a bare identity, e.g. a staged successor).
 fn identity_from_wire(blob: archive_wire::SigningIdentityBlob) -> Result<Arc<TwoMlsPqIdentity>> {
     TwoMlsPqIdentity::from_signing_keys(
         blob.client_id,
         blob.classical_signing_key,
+        blob.classical_kps,
         blob.pq_signing_key,
+        blob.pq_kps,
     )
 }
 
@@ -3448,6 +3465,41 @@ mod tests {
         // Both directions keep flowing across the restore.
         message_round(&restored, &bob_session, b"restored->bob");
         message_round(&bob_session, &restored, b"bob->restored");
+    }
+
+    #[test]
+    fn test_archive_before_return_welcome_join_restores_and_joins() {
+        // The initiator archives right after `initiate` — before the peer's return welcome
+        // exists — so its return-group key package is still pending in the client store and
+        // the recv group is not yet joined. A self-contained restore must carry that key
+        // package, or the return-welcome join below fails (an empty-store restore cannot
+        // find the private material the welcome addresses). This is the archive-returning
+        // `reply` path the Swift adapter drives.
+        let alice = make_client();
+        let bob = make_client();
+        let alice_kp = make_combiner_kp(&alice);
+        let bob_kp = make_combiner_kp(&bob);
+
+        let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp));
+        let welcome_a = assert_some!(alice_session.pending_outbound());
+
+        // Archive and restore the initiator BEFORE it has joined the return welcome.
+        let restored_alice = round_trip(&alice_session);
+        assert!(restored_alice.receive_group_id().is_none());
+
+        let bob_session = assert_ok!(TwoMlsPqSession::accept(
+            Arc::clone(&bob),
+            welcome_a,
+            alice_kp
+        ));
+        let welcome_b = assert_some!(bob_session.pending_outbound());
+        // The restored initiator joins the return welcome using its carried key package.
+        assert_ok!(restored_alice.process_incoming(welcome_b));
+        assert!(restored_alice.receive_group_id().is_some());
+
+        // Both directions flow on the restored, now-established session.
+        message_round(&restored_alice, &bob_session, b"restored-join");
+        message_round(&bob_session, &restored_alice, b"back");
     }
 
     #[test]

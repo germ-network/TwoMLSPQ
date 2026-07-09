@@ -7,7 +7,9 @@ use crate::invitation::{
     combiner_from_invitation, decode_archive, encode_archive, generate_combiner_invitation,
     CombinerInvitation, SpawnedGroups,
 };
-use crate::key_package_store::{CombinerClient, MlsClient, PqMlsClient, SyntheticKeyPackageStore};
+use crate::key_package_store::{
+    CombinerClient, KeyPackageSecret, MlsClient, PqMlsClient, SyntheticKeyPackageStore,
+};
 use crate::session::TwoMlsPqSession;
 use crate::{ClientId, MlsCipherSuite, MlsGroupId, Result, TwoMlsPqError};
 
@@ -42,22 +44,29 @@ impl TwoMlsPqIdentity {
     }
 
     /// Rebuild an identity from its archived signing keys (ClientId + each MLS half's
-    /// signing key), with empty key-package stores — a bare identity restore. Used by
-    /// session archive/restore, where the MLS signing keys are session-owned state (the
+    /// signing key) and each half's retained key packages — a self-contained restore. Used
+    /// by session archive/restore, where the MLS signing keys are session-owned state (the
     /// app owns only the opaque ClientId); the public halves are re-derived from the
     /// signing keys inside `from_key_packages`, giving byte-exact client continuity.
+    ///
+    /// The key-package stores carry any key package the client had minted but not yet
+    /// consumed — critically the initiator's return-group key package, which the peer's
+    /// return welcome addresses; without it a restored initiator could not join. Pass empty
+    /// slices for a bare identity restore (e.g. a staged rotation successor).
     pub(crate) fn from_signing_keys(
         client_id: Vec<u8>,
         classical_signing_key: Zeroizing<Vec<u8>>,
+        classical_key_packages: impl IntoIterator<Item = KeyPackageSecret>,
         pq_signing_key: Zeroizing<Vec<u8>>,
+        pq_key_packages: impl IntoIterator<Item = KeyPackageSecret>,
     ) -> Result<Arc<Self>> {
         let inner = CombinerClient::from_key_packages(
             apq::ArchivedIdentity {
                 client_id,
                 classical_signing_key,
-                classical_kp_store: SyntheticKeyPackageStore::default(),
+                classical_kp_store: SyntheticKeyPackageStore::preloaded(classical_key_packages),
                 pq_signing_key,
-                pq_kp_store: SyntheticKeyPackageStore::default(),
+                pq_kp_store: SyntheticKeyPackageStore::preloaded(pq_key_packages),
             },
             crate::providers::crypto_config(),
         )?;
