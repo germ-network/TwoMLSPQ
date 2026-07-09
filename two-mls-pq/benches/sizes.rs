@@ -43,9 +43,8 @@ fn main() {
     bob_s.process_incoming(full.clone()).unwrap();
 
     // Agent rotation — tag 0x03.
-    let new_alice = client();
-    let new_id = new_alice.client_id();
-    alice_s.stage_rotation(Arc::clone(&new_alice)).unwrap();
+    let new_id = client().client_id();
+    alice_s.stage_rotation(new_id.bytes.clone()).unwrap();
     alice_s.prepare_to_encrypt(Some(new_id)).unwrap();
     let rotation = alice_s.encrypt(payload.to_vec()).unwrap().cipher_text;
 

@@ -91,11 +91,13 @@ epoch and refreshing the PSK binding.
 
 ## Agent key rotation
 
-`stage_rotation(new_client)` then `prepare_to_encrypt(Some(new_id))` commits the
-handoff to the staged agent client, announcing the new `ClientId` in the commit's
-authenticated data (the classical leaf credential itself is unchanged). The local
-state becomes `AgentState::Pending { old, new }` until the peer replies, then
-resolves to `Sync { new }`. The peer observes the change as
+`stage_rotation(new_client_id)` then `prepare_to_encrypt(Some(new_id))` commits the
+handoff to the staged agent, announcing the new `ClientId` in the commit's
+authenticated data (the classical leaf credential itself is unchanged). The app supplies
+only the opaque `ClientId`; the successor's MLS signing keys are minted internally, as
+session-owned state — staging the same id twice is a no-op, a different id replaces the
+staged one. The local state becomes `AgentState::Pending { old, new }` until the peer
+replies, then resolves to `Sync { new }`. The peer observes the change as
 `CommitResult.new_sender`.
 
 The **PQ leaves catch up on the next re-key**: `pq_rekey_begin(rotating: new_id)` —
