@@ -50,12 +50,19 @@ The receiving side of a published key package — no live client required.
   identity, the key package's private material, the consumed-remote set, the
   spawned-group forward table, and the processed-welcome ledger.
 - `client_id()`, `combiner_key_package()` — what to publish.
-- `receive(welcome, their_key_package, spawn_token) -> TwoMlsPqSession` — establish
-  from a remote initiator's welcome; rejects a re-delivered welcome (byte-identical,
-  via the processed-welcome ledger) and a repeat remote (both `DuplicateWelcome`),
-  and, for a single-use invitation whose key package has already been consumed, any
-  further welcome (`InvitationSpent`). `spawn_token` is an opaque, replay-stable
-  identifier for the initial frame, keying the forward table.
+- `receive(welcome, their_key_package, spawn_token, new_client_id) -> TwoMlsPqSession`
+  — establish from a remote initiator's welcome; rejects a re-delivered welcome
+  (byte-identical, via the processed-welcome ledger) and a repeat remote (both
+  `DuplicateWelcome`), and, for a single-use invitation whose key package has already
+  been consumed, any further welcome (`InvitationSpent`). `spawn_token` is an opaque,
+  replay-stable identifier for the initial frame, keying the forward table.
+  `new_client_id` is an optional **dedicated per-session principal**: when `Some`, the
+  spawned session's send group is created under a freshly-minted principal carrying
+  that ClientId (signing keys minted internally, as with `stage_rotation`), so the
+  initiator sees the dedicated principal from the very first frame — no rotation
+  commit, so nothing can displace the welcome staple. The receive-group join still
+  uses the invitation identity (the welcome was addressed to its key package), and
+  the session id still derives from the founding pair, so both sides agree on it.
 - `forward_group_id(spawn_token) -> Option<MlsGroupId>` — resolve a replayed
   initial frame to the spawned session's receive group (its classical message-half id).
 - `processed_welcome_group_id(welcome) -> Option<MlsGroupId>` — the content-keyed

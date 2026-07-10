@@ -478,12 +478,24 @@ impl TwoMlsPqInvitation {
     /// the forward table: a replayed frame decodes to the same token, `forward_group_id`
     /// resolves it to the spawned session, and `TwoMlsPqSession::forwarded`
     /// acknowledges it there.
+    ///
+    /// `new_client_id` is an optional dedicated per-session principal: when `Some`, the
+    /// spawned session's send group is created under a freshly-minted principal carrying
+    /// that ClientId (signing keys are session-owned, minted internally — the same
+    /// convention as `stage_rotation`), so the initiator sees the dedicated principal
+    /// from the very first frame and no rotation commit is needed. The receive-group
+    /// join still uses this invitation's identity — the welcome was addressed to its key
+    /// package. `None` keeps the session under the invitation identity.
     pub fn receive(
         &self,
         welcome: Vec<u8>,
         their_key_package: CombinerKeyPackage,
         spawn_token: Vec<u8>,
+        new_client_id: Option<Vec<u8>>,
     ) -> Result<Arc<TwoMlsPqSession>> {
+        // Mint the dedicated principal before anything is claimed or reserved, so a
+        // failure here needs no rollback.
+        let session_client = new_client_id.map(TwoMlsPqPrincipal::new).transpose()?;
         // Content-keyed idempotency, checked before anything is claimed or reserved: a
         // welcome these exact bytes already spawned a session from is a re-delivery, not
         // a fresh invite — the caller resolves it via `processed_welcome_group_id` and
@@ -534,7 +546,9 @@ impl TwoMlsPqInvitation {
         }
 
         match TwoMlsPqPrincipal::from_combiner_invitation(&snapshot)
-            .and_then(|client| TwoMlsPqSession::accept(client, welcome, their_key_package))
+            .and_then(|client| {
+                TwoMlsPqSession::accept_with(client, session_client, welcome, their_key_package)
+            })
             .and_then(|session| {
                 // Enter the spawn in the forward table and the welcome in the
                 // processed ledger; the acceptor always has a receive group straight
@@ -814,7 +828,7 @@ mod tests {
         let welcome_a = alice_session.test_initial_welcome();
 
         // Bob accepts through the invitation (no live client that generated the KP).
-        let bob_session = assert_ok!(bob_inv.receive(welcome_a, alice_kp, b"token".to_vec()));
+        let bob_session = assert_ok!(bob_inv.receive(welcome_a, alice_kp, b"token".to_vec(), None));
         let welcome_b = assert_some!(bob_session.pending_outbound());
         assert_ok!(alice_session.process_incoming(welcome_b));
 
@@ -841,10 +855,10 @@ mod tests {
         let welcome_a = alice_session.test_initial_welcome();
 
         // First receive consumes Alice's identity.
-        assert_ok!(bob_inv.receive(welcome_a.clone(), alice_kp.clone(), b"token".to_vec()));
+        assert_ok!(bob_inv.receive(welcome_a.clone(), alice_kp.clone(), b"token".to_vec(), None));
         // A second welcome from the same remote is rejected as a replay.
         assert_err!(
-            bob_inv.receive(welcome_a, alice_kp, b"token".to_vec()),
+            bob_inv.receive(welcome_a, alice_kp, b"token".to_vec(), None),
             crate::TwoMlsPqError::DuplicateWelcome
         );
     }
@@ -872,8 +886,12 @@ mod tests {
             .processed_welcome_group_id(welcome_a.clone())
             .is_none());
 
-        let bob_session =
-            assert_ok!(bob_inv.receive(welcome_a.clone(), alice_kp.clone(), b"token".to_vec()));
+        let bob_session = assert_ok!(bob_inv.receive(
+            welcome_a.clone(),
+            alice_kp.clone(),
+            b"token".to_vec(),
+            None
+        ));
 
         // A re-delivered welcome resolves — content-keyed, no host token convention —
         // to the spawned session's receive group…
@@ -885,7 +903,7 @@ mod tests {
         // …and `receive` itself rejects it up front, before claiming or reserving
         // anything.
         assert_err!(
-            bob_inv.receive(welcome_a.clone(), alice_kp, b"token2".to_vec()),
+            bob_inv.receive(welcome_a.clone(), alice_kp, b"token2".to_vec(), None),
             crate::TwoMlsPqError::DuplicateWelcome
         );
 
@@ -963,14 +981,14 @@ mod tests {
         let welcome_a = alice_session.test_initial_welcome();
 
         // Consume Alice on the live invitation.
-        assert_ok!(bob_inv.receive(welcome_a.clone(), alice_kp.clone(), b"token".to_vec()));
+        assert_ok!(bob_inv.receive(welcome_a.clone(), alice_kp.clone(), b"token".to_vec(), None));
 
         // Archive + restore; the consumed set must survive so the replay is still rejected.
         let restored = assert_ok!(super::TwoMlsPqInvitation::new(
             assert_ok!(bob_inv.archive())
         ));
         assert_err!(
-            restored.receive(welcome_a, alice_kp, b"token".to_vec()),
+            restored.receive(welcome_a, alice_kp, b"token".to_vec(), None),
             crate::TwoMlsPqError::DuplicateWelcome
         );
     }
@@ -1009,7 +1027,7 @@ mod tests {
         let token = b"spawn-token".to_vec();
         assert!(bob_inv.forward_group_id(token.clone()).is_none());
 
-        let bob_session = assert_ok!(bob_inv.receive(welcome_a, alice_kp, token.clone()));
+        let bob_session = assert_ok!(bob_inv.receive(welcome_a, alice_kp, token.clone(), None));
 
         // The replayed token now names the spawned session's receive group…
         let gid = assert_some!(bob_inv.forward_group_id(token.clone()));
@@ -1047,7 +1065,7 @@ mod tests {
         let welcome_a = alice_session.test_initial_welcome();
 
         let token = b"spawn-token".to_vec();
-        let bob_session = assert_ok!(bob_inv.receive(welcome_a, alice_kp, token.clone()));
+        let bob_session = assert_ok!(bob_inv.receive(welcome_a, alice_kp, token.clone(), None));
         let recv = assert_some!(bob_session.receive_group_id());
 
         let restored = assert_ok!(super::TwoMlsPqInvitation::new(
@@ -1120,11 +1138,16 @@ mod tests {
         // A failed establishment must NOT consume the remote — the reservation is rolled
         // back, so a valid retry from the same remote still succeeds.
         assert!(bob_inv
-            .receive(b"not-a-welcome".to_vec(), alice_kp.clone(), b"bad".to_vec())
+            .receive(
+                b"not-a-welcome".to_vec(),
+                alice_kp.clone(),
+                b"bad".to_vec(),
+                None
+            )
             .is_err());
         // …and the failed spawn must not enter the forward table either.
         assert!(bob_inv.forward_group_id(b"bad".to_vec()).is_none());
-        assert_ok!(bob_inv.receive(welcome_a, alice_kp, b"token".to_vec()));
+        assert_ok!(bob_inv.receive(welcome_a, alice_kp, b"token".to_vec(), None));
     }
 
     /// A single-use (not last-resort) invitation accepts exactly one welcome; afterwards its
@@ -1153,12 +1176,12 @@ mod tests {
             None,
         ));
         let welcome_a = alice_session.test_initial_welcome();
-        assert_ok!(bob_inv.receive(welcome_a, alice_kp, b"token-a".to_vec()));
+        assert_ok!(bob_inv.receive(welcome_a, alice_kp, b"token-a".to_vec(), None));
 
         let carol_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&carol), bob_kp, None));
         let welcome_c = carol_session.test_initial_welcome();
         assert_err!(
-            bob_inv.receive(welcome_c, carol_kp, b"token-c".to_vec()),
+            bob_inv.receive(welcome_c, carol_kp, b"token-c".to_vec(), None),
             crate::TwoMlsPqError::InvitationSpent
         );
     }
@@ -1189,7 +1212,7 @@ mod tests {
             None,
         ));
         let welcome_a = alice_session.test_initial_welcome();
-        assert_ok!(bob_inv.receive(welcome_a, alice_kp, b"token-a".to_vec()));
+        assert_ok!(bob_inv.receive(welcome_a, alice_kp, b"token-a".to_vec(), None));
 
         let restored = assert_ok!(super::TwoMlsPqInvitation::new(
             assert_ok!(bob_inv.archive())
@@ -1197,7 +1220,7 @@ mod tests {
         let carol_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&carol), bob_kp, None));
         let welcome_c = carol_session.test_initial_welcome();
         assert_err!(
-            restored.receive(welcome_c, carol_kp, b"token-c".to_vec()),
+            restored.receive(welcome_c, carol_kp, b"token-c".to_vec(), None),
             crate::TwoMlsPqError::InvitationSpent
         );
         assert_err!(
@@ -1228,10 +1251,15 @@ mod tests {
         let welcome_a = alice_session.test_initial_welcome();
 
         assert!(bob_inv
-            .receive(b"not-a-welcome".to_vec(), alice_kp.clone(), b"bad".to_vec())
+            .receive(
+                b"not-a-welcome".to_vec(),
+                alice_kp.clone(),
+                b"bad".to_vec(),
+                None
+            )
             .is_err());
         // The key package was restored, so a valid welcome still establishes.
-        assert_ok!(bob_inv.receive(welcome_a, alice_kp, b"token".to_vec()));
+        assert_ok!(bob_inv.receive(welcome_a, alice_kp, b"token".to_vec(), None));
     }
 
     /// The defining last-resort behavior: the same published key package accepts welcomes from
@@ -1260,11 +1288,11 @@ mod tests {
             None,
         ));
         let welcome_a = alice_session.test_initial_welcome();
-        assert_ok!(bob_inv.receive(welcome_a, alice_kp, b"token-a".to_vec()));
+        assert_ok!(bob_inv.receive(welcome_a, alice_kp, b"token-a".to_vec(), None));
 
         let carol_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&carol), bob_kp, None));
         let welcome_c = carol_session.test_initial_welcome();
-        assert_ok!(bob_inv.receive(welcome_c, carol_kp, b"token-c".to_vec()));
+        assert_ok!(bob_inv.receive(welcome_c, carol_kp, b"token-c".to_vec(), None));
     }
 
     /// The key-package store is only a serving interface: once the acceptor's join has

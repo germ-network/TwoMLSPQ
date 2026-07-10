@@ -63,7 +63,16 @@ pub fn version() -> String {
 // new `TwoMlsPqInvitation::open_initial(blob) -> InitialFrame { app_payload, welcome }`
 // opens it (decrypt-only, does not consume the invitation), replacing the raw
 // `hpke_open` + manual compose the host did before.
-const BINDING_CONTRACT_VERSION: u64 = 8;
+// v9 (2026-07-10): establishment-time principal selection — `TwoMlsPqInvitation::receive`
+// gains `new_client_id: Option<Vec<u8>>`: the spawned session's send group is created
+// under a freshly-minted dedicated principal (no rotation commit; the welcome's creator
+// leaf carries the dedicated id), replacing the receive → stage_rotation →
+// prepare_to_encrypt(Some(_)) first-frame dance that the peer_confirmed gate now
+// (correctly) refuses. Semantics: joining the peer's send group adopts the creator
+// leaf's ClientId as `their_principal_state`, and the frame whose welcome staple
+// performed the join surfaces it as `remote_commit.new_sender` when it differs from
+// the invitation identity.
+const BINDING_CONTRACT_VERSION: u64 = 9;
 
 /// See `BINDING_CONTRACT_VERSION`. Exported so the Swift layer can verify the
 /// binding it was generated with matches the binary it loaded.
