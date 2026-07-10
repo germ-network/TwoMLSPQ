@@ -268,10 +268,11 @@ pub struct HpkeSealed {
     pub ciphertext: Vec<u8>,
 }
 
-/// HPKE-seal `plaintext` to a published combiner key package's (classical) init key — the
-/// sender side of the initial routing-header pattern; the holder of the key package's
-/// invitation opens it with `TwoMlsPqInvitation::hpke_open`. `info` defaults to the key
-/// package's credential (the recipient's ClientId), matching `hpke_open`'s default.
+/// HPKE-seal `plaintext` to a published combiner key package's **PQ half** init key (spec
+/// §A.1: the envelope is sealed to the PQ EK in KP′, under the PQ suite) — the sender side
+/// of the initial routing-header pattern; the holder of the key package's invitation opens
+/// it with `TwoMlsPqInvitation::hpke_open`. `info` defaults to the key package's credential
+/// (the recipient's ClientId), matching `hpke_open`'s default.
 #[uniffi::export]
 pub fn hpke_seal_to_key_package(
     key_package: CombinerKeyPackage,
@@ -510,12 +511,13 @@ impl TwoMlsPqInvitation {
             })
     }
 
-    /// HPKE-decrypt data sealed to this invitation's (classical) key package init key — the
-    /// initial routing-header pattern from classical TwoMLS. `info` defaults to the
-    /// ClientId; `kem_output` and `ciphertext` are the two components of the HPKE ciphertext
-    /// (kept separate so this stays agnostic to any outer wire framing). Fails with
-    /// `InvitationSpent` once a single-use invitation has been consumed — its captured PQ
-    /// key-package material, and thus the init key this opens with, is then gone.
+    /// HPKE-decrypt data sealed to this invitation's **PQ half** key package init key (spec
+    /// §A.1; counterpart of `hpke_seal_to_key_package`) — the initial routing-header pattern
+    /// inherited from classical TwoMLS, which sealed to its classical init key. `info`
+    /// defaults to the ClientId; `kem_output` and `ciphertext` are the two components of the
+    /// HPKE ciphertext (kept separate so this stays agnostic to any outer wire framing).
+    /// Fails with `InvitationSpent` once a single-use invitation has been consumed — its
+    /// captured PQ key-package material, and thus the init key this opens with, is then gone.
     pub fn hpke_open(
         &self,
         kem_output: Vec<u8>,
