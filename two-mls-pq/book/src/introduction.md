@@ -39,5 +39,6 @@ hybrid (classical + post-quantum) guarantee comes from this two-group binding, n
 from a hybrid cipher suite.
 
 The rest of this book covers the cipher suites, the session lifecycle, the wire
-format, the PSK binding contract, and the public API, finishing with an end-to-end
-walkthrough and how to run the benchmarks.
+format, header encryption (the outer seal that hides frame metadata), the PSK
+binding contract, and the public API, finishing with an end-to-end walkthrough and
+how to run the benchmarks.

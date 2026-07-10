@@ -94,6 +94,21 @@ struct SessionInner {
     /// Keyed by classical epoch; the window follows mls-rs's own epoch retention (see
     /// `record_listen_rendezvous`) — current epoch + the prior epochs mls-rs retains.
     listen_rendezvous: BTreeMap<u64, Vec<u8>>,
+    /// Header-encryption receive window: `header_key(send_group.classical)` per retained
+    /// classical epoch of MY send group. The peer seals frames to me under my send group
+    /// (their recv group) as they last applied it, so opening trial-decrypts over this
+    /// window (a frame that crossed one of my commits opens with the older entry).
+    /// Captured live-at-epoch in lockstep with `listen_rendezvous` and retained by the
+    /// same rule, so a frame that can still be routed can still be opened. Session-owned,
+    /// so it rides the archive.
+    recv_header_keys: BTreeMap<u64, Vec<u8>>,
+    /// The PQ side-band's header receive window: `header_key_pq(send_group.pq, e)` per
+    /// recent `pq_epoch` of my own send-PQ group (the peer seals side-band frames under
+    /// their recv-PQ, which is my send-PQ). Separate from `recv_header_keys` so the
+    /// side-band's outer seal tracks the PQ ratchet's cadence rather than the async
+    /// classical one. Keyed by `pq_epoch`; retained "keep newest `PQ_HEADER_WINDOW`" —
+    /// session-owned, with no rendezvous or mls-rs coupling (PQ keeps no rendezvous).
+    recv_header_keys_pq: BTreeMap<u64, Vec<u8>>,
     /// The group-state storage backing the send group's classical half, captured from
     /// the client that CONSTRUCTED the session. The retention probe must read this
     /// handle, not one reached through `self.client`: a Phase 8 rotation replaces
@@ -224,6 +239,36 @@ pub fn pq_frame_kind(tag: u8) -> Option<PqFrameKind> {
     })
 }
 
+/// What `open_incoming` found once the header seal was removed — the routing signal the
+/// plaintext tag byte carried before header encryption hid it. The host dispatches on
+/// this: `Message` to `process_incoming`, `PqSideBand` to the named `pq_*` entry point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum OpenedFrameKind {
+    /// A standalone welcome (`0x01`) or message frame (`0x03`) — route the opened frame
+    /// to `process_incoming`, which handles both by their now-decrypted leading tag.
+    Message,
+    /// A PQ side-band frame — route the opened frame to the `pq_*` method named by `kind`.
+    PqSideBand { kind: PqFrameKind },
+}
+
+/// The result of removing a frame's header seal: the plaintext frame plus its routing
+/// kind. The frame is the exact bytes the pre-header-encryption entry points expect.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct OpenedFrame {
+    pub kind: OpenedFrameKind,
+    pub frame: Vec<u8>,
+}
+
+/// Classify an opened (plaintext) frame by its leading tag. `None` for any byte that is
+/// neither a message-path nor a side-band tag — a successfully-decrypted-but-unrecognized
+/// frame, treated as malformed.
+fn opened_frame_kind(tag: u8) -> Option<OpenedFrameKind> {
+    match tag {
+        APQ_TAG | MESSAGE_FRAME_TAG => Some(OpenedFrameKind::Message),
+        other => pq_frame_kind(other).map(|kind| OpenedFrameKind::PqSideBand { kind }),
+    }
+}
+
 #[cfg(test)]
 mod pq_frame_kind_tests {
     use super::*;
@@ -292,7 +337,12 @@ enum PqInflight {
 // The header carries the concrete `ApqCipherSuite` pair (4 bytes, classical then pq,
 // big-endian) in place of the old PQ-mode byte: the suite is a stored session property, and a
 // restored archive whose pair differs from this build's pinned suite fails loudly.
-const SESSION_ARCHIVE_VERSION: u8 = 2;
+// v3 (header encryption): the archive gained the per-epoch header receive window
+// (`recv_header_keys`), so a restored session can still open frames sealed under a recent
+// send-group epoch.
+// v4 (PQ-family side-band keys): added the PQ header window (`recv_header_keys_pq`), so a
+// restored session opens PQ side-band frames sealed under a recent pq_epoch too.
+const SESSION_ARCHIVE_VERSION: u8 = 4;
 
 // In its own module because the derive-generated impls reference the std `Result`, which
 // the crate-local `Result` alias would shadow (same pattern as `invitation::wire`).
@@ -334,6 +384,15 @@ mod archive_wire {
         pub(super) epoch: u64,
         #[mls_codec(with = "mls_rs_codec::byte_vec")]
         pub(super) addr: Vec<u8>,
+    }
+
+    /// One per-epoch header receive key (header-encryption exporter of the send group,
+    /// captured at its live epoch alongside the listen address).
+    #[derive(MlsSize, MlsEncode, MlsDecode)]
+    pub(super) struct HeaderKeyEntry {
+        pub(super) epoch: u64,
+        #[mls_codec(with = "mls_rs_codec::byte_vec")]
+        pub(super) key: Vec<u8>,
     }
 
     /// `PrincipalState` on the wire: `Sync { client_id: active }` when `pending_new` is
@@ -442,6 +501,8 @@ mod archive_wire {
         pub(super) send_psk_ledger: Vec<PskEntry>,
         pub(super) retired_send_psks: Vec<ExternalPskId>,
         pub(super) listen_rendezvous: Vec<ListenEntry>,
+        pub(super) recv_header_keys: Vec<HeaderKeyEntry>,
+        pub(super) recv_header_keys_pq: Vec<HeaderKeyEntry>,
         pub(super) pending_outbound: Option<Vec<u8>>,
         pub(super) pending_proposal_hash: Option<Vec<u8>>,
         /// The commit-or-welcome staple every outbound frame re-sends. Never empty on a
@@ -678,19 +739,27 @@ impl TwoMlsPqSession {
     /// (tag 0x05). The decapsulation key is held until the ciphertext arrives.
     pub fn pq_ratchet_begin(&self) -> Result<Vec<u8>> {
         let mut inner = self.lock();
+        // A.3 is post-A.4 (both PQ halves live), so the recv group always exists here —
+        // guard explicitly, both because the ratchet is meaningless pre-establishment and
+        // because the header seal below needs the recv group's key.
+        if inner.recv_group.is_none() {
+            return Err(TwoMlsPqError::SessionNotEstablished);
+        }
         if inner.pq_inflight.is_some() {
             return Err(TwoMlsPqError::SessionNotReady);
         }
         let eph = apq::pq_ratchet::generate_ephemeral(&providers::pq_kem()?)?;
         let mut msg = vec![PQ_EK_TAG];
         msg.extend_from_slice(&eph.encapsulation_key());
+        let sealed = inner.seal_side_band(&msg)?;
         inner.pq_inflight = Some(PqInflight::Initiating(eph));
-        Ok(msg)
+        Ok(sealed)
     }
 
     /// Responder — encapsulate a fresh secret to the initiator's EK, hold it, and return the
     /// ciphertext message (tag 0x07).
     pub fn pq_ratchet_respond(&self, ek_msg: Vec<u8>) -> Result<()> {
+        let ek_msg = self.lock().open_or_raw(ek_msg);
         let (&tag, ek) = ek_msg.split_first().ok_or(TwoMlsPqError::Mls)?;
         if tag != PQ_EK_TAG {
             return Err(TwoMlsPqError::Mls);
@@ -711,6 +780,7 @@ impl TwoMlsPqSession {
     /// commit, bind the exported apq_psk into the classical half, and staple an app message.
     /// Returns the bind frame (tag 0x09).
     pub fn pq_ratchet_bind(&self, ct_msg: Vec<u8>, app: Vec<u8>) -> Result<()> {
+        let ct_msg = self.lock().open_or_raw(ct_msg);
         let (&tag, ct) = ct_msg.split_first().ok_or(TwoMlsPqError::Mls)?;
         if tag != PQ_CT_TAG {
             return Err(TwoMlsPqError::Mls);
@@ -779,14 +849,17 @@ impl TwoMlsPqSession {
         inner.pq_turn_mine = false;
         inner.pending_pq_outbound = Some(encode_pq_bind(pq_commit, cl_commit, app_ct));
         // The bind committed classically in our send group — capture the new
-        // epoch's listen address.
+        // epoch's listen address — and advanced our send-PQ's pq_epoch — capture its
+        // new header key.
         inner.record_listen_rendezvous()?;
+        inner.record_pq_header_key()?;
         Ok(())
     }
 
     /// Responder — apply the stapled bind: register the held secret, apply the PQ partial commit
     /// and classical commit on the recv group, and return the decrypted app message.
     pub fn pq_ratchet_apply(&self, bind_msg: Vec<u8>) -> Result<Vec<u8>> {
+        let bind_msg = self.lock().open_or_raw(bind_msg);
         let (pq_commit, cl_commit, app_ct) = decode_pq_bind(&bind_msg)?;
         let mut inner = self.lock();
         let s = match inner.pq_inflight.take() {
@@ -883,8 +956,9 @@ impl TwoMlsPqSession {
         };
         let mut msg = vec![PQ_REKEY_UPD_TAG];
         msg.extend_from_slice(&proposal.to_bytes().map_err(|_| TwoMlsPqError::Mls)?);
+        let sealed = inner.seal_side_band(&msg)?;
         inner.pq_inflight = Some(PqInflight::RekeyInitiated { rotating });
-        Ok(msg)
+        Ok(sealed)
     }
 
     /// A.5 responder — commit the initiator's Upd' on our own send-PQ with an updatePath
@@ -899,6 +973,7 @@ impl TwoMlsPqSession {
     /// authoritative identity-rotation channel — this reports the PQ half catching up
     /// and does not touch the session's principal state.
     pub fn pq_rekey_respond(&self, upd_msg: Vec<u8>) -> Result<Option<ClientId>> {
+        let upd_msg = self.lock().open_or_raw(upd_msg);
         let (&tag, proposal_bytes) = upd_msg.split_first().ok_or(TwoMlsPqError::Mls)?;
         if tag != PQ_REKEY_UPD_TAG {
             return Err(TwoMlsPqError::Mls);
@@ -967,6 +1042,8 @@ impl TwoMlsPqSession {
         };
         inner.pq_inflight = Some(PqInflight::RekeyResponded);
         inner.pending_pq_outbound = Some(encode_pq_rekey_commit(commit_bytes, counter));
+        // Our send-PQ's pq_epoch advanced (updatePath commit) — capture its new key.
+        inner.record_pq_header_key()?;
         Ok(rotated)
     }
 
@@ -977,6 +1054,7 @@ impl TwoMlsPqSession {
     /// responder (empty counter slot), apply the final commit, take the turn, and return
     /// `false` — the operation is complete.
     pub fn pq_rekey_apply(&self, msg: Vec<u8>) -> Result<bool> {
+        let msg = self.lock().open_or_raw(msg);
         let (commit_bytes, counter_bytes) = decode_pq_rekey_commit(&msg)?;
         let mut inner = self.lock();
         // Reject unsolicited commits before parsing or registering anything.
@@ -1083,6 +1161,8 @@ impl TwoMlsPqSession {
                 // Our operation completes once the peer applies; the turn passes.
                 inner.pq_turn_mine = false;
                 inner.pending_pq_outbound = Some(encode_pq_rekey_commit(commit2, Vec::new()));
+                // Our send-PQ's pq_epoch advanced (the counter-Upd' commit) — capture it.
+                inner.record_pq_header_key()?;
                 Ok(true)
             }
             Some(PqInflight::RekeyResponded) => {
@@ -1162,6 +1242,62 @@ fn rendezvous_secret(group: &crate::key_package_store::MlsGroup) -> Result<Vec<u
         .map_err(|_| TwoMlsPqError::Mls)
 }
 
+// Header encryption: the outer symmetric seal that turns every rendezvous-channel frame
+// into one opaque blob (no plaintext tag, group id, epoch, or Welcome metadata). The key
+// is an exporter of a group's half under a label distinct from the rendezvous and PSK
+// exporters, so the derivations never collide. Both parties compute the same key on the
+// same group at the same epoch; outsiders cannot.
+//
+// Two key families, one per stream, so each header key tracks the clock of the frames it
+// protects (the classical and PQ ratchets run on independent, async cadences):
+//   * message-path frames (0x01/0x03) seal under the CLASSICAL half's exporter, keyed by
+//     the classical epoch — `header_key` / `recv_header_keys`;
+//   * PQ side-band frames (0x05–0x11) seal under the PQ half's exporter, keyed by
+//     `pq_epoch` — `header_key_pq` / `recv_header_keys_pq`.
+// The one exception is the pre-A.4 BOOTSTRAP_KP, whose recv-PQ group does not exist yet;
+// it falls back to the classical seal (see `SessionInner::seal_side_band`).
+//
+// The two families only choose which group HALF derives the key; the AEAD that consumes
+// it is a single configured choice (`providers::HEADER_AEAD_SUITE`), independent of the
+// group suites, and the key length is that AEAD's key size (`header_key_len`) — so the
+// header seal is crypto-agile as its own layer.
+const HEADER_KEY_LABEL: &[u8] = b"germ.network.twomlspq.headerKey.v1";
+const HEADER_KEY_PQ_LABEL: &[u8] = b"germ.network.twomlspq.headerKey.pq.v1";
+// PQ header window depth: the side-band is turn-based with one op in flight, so `pq_epoch`
+// advances slowly; a few recent keys cover any lag. Session-owned secrets, so this is a
+// plain "keep newest N", not tied to mls-rs retention or the (classical-only) rendezvous.
+const PQ_HEADER_WINDOW: usize = 4;
+
+/// The header key length: the key size of the configured header AEAD
+/// (`providers::HEADER_AEAD_SUITE`), so the exporter output always matches whatever cipher
+/// seals the frame — no hardcoded assumption of a 32-byte (ChaCha) key.
+fn header_key_len() -> Result<usize> {
+    use mls_rs::CipherSuiteProvider;
+    Ok(providers::header_aead_suite()?.aead_key_size())
+}
+
+/// Derive the message-path header key for a group at its current classical epoch:
+/// `exportSecret(label, group_id, header_key_len())` on the classical half. Context = the
+/// group id (domain separation on top of the group-specific exporter, matching the
+/// classical stack's convention).
+fn header_key(group: &crate::key_package_store::MlsGroup) -> Result<Vec<u8>> {
+    group
+        .export_secret(HEADER_KEY_LABEL, group.group_id(), header_key_len()?)
+        .map(|secret| secret.as_bytes().to_vec())
+        .map_err(|_| TwoMlsPqError::Mls)
+}
+
+/// Derive the PQ side-band header key for a group at its current `pq_epoch`:
+/// `exportSecret(pq_label, group_id, header_key_len())` on the PQ half. Same exporter shape
+/// as `header_key` (both halves are `Group<_>`), a distinct label, and keyed by the PQ
+/// clock so the side-band's outer seal rotates with the PQ ratchet, not classical traffic.
+fn header_key_pq(group: &crate::key_package_store::PqMlsGroup) -> Result<Vec<u8>> {
+    group
+        .export_secret(HEADER_KEY_PQ_LABEL, group.group_id(), header_key_len()?)
+        .map(|secret| secret.as_bytes().to_vec())
+        .map_err(|_| TwoMlsPqError::Mls)
+}
+
 /// The APQ epoch pair for a combiner group: the PQ side-band epoch (0 while that
 /// half is deferred) and the classical message epoch. Single home for the
 /// pq-zero-when-deferred rule, shared by `epochs()` and `encrypt()`.
@@ -1211,7 +1347,12 @@ impl SessionInner {
             return Ok(());
         }
         let secret = rendezvous_secret(group)?;
+        // The header receive key for this epoch is captured in lockstep with the listen
+        // address: both are send-group exporters only derivable while this epoch is live,
+        // and retaining them together keeps "routable ⟺ openable" exact.
+        let header = header_key(group)?;
         self.listen_rendezvous.insert(epoch, secret);
+        self.recv_header_keys.insert(epoch, header);
 
         send.message_group_mut()
             .write_to_storage()
@@ -1222,9 +1363,126 @@ impl SessionInner {
         // the new principal's client with a fresh, empty storage, and probing it would
         // prune every prior epoch's listen address (dropping in-flight traffic).
         let storage = &self.send_group_storage;
-        self.listen_rendezvous
-            .retain(|&e, _| e == epoch || matches!(storage.epoch(&group_id, e), Ok(Some(_))));
+        let retain = |e: u64| e == epoch || matches!(storage.epoch(&group_id, e), Ok(Some(_)));
+        self.listen_rendezvous.retain(|&e, _| retain(e));
+        self.recv_header_keys.retain(|&e, _| retain(e));
         Ok(())
+    }
+
+    /// Capture my send-PQ group's header key at its current `pq_epoch` into the PQ
+    /// receive window. Idempotent per `pq_epoch`; a no-op until the send-PQ half exists
+    /// (deferred on the acceptor until the A.4 bootstrap). Called wherever the send-PQ
+    /// group is created or its `pq_epoch` advances — group creation (`initiate`,
+    /// `pq_bootstrap_respond`), the A.3 bind (`pq_ratchet_bind`), and the A.5 commits
+    /// (`pq_rekey_respond` / `pq_rekey_apply`). Retention is a plain keep-newest window
+    /// (these are session-owned secrets; the PQ side-band has no rendezvous and no
+    /// mls-rs-retention story to follow).
+    fn record_pq_header_key(&mut self) -> Result<()> {
+        let Some(send) = self.send_group.as_ref() else {
+            return Ok(());
+        };
+        let Some(send_pq) = send.pq.as_ref() else {
+            return Ok(());
+        };
+        let epoch = send_pq.current_epoch();
+        if self.recv_header_keys_pq.contains_key(&epoch) {
+            return Ok(());
+        }
+        self.recv_header_keys_pq
+            .insert(epoch, header_key_pq(send_pq)?);
+        // Keep only the newest PQ_HEADER_WINDOW epochs.
+        while self.recv_header_keys_pq.len() > PQ_HEADER_WINDOW {
+            if let Some(&oldest) = self.recv_header_keys_pq.keys().next() {
+                self.recv_header_keys_pq.remove(&oldest);
+            }
+        }
+        Ok(())
+    }
+
+    /// Seal an outbound frame under the header key of MY recv group (the peer's send
+    /// group) at its current classical epoch: `[random nonce][AEAD ct+tag]`, empty AAD.
+    /// The peer opens it from its own send-group window (`recv_header_keys`). Requires a
+    /// recv group — the one pre-establishment frame (the initiator's initial welcome on
+    /// the invitation channel) has no symmetric key and is not sealed here.
+    fn seal(&self, frame: &[u8]) -> Result<Vec<u8>> {
+        let recv = self
+            .recv_group
+            .as_ref()
+            .ok_or(TwoMlsPqError::SessionNotEstablished)?;
+        self.seal_with(&header_key(&recv.classical)?, frame)
+    }
+
+    /// Seal a PQ side-band frame under the PQ family — `header_key_pq(recv_group.pq)` at
+    /// its current `pq_epoch`, the peer opening it from its own send-PQ window. Falls back
+    /// to the classical `seal` when the recv-PQ group does not exist yet: the only such
+    /// frame is the pre-A.4 `BOOTSTRAP_KP` (its recv-PQ is the group the bootstrap is
+    /// creating), a one-time establishment frame whose cadence is irrelevant, and the
+    /// receiver opens it from its classical window via the dual-window `try_open`.
+    fn seal_side_band(&self, frame: &[u8]) -> Result<Vec<u8>> {
+        let recv = self
+            .recv_group
+            .as_ref()
+            .ok_or(TwoMlsPqError::SessionNotEstablished)?;
+        match recv.pq.as_ref() {
+            Some(pq) => self.seal_with(&header_key_pq(pq)?, frame),
+            None => self.seal(frame),
+        }
+    }
+
+    /// Seal `frame` under `key`: `[random nonce][AEAD ct+tag]`, empty AAD.
+    fn seal_with(&self, key: &[u8], frame: &[u8]) -> Result<Vec<u8>> {
+        use mls_rs::CipherSuiteProvider;
+        let cs = providers::header_aead_suite()?;
+        let mut out = vec![0u8; cs.aead_nonce_size()];
+        cs.random_bytes(&mut out).map_err(|_| TwoMlsPqError::Mls)?;
+        let ct = cs
+            .aead_seal(key, frame, None, &out)
+            .map_err(|_| TwoMlsPqError::Mls)?;
+        out.extend_from_slice(&ct);
+        Ok(out)
+    }
+
+    /// Remove the header seal if this window can, else return the blob unchanged. Lets the
+    /// receive entry points (`process_incoming`, the `pq_*` receivers) accept either the
+    /// sealed blob straight off the wire OR the already-opened `frame` a host took from
+    /// `open_incoming` — an honestly-sealed frame always opens, an already-plaintext frame
+    /// fails AEAD auth under every key and passes through. (This is a receiver convenience;
+    /// the metadata-hiding property is a sender guarantee — every outbound frame is sealed
+    /// — so accepting an opened frame here downgrades nothing an observer can see.)
+    fn open_or_raw(&self, blob: Vec<u8>) -> Vec<u8> {
+        match self.try_open(&blob) {
+            Ok(Some(frame)) => frame,
+            _ => blob,
+        }
+    }
+
+    /// Trial-decrypt an inbound blob against the header receive window, newest epoch
+    /// first (the common case is the newest or second-newest key). `None` if no window
+    /// key opens it — an out-of-window or garbage frame, indistinguishable by
+    /// construction. Every candidate key is an honestly-derived secret, so trial
+    /// decryption with a non-committing AEAD is safe here (no attacker-chosen keys, so no
+    /// partitioning oracle).
+    fn try_open(&self, blob: &[u8]) -> Result<Option<Vec<u8>>> {
+        use mls_rs::CipherSuiteProvider;
+        let cs = providers::header_aead_suite()?;
+        let nonce_size = cs.aead_nonce_size();
+        if blob.len() < nonce_size {
+            return Ok(None);
+        }
+        let (nonce, ct) = blob.split_at(nonce_size);
+        // Both families use the same AEAD; only the key set differs. A message frame
+        // authenticates only under a classical-window key and a side-band frame only
+        // under a PQ-window key (the pre-A.4 BOOTSTRAP_KP under classical), so trying
+        // both windows resolves either without ambiguity. Newest epoch first in each.
+        let windows = [&self.recv_header_keys, &self.recv_header_keys_pq];
+        for keys in windows {
+            for key in keys.values().rev() {
+                if let Ok(pt) = cs.aead_open(key, ct, None, nonce) {
+                    return Ok(Some(pt.to_vec()));
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// Transition `my_state` from `Pending { old, new }` to `Sync { new }`.
@@ -1620,6 +1878,8 @@ fn build_session(
             send_psk_ledger: VecDeque::new(),
             retired_send_psks: Vec::new(),
             listen_rendezvous: BTreeMap::new(),
+            recv_header_keys: BTreeMap::new(),
+            recv_header_keys_pq: BTreeMap::new(),
             send_group_storage,
             psk_stores,
             psk_stores_from,
@@ -1683,16 +1943,35 @@ impl TwoMlsPqSession {
     pub(crate) fn set_spawn_token(&self, token: Vec<u8>) {
         self.lock().spawn_token = Some(token);
     }
+
+    /// Test-only: the plaintext initial welcome — the initiator's `current_staple` before
+    /// its first commit, which is exactly the plaintext `APQWelcome_A`. Production delivers
+    /// this only inside the §A.1 envelope (`pending_outbound` → `TwoMlsPqInvitation::
+    /// open_initial`); tests that drive `accept`/`receive` directly use this to skip the
+    /// envelope round-trip. The real envelope path is exercised by `establish_sessions` and
+    /// the dedicated envelope tests.
+    #[cfg(test)]
+    pub(crate) fn test_initial_welcome(&self) -> Vec<u8> {
+        self.lock().current_staple.clone()
+    }
 }
 
 #[uniffi::export]
 impl TwoMlsPqSession {
     /// Create a session as the initiating party targeting `their_key_package`.
-    /// Retrieve the outbound APQWelcome bytes via `pending_outbound`.
+    ///
+    /// `app_payload` is the host's opaque app-layer welcome (identity introduction, signed
+    /// keys, …), or `None`. It is composed with the MLS welcome and HPKE-sealed to the
+    /// peer's KP′ inside the library, so `pending_outbound()` returns one opaque envelope —
+    /// the first frame's metadata (including the app-layer welcome that identifies the
+    /// initiator) is hidden without the host having to compose the envelope itself. The
+    /// peer recovers both halves with `TwoMlsPqInvitation::open_initial`, then joins with
+    /// `receive`.
     #[uniffi::constructor]
     pub fn initiate(
         client: Arc<TwoMlsPqPrincipal>,
         their_key_package: CombinerKeyPackage,
+        app_payload: Option<Vec<u8>>,
     ) -> Result<Arc<Self>> {
         validate_combiner_kp(client.combiner().cipher_suite(), &their_key_package)?;
         let their_parsed = parse_mls_key_package(their_key_package.classical.clone())?;
@@ -1705,20 +1984,38 @@ impl TwoMlsPqSession {
             client.combiner(),
         )?;
 
+        // The first frame has no symmetric key yet, so it is not header-sealed; instead the
+        // library HPKE-envelopes `[app_payload ∥ APQWelcome_A]` to the peer's KP′ (§A.1), and
+        // `pending_outbound` returns that opaque envelope. The peer opens it with
+        // `TwoMlsPqInvitation::open_initial`.
+        let envelope = crate::key_packages::seal_initial_envelope(
+            &their_key_package,
+            app_payload.as_deref(),
+            &apq_welcome,
+        )?;
+
         let session = build_session(
             client,
             Some(send_group),
             None,
+            // `build_session` seeds `current_staple` from this — it MUST be the plaintext
+            // `APQWelcome_A` (the message-frame staple form, first byte 0x01, that the peer
+            // idempotently skips), not the sealed envelope. `pending_outbound` is replaced
+            // with the envelope just below.
             Some(apq_welcome),
             session_id,
             their_id,
             true,
             None,
         );
+        session.lock().pending_outbound = Some(envelope);
         // Seed the PSK ledger with the send group's establishment epoch, and capture
-        // the establishment epoch's listen address.
+        // the establishment epoch's listen address (and the send-PQ header key when the
+        // send-PQ half exists — the initiator's does at `initiate`; the acceptor's is
+        // deferred to the A.4 bootstrap, so this is a no-op there).
         session.lock().remember_send_psk()?;
         session.lock().record_listen_rendezvous()?;
+        session.lock().record_pq_header_key()?;
         Ok(session)
     }
 
@@ -1786,9 +2083,12 @@ impl TwoMlsPqSession {
             Some(crate::sha256(&welcome)),
         );
         // Seed the PSK ledger with the send group's establishment epoch, and capture
-        // the establishment epoch's listen address.
+        // the establishment epoch's listen address (and the send-PQ header key when the
+        // send-PQ half exists — the initiator's does at `initiate`; the acceptor's is
+        // deferred to the A.4 bootstrap, so this is a no-op there).
         session.lock().remember_send_psk()?;
         session.lock().record_listen_rendezvous()?;
+        session.lock().record_pq_header_key()?;
         Ok(session)
     }
 
@@ -1849,6 +2149,15 @@ impl TwoMlsPqSession {
             .listen_rendezvous
             .iter()
             .any(|e| e.addr.len() != RENDEZVOUS_LEN)
+        {
+            return Err(TwoMlsPqError::ArchiveInvalid);
+        }
+        let hk_len = header_key_len()?;
+        if wire
+            .recv_header_keys
+            .iter()
+            .chain(wire.recv_header_keys_pq.iter())
+            .any(|e| e.key.len() != hk_len)
         {
             return Err(TwoMlsPqError::ArchiveInvalid);
         }
@@ -1934,6 +2243,16 @@ impl TwoMlsPqSession {
                     .into_iter()
                     .map(|entry| (entry.epoch, entry.addr))
                     .collect(),
+                recv_header_keys: wire
+                    .recv_header_keys
+                    .into_iter()
+                    .map(|entry| (entry.epoch, entry.key))
+                    .collect(),
+                recv_header_keys_pq: wire
+                    .recv_header_keys_pq
+                    .into_iter()
+                    .map(|entry| (entry.epoch, entry.key))
+                    .collect(),
                 send_group_storage,
                 psk_stores,
                 psk_stores_from,
@@ -1945,7 +2264,18 @@ impl TwoMlsPqSession {
     /// Welcome bytes to deliver to the remote party to complete group establishment.
     /// Returns `None` once consumed or when both groups are live.
     pub fn pending_outbound(&self) -> Option<Vec<u8>> {
-        self.lock().pending_outbound.take()
+        let mut inner = self.lock();
+        let frame = inner.pending_outbound.take()?;
+        // The acceptor's return welcome (recv group already exists) is sealed like any
+        // rendezvous-channel frame — the peer opens it from its send-group window. The
+        // initiator's initial welcome (no recv group yet) travels the invitation channel
+        // instead and is delivered as-is; the host envelopes it via
+        // `hpke_seal_to_key_package`, and the invitation opens it before `receive`.
+        if inner.recv_group.is_some() {
+            inner.seal(&frame).ok()
+        } else {
+            Some(frame)
+        }
     }
 
     /// True once both directions' PQ halves are live (post-A.4 bootstrap).
@@ -1967,7 +2297,12 @@ impl TwoMlsPqSession {
     /// (`pq_ratchet_respond` / `pq_ratchet_bind` / `pq_bootstrap_respond`). Single slot,
     /// single delivery: those operations refuse to start while a frame is waiting.
     pub fn pq_take_pending_outbound(&self) -> Option<Vec<u8>> {
-        self.lock().pending_pq_outbound.take()
+        let mut inner = self.lock();
+        let frame = inner.pending_pq_outbound.take()?;
+        // Side-band frames seal under the PQ family (the responder is post-establishment,
+        // so its recv-PQ group exists); the classical fallback in `seal_side_band` is
+        // never hit here.
+        inner.seal_side_band(&frame).ok()
     }
 
     /// The send group's APQ epoch pair (PQ side-band, classical message group).
@@ -2013,7 +2348,10 @@ impl TwoMlsPqSession {
         let kp = inner.client.combiner().generate_pq_key_package()?;
         let mut msg = vec![PQ_BOOTSTRAP_KP_TAG];
         msg.extend_from_slice(&kp);
-        Ok(msg)
+        // Side-band frame. Pre-A.4 our recv-PQ (Group_B.pq) is the group the bootstrap
+        // is creating, so `seal_side_band` falls back to the classical seal for exactly
+        // this frame; the peer opens it from its classical window.
+        inner.seal_side_band(&msg)
     }
 
     /// A.4 responder — stand up the deferred send-group PQ half around the peer's key
@@ -2022,6 +2360,7 @@ impl TwoMlsPqSession {
     /// the classical group at the next A.3 bind. Taking this turn makes the next
     /// operation ours.
     pub fn pq_bootstrap_respond(&self, kp_msg: Vec<u8>) -> Result<()> {
+        let kp_msg = self.lock().open_or_raw(kp_msg);
         let (&tag, kp) = kp_msg.split_first().ok_or(TwoMlsPqError::Mls)?;
         if tag != PQ_BOOTSTRAP_KP_TAG {
             return Err(TwoMlsPqError::Mls);
@@ -2054,6 +2393,9 @@ impl TwoMlsPqSession {
         };
         inner.pq_turn_mine = true;
         inner.pending_pq_outbound = Some(frame);
+        // Our send-PQ half now exists (Group_B.pq) — capture its header key so we can
+        // open side-band frames the peer seals to it.
+        inner.record_pq_header_key()?;
         Ok(())
     }
 
@@ -2062,6 +2404,7 @@ impl TwoMlsPqSession {
     /// PQ-groups-only, like the responder side: no classical commit is applied here.
     /// The turn passes to the peer.
     pub fn pq_bootstrap_apply(&self, bind_msg: Vec<u8>) -> Result<()> {
+        let bind_msg = self.lock().open_or_raw(bind_msg);
         let pq_welcome = decode_bootstrap_bind(&bind_msg)?;
         let mut inner = self.lock();
         // Validate the peer's PQ welcome suite before joining — an early, clear
@@ -2183,7 +2526,11 @@ impl TwoMlsPqSession {
         if inner.current_staple.is_empty() {
             return Err(TwoMlsPqError::SessionNotReady);
         }
-        let cipher_text = encode_message_frame(&inner.current_staple, proposal, app_bytes);
+        let frame = encode_message_frame(&inner.current_staple, proposal, app_bytes);
+        // Header encryption: seal the whole frame into one opaque blob before it leaves
+        // the library. `encrypt` only runs post-establishment (prepare needs the recv
+        // group), so the seal key is always available.
+        let cipher_text = inner.seal(&frame)?;
 
         let sender = inner.my_state.client_id();
         let recipient = inner.their_state.client_id();
@@ -2194,6 +2541,37 @@ impl TwoMlsPqSession {
             recipient,
             epochs,
         })
+    }
+
+    /// Remove the header seal from an inbound rendezvous-channel blob, returning the
+    /// plaintext frame and its routing kind, or `None` if no key in the header receive
+    /// window opens it (an out-of-window or garbage blob — indistinguishable by
+    /// construction, the same "unknown, drop it" signal the reconnect path assigns).
+    ///
+    /// This is the single entry point for frames that arrive on a rendezvous address. The
+    /// host dispatches on `OpenedFrame.kind`: `Message` → `process_incoming(frame)`;
+    /// `PqSideBand { kind }` → the `pq_*` method that `kind` names. The old plaintext
+    /// entry points keep their signatures and now take the opened `frame`.
+    ///
+    /// (The initiator's initial welcome does NOT come through here — it arrives on the
+    /// invitation channel and goes to `TwoMlsPqInvitation::receive`.)
+    ///
+    /// Observability: an opened frame whose leading tag is unrecognized is
+    /// `DecryptionFailed`, but a blob no window key opens is a silent `None`. Desyncs that
+    /// mls-rs would once have surfaced loudly can therefore read as `None` here; a host
+    /// tracking liveness should treat a run of `None`s on a live session as a reconnect
+    /// signal.
+    pub fn open_incoming(&self, blob: Vec<u8>) -> Result<Option<OpenedFrame>> {
+        let inner = self.lock();
+        let Some(frame) = inner.try_open(&blob)? else {
+            return Ok(None);
+        };
+        let kind = frame
+            .first()
+            .copied()
+            .and_then(opened_frame_kind)
+            .ok_or(TwoMlsPqError::DecryptionFailed)?;
+        Ok(Some(OpenedFrame { kind, frame }))
     }
 
     /// Process an incoming message.
@@ -2216,6 +2594,10 @@ impl TwoMlsPqSession {
     /// else — including bare MLS ciphertext, which no longer occurs on the send path — is
     /// rejected as `DecryptionFailed`.
     pub fn process_incoming(&self, ciphertext: Vec<u8>) -> Result<Option<DecryptResult>> {
+        // Header encryption: accept either the sealed blob off the wire or the frame a
+        // host already took from `open_incoming` (see `open_or_raw`). The initiator's
+        // initial welcome (invitation channel, unsealed) passes through untouched.
+        let ciphertext = self.lock().open_or_raw(ciphertext);
         // Standalone APQWelcome: the initiator's welcome arrives this way over the
         // invitation channel, and hosts may also deliver the acceptor's return welcome
         // standalone. The same welcome also rides message-frame staples, so processing
@@ -2499,6 +2881,22 @@ impl TwoMlsPqSession {
                     addr: addr.clone(),
                 })
                 .collect(),
+            recv_header_keys: inner
+                .recv_header_keys
+                .iter()
+                .map(|(&epoch, key)| archive_wire::HeaderKeyEntry {
+                    epoch,
+                    key: key.clone(),
+                })
+                .collect(),
+            recv_header_keys_pq: inner
+                .recv_header_keys_pq
+                .iter()
+                .map(|(&epoch, key)| archive_wire::HeaderKeyEntry {
+                    epoch,
+                    key: key.clone(),
+                })
+                .collect(),
             pending_outbound: inner.pending_outbound.clone(),
             pending_proposal_hash: inner.pending_proposal_hash.clone(),
             current_staple: inner.current_staple.clone(),
@@ -2735,7 +3133,7 @@ mod tests {
         let alice = make_client();
         let bob = make_client();
         let bob_kp = make_combiner_kp(&bob);
-        let session = assert_ok!(TwoMlsPqSession::initiate(alice, bob_kp));
+        let session = assert_ok!(TwoMlsPqSession::initiate(alice, bob_kp, None));
         assert!(session.pending_outbound().is_some());
     }
 
@@ -2744,7 +3142,7 @@ mod tests {
         let alice = make_client();
         let bob = make_client();
         let bob_kp = make_combiner_kp(&bob);
-        let session = assert_ok!(TwoMlsPqSession::initiate(alice, bob_kp));
+        let session = assert_ok!(TwoMlsPqSession::initiate(alice, bob_kp, None));
         let first = session.pending_outbound();
         let second = session.pending_outbound();
         assert!(first.is_some());
@@ -2756,7 +3154,7 @@ mod tests {
         let alice = make_client();
         let bob = make_client();
         let bob_kp = make_combiner_kp(&bob);
-        let session = assert_ok!(TwoMlsPqSession::initiate(alice, bob_kp));
+        let session = assert_ok!(TwoMlsPqSession::initiate(alice, bob_kp, None));
         assert!(!session.is_established());
     }
 
@@ -2767,8 +3165,8 @@ mod tests {
         let alice_kp = make_combiner_kp(&alice);
         let bob_kp = make_combiner_kp(&bob);
 
-        let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp));
-        let apq_welcome_a = assert_some!(alice_session.pending_outbound());
+        let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
+        let apq_welcome_a = alice_session.test_initial_welcome();
 
         let bob_session = assert_ok!(TwoMlsPqSession::accept(bob, apq_welcome_a, alice_kp));
         assert!(bob_session.pending_outbound().is_some());
@@ -2793,7 +3191,7 @@ mod tests {
 
         // Initiator: listening works immediately (send group @ classical epoch 1);
         // nowhere to post until the return welcome stands up the recv group.
-        let alice_s = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp));
+        let alice_s = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
         let listen_a = assert_ok!(alice_s.should_listen_on());
         assert!(!listen_a.send_group.classical.bytes.is_empty());
         assert!(!listen_a.send_group.pq.bytes.is_empty());
@@ -2807,7 +3205,7 @@ mod tests {
 
         // Acceptor: posts immediately — its recv group is the initiator's send
         // group, so its post address is the initiator's listen address verbatim.
-        let welcome_a = assert_some!(alice_s.pending_outbound());
+        let welcome_a = alice_s.test_initial_welcome();
         let bob_s = assert_ok!(TwoMlsPqSession::accept(bob, welcome_a, alice_kp));
         let bob_post = assert_some!(assert_ok!(bob_s.send_rendezvous()));
         assert_eq!(
@@ -3052,7 +3450,13 @@ mod tests {
     /// responder applies the final commit (turn flipped to the responder).
     fn rekey_round(initiator: &Arc<TwoMlsPqSession>, responder: &Arc<TwoMlsPqSession>) {
         let upd = assert_ok!(initiator.pq_rekey_begin(None));
-        assert_eq!(upd.first(), Some(&super::PQ_REKEY_UPD_TAG));
+        // The frame is sealed on the wire; opened, it classifies as the rekey Upd'.
+        assert_eq!(
+            assert_some!(assert_ok!(responder.open_incoming(upd.clone()))).kind,
+            super::OpenedFrameKind::PqSideBand {
+                kind: super::PqFrameKind::RekeyUpdate
+            }
+        );
         // A rotation-less rekey announces no credential.
         assert!(assert_ok!(responder.pq_rekey_respond(upd)).is_none());
         let reply = assert_some!(responder.pq_take_pending_outbound());
@@ -3530,16 +3934,18 @@ mod tests {
     }
 
     #[test]
-    fn test_pq_ratchet_apply_without_respond_is_rejected() {
+    fn test_pq_ratchet_apply_from_stranger_is_rejected() {
         let (alice, bob) = establish_sessions();
         let ek = assert_ok!(alice.pq_ratchet_begin());
         assert_ok!(bob.pq_ratchet_respond(ek));
         let ct = assert_some!(bob.pq_take_pending_outbound());
         assert_ok!(alice.pq_ratchet_bind(ct, b"x".to_vec()));
         let bind = assert_some!(alice.pq_take_pending_outbound());
-        // A different session that never responded has no held secret.
+        // A different session cannot open the sealed bind (its header window holds none
+        // of this session's keys), so it is rejected at the seal — `Mls` on the
+        // passed-through, unparseable blob — before any KEM state is consulted.
         let (_a2, b2) = establish_sessions();
-        assert_err!(b2.pq_ratchet_apply(bind), TwoMlsPqError::SessionNotReady);
+        assert_err!(b2.pq_ratchet_apply(bind), TwoMlsPqError::Mls);
     }
 
     #[test]
@@ -3550,17 +3956,20 @@ mod tests {
     }
 
     #[test]
-    fn test_pq_ratchet_tampered_ciphertext_fails_to_apply() {
+    fn test_pq_ratchet_tampered_frame_fails_to_bind() {
         let (alice, bob) = establish_sessions();
         let ek = assert_ok!(alice.pq_ratchet_begin());
         assert_ok!(bob.pq_ratchet_respond(ek));
         let mut ct = assert_some!(bob.pq_take_pending_outbound());
+        // Flip a byte of the sealed ciphertext frame: the header AEAD tag no longer
+        // verifies, so Alice cannot open it and the bind is rejected at the seal (the
+        // passed-through blob's nonce byte is not `PQ_CT_TAG`). Header encryption makes
+        // any wire-level tamper a seal failure before the ML-KEM layer is reached.
+        // (ML-KEM implicit rejection itself is exercised at the `apq` layer, below the
+        // seal.)
         let last = ct.len() - 1;
         ct[last] ^= 0xFF;
-        // Alice binds a divergent S (ML-KEM implicit rejection); Bob holds the real S → apply fails.
-        assert_ok!(alice.pq_ratchet_bind(ct, b"x".to_vec()));
-        let bind = assert_some!(alice.pq_take_pending_outbound());
-        assert_err!(bob.pq_ratchet_apply(bind), TwoMlsPqError::Mls);
+        assert_err!(alice.pq_ratchet_bind(ct, b"x".to_vec()), TwoMlsPqError::Mls);
     }
 
     #[test]
@@ -3585,7 +3994,7 @@ mod tests {
         let pq = assert_ok!(bob.generate_key_package(crate::MlsCipherSuite::x25519_chacha()));
         let bad_kp = crate::key_packages::CombinerKeyPackage { classical, pq };
         assert_err!(
-            TwoMlsPqSession::initiate(alice, bad_kp),
+            TwoMlsPqSession::initiate(alice, bad_kp, None),
             TwoMlsPqError::PqNotAvailable
         );
     }
@@ -3608,8 +4017,8 @@ mod tests {
         let alice_kp = make_combiner_kp(&alice);
         let bob_kp = make_combiner_kp(&bob);
 
-        let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp));
-        let apq_welcome_a = assert_some!(alice_session.pending_outbound());
+        let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
+        let apq_welcome_a = alice_session.test_initial_welcome();
 
         let bob_session = assert_ok!(TwoMlsPqSession::accept(
             Arc::clone(&bob),
@@ -3696,8 +4105,8 @@ mod tests {
         let bob = make_client();
         let alice_kp = make_combiner_kp(&alice);
         let bob_kp = make_combiner_kp(&bob);
-        let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp));
-        let welcome = assert_some!(alice_session.pending_outbound());
+        let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
+        let welcome = alice_session.test_initial_welcome();
         assert_ok!(TwoMlsPqSession::accept(bob, welcome, alice_kp));
     }
 
@@ -3707,8 +4116,8 @@ mod tests {
         let bob = make_client();
         let alice_kp = make_combiner_kp(&alice);
         let bob_kp = make_combiner_kp(&bob);
-        let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp));
-        let welcome = assert_some!(alice_session.pending_outbound());
+        let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
+        let welcome = alice_session.test_initial_welcome();
         let bob_session = assert_ok!(TwoMlsPqSession::accept(Arc::clone(&bob), welcome, alice_kp));
         assert!(bob_session.has_receive_group());
         assert!(bob_session.is_established());
@@ -3785,8 +4194,8 @@ mod tests {
         let alice_kp = make_combiner_kp(&alice);
         let bob_kp = make_combiner_kp(&bob);
 
-        let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp));
-        let welcome_a = assert_some!(alice_session.pending_outbound());
+        let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
+        let welcome_a = alice_session.test_initial_welcome();
 
         // Archive and restore the initiator BEFORE it has joined the return welcome.
         let restored_alice = round_trip(&alice_session);
@@ -3878,8 +4287,8 @@ mod tests {
             bob.generate_invitation(true)
         )));
         let bob_kp = bob_inv.combiner_key_package();
-        let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp));
-        let welcome_a = assert_some!(alice_session.pending_outbound());
+        let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
+        let welcome_a = alice_session.test_initial_welcome();
         let token = b"spawn-token".to_vec();
         let bob_session = assert_ok!(bob_inv.receive(welcome_a, alice_kp, token.clone()));
 
@@ -4160,7 +4569,7 @@ mod tests {
         let bob = make_client();
         let bob_kp = make_combiner_kp(&bob);
         // Initiator pre-return-welcome: no recv group, nowhere to post.
-        let session = assert_ok!(TwoMlsPqSession::initiate(alice, bob_kp));
+        let session = assert_ok!(TwoMlsPqSession::initiate(alice, bob_kp, None));
         assert!(assert_ok!(session.send_rendezvous()).is_none());
     }
 
@@ -4180,15 +4589,13 @@ mod tests {
 
     #[test]
     fn test_forwarded_refused_without_spawn_token() {
-        // Initiator sessions (and acceptor sessions built directly via `accept`, not
-        // through an invitation) carry no spawn token — nothing to match replays against.
-        let (alice_session, bob_session) = establish_sessions();
+        // An initiator session carries no spawn token — nothing to match replays against —
+        // so `forwarded` refuses. (An acceptor built through `TwoMlsPqInvitation::receive`
+        // does have one, keyed by the invitation; that path is covered by the forward-table
+        // tests.)
+        let (alice_session, _bob_session) = establish_sessions();
         assert_err!(
             alice_session.forwarded(vec![]),
-            TwoMlsPqError::SessionNotReady
-        );
-        assert_err!(
-            bob_session.forwarded(b"anything".to_vec()),
             TwoMlsPqError::SessionNotReady
         );
     }
@@ -4290,8 +4697,12 @@ mod tests {
         let bob_kp = make_combiner_kp(&bob);
         let carol_kp = make_combiner_kp(&carol);
 
-        let alice_bob = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp));
-        let alice_carol = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), carol_kp));
+        let alice_bob = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
+        let alice_carol = assert_ok!(TwoMlsPqSession::initiate(
+            Arc::clone(&alice),
+            carol_kp,
+            None
+        ));
 
         assert_ne!(
             alice_bob.active_session_id().bytes,
@@ -4438,8 +4849,8 @@ mod tests {
         let bob = make_client();
         let alice_kp = make_combiner_kp(&alice);
         let bob_kp = make_combiner_kp(&bob);
-        let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp));
-        let welcome_a = assert_some!(alice_session.pending_outbound());
+        let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
+        let welcome_a = alice_session.test_initial_welcome();
         let bob_session = assert_ok!(TwoMlsPqSession::accept(
             Arc::clone(&bob),
             welcome_a,
@@ -4552,9 +4963,16 @@ mod tests {
         );
     }
 
-    /// Extract the staple section of a message frame (test-side peek).
-    fn frame_staple(frame: &[u8]) -> Vec<u8> {
-        let (staple, _, _) = assert_ok!(super::decode_message_frame(frame));
+    /// Remove the header seal from a frame `receiver` would open (test-side peek — the
+    /// wire is sealed, so inspecting a frame's plaintext structure goes through the
+    /// receiver's header window, exactly as `open_incoming` does for the host).
+    fn open_frame(receiver: &TwoMlsPqSession, blob: &[u8]) -> Vec<u8> {
+        assert_some!(assert_ok!(receiver.open_incoming(blob.to_vec()))).frame
+    }
+
+    /// Extract the staple section of a message frame `receiver` opens.
+    fn frame_staple(receiver: &TwoMlsPqSession, blob: &[u8]) -> Vec<u8> {
+        let (staple, _, _) = assert_ok!(super::decode_message_frame(&open_frame(receiver, blob)));
         staple
     }
 
@@ -4566,8 +4984,8 @@ mod tests {
         let bob_kp = make_combiner_kp(&bob);
 
         // Alice initiates; her welcome_a is delivered separately so Bob can accept.
-        let alice_s = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp));
-        let welcome_a = assert_some!(alice_s.pending_outbound());
+        let alice_s = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
+        let welcome_a = alice_s.test_initial_welcome();
         let bob_s = assert_ok!(TwoMlsPqSession::accept(
             Arc::clone(&bob),
             welcome_a,
@@ -4581,8 +4999,11 @@ mod tests {
         );
         assert_ok!(bob_s.prepare_to_encrypt(None));
         let first = assert_ok!(bob_s.encrypt(b"hello".to_vec())).cipher_text;
-        assert_eq!(first.first(), Some(&super::MESSAGE_FRAME_TAG));
-        let welcome_b = frame_staple(&first);
+        assert_eq!(
+            open_frame(&alice_s, &first).first(),
+            Some(&super::MESSAGE_FRAME_TAG)
+        );
+        let welcome_b = frame_staple(&alice_s, &first);
         assert_eq!(
             welcome_b.first(),
             Some(&super::APQ_TAG),
@@ -4610,7 +5031,7 @@ mod tests {
         assert_ok!(bob_s.prepare_to_encrypt(None));
         let second = assert_ok!(bob_s.encrypt(b"world".to_vec())).cipher_text;
         assert_eq!(
-            frame_staple(&second),
+            frame_staple(&alice_s, &second),
             welcome_b,
             "welcome staple repeats until the first commit"
         );
@@ -4629,7 +5050,7 @@ mod tests {
         let prep = assert_ok!(bob_s.prepare_to_encrypt(None));
         assert!(prep.did_commit);
         let committed = assert_ok!(bob_s.encrypt(b"committed".to_vec())).cipher_text;
-        let staple = frame_staple(&committed);
+        let staple = frame_staple(&alice_s, &committed);
         assert_eq!(
             staple.first(),
             Some(&0x00),
@@ -4637,6 +5058,367 @@ mod tests {
         );
         let result3 = assert_some!(assert_ok!(alice_s.process_incoming(committed)));
         assert_some!(result3.remote_commit);
+    }
+
+    // ---- Header encryption ----
+
+    /// No plaintext MLS/TwoMLSPQ framing survives the seal: a sealed frame must not begin
+    /// with an MLS version byte (0x00) or any TwoMLSPQ tag, and must not contain the
+    /// recognizable APQWelcome framing of its own staple.
+    #[test]
+    fn test_sealed_frames_carry_no_plaintext_framing() {
+        let (alice_session, bob_session) = establish_sessions();
+        assert_ok!(bob_session.prepare_to_encrypt(None));
+        let sealed = assert_ok!(bob_session.encrypt(b"secret".to_vec())).cipher_text;
+
+        // The plaintext frame is a welcome-stapled message frame; its bytes must not
+        // appear verbatim in the sealed blob.
+        let plaintext = open_frame(&alice_session, &sealed);
+        assert_eq!(plaintext.first(), Some(&super::MESSAGE_FRAME_TAG));
+        assert!(
+            !sealed
+                .windows(plaintext.len().min(16))
+                .any(|w| w == &plaintext[..plaintext.len().min(16)]),
+            "sealed blob leaks a prefix of the plaintext frame"
+        );
+        // First byte is a random nonce, never a tag or the MLS 0x00 version byte (with
+        // overwhelming probability; a fixed seed would make this exact, but the point is
+        // that nothing structural is guaranteed to be there).
+        assert_ne!(sealed.first(), Some(&super::MESSAGE_FRAME_TAG));
+    }
+
+    /// A frame sealed under an epoch still in the receive window opens after the receiver
+    /// has advanced its own send group past it — the cross-commit crossing the window
+    /// exists for.
+    #[test]
+    fn test_sealed_frame_crossing_a_commit_still_opens() {
+        let (alice_session, bob_session) = establish_sessions();
+
+        // Alice seals a frame under Bob's send group (her recv group) at its current
+        // epoch; hold it unopened.
+        assert_ok!(alice_session.prepare_to_encrypt(None));
+        let early = assert_ok!(alice_session.encrypt(b"early".to_vec())).cipher_text;
+
+        // A full round now advances BOB's send group past that epoch: Alice proposes,
+        // Bob approves and commits (Bob's send group is the one Bob's header window — and
+        // Alice's seal of `early` — key off).
+        assert_ok!(alice_session.prepare_to_encrypt(None));
+        let a2 = assert_ok!(alice_session.encrypt(b"a2".to_vec()));
+        let r = assert_some!(assert_ok!(bob_session.process_incoming(a2.cipher_text)));
+        assert_ok!(bob_session.queue_proposal(assert_some!(r.proposal).digest));
+        assert!(assert_ok!(bob_session.prepare_to_encrypt(None)).did_commit);
+        let _c = assert_ok!(bob_session.encrypt(b"c".to_vec()));
+
+        // Bob's window now spans both his pre- and post-commit epochs, so the `early`
+        // frame (sealed under the older epoch) still opens.
+        let opened = assert_some!(assert_ok!(bob_session.open_incoming(early)));
+        assert_eq!(opened.kind, super::OpenedFrameKind::Message);
+    }
+
+    /// A restored session still opens frames sealed under a recent epoch — the header
+    /// window rides the archive.
+    #[test]
+    fn test_restored_session_opens_in_flight_frame() {
+        let (alice_session, bob_session) = establish_sessions();
+        assert_ok!(alice_session.prepare_to_encrypt(None));
+        let sealed = assert_ok!(alice_session.encrypt(b"in flight".to_vec())).cipher_text;
+
+        // Bob archives and restores BEFORE opening the frame.
+        let archive = assert_ok!(bob_session.archive());
+        let restored = assert_ok!(TwoMlsPqSession::from_archive(archive));
+        let result = assert_some!(assert_ok!(restored.process_incoming(sealed)));
+        assert_eq!(
+            assert_some!(result.application_message).app_message_data,
+            b"in flight"
+        );
+    }
+
+    /// A garbage blob (no window key opens it) is a silent `None`, not an error.
+    #[test]
+    fn test_open_incoming_garbage_is_none() {
+        let (alice_session, _bob) = establish_sessions();
+        assert!(assert_ok!(alice_session.open_incoming(vec![0xAB; 64])).is_none());
+        assert!(assert_ok!(alice_session.open_incoming(vec![])).is_none());
+    }
+
+    /// A sealed PQ side-band frame opens and classifies to the right `pq_*` kind, and the
+    /// The header key length tracks the configured header AEAD's key size — so a future
+    /// change of `HEADER_AEAD_SUITE` to a different-key-length cipher can't silently
+    /// desync key derivation from the seal. (Sanity for the crypto-agility wiring; today
+    /// both are 32 for ChaCha20-Poly1305.)
+    #[test]
+    fn test_header_key_len_matches_aead() {
+        use mls_rs::CipherSuiteProvider;
+        let aead_key_size = assert_ok!(crate::providers::header_aead_suite()).aead_key_size();
+        assert_eq!(assert_ok!(super::header_key_len()), aead_key_size);
+
+        // A derived header key is exactly that length.
+        let (alice, _bob) = establish_sessions();
+        assert_ok!(alice.prepare_to_encrypt(None));
+        let sealed = assert_ok!(alice.encrypt(b"x".to_vec())).cipher_text;
+        // Sealed length = nonce + plaintext + tag; nonce size also tracks the suite.
+        let cs = assert_ok!(crate::providers::header_aead_suite());
+        assert!(sealed.len() > cs.aead_nonce_size());
+    }
+
+    /// full A.3 round drives end-to-end through sealed frames.
+    #[test]
+    fn test_sealed_side_band_opens_and_classifies() {
+        let (alice, bob) = establish_full();
+        let ek = assert_ok!(alice.pq_ratchet_begin());
+        // Sealed on the wire; opens on Bob's window as the ratchet EK frame.
+        assert_eq!(
+            assert_some!(assert_ok!(bob.open_incoming(ek.clone()))).kind,
+            super::OpenedFrameKind::PqSideBand {
+                kind: super::PqFrameKind::RatchetEphemeralKey
+            }
+        );
+        // And the round completes through the sealed frames (receivers auto-open).
+        assert_ok!(bob.pq_ratchet_respond(ek));
+        let ct = assert_some!(bob.pq_take_pending_outbound());
+        assert_ok!(alice.pq_ratchet_bind(ct, b"a".to_vec()));
+        let bind = assert_some!(alice.pq_take_pending_outbound());
+        assert_eq!(assert_ok!(bob.pq_ratchet_apply(bind)), b"a");
+    }
+
+    /// The point of the PQ family: a side-band frame is keyed by `pq_epoch`, so it
+    /// survives classical churn that evicts the message-path window — proving it does not
+    /// ride the (async) classical key. Contrast: a message frame from the same pre-churn
+    /// moment is evicted and no longer opens.
+    #[test]
+    fn test_side_band_survives_classical_churn() {
+        let (alice, bob) = establish_full();
+
+        // Capture two pre-churn frames Bob will try to open later: a message frame
+        // (classical-keyed) and a side-band EK (PQ-keyed).
+        assert_ok!(alice.prepare_to_encrypt(None));
+        let early_message = assert_ok!(alice.encrypt(b"early".to_vec())).cipher_text;
+        let ek = assert_ok!(alice.pq_ratchet_begin());
+
+        // Churn ONLY the classical ratchet, well past mls-rs epoch retention: Alice
+        // proposes, Bob commits Bob's send group each round, both stay in lockstep. No PQ
+        // activity, so `pq_epoch` — and Bob's PQ window — is untouched.
+        for _ in 0..10 {
+            assert_ok!(alice.prepare_to_encrypt(None));
+            let a = assert_ok!(alice.encrypt(b"churn".to_vec()));
+            let r = assert_some!(assert_ok!(bob.process_incoming(a.cipher_text)));
+            assert_ok!(bob.queue_proposal(assert_some!(r.proposal).digest));
+            assert!(assert_ok!(bob.prepare_to_encrypt(None)).did_commit);
+            let bc = assert_ok!(bob.encrypt(b"c".to_vec()));
+            assert_some!(assert_ok!(alice.process_incoming(bc.cipher_text)));
+        }
+
+        // The classical window has churned past the early message's epoch — it no longer
+        // opens…
+        assert!(
+            assert_ok!(bob.open_incoming(early_message)).is_none(),
+            "message-path window should have evicted the pre-churn epoch"
+        );
+        // …but the EK, keyed by the (unchanged) pq_epoch, still opens. If it rode the
+        // classical key it would have been evicted alongside the message frame.
+        assert_eq!(
+            assert_some!(assert_ok!(bob.open_incoming(ek))).kind,
+            super::OpenedFrameKind::PqSideBand {
+                kind: super::PqFrameKind::RatchetEphemeralKey
+            }
+        );
+    }
+
+    /// The pre-A.4 BOOTSTRAP_KP has no recv-PQ group yet, so it falls back to the
+    /// classical seal and opens via the classical window — still classifying as the
+    /// bootstrap side-band frame.
+    #[test]
+    fn test_bootstrap_kp_opens_via_classical_fallback() {
+        let (alice, bob) = establish_sessions();
+        let kp = assert_ok!(alice.pq_bootstrap_begin(None));
+        assert_eq!(
+            assert_some!(assert_ok!(bob.open_incoming(kp.clone()))).kind,
+            super::OpenedFrameKind::PqSideBand {
+                kind: super::PqFrameKind::BootstrapKeyPackage
+            }
+        );
+        // And the bootstrap completes through the sealed frames.
+        assert_ok!(bob.pq_bootstrap_respond(kp));
+        let bind = assert_some!(bob.pq_take_pending_outbound());
+        assert_ok!(alice.pq_bootstrap_apply(bind));
+        assert!(alice.is_fully_established() && bob.is_fully_established());
+    }
+
+    /// A restored session opens an in-flight side-band frame — the PQ window rides the
+    /// archive.
+    #[test]
+    fn test_restored_session_opens_in_flight_side_band() {
+        let (alice, bob) = establish_full();
+        let ek = assert_ok!(alice.pq_ratchet_begin());
+
+        // Bob archives and restores before opening the EK.
+        let restored = assert_ok!(TwoMlsPqSession::from_archive(assert_ok!(bob.archive())));
+        assert_eq!(
+            assert_some!(assert_ok!(restored.open_incoming(ek))).kind,
+            super::OpenedFrameKind::PqSideBand {
+                kind: super::PqFrameKind::RatchetEphemeralKey
+            }
+        );
+    }
+
+    /// The initiator's initial welcome (invitation channel) is NOT sealed — it has no
+    /// symmetric key yet; the acceptor's return welcome (recv group live) IS sealed.
+    #[test]
+    fn test_initial_envelope_roundtrip_return_welcome_sealed() {
+        use crate::key_packages::TwoMlsPqInvitation;
+        let alice = make_client();
+        let bob = make_client();
+        let alice_kp = make_combiner_kp(&alice);
+        let bob_inv = assert_ok!(TwoMlsPqInvitation::new(assert_ok!(
+            bob.generate_invitation(true)
+        )));
+        let bob_kp = bob_inv.combiner_key_package();
+
+        // Alice's initial welcome is the §A.1 envelope over `[app_payload ∥ APQWelcome_A]`,
+        // sealed to Bob's KP′ inside `initiate` — an opaque blob, NOT the plaintext welcome.
+        let app = b"app-layer-welcome".to_vec();
+        let alice_s = assert_ok!(TwoMlsPqSession::initiate(
+            Arc::clone(&alice),
+            bob_kp,
+            Some(app.clone())
+        ));
+        let envelope = assert_some!(alice_s.pending_outbound());
+        assert_ne!(
+            envelope.first(),
+            Some(&super::APQ_TAG),
+            "the initial frame is the opaque envelope, not the plaintext welcome"
+        );
+        assert!(
+            !envelope
+                .windows(4)
+                .any(|w| w == &alice_s.test_initial_welcome()[..4]),
+            "the plaintext welcome must not appear in the envelope"
+        );
+
+        // Bob opens the envelope: app_payload round-trips, welcome is the plaintext APQWelcome.
+        let opened = assert_ok!(bob_inv.open_initial(envelope));
+        assert_eq!(opened.app_payload, Some(app));
+        assert_eq!(opened.welcome.first(), Some(&super::APQ_TAG));
+
+        let bob_s = assert_ok!(bob_inv.receive(opened.welcome, alice_kp, b"tok".to_vec()));
+        // Bob's return welcome is symmetric-sealed (Bob has the recv group) and opens on
+        // Alice's window to the APQWelcome.
+        let welcome_b = assert_some!(bob_s.pending_outbound());
+        assert_ne!(welcome_b.first(), Some(&super::APQ_TAG));
+        assert_eq!(
+            open_frame(&alice_s, &welcome_b).first(),
+            Some(&super::APQ_TAG)
+        );
+    }
+
+    /// `app_payload: None` round-trips as `None` (empty section), and the welcome still
+    /// recovers.
+    #[test]
+    fn test_initial_envelope_no_app_payload() {
+        use crate::key_packages::TwoMlsPqInvitation;
+        let alice = make_client();
+        let bob = make_client();
+        let alice_kp = make_combiner_kp(&alice);
+        let bob_inv = assert_ok!(TwoMlsPqInvitation::new(assert_ok!(
+            bob.generate_invitation(true)
+        )));
+        let bob_kp = bob_inv.combiner_key_package();
+
+        let alice_s = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
+        let opened = assert_ok!(bob_inv.open_initial(assert_some!(alice_s.pending_outbound())));
+        assert_eq!(opened.app_payload, None);
+        assert_ok!(bob_inv.receive(opened.welcome, alice_kp, b"tok".to_vec()));
+    }
+
+    /// A re-sent envelope has a fresh HPKE ephemeral (different outer bytes) but the same
+    /// plaintext — so a spawn token computed over the opened frame is replay-stable, and a
+    /// last-resort invitation opens both.
+    #[test]
+    fn test_initial_envelope_resend_same_plaintext() {
+        use crate::key_packages::TwoMlsPqInvitation;
+        let alice = make_client();
+        let bob = make_client();
+        let bob_inv = assert_ok!(TwoMlsPqInvitation::new(assert_ok!(
+            bob.generate_invitation(true)
+        )));
+        let bob_kp = bob_inv.combiner_key_package();
+
+        // Two independent initiations to the same KP seal different outer bytes…
+        let a1 = assert_ok!(TwoMlsPqSession::initiate(
+            Arc::clone(&alice),
+            bob_kp.clone(),
+            Some(b"p".to_vec())
+        ));
+        let e1 = assert_some!(a1.pending_outbound());
+        let a2 = assert_ok!(TwoMlsPqSession::initiate(
+            Arc::clone(&alice),
+            bob_kp,
+            Some(b"p".to_vec())
+        ));
+        let e2 = assert_some!(a2.pending_outbound());
+        assert_ne!(
+            e1, e2,
+            "fresh HPKE ephemeral per seal → different outer bytes"
+        );
+        // …but each opens to an app_payload the host can key a stable token on.
+        assert_eq!(
+            assert_ok!(bob_inv.open_initial(e1)).app_payload,
+            Some(b"p".to_vec())
+        );
+        assert_eq!(
+            assert_ok!(bob_inv.open_initial(e2)).app_payload,
+            Some(b"p".to_vec())
+        );
+    }
+
+    /// A spent single-use invitation cannot `open_initial` (its KP′ material is gone), so
+    /// replays after consumption are dropped as undecryptable.
+    #[test]
+    fn test_spent_invitation_cannot_open_initial() {
+        use crate::key_packages::TwoMlsPqInvitation;
+        let alice = make_client();
+        let carol = make_client();
+        let bob = make_client();
+        let alice_kp = make_combiner_kp(&alice);
+        let bob_inv = assert_ok!(TwoMlsPqInvitation::new(assert_ok!(
+            bob.generate_invitation(false)
+        )));
+        let bob_kp = bob_inv.combiner_key_package();
+
+        // Alice consumes the single-use invitation.
+        let alice_s = assert_ok!(TwoMlsPqSession::initiate(
+            Arc::clone(&alice),
+            bob_kp.clone(),
+            None
+        ));
+        let opened = assert_ok!(bob_inv.open_initial(assert_some!(alice_s.pending_outbound())));
+        assert_ok!(bob_inv.receive(opened.welcome, alice_kp, b"tok".to_vec()));
+
+        // Carol's later envelope can no longer be opened — the KP′ material is spent.
+        let carol_s = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&carol), bob_kp, None));
+        assert_err!(
+            bob_inv.open_initial(assert_some!(carol_s.pending_outbound())),
+            TwoMlsPqError::InvitationSpent
+        );
+    }
+
+    /// The initiator's message-frame staple stays the plaintext `APQWelcome_A` (first byte
+    /// 0x01) even though `pending_outbound` is the opaque envelope — the two are
+    /// deliberately split in `initiate`.
+    #[test]
+    fn test_initiator_staple_is_plaintext_welcome() {
+        let alice = make_client();
+        let bob = make_client();
+        let bob_kp = make_combiner_kp(&bob);
+        let alice_s = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
+        assert_eq!(
+            alice_s.test_initial_welcome().first(),
+            Some(&super::APQ_TAG)
+        );
+        assert_ne!(
+            assert_some!(alice_s.pending_outbound()).first(),
+            Some(&super::APQ_TAG)
+        );
     }
 
     #[test]
@@ -4761,8 +5543,9 @@ mod tests {
         let carol = make_client();
         let dave = make_client();
         let dave_kp = make_combiner_kp(&dave);
-        let carol_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&carol), dave_kp));
-        let foreign_welcome = assert_some!(carol_session.pending_outbound());
+        let carol_session =
+            assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&carol), dave_kp, None));
+        let foreign_welcome = carol_session.test_initial_welcome();
 
         assert_err!(
             alice_session.process_incoming(foreign_welcome),
@@ -4856,7 +5639,7 @@ mod tests {
         let alice = make_client();
         let bob = make_client();
         let bob_kp = make_combiner_kp(&bob);
-        let session = assert_ok!(TwoMlsPqSession::initiate(alice, bob_kp));
+        let session = assert_ok!(TwoMlsPqSession::initiate(alice, bob_kp, None));
         assert_err!(
             session.prepare_to_encrypt(None),
             TwoMlsPqError::SessionNotReady
@@ -4889,7 +5672,7 @@ mod tests {
         let alice = make_client();
         let bob = make_client();
         let bob_kp = make_combiner_kp(&bob);
-        let session = assert_ok!(TwoMlsPqSession::initiate(alice, bob_kp));
+        let session = assert_ok!(TwoMlsPqSession::initiate(alice, bob_kp, None));
         assert!(session.receive_group_id().is_none());
     }
 
@@ -4905,7 +5688,7 @@ mod tests {
         let alice = make_client();
         let bob = make_client();
         let bob_kp = make_combiner_kp(&bob);
-        let session = assert_ok!(TwoMlsPqSession::initiate(alice, bob_kp));
+        let session = assert_ok!(TwoMlsPqSession::initiate(alice, bob_kp, None));
         assert!(!session.has_receive_group());
     }
 
@@ -4915,8 +5698,8 @@ mod tests {
         let bob = make_client();
         let alice_kp = make_combiner_kp(&alice);
         let bob_kp = make_combiner_kp(&bob);
-        let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp));
-        let welcome = assert_some!(alice_session.pending_outbound());
+        let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
+        let welcome = alice_session.test_initial_welcome();
         let bob_session = assert_ok!(TwoMlsPqSession::accept(bob, welcome, alice_kp));
         assert!(bob_session.has_receive_group());
     }
@@ -4926,7 +5709,7 @@ mod tests {
         let alice = make_client();
         let bob = make_client();
         let bob_kp = make_combiner_kp(&bob);
-        let session = assert_ok!(TwoMlsPqSession::initiate(alice, bob_kp));
+        let session = assert_ok!(TwoMlsPqSession::initiate(alice, bob_kp, None));
         assert!(session.proposal_context().is_none());
     }
 
@@ -4945,7 +5728,7 @@ mod tests {
         let alice_id = alice.client_id();
         let bob = make_client();
         let bob_kp = make_combiner_kp(&bob);
-        let session = assert_ok!(TwoMlsPqSession::initiate(alice, bob_kp));
+        let session = assert_ok!(TwoMlsPqSession::initiate(alice, bob_kp, None));
         assert!(matches!(
             session.my_principal_state(),
             PrincipalState::Sync { .. }
@@ -5122,8 +5905,8 @@ mod tests {
         let alice_kp = make_combiner_kp(&alice);
         let bob_kp = make_combiner_kp(&bob);
 
-        let alice_s = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp));
-        let welcome_a = assert_some!(alice_s.pending_outbound());
+        let alice_s = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
+        let welcome_a = alice_s.test_initial_welcome();
         let bob_s = assert_ok!(TwoMlsPqSession::accept(
             Arc::clone(&bob),
             welcome_a.clone(),
@@ -5309,7 +6092,7 @@ mod tests {
             pq: assert_ok!(peer.generate_key_package(MlsCipherSuite::x25519_chacha())),
         };
         assert_err!(
-            TwoMlsPqSession::initiate(Arc::clone(&alice), both_classical),
+            TwoMlsPqSession::initiate(Arc::clone(&alice), both_classical, None),
             TwoMlsPqError::PqNotAvailable
         );
 
@@ -5320,7 +6103,7 @@ mod tests {
             pq: assert_ok!(peer.generate_key_package(MlsCipherSuite::x25519_chacha())),
         };
         assert_err!(
-            TwoMlsPqSession::initiate(Arc::clone(&alice), swapped),
+            TwoMlsPqSession::initiate(Arc::clone(&alice), swapped, None),
             TwoMlsPqError::CipherSuiteMismatch
         );
     }
@@ -5330,8 +6113,8 @@ mod tests {
         let alice = make_client();
         let bob = make_client();
         let bob_kp = make_combiner_kp(&bob);
-        let alice_s = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp));
-        let welcome = assert_some!(alice_s.pending_outbound());
+        let alice_s = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
+        let welcome = alice_s.test_initial_welcome();
         // Swap the welcome's two halves so each slot's cleartext cipher suite is wrong for the
         // acceptor's expected pair — caught pre-join, not as a late decrypt failure.
         let (classical, pq) = assert_ok!(apq::decode_apq_welcome(&welcome));

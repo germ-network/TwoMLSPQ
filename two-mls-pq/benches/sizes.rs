@@ -9,20 +9,26 @@ use std::sync::Arc;
 
 mod common;
 use common::{client, combiner_kp, suite_label};
-use two_mls_pq::session::TwoMlsPqSession;
+use two_mls_pq::{key_packages::TwoMlsPqInvitation, session::TwoMlsPqSession};
 
 fn main() {
     let payload: &[u8] = b"the quick brown fox jumps over the lazy dog";
 
-    // Establishment — capture both APQ welcomes.
+    // Establishment — Alice's first frame is the §A.1 envelope (sealed to Bob's KP′);
+    // Bob's return is a sealed APQ welcome.
     let alice = client();
     let bob = client();
     let alice_kp = combiner_kp(&alice);
-    let bob_kp = combiner_kp(&bob);
 
-    let alice_s = TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp).unwrap();
-    let welcome_a = alice_s.pending_outbound().unwrap();
-    let bob_s = TwoMlsPqSession::accept(Arc::clone(&bob), welcome_a.clone(), alice_kp).unwrap();
+    let bob_inv = TwoMlsPqInvitation::new(bob.generate_invitation(true).unwrap()).unwrap();
+    let bob_kp = bob_inv.combiner_key_package();
+
+    let alice_s = TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None).unwrap();
+    let envelope_a = alice_s.pending_outbound().unwrap();
+    let opened = bob_inv.open_initial(envelope_a.clone()).unwrap();
+    let bob_s = bob_inv
+        .receive(opened.welcome, alice_kp, b"sizes".to_vec())
+        .unwrap();
     let welcome_b = bob_s.pending_outbound().unwrap();
     alice_s.process_incoming(welcome_b.clone()).unwrap();
 
@@ -53,10 +59,14 @@ fn main() {
         let a = client();
         let b = client();
         let a_kp = combiner_kp(&a);
-        let b_kp = combiner_kp(&b);
-        let a_s = TwoMlsPqSession::initiate(Arc::clone(&a), b_kp).unwrap();
-        let wa = a_s.pending_outbound().unwrap();
-        let b_s = TwoMlsPqSession::accept(Arc::clone(&b), wa, a_kp).unwrap();
+        let b_inv = TwoMlsPqInvitation::new(b.generate_invitation(true).unwrap()).unwrap();
+        let b_kp = b_inv.combiner_key_package();
+        let a_s = TwoMlsPqSession::initiate(Arc::clone(&a), b_kp, None).unwrap();
+        let envelope = a_s.pending_outbound().unwrap();
+        let opened = b_inv.open_initial(envelope).unwrap();
+        let b_s = b_inv
+            .receive(opened.welcome, a_kp, b"sizes-pq".to_vec())
+            .unwrap();
         let wb = b_s.pending_outbound().unwrap();
         a_s.process_incoming(wb).unwrap();
 
@@ -65,25 +75,28 @@ fn main() {
         let ct = b_s.pq_take_pending_outbound().unwrap();
         a_s.pq_ratchet_bind(ct.clone(), payload.to_vec()).unwrap();
         let bind = a_s.pq_take_pending_outbound().unwrap();
+        // `bind` is sealed on the wire; open it on the receiver to read the plaintext
+        // `[tag ∥ pq_commit ∥ classical ∥ app]` layout the outer seal hides.
+        let plain_bind = b_s.open_incoming(bind.clone()).unwrap().unwrap().frame;
         b_s.pq_ratchet_apply(bind.clone()).unwrap();
 
         let rdlen = |buf: &[u8], at: usize| {
             u32::from_le_bytes([buf[at], buf[at + 1], buf[at + 2], buf[at + 3]]) as usize
         };
-        let pq_commit = rdlen(&bind, 1);
+        let pq_commit = rdlen(&plain_bind, 1);
         let cl_at = 1 + 4 + pq_commit;
-        let cl = rdlen(&bind, cl_at);
+        let cl = rdlen(&plain_bind, cl_at);
         let app_at = cl_at + 4 + cl;
-        let app = rdlen(&bind, app_at);
+        let app = rdlen(&plain_bind, app_at);
         (ek.len(), ct.len(), bind.len(), pq_commit, cl, app)
     };
 
     println!("\n=== TwoMLSPQ ciphertext sizes ({}) ===", suite_label());
     println!("payload (plaintext)          : {:>6} B", payload.len());
-    println!("APQ welcome A (0x01)         : {:>6} B", welcome_a.len());
-    println!("APQ welcome B (0x01)         : {:>6} B", welcome_b.len());
-    println!("partial commit + app (0x05)  : {:>6} B", partial.len());
-    println!("full commit + app (0x05)     : {:>6} B", full.len());
+    println!("initial envelope A (§A.1)    : {:>6} B", envelope_a.len());
+    println!("APQ welcome B (0x01, sealed) : {:>6} B", welcome_b.len());
+    println!("partial commit + app (0x03)  : {:>6} B", partial.len());
+    println!("full commit + app (0x03)     : {:>6} B", full.len());
     println!("rotation commit + app (0x03) : {:>6} B", rotation.len());
     println!(
         "overhead: partial={} B, full={} B, rotation={} B (over payload)\n",
@@ -94,9 +107,9 @@ fn main() {
 
     {
         println!("--- PQ ratchet (architecture-diagrams PR #2 §A.3) ---");
-        println!("PQ EK message (0x0B)         : {:>6} B", pq_ek);
-        println!("PQ ct message (0x0D)         : {:>6} B", pq_ct);
-        println!("PQ bind frame (0x0F)         : {:>6} B", pq_bind);
+        println!("PQ EK message (0x05, sealed) : {:>6} B", pq_ek);
+        println!("PQ ct message (0x07, sealed) : {:>6} B", pq_ct);
+        println!("PQ bind frame (0x09, sealed) : {:>6} B", pq_bind);
         println!("  PQ partial-commit (no path): {:>6} B", pq_commit_len);
         println!("  classical commit           : {:>6} B", cl_commit_len);
         println!("  app                        : {:>6} B", pq_app_len);

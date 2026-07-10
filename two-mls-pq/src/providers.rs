@@ -98,3 +98,36 @@ pub(crate) fn pq_envelope_suite(
     pq().cipher_suite_provider(pq_cipher_suite())
         .ok_or(TwoMlsPqError::Mls)
 }
+
+/// The cipher suite whose AEAD backs the header-encryption seal — the single
+/// configuration point for the header AEAD. **Only the suite's AEAD and CSPRNG are used**
+/// (`aead_seal`/`aead_open`/`random_bytes`/`aead_key_size`/`aead_nonce_size`); its
+/// KEM/hash/signature are irrelevant. This is deliberately decoupled from the session's
+/// group suites: the header seal is its own primitive (versioned by the `…headerKey.v1`
+/// exporter label), not inherited per-group — the message-path and PQ side-band header
+/// keys are derived from their respective group halves but are both sealed with THIS
+/// AEAD. Swapping the header AEAD is a one-line change here; the header key length and
+/// nonce length are read from the chosen suite (`header_aead_suite().aead_key_size()` /
+/// `.aead_nonce_size()`), so nothing downstream assumes a specific cipher or size.
+///
+/// Both provider backends (awslc, cryptokit) must support the chosen suite. The current
+/// choice is ChaCha20-Poly1305 (`0x0003`): a 256-bit key — the strongest AEAD margin, and
+/// notably better post-quantum headroom than the PQ suite's AES-128-GCM, which is why the
+/// side-band is sealed with this rather than its own group's AEAD.
+///
+/// This is a build-level constant, not a per-session/negotiated value: both parties must
+/// agree on the header AEAD to open each other's frames, and there is no negotiation
+/// mechanism today. Runtime negotiation would be a separate protocol change (advertise the
+/// header AEAD at establishment).
+pub(crate) const HEADER_AEAD_SUITE: mls_rs::CipherSuite = APQ_SUITE.classical;
+
+/// The suite provider backing the header-encryption AEAD. See [`HEADER_AEAD_SUITE`].
+pub(crate) fn header_aead_suite(
+) -> Result<impl mls_rs::CipherSuiteProvider<Error = impl std::error::Error + Send + Sync + 'static>>
+{
+    use mls_rs::CryptoProvider;
+    // The AEAD is a classical symmetric primitive; the classical provider supplies it.
+    classical()
+        .cipher_suite_provider(HEADER_AEAD_SUITE)
+        .ok_or(TwoMlsPqError::Mls)
+}

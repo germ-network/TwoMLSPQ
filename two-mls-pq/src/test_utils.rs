@@ -3,7 +3,7 @@ use std::sync::Arc;
 use mls_rs::{CipherSuiteProvider, CryptoProvider};
 
 use crate::{
-    key_packages::{CombinerKeyPackage, TwoMlsPqPrincipal},
+    key_packages::{CombinerKeyPackage, TwoMlsPqInvitation, TwoMlsPqPrincipal},
     session::TwoMlsPqSession,
 };
 
@@ -28,15 +28,20 @@ pub(crate) fn establish_sessions() -> (Arc<TwoMlsPqSession>, Arc<TwoMlsPqSession
     let alice = make_client();
     let bob = make_client();
     let alice_kp = make_combiner_kp(&alice);
-    let bob_kp = make_combiner_kp(&bob);
 
-    let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp));
-    let welcome_a = assert_some!(alice_session.pending_outbound());
-    let bob_session = assert_ok!(TwoMlsPqSession::accept(
-        Arc::clone(&bob),
-        welcome_a,
-        alice_kp
-    ));
+    // The production establishment path: Bob publishes an invitation (whose KP Alice
+    // initiates to and which opens the §A.1 envelope). Alice's first frame is the sealed
+    // envelope; Bob opens it and joins.
+    let bob_inv = assert_ok!(TwoMlsPqInvitation::new(assert_ok!(
+        bob.generate_invitation(true)
+    )));
+    let bob_kp = bob_inv.combiner_key_package();
+
+    let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
+    let envelope = assert_some!(alice_session.pending_outbound());
+    let opened = assert_ok!(bob_inv.open_initial(envelope));
+    let bob_session = assert_ok!(bob_inv.receive(opened.welcome, alice_kp, b"establish".to_vec()));
+
     let welcome_b = assert_some!(bob_session.pending_outbound());
     assert_ok!(alice_session.process_incoming(welcome_b));
     (alice_session, bob_session)

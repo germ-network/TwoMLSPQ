@@ -17,10 +17,10 @@ The narrative, step by step:
    halves, same `ClientId`).
 3. **Parsing** — the peer's halves parse to `MlsKeyPackage`s; the classical suite is
    `0x0003`, the PQ suite `0xFDEA`; the two `ClientId`s must match.
-4. **Establishment** — `initiate` → `APQWelcome_A` → `accept` → `APQWelcome_B` →
-   `process_incoming` (standalone, or as the staple on Bob's first frame — welcome
-   re-deliveries are idempotent). Both sides are now established with the PSK chain
-   bound.
+4. **Establishment** — `initiate(…, app_payload)` → envelope → `open_initial` →
+   `receive` → `APQWelcome_B` → `process_incoming` (standalone, or as the staple on
+   Bob's first frame — welcome re-deliveries are idempotent). Both sides are now
+   established with the PSK chain bound.
 5. **Routine round** — Alice `prepare_to_encrypt(None)` + `encrypt`. The frame is the
    `[staple][proposal][app]` triple: her latest send-group commit (or her welcome,
    until the first commit) plus an `Upd(Alice)` proposal for Bob to approve; Bob
