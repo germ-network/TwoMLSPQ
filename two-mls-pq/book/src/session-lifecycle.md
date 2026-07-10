@@ -103,7 +103,7 @@ and the bridging commit no longer rides any frame — reconnect territory,
 distinguishable from a transient `DecryptionFailed` (e.g. a message frame that
 overtook its A.3 BIND, which succeeds on retry once the BIND lands).
 
-## Remote proposals & full commit
+## Remote proposals & the folding commit
 
 When `process_incoming` surfaces a `proposal`, CommProtocol orders it against its own
 sequence number and, if accepted, calls `queue_proposal(digest)`. The next

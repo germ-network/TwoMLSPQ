@@ -42,7 +42,7 @@ See the [Concepts](./concepts.md) object-model notes.
 
 ## Refresh
 
-On a full commit — one that consumes the peer's approved Upd proposal — the committer
+On a folding commit — one that consumes the peer's approved Upd proposal — the committer
 re-exports the cross-party PSK from its **receive** group's classical half at the
 current epoch and injects it into its own send-group commit, re-binding the two
 directions and providing break-in recovery.

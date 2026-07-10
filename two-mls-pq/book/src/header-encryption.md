@@ -175,7 +175,7 @@ halves and rotates with `pq_epoch`, so each header key tracks the clock of the f
 it protects. This matters because the classical and PQ ratchets run on **independent,
 asynchronous cadences** — the classical ratchet is continuous (every message), the PQ
 side-band is a slower turn-based exchange, and the two synchronize only at the A.3 bind
-(partial PQ commit + full classical commit importing the exported PSK). A side-band
+(partial PQ commit + the classical commit importing the exported PSK). A side-band
 frame keyed by the classical epoch would have its outer-seal availability governed by
 classical message volume: a frame in flight could be overtaken by classical epoch
 advances unrelated to it and, past the classical retention window, become unopenable.
