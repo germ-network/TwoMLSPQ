@@ -11,11 +11,12 @@ use mls_rs::{
 };
 
 use apq::authentication::{AuthCoreHandle, PartySequence};
+use apq::component::{read_apqinfo, verify_deferred_pq_info, ApqInfo, EPOCH_UNBOUND};
 use apq::{
     create_bound_classical_send_group, create_combiner_send_group, create_group_with_member,
     decode_apq_welcome, encode_apq_welcome, export_psk, forget_psk,
     join_combiner_group_from_halves, join_group_from_welcome, register_psk, sender_client_id,
-    APQ_TAG,
+    GroupCreation, APQ_TAG,
 };
 
 use crate::key_package_store::CombinerGroup;
@@ -2725,6 +2726,7 @@ impl TwoMlsPqSession {
             return Err(TwoMlsPqError::RemoteIdentityMismatch);
         }
         let client = inner.client.clone();
+        let suite = inner.suite;
         // The new PQ half resolves PSKs from the CURRENT client's stores (A.4 runs on
         // the principal a Phase 8 rotation may have installed) — track them.
         inner.track_psk_stores(&client);
@@ -2736,7 +2738,26 @@ impl TwoMlsPqSession {
             if send.pq.is_some() {
                 return Err(TwoMlsPqError::SessionNotReady);
             }
-            let (pq_group, pq_welcome) = create_group_with_member(client.pq(), kp, &[])?;
+            // The classical half's creation-time APQInfo pre-allocated this PQ half's
+            // group id at establishment: create the group under exactly that id, and
+            // record the mirror view {t: EPOCH_UNBOUND, pq: 1} in the new half's own
+            // APQInfo (no classical commit rides A.4, so its classical epoch is the
+            // deferred sentinel until the next A.3 bind attests both).
+            let classical_info = read_apqinfo(&send.classical)?;
+            let pq_gid = classical_info.pq_session_group_id.clone();
+            let info = ApqInfo::new(
+                suite,
+                classical_info.t_session_group_id.clone(),
+                pq_gid.clone(),
+                EPOCH_UNBOUND,
+                1,
+            );
+            let (pq_group, pq_welcome) = create_group_with_member(
+                client.pq(),
+                kp,
+                &[],
+                GroupCreation::new(pq_gid, &info, None)?,
+            )?;
             // PQ-groups-only (spec A.4): no classical bind here. The new PQ half's
             // secrecy reaches ASG-cl at the next A.3 ratchet; until then ASG-cl keeps
             // the PQ-derived security chained in at establishment.
@@ -2764,6 +2785,7 @@ impl TwoMlsPqSession {
         // welcome path).
         check_welcome_suite(&pq_welcome, inner.suite.pq)?;
         let client = inner.client.clone();
+        let suite = inner.suite;
         // The joined PQ half resolves PSKs from the CURRENT client's stores — track them.
         inner.track_psk_stores(&client);
         {
@@ -2775,6 +2797,15 @@ impl TwoMlsPqSession {
                 return Err(TwoMlsPqError::SessionNotReady);
             }
             let pq = join_group_from_welcome(client.pq(), &pq_welcome)?;
+            // -02 verification: the joined group must be the one whose id the classical
+            // half's APQInfo pre-allocated at establishment, and its own APQInfo must be
+            // the deferred mirror ({t: EPOCH_UNBOUND, pq: 1}, same identity fields).
+            // Strict roster-set equality across the halves is NOT checked here — under
+            // the AS lag model the classical half's leaves may trail a canonicalized
+            // rotation while the fresh PQ half carries current principals; per-leaf
+            // membership is enforced by the AS (`validate_member`) inside the join.
+            let classical_info = read_apqinfo(&recv.classical)?;
+            verify_deferred_pq_info(&pq, &classical_info, suite)?;
             recv.set_pq(pq, client.combiner());
         }
         inner.pq_turn_mine = false;
@@ -6733,7 +6764,8 @@ mod tests {
         let (group, _) = assert_ok!(apq::create_group_with_member(
             alice.classical(),
             &bob_kp.classical,
-            &[]
+            &[],
+            apq::GroupCreation::bare(assert_ok!(alice.combiner().random_group_id())),
         ));
 
         let s1 = assert_ok!(group.export_secret(b"exportSecret", b"derive", 32));

@@ -21,6 +21,7 @@
 pub mod archive;
 pub mod authentication;
 mod client;
+pub mod component;
 mod group;
 pub mod pq_ratchet;
 pub mod rules;
@@ -37,7 +38,7 @@ pub use group::{
     ensure_two_party, export_and_register_psk, export_psk, forget_psk, forget_psk_stores,
     join_combiner_group, join_combiner_group_from_halves, join_group_from_welcome,
     load_combiner_group, register_psk, register_psk_stores, sender_client_id, CombinerGroup,
-    CombinerGroupState, MlsGroup, PqMlsGroup, APQ_TAG,
+    CombinerGroupState, GroupCreation, MlsGroup, PqMlsGroup, APQ_TAG,
 };
 
 /// Failure categories for the combiner layer. The two-mls layer maps these onto its
@@ -69,6 +70,11 @@ pub enum CombinerError {
     /// which is a local provider-capability gap.
     #[error("cipher suite mismatch")]
     CipherSuiteMismatch,
+    /// The draft -02 bookkeeping failed verification: an `APQInfo` GroupContext extension is
+    /// missing or inconsistent across a pair's halves, an `AppDataUpdate` epoch attestation
+    /// does not match the actual post-commit epochs, or the two halves' rosters diverge.
+    #[error("APQInfo missing or inconsistent")]
+    ApqInfoMismatch,
 }
 
 pub type Result<T> = std::result::Result<T, CombinerError>;

@@ -23,6 +23,8 @@ use mls_rs::{
     MlsRules,
 };
 
+use crate::component::{ApqInfoUpdate, APP_DATA_UPDATE};
+
 /// A commit (built or received) violated the TwoMLS operation whitelist.
 #[derive(Debug, thiserror::Error)]
 pub enum RuleError {
@@ -46,6 +48,12 @@ pub enum RuleError {
     /// The roster is neither mid-creation (1) nor steady-state (2).
     #[error("roster is not two-party")]
     NotTwoParty,
+    /// An `AppDataUpdate` custom proposal failed validation: more than one, not the
+    /// committer's own, a malformed payload, an attested epoch that is not this group's
+    /// next, or co-riding an Update (a FULL commit never folds one in this protocol —
+    /// that shape difference is what keeps A.5 re-key commits AppDataUpdate-free).
+    #[error("invalid AppDataUpdate proposal")]
+    BadAppDataUpdate,
 }
 
 impl IntoAnyError for RuleError {
@@ -67,7 +75,7 @@ impl MlsRules for TwoMlsRules {
         _direction: CommitDirection,
         source: CommitSource,
         roster: &Roster,
-        _context: &GroupContext,
+        context: &GroupContext,
         proposals: ProposalBundle,
     ) -> Result<ProposalBundle, RuleError> {
         // Only an existing member ever commits.
@@ -81,9 +89,42 @@ impl MlsRules for TwoMlsRules {
             || !proposals.reinit_proposals().is_empty()
             || !proposals.external_init_proposals().is_empty()
             || !proposals.group_context_ext_proposals().is_empty()
-            || !proposals.custom_proposals().is_empty()
         {
             return Err(RuleError::ForbiddenProposal);
+        }
+
+        // The one admissible custom proposal is the -02 `AppDataUpdate` epoch attestation
+        // (see `component.rs`), committed by the committer itself on a FULL commit's
+        // halves. Its same-half epoch must be exactly this group's next epoch (the
+        // pre-commit context is in hand here); the cross-half equality is verified in the
+        // session layer, which sees both groups. It never co-rides an Update: no FULL
+        // commit in this protocol folds one, and that shape difference is what keeps A.5
+        // re-key commits (Update + PSK) AppDataUpdate-free at the rules level.
+        let customs = proposals.custom_proposals();
+        if customs.len() > 1 {
+            return Err(RuleError::BadAppDataUpdate);
+        }
+        if let Some(custom) = customs.first() {
+            if custom.proposal.proposal_type() != APP_DATA_UPDATE {
+                return Err(RuleError::ForbiddenProposal);
+            }
+            match custom.sender {
+                Sender::Member(index) if index == committer.index => {}
+                _ => return Err(RuleError::BadAppDataUpdate),
+            }
+            if !proposals.update_proposals().is_empty() {
+                return Err(RuleError::BadAppDataUpdate);
+            }
+            let update = ApqInfoUpdate::from_custom_proposal(&custom.proposal)
+                .map_err(|_| RuleError::BadAppDataUpdate)?;
+            let attested = match crate::client::suite_is_pq(context.cipher_suite) {
+                Some(true) => update.pq_epoch,
+                Some(false) => update.t_epoch,
+                None => return Err(RuleError::BadAppDataUpdate),
+            };
+            if attested != context.epoch + 1 {
+                return Err(RuleError::BadAppDataUpdate);
+            }
         }
 
         // Every PSK is an external PSK (the APQ / cross-party bindings); this

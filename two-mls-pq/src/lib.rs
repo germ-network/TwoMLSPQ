@@ -419,6 +419,13 @@ pub enum TwoMlsPqError {
     /// authorize-and-reprocess recovers the round.
     #[error("credential succession rejected by the authentication service")]
     CredentialRejected,
+    /// The draft -02 bookkeeping failed verification: an `APQInfo` GroupContext extension
+    /// is missing or inconsistent across a pair's halves (a welcome without one is a
+    /// downgrade attempt), an A.4 group id does not match the id pre-allocated at
+    /// establishment, or an `AppDataUpdate` epoch attestation does not match the actual
+    /// post-commit epochs of both groups.
+    #[error("APQInfo missing or inconsistent")]
+    ApqInfoMismatch,
 }
 
 /// SHA-256 over `bytes` — the single hashing primitive behind every digest this
@@ -465,6 +472,7 @@ impl From<apq::CombinerError> for TwoMlsPqError {
             apq::CombinerError::ArchiveInvalid => TwoMlsPqError::ArchiveInvalid,
             apq::CombinerError::UnsupportedCipherSuite => TwoMlsPqError::UnsupportedCipherSuite,
             apq::CombinerError::CipherSuiteMismatch => TwoMlsPqError::CipherSuiteMismatch,
+            apq::CombinerError::ApqInfoMismatch => TwoMlsPqError::ApqInfoMismatch,
         }
     }
 }

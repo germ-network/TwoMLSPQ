@@ -17,6 +17,7 @@ use mls_rs::{
 use zeroize::Zeroizing;
 
 use crate::authentication::{AuthView, TwoMlsIdentityProvider};
+use crate::component::{APP_DATA_UPDATE, APQINFO_EXTENSION_TYPE};
 use crate::rules::TwoMlsRules;
 use crate::storage::PersistableGroupStorage;
 use crate::{CombinerError, Result};
@@ -38,6 +39,13 @@ const _: () = assert!(CipherSuite::ML_KEM_768.raw_value() == ML_KEM_768);
 struct SuiteClass {
     kem_pq: bool,
     sig_pq: bool,
+}
+
+/// Whether a recognized suite is a post-quantum KEM suite (the PQ half) — `None` for an
+/// unrecognized value. Lets the rules pick which `AppDataUpdate` epoch field attests the
+/// group being committed to.
+pub(crate) fn suite_is_pq(suite: CipherSuite) -> Option<bool> {
+    class(suite).map(|c| c.kem_pq)
 }
 
 /// Classify a suite TwoMLSPQ recognizes, or `None` for an unassigned value. This is the single
@@ -217,6 +225,10 @@ where
     /// The cipher-suite pair this client's two halves were built for — the fixed, stored
     /// property a session is locked to. The APQ mode is derived from it.
     suite: ApqCipherSuite,
+    /// The classical suite's provider handle, retained from construction so the client can
+    /// mint random group ids (see [`random_group_id`](Self::random_group_id)) without
+    /// re-resolving the provider.
+    classical_cs: <C as CryptoProvider>::CipherSuiteProvider,
     classical_signing_key: Zeroizing<Vec<u8>>,
     /// The classical signing key's public half, kept from construction so the rotation
     /// credential handoff never re-derives it (mirror of `pq_signing_public`).
@@ -313,6 +325,7 @@ where
         Ok(Self {
             client_id,
             suite,
+            classical_cs,
             classical_signing_key,
             classical_signing_public,
             classical,
@@ -390,6 +403,7 @@ where
         Ok(Self {
             client_id,
             suite,
+            classical_cs,
             classical_signing_key,
             classical_signing_public,
             classical,
@@ -402,6 +416,15 @@ where
             pq_group_storage,
             auth_view,
         })
+    }
+
+    /// A fresh random group id (KDF-extract-sized, matching mls-rs's own default), for
+    /// pre-generating a group's id so it can appear inside its own creation-time
+    /// `APQInfo` — including pre-allocating the deferred A.4 PQ half's id.
+    pub fn random_group_id(&self) -> Result<Vec<u8>> {
+        self.classical_cs
+            .random_bytes_vec(self.classical_cs.kdf_extract_size())
+            .map_err(|_| CombinerError::Mls)
     }
 
     /// The agent's ClientId bytes (opaque Basic Credential identity).
@@ -540,6 +563,11 @@ fn build_client<S: KeyPackageStorage + Clone, C: CryptoProvider + Clone>(
         // The TwoMLS operation whitelist (see `rules.rs`): vetoes any commit — built
         // or received — outside the protocol's fixed shape.
         .mls_rules(TwoMlsRules)
+        // draft -02 machinery (see `component.rs`): every leaf advertises the APQInfo
+        // GroupContext extension and the AppDataUpdate proposal type — mls-rs requires
+        // every occupied leaf to support them before they may appear in a group.
+        .extension_type(APQINFO_EXTENSION_TYPE)
+        .custom_proposal_type(APP_DATA_UPDATE)
         .signing_identity(signing_identity, secret_key, suite)
         .build()
 }

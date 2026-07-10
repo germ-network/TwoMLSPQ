@@ -10,6 +10,10 @@ use mls_rs::{
 use zeroize::Zeroizing;
 
 use crate::client::{CombinerClient, OurConfig, PqConfig};
+use crate::component::{
+    apq_info_extensions, ensure_membership_consistent, verify_apqinfo_pair, ApqInfo, ApqInfoUpdate,
+    EPOCH_UNBOUND,
+};
 use crate::storage::PersistableGroupStorage;
 use crate::{CombinerError, Result};
 
@@ -320,6 +324,42 @@ where
     Ok(psk_id)
 }
 
+/// Creation-time parameters for one half of a combiner group: the pre-generated group id
+/// (a group's own id must appear inside its creation-time `APQInfo`, so it exists before
+/// `create_group`), the GroupContext extensions (carrying the `APQInfo`), and — when the
+/// creation commit is one half of a -02 FULL — the `AppDataUpdate` epoch attestation to
+/// ride it.
+pub struct GroupCreation {
+    pub group_id: Vec<u8>,
+    pub extensions: ExtensionList,
+    pub app_data_update: Option<ApqInfoUpdate>,
+}
+
+impl GroupCreation {
+    /// Creation parameters carrying the given `APQInfo` (the production shape).
+    pub fn new(
+        group_id: Vec<u8>,
+        info: &ApqInfo,
+        app_data_update: Option<ApqInfoUpdate>,
+    ) -> Result<Self> {
+        Ok(Self {
+            group_id,
+            extensions: apq_info_extensions(info)?,
+            app_data_update,
+        })
+    }
+
+    /// Creation parameters with no extensions and no attestation — for tests exercising
+    /// the raw primitive below the combiner builders.
+    pub fn bare(group_id: Vec<u8>) -> Self {
+        Self {
+            group_id,
+            extensions: ExtensionList::new(),
+            app_data_update: None,
+        }
+    }
+}
+
 /// Create a group and commit the given key package in as the first member.
 /// Each id in `psk_ids` is injected as an external PSK binding on the member-add commit.
 /// Returns (group-at-epoch-1, MLS-encoded Welcome bytes).
@@ -329,9 +369,15 @@ pub fn create_group_with_member<Cfg: MlsConfig>(
     mls_client: &Client<Cfg>,
     their_kp_bytes: &[u8],
     psk_ids: &[ExternalPskId],
+    creation: GroupCreation,
 ) -> Result<(Group<Cfg>, Vec<u8>)> {
     let mut group = mls_client
-        .create_group(ExtensionList::new(), ExtensionList::new(), None)
+        .create_group_with_id(
+            creation.group_id,
+            creation.extensions,
+            ExtensionList::new(),
+            None,
+        )
         .map_err(|_| CombinerError::Mls)?;
     let their_kp =
         MlsMessage::from_bytes(their_kp_bytes).map_err(|_| CombinerError::InvalidKeyPackage)?;
@@ -343,6 +389,9 @@ pub fn create_group_with_member<Cfg: MlsConfig>(
         builder = builder
             .add_external_psk(psk.clone())
             .map_err(|_| CombinerError::Mls)?;
+    }
+    if let Some(update) = creation.app_data_update {
+        builder = builder.custom_proposal(update.to_custom_proposal()?);
     }
     let commit_output = builder.build().map_err(|_| CombinerError::Mls)?;
     group
@@ -420,12 +469,33 @@ where
     // identity into the AS state so the added leaves validate.
     let peer_id = key_package_client_id(pq_kp)?;
     client.auth_view().with(|core| core.theirs.commit(peer_id));
+    // Pre-generate both halves' group ids so each half's creation-time APQInfo can name
+    // the full pair. Both halves land at epoch 1 after their creation commit, and the
+    // pair is created together — a structurally FULL creation, so both commits carry the
+    // {1, 1} AppDataUpdate attestation.
+    let suite = client.cipher_suite();
+    let t_gid = client.random_group_id()?;
+    let pq_gid = client.random_group_id()?;
+    let info = ApqInfo::new(suite, t_gid.clone(), pq_gid.clone(), 1, 1);
+    let attestation = ApqInfoUpdate {
+        t_epoch: 1,
+        pq_epoch: 1,
+    };
     // PQ side group first, unbound.
-    let (pq_group, pq_welcome) = create_group_with_member(client.pq(), pq_kp, &[])?;
+    let (pq_group, pq_welcome) = create_group_with_member(
+        client.pq(),
+        pq_kp,
+        &[],
+        GroupCreation::new(pq_gid, &info, Some(attestation))?,
+    )?;
     // APQ-PSK: export from the PQ group, inject into the classical message group.
     let apq_psk = export_and_register_psk(&pq_group, client)?;
-    let (classical_group, classical_welcome) =
-        create_group_with_member(client.classical(), classical_kp, &[apq_psk])?;
+    let (classical_group, classical_welcome) = create_group_with_member(
+        client.classical(),
+        classical_kp,
+        &[apq_psk],
+        GroupCreation::new(t_gid, &info, Some(attestation))?,
+    )?;
     let apq = encode_apq_welcome(classical_welcome, pq_welcome);
     Ok((
         CombinerGroup::from_client(client, classical_group, Some(pq_group)),
@@ -475,6 +545,13 @@ where
     })();
     client.auth_view().with(|core| core.adopting = false);
     let group: CombinerGroup<S, C, P> = joined?;
+    // -02 joiner verification: both halves carry a coherent, mutually consistent APQInfo
+    // naming exactly these groups, and both rosters hold the same two identities.
+    {
+        let pq = group.pq.as_ref().ok_or(CombinerError::Mls)?;
+        verify_apqinfo_pair(&group.classical, Some(pq), client.cipher_suite())?;
+        ensure_membership_consistent(&group.classical, pq)?;
+    }
     let mine = group.classical.current_member_index();
     let creator = sender_client_id(&group.classical, if mine == 0 { 1 } else { 0 })?;
     client.auth_view().with(|core| core.theirs.commit(creator));
@@ -497,8 +574,21 @@ where
     let peer_id = key_package_client_id(classical_kp)?;
     client.auth_view().with(|core| core.theirs.commit(peer_id));
     let psk_cross = export_and_register_psk(recv_classical, client)?;
-    let (classical_group, classical_welcome) =
-        create_group_with_member(client.classical(), classical_kp, &[psk_cross])?;
+    // Pre-allocate the deferred PQ half's group id now: it is pinned inside the
+    // classical half's APQInfo (durable in GroupContext, riding the Welcome), and the
+    // A.4 bootstrap must later create the PQ group under exactly this id. The PQ epoch
+    // is the deferred sentinel; this classical-only creation is a -02 PARTIAL, so no
+    // AppDataUpdate rides it.
+    let suite = client.cipher_suite();
+    let t_gid = client.random_group_id()?;
+    let pq_gid = client.random_group_id()?;
+    let info = ApqInfo::new(suite, t_gid.clone(), pq_gid, 1, EPOCH_UNBOUND);
+    let (classical_group, classical_welcome) = create_group_with_member(
+        client.classical(),
+        classical_kp,
+        &[psk_cross],
+        GroupCreation::new(t_gid, &info, None)?,
+    )?;
     Ok((
         CombinerGroup::from_client(client, classical_group, None),
         classical_welcome,
@@ -524,12 +614,31 @@ where
     client.auth_view().with(|core| core.theirs.commit(peer_id));
     // Cross-party TwoMLS-PSK from the recv group (Group_A classical).
     let psk_cross = export_and_register_psk(recv_classical, client)?;
+    // Pre-generated ids + APQInfo in both halves; both creation commits carry the
+    // {1, 1} attestation (the pair is created together — structurally FULL).
+    let suite = client.cipher_suite();
+    let t_gid = client.random_group_id()?;
+    let pq_gid = client.random_group_id()?;
+    let info = ApqInfo::new(suite, t_gid.clone(), pq_gid.clone(), 1, 1);
+    let attestation = ApqInfoUpdate {
+        t_epoch: 1,
+        pq_epoch: 1,
+    };
     // PQ side group first, unbound.
-    let (pq_group, pq_welcome) = create_group_with_member(client.pq(), pq_kp, &[])?;
+    let (pq_group, pq_welcome) = create_group_with_member(
+        client.pq(),
+        pq_kp,
+        &[],
+        GroupCreation::new(pq_gid, &info, Some(attestation))?,
+    )?;
     // Intra-party APQ-PSK from Group_B's PQ group.
     let psk_apq = export_and_register_psk(&pq_group, client)?;
-    let (classical_group, classical_welcome) =
-        create_group_with_member(client.classical(), classical_kp, &[psk_cross, psk_apq])?;
+    let (classical_group, classical_welcome) = create_group_with_member(
+        client.classical(),
+        classical_kp,
+        &[psk_cross, psk_apq],
+        GroupCreation::new(t_gid, &info, Some(attestation))?,
+    )?;
     let apq = encode_apq_welcome(classical_welcome, pq_welcome);
     Ok((
         CombinerGroup::from_client(client, classical_group, Some(pq_group)),
@@ -684,6 +793,7 @@ mod tests {
             alice.classical(),
             &bob.generate_classical_key_package().unwrap(),
             &[],
+            GroupCreation::bare(alice.random_group_id().unwrap()),
         )
         .unwrap();
         let mut bob_recv = join_group_from_welcome(bob.classical(), &welcome).unwrap();
@@ -894,6 +1004,7 @@ mod tests {
             alice.classical(),
             &bob.generate_classical_key_package().unwrap(),
             &[],
+            GroupCreation::bare(alice.random_group_id().unwrap()),
         )
         .unwrap();
 
@@ -916,6 +1027,7 @@ mod tests {
             alice.classical(),
             &bob.generate_classical_key_package().unwrap(),
             &[],
+            GroupCreation::bare(alice.random_group_id().unwrap()),
         )
         .unwrap();
         // Leaf 0 is the creating client.
