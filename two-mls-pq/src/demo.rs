@@ -139,23 +139,43 @@ fn demo_e2e_full_session() {
     );
     println!("[7] bidirectional messaging continues post-refresh");
 
-    // Step 8 — principal key rotation (0x03): Alice rotates to a new principal (its signing keys
-    // are minted internally; the app supplies only the opaque ClientId).
+    // Step 8 — principal key rotation: Alice stages a successor (its signing keys are
+    // minted internally; the app supplies only the opaque ClientId) and PROPOSES it on
+    // her next frame. Bob's app approves the candidate (queue_proposal — the running
+    // tally) and his commit defines Alice's canonical next credential; the staple back
+    // canonicalizes her session onto the successor.
     let new_alice_id = make_client().client_id();
     assert_ok!(alice_session.stage_rotation(new_alice_id.bytes.clone()));
-    let prep = assert_ok!(alice_session.prepare_to_encrypt(Some(new_alice_id.clone())));
-    assert!(prep.did_commit);
-    let enc = assert_ok!(alice_session.encrypt(b"rotated".to_vec()));
-    let got = assert_some!(assert_ok!(bob_session.process_incoming(enc.cipher_text)));
-    assert_eq!(
-        assert_some!(assert_some!(got.remote_commit).new_sender),
-        new_alice_id
-    );
     assert!(matches!(
         alice_session.my_principal_state(),
         PrincipalState::Pending { .. }
     ));
-    println!("[8] principal rotation: bob observes alice's new identity; alice state = Pending");
+    assert_ok!(alice_session.prepare_to_encrypt(Some(new_alice_id.clone())));
+    let enc = assert_ok!(alice_session.encrypt(b"rotating".to_vec()));
+    let got = assert_some!(assert_ok!(bob_session.process_incoming(enc.cipher_text)));
+    let offered = assert_some!(got.proposal);
+    assert_eq!(offered.proposing, new_alice_id);
+    assert_ok!(bob_session.queue_proposal(offered.digest));
+    let prep = assert_ok!(bob_session.prepare_to_encrypt(None));
+    assert!(prep.did_commit);
+    assert_eq!(
+        assert_some!(prep.committed_remote_client_id),
+        new_alice_id.clone()
+    );
+    let frame = assert_ok!(bob_session.encrypt(b"canonicalize".to_vec()));
+    let got = assert_some!(assert_ok!(alice_session.process_incoming(frame.cipher_text)));
+    assert_eq!(
+        assert_some!(got.remote_commit).new_recipient,
+        new_alice_id.clone()
+    );
+    assert!(matches!(
+        alice_session.my_principal_state(),
+        PrincipalState::Sync { .. }
+    ));
+    assert_eq!(alice_session.my_principal_state().client_id(), new_alice_id);
+    println!(
+        "[8] credential rotation: alice proposed, bob's commit canonicalized; alice state = Sync"
+    );
 
     println!("\n=== walkthrough complete ===\n");
 }

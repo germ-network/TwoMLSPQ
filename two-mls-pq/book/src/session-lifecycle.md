@@ -9,12 +9,20 @@
    so the app-layer welcome that identifies Alice is hidden on the invitation channel
    (see [Header Encryption](./header-encryption.md)).
 2. **`TwoMlsPqInvitation::open_initial(envelope) -> { app_payload, welcome }`** then
-   **`receive(welcome, their_kp, spawn_token)`** — Bob opens the envelope (the invitation
-   holds the KP′ material), validates the app-layer welcome, and joins Group_A as his
-   receive group (PQ half first, re-deriving the APQ-PSK, then the classical half),
-   and builds his own send group (Group_B) **classical half only**, bound by a
-   cross-party PSK exported from Group_A's classical half — Group_B's PQ half is
-   deferred to the bootstrap (below), so Bob can send immediately. `APQWelcome_B`
+   **`receive(welcome, their_kp, spawn_token, new_client_id, expected_remote)`** — Bob
+   opens the envelope
+   (the invitation holds the KP′ material), validates the app-layer welcome, and joins
+   Group_A as his receive group (PQ half first, re-deriving the APQ-PSK, then the
+   classical half), and builds his own send group (Group_B) **classical half only**,
+   bound by a cross-party PSK exported from Group_A's classical half — Group_B's PQ
+   half is deferred to the bootstrap (below), so Bob can send immediately.
+   `new_client_id` selects an optional **dedicated per-session principal** at
+   establishment: Group_B (and later its A.4 PQ half) is created under a freshly-minted
+   principal with that id, so Alice sees the dedicated principal as the creator leaf of
+   the very welcome she joins from — no first-frame rotation is needed. Alice adopts the id
+   on the joining frame, surfacing it as `remote_commit.new_sender`; authenticity rides
+   the cross-party PSK — only the invitation holder can create a Group_B that Alice's
+   join accepts. `APQWelcome_B`
    (with an empty PQ slot) rides as the **staple** on every frame Bob sends until his
    first commit (see [Wire Format](./wire-format.md)); a standalone copy is also in
    `pending_outbound()` for hosts that deliver it separately.
@@ -74,7 +82,8 @@ Sending is two-phase so CommProtocol can bind a per-round proposal hash:
   - `proposing: None` → routine round. Our own send group commits only when a
     queued, app-approved remote proposal is pending — then `did_commit: true` and
     the cross-party PSK refreshes.
-  - `proposing: Some(new_client_id)` → principal rotation (after `stage_rotation`).
+  - `proposing: Some(new_client_id)` → this round's Upd proposes the named staged
+    rotation candidate (after `stage_rotation`; see Principal key rotation below).
 - **`encrypt(app_message)`** — binds the pending `proposal_hash` into the message's
   authenticated data and returns `EncryptResult { cipher_text, sender, recipient,
   epochs }`, where `epochs` is the send group's epoch pair — `pq_epoch` (0 while that
@@ -90,12 +99,17 @@ Sending is two-phase so CommProtocol can bind a per-round proposal hash:
 - `application_message` — a decrypted app message.
 - `proposal` — the peer's stapled `Upd(sender)` proposal, offered for app approval
   (then `queue_proposal(digest)`).
-- `remote_commit` — a `CommitResult`, surfaced on the frame whose staple was applied
-  (e.g. peer rotated → `new_sender`); repeats of an already-applied staple are
-  silent skips.
-- `None` — a re-delivered welcome (standalone `0x01` already joined from), or a
-  message for an unknown epoch (a reconnect condition — not recovered
-  in-library; see Planned Features).
+- `remote_commit` — a `CommitResult`, surfaced on the delivery that applied the staple
+  or performed the welcome join (peer rotated, or established under a dedicated
+  principal → `new_sender`); repeats of an already-applied staple are silent skips. A
+  *standalone* welcome that adopts a dedicated peer principal returns a `DecryptResult`
+  with only `remote_commit` set — the handoff is observable whichever copy of the
+  welcome arrives first. `new_sender` is an event hint; `their_principal_state()` is
+  the truth (the signal is lost if the same frame's app message fails).
+- `None` — a welcome that changed nothing to announce (a re-delivery already joined
+  from, or a first join under the peer's expected identity), or a message for an
+  unknown epoch (a reconnect condition — not recovered in-library; see
+  Planned Features).
 
 A stapled commit *ahead* of the receive group's next epoch fails with `EpochDesync`
 before the app ciphertext is touched: the peer advanced more than one commit past us
@@ -112,30 +126,37 @@ epoch and refreshing the PSK binding.
 
 ## Principal key rotation
 
-`stage_rotation(new_client_id)` then `prepare_to_encrypt(Some(new_id))` commits the
-handoff to the staged principal, announcing the new `ClientId` in the commit's
-authenticated data (the classical leaf credential itself is unchanged; ratchet
-commits have empty AD, which is the whole wire discriminator). A rotation round is
-otherwise an ordinary round: it stages the routine `Upd(self)` proposal, and it
-folds a queued, app-approved peer proposal into the same commit (with the
-cross-party PSK refresh, reported via `committed_remote_client_id`). Rotation is
-gated on having processed at least one peer message frame (`SessionNotReady`
-otherwise) — a unilateral commit must never displace a welcome staple the peer may
-still need. The app supplies
-only the opaque `ClientId`; the successor's MLS signing keys are minted internally, as
-session-owned state — staging the same id twice is a no-op, a different id replaces the
-staged one. The local state becomes `AgentState::Pending { old, new }` until the peer
-replies, then resolves to `Sync { new }`. The peer observes the change as
-`CommitResult.new_sender`.
+Rotation is **proposal-driven** (see [Group Rules](./group-rules.md) — the
+Authentication Service): `stage_rotation(new_client_id)` mints the successor (the app
+supplies only the opaque ClientId; signing keys are session-owned) and marks the
+session `Pending`; `prepare_to_encrypt(Some(new_id))` makes this round's stapled
+Upd(self) carry the candidate's credential. Different rounds may propose different
+candidates — the app orders them. The peer surfaces each candidate as
+`QueuedRemoteProposal.proposing`, approves one with `queue_proposal` (the running
+tally), and its next commit **canonicalizes** it: `committed_remote_client_id` and
+`their_principal_state` report the new identity on the committing side, and the
+commit staple's return canonicalizes the proposer (`remote_commit.new_recipient`,
+`my_principal_state` → `Sync { new }`, the session swaps to the winning principal).
+Because rotation rides the proposal slot, it can be offered on the very first frame —
+it can never displace the welcome staple. A candidate proposed on the wire is never
+dropped (the peer may commit any of them); staging beyond the in-flight window parks
+the request in a single deferred slot and proposes it on the next routine round once a
+slot frees. On the receiver, `queue_proposal` is a single-occupancy latest-wins tally
+(`queued_remote_successor()` reveals it), epoch-locked so it is dropped when the send
+epoch advances by an A.3 bind.
 
-The **PQ leaves catch up on the next re-key**: `pq_rekey_begin(rotating: new_id)` —
-which must name the session's *current* principal, i.e. the classical rotation above has
-already happened — moves the initiator's leaf in both PQ groups to the new principal's
-signing key (the `Upd'`, then the final `Commit'`'s updatePath). The `ClientId`
-travels in the proposal's authenticated data, and the responder returns it from
-`pq_rekey_respond`; leaf credential *bytes* stay fixed, as on the classical side.
-`pq_bootstrap_begin(rotating:)` accepts the same id — its key package is generated by
-the current principal, so the check alone suffices.
+The winner's other leaves **lag and catch up**: the proposer's own send-group leaf
+moves at its next approved commit (the peer observes `new_sender` on that staple, and
+message attribution follows); the PQ leaves catch up at the next A.4/A.5 handoff
+(`pq_rekey_begin(rotating:)` must name the session's *current* — already canonical —
+principal, and the handoff's new leaf carries that credential); the acceptor's
+recv-group leaf converges from the invitation identity to the dedicated
+establishment principal via its first committed Upd. Every catch-up is validated
+against the AS history window.
+
+For the common "dedicated agent per session" pattern, don't rotate at establishment
+at all: pass the agent's id to `receive(…, new_client_id:)` and the session is born
+under it (Establishment, above).
 
 ## Invitations & replayed initial frames
 

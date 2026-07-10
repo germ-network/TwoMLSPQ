@@ -14,7 +14,7 @@ post-quantum gap for direct (1:1) conversations.
 ```
 iOS App
   └─ CommProtocol (Swift)        DIDs · Anchors · Agent keys · routing
-       └─ TwoMLSPQ (this crate)  sessions · two APQ send groups
+       └─ TwoMLSPQ (this crate)  sessions · two send groups (APQ groups)
             └─ mls-rs            MLS group state · key schedules
                  └─ crypto       X25519/ChaCha (classical) · ML-KEM-768 (PQ)
 ```

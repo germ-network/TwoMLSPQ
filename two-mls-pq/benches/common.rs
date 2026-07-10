@@ -46,7 +46,13 @@ pub fn established() -> (Arc<TwoMlsPqSession>, Arc<TwoMlsPqSession>) {
     let envelope = alice_session.pending_outbound().unwrap();
     let opened = bob_inv.open_initial(envelope).unwrap();
     let bob_session = bob_inv
-        .receive(opened.welcome, alice_kp, b"bench-establish".to_vec())
+        .receive(
+            opened.welcome,
+            alice_kp,
+            b"bench-establish".to_vec(),
+            None,
+            None,
+        )
         .unwrap();
     let welcome_b = bob_session.pending_outbound().unwrap();
     alice_session.process_incoming(welcome_b).unwrap();

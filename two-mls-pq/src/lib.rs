@@ -63,7 +63,55 @@ pub fn version() -> String {
 // new `TwoMlsPqInvitation::open_initial(blob) -> InitialFrame { app_payload, welcome }`
 // opens it (decrypt-only, does not consume the invitation), replacing the raw
 // `hpke_open` + manual compose the host did before.
-const BINDING_CONTRACT_VERSION: u64 = 8;
+// v9 (2026-07-10): establishment-time principal selection — `TwoMlsPqInvitation::receive`
+// gains `new_client_id: Option<Vec<u8>>`: the spawned session's send group is created
+// under a freshly-minted dedicated principal (no rotation commit; the welcome's creator
+// leaf carries the dedicated id), replacing the receive → stage_rotation →
+// prepare_to_encrypt(Some(_)) first-frame dance that the peer_confirmed gate now
+// (correctly) refuses. Semantics: joining the peer's send group adopts the creator
+// leaf's ClientId as `their_principal_state`, and the delivery that performed the join
+// surfaces it as `remote_commit.new_sender` when it differs from the invitation
+// identity — on the message frame whose staple joined, AND on a standalone welcome
+// (`process_incoming` then returns `Some(DecryptResult { remote_commit, .. })` instead
+// of `None`; re-deliveries and unchanged-principal joins stay `None`). TwoMlsPqError
+// gained `InvalidClientId` (an empty principal id supplied to `receive(new_client_id:)`
+// or `stage_rotation` — empty is reserved as the ratchet-commit AD discriminator).
+// Hardening: every join and applied peer commit now enforces the protocol's two-party
+// group shape (a crafted welcome/commit/proposal carrying extra leaves is rejected as
+// `Mls`).
+// Also in v9 (2026-07-10, group rules): `receive` gains `expected_remote: Option<Vec<u8>>`
+// — the identity the caller already expects the welcome from; a mismatched key package is
+// rejected as the new `RemoteIdentityMismatch` BEFORE any invitation state is claimed.
+// Unconditionally, the welcome's creator leaf must now match the supplied key package at
+// `receive`/`accept`, and an A.4 bootstrap key package must name the established peer
+// (both `RemoteIdentityMismatch`). Commits are now filtered against the TwoMLS operation
+// whitelist on both build and receive (creation = exactly one Add; steady state = at most
+// one peer-leaf Update + external PSKs; everything else rejected as `Mls`), and a stapled
+// or A.5 proposal that is not the peer's own-leaf Update is rejected at ingest
+// (`ProposalRejected`).
+// Also in v9 (2026-07-10, the TwoMLS AS): credential rotation is PROPOSAL-DRIVEN.
+// `stage_rotation` mints a candidate (several may be staged; my_principal_state is
+// Pending while any are); `prepare_to_encrypt(Some(id))` selects which candidate this
+// round's Upd proposes (it no longer commits a rotation — the unilateral AD-announced
+// rotation commit is gone, and rotation may ride the very first frame);
+// `QueuedRemoteProposal.proposing` now carries the CANDIDATE credential the Upd's
+// leaf bears; `queue_proposal` approval authorizes it; the approver's commit
+// canonicalizes it (`committed_remote_client_id`, `their_principal_state`), and the
+// staple back swaps the proposer onto the winner (`remote_commit.new_recipient`,
+// Sync). Leaf credentials genuinely move in leaves now; `new_sender` derives from the
+// observed leaf change (commit AD is no longer read). TwoMlsPqError gained
+// `CredentialRejected` (AS refusal, retryable from a staple). The session archive
+// carries the AS sequences and staged candidates (SESSION_ARCHIVE_VERSION -> 5; v4
+// blobs fail ArchiveInvalid per prerelease policy).
+// Also in v9 (2026-07-10, candidate lifecycle): staged rotation candidates are never
+// evicted (a sent candidate the peer may still commit is retained until
+// canonicalization); overflow beyond the in-flight window parks in a single deferred
+// slot and is proposed on the next routine round. `queue_proposal` validates then
+// `clear_proposal_cache`s (nothing is cached until the fold re-applies it), so a
+// rejected call is a no-op and replacing the running tally is a clean overwrite; the
+// tally is dropped when the send epoch advances via an A.3 bind. New exported getter
+// `queued_remote_successor() -> Option<ClientId>` surfaces the current tally.
+const BINDING_CONTRACT_VERSION: u64 = 9;
 
 /// See `BINDING_CONTRACT_VERSION`. Exported so the Swift layer can verify the
 /// binding it was generated with matches the binary it loaded.
@@ -350,6 +398,27 @@ pub enum TwoMlsPqError {
     /// mis-route or an unexpected re-invite.
     #[error("a different welcome arrived for an already-joined receive group")]
     UnexpectedWelcome,
+    /// A principal ClientId supplied for announcement on the wire is empty. Empty is
+    /// reserved: the rotation-commit discriminator is "empty authenticated_data = ratchet
+    /// commit", so an empty id could never be announced or observed by the peer. Raised by
+    /// `TwoMlsPqInvitation::receive(new_client_id: Some(vec![]))` and
+    /// `stage_rotation(vec![])`.
+    #[error("principal client id must be non-empty")]
+    InvalidClientId,
+    /// An establishment identity failed to match: the remote's key package does not carry
+    /// the identity the caller said it expects (`receive(expected_remote:)` — checked
+    /// before any invitation state is claimed, so the invitation stays fully reusable),
+    /// the welcome's creator leaf does not match the supplied key package, or an A.4
+    /// bootstrap key package names a principal that is not the established peer.
+    #[error("remote identity does not match the expected principal")]
+    RemoteIdentityMismatch,
+    /// A credential failed the Authentication Service: an Update proposing an
+    /// unauthorized successor, a commit moving a leaf outside the app-defined
+    /// sequence, or a canonicalized credential naming no staged candidate. Retryable
+    /// where it arises from a staple — the staple re-rides every frame, so
+    /// authorize-and-reprocess recovers the round.
+    #[error("credential succession rejected by the authentication service")]
+    CredentialRejected,
 }
 
 /// SHA-256 over `bytes` — the single hashing primitive behind every digest this
