@@ -94,7 +94,7 @@ struct PQInvitationReceiveTests {
 		)
 
 		// A transport re-delivery of the same welcome is dropped.
-		#expect(throws: (any Error).self) {
+		#expect(throws: TwoMlsPqError.DuplicateWelcome) {
 			_ = try invitation.receive(
 				sendGroupWelcome: welcome,
 				remoteKeyPackage: initiatorKp,

@@ -239,8 +239,11 @@ struct RotationDemo {
 		#expect(remotePQ.turn == .weInitiate)
 
 		//A.3 cannot carry a rotation — no updatePath rides the ratchet
-		guard (try? remotePQ.begin(.ratchet, rotating: dedicatedAgentId)) == nil else {
-			throw TestErrors.unexpected
+		do {
+			_ = try remotePQ.begin(.ratchet, rotating: dedicatedAgentId)
+			Issue.record("expected rotationCannotRideRatchet")
+		} catch TwoMLSPQConformanceError.rotationCannotRideRatchet {
+			// expected
 		}
 
 		//A.5 with the credential handoff: the rekey hands remote's PQ leaves to
