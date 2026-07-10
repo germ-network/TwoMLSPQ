@@ -52,6 +52,7 @@ pub(crate) type CombinerClient = apq::CombinerClient<SyntheticKeyPackageStore, C
 pub(crate) type CombinerGroup = apq::CombinerGroup<SyntheticKeyPackageStore, Classical, Pq>;
 pub(crate) type MlsClient = apq::MlsClient<SyntheticKeyPackageStore, Classical>;
 pub(crate) type MlsGroup = apq::MlsGroup<SyntheticKeyPackageStore, Classical>;
+pub(crate) type PqMlsGroup = apq::PqMlsGroup<SyntheticKeyPackageStore, Pq>;
 pub(crate) type PqMlsClient = apq::PqMlsClient<SyntheticKeyPackageStore, Pq>;
 
 #[derive(Clone, Default)]

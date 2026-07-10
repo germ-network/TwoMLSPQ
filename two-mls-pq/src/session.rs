@@ -102,6 +102,13 @@ struct SessionInner {
     /// same rule, so a frame that can still be routed can still be opened. Session-owned,
     /// so it rides the archive.
     recv_header_keys: BTreeMap<u64, Vec<u8>>,
+    /// The PQ side-band's header receive window: `header_key_pq(send_group.pq, e)` per
+    /// recent `pq_epoch` of my own send-PQ group (the peer seals side-band frames under
+    /// their recv-PQ, which is my send-PQ). Separate from `recv_header_keys` so the
+    /// side-band's outer seal tracks the PQ ratchet's cadence rather than the async
+    /// classical one. Keyed by `pq_epoch`; retained "keep newest `PQ_HEADER_WINDOW`" —
+    /// session-owned, with no rendezvous or mls-rs coupling (PQ keeps no rendezvous).
+    recv_header_keys_pq: BTreeMap<u64, Vec<u8>>,
     /// The group-state storage backing the send group's classical half, captured from
     /// the client that CONSTRUCTED the session. The retention probe must read this
     /// handle, not one reached through `self.client`: a Phase 8 rotation replaces
@@ -333,7 +340,9 @@ enum PqInflight {
 // v3 (header encryption): the archive gained the per-epoch header receive window
 // (`recv_header_keys`), so a restored session can still open frames sealed under a recent
 // send-group epoch.
-const SESSION_ARCHIVE_VERSION: u8 = 3;
+// v4 (PQ-family side-band keys): added the PQ header window (`recv_header_keys_pq`), so a
+// restored session opens PQ side-band frames sealed under a recent pq_epoch too.
+const SESSION_ARCHIVE_VERSION: u8 = 4;
 
 // In its own module because the derive-generated impls reference the std `Result`, which
 // the crate-local `Result` alias would shadow (same pattern as `invitation::wire`).
@@ -493,6 +502,7 @@ mod archive_wire {
         pub(super) retired_send_psks: Vec<ExternalPskId>,
         pub(super) listen_rendezvous: Vec<ListenEntry>,
         pub(super) recv_header_keys: Vec<HeaderKeyEntry>,
+        pub(super) recv_header_keys_pq: Vec<HeaderKeyEntry>,
         pub(super) pending_outbound: Option<Vec<u8>>,
         pub(super) pending_proposal_hash: Option<Vec<u8>>,
         /// The commit-or-welcome staple every outbound frame re-sends. Never empty on a
@@ -741,7 +751,7 @@ impl TwoMlsPqSession {
         let eph = apq::pq_ratchet::generate_ephemeral(&providers::pq_kem()?)?;
         let mut msg = vec![PQ_EK_TAG];
         msg.extend_from_slice(&eph.encapsulation_key());
-        let sealed = inner.seal(&msg)?;
+        let sealed = inner.seal_side_band(&msg)?;
         inner.pq_inflight = Some(PqInflight::Initiating(eph));
         Ok(sealed)
     }
@@ -839,8 +849,10 @@ impl TwoMlsPqSession {
         inner.pq_turn_mine = false;
         inner.pending_pq_outbound = Some(encode_pq_bind(pq_commit, cl_commit, app_ct));
         // The bind committed classically in our send group — capture the new
-        // epoch's listen address.
+        // epoch's listen address — and advanced our send-PQ's pq_epoch — capture its
+        // new header key.
         inner.record_listen_rendezvous()?;
+        inner.record_pq_header_key()?;
         Ok(())
     }
 
@@ -944,7 +956,7 @@ impl TwoMlsPqSession {
         };
         let mut msg = vec![PQ_REKEY_UPD_TAG];
         msg.extend_from_slice(&proposal.to_bytes().map_err(|_| TwoMlsPqError::Mls)?);
-        let sealed = inner.seal(&msg)?;
+        let sealed = inner.seal_side_band(&msg)?;
         inner.pq_inflight = Some(PqInflight::RekeyInitiated { rotating });
         Ok(sealed)
     }
@@ -1030,6 +1042,8 @@ impl TwoMlsPqSession {
         };
         inner.pq_inflight = Some(PqInflight::RekeyResponded);
         inner.pending_pq_outbound = Some(encode_pq_rekey_commit(commit_bytes, counter));
+        // Our send-PQ's pq_epoch advanced (updatePath commit) — capture its new key.
+        inner.record_pq_header_key()?;
         Ok(rotated)
     }
 
@@ -1147,6 +1161,8 @@ impl TwoMlsPqSession {
                 // Our operation completes once the peer applies; the turn passes.
                 inner.pq_turn_mine = false;
                 inner.pending_pq_outbound = Some(encode_pq_rekey_commit(commit2, Vec::new()));
+                // Our send-PQ's pq_epoch advanced (the counter-Upd' commit) — capture it.
+                inner.record_pq_header_key()?;
                 Ok(true)
             }
             Some(PqInflight::RekeyResponded) => {
@@ -1228,26 +1244,45 @@ fn rendezvous_secret(group: &crate::key_package_store::MlsGroup) -> Result<Vec<u
 
 // Header encryption: the outer symmetric seal that turns every rendezvous-channel frame
 // into one opaque blob (no plaintext tag, group id, epoch, or Welcome metadata). The key
-// is an exporter of a group's classical half under a label distinct from the rendezvous
-// and PSK exporters, so the three derivations never collide. Both parties compute the
-// same key on the same group at the same epoch; outsiders cannot.
+// is an exporter of a group's half under a label distinct from the rendezvous and PSK
+// exporters, so the derivations never collide. Both parties compute the same key on the
+// same group at the same epoch; outsiders cannot.
 //
-// Design note (divergence from the header-encryption chapter's two-family scheme): ALL
-// frames — message path and PQ side-band alike — seal under this one classical family,
-// not a separate PQ-half family for the side-band. The side-band is post-establishment
-// and turn-based, so the classical recv-group key is always available and its window
-// already tolerates the same crossing; the only thing given up is "side-band header keys
-// rotate with pq_epoch" (they rotate with the classical epoch instead, which advances
-// every routine round). See the chapter for the PQ-family refinement.
+// Two key families, one per stream, so each header key tracks the clock of the frames it
+// protects (the classical and PQ ratchets run on independent, async cadences):
+//   * message-path frames (0x01/0x03) seal under the CLASSICAL half's exporter, keyed by
+//     the classical epoch — `header_key` / `recv_header_keys`;
+//   * PQ side-band frames (0x05–0x11) seal under the PQ half's exporter, keyed by
+//     `pq_epoch` — `header_key_pq` / `recv_header_keys_pq`.
+// The one exception is the pre-A.4 BOOTSTRAP_KP, whose recv-PQ group does not exist yet;
+// it falls back to the classical seal (see `SessionInner::seal_side_band`).
 const HEADER_KEY_LABEL: &[u8] = b"germ.network.twomlspq.headerKey.v1";
+const HEADER_KEY_PQ_LABEL: &[u8] = b"germ.network.twomlspq.headerKey.pq.v1";
 const HEADER_KEY_LEN: usize = 32;
+// PQ header window depth: the side-band is turn-based with one op in flight, so `pq_epoch`
+// advances slowly; a few recent keys cover any lag. Session-owned secrets, so this is a
+// plain "keep newest N", not tied to mls-rs retention or the (classical-only) rendezvous.
+const PQ_HEADER_WINDOW: usize = 4;
 
-/// Derive the header-encryption key for a group at its current epoch: `exportSecret(label,
-/// group_id, 32)` on the classical half. Context = the group id (domain separation on top
-/// of the group-specific exporter, matching the classical stack's convention).
+/// Derive the message-path header key for a group at its current classical epoch:
+/// `exportSecret(label, group_id, 32)` on the classical half. Context = the group id
+/// (domain separation on top of the group-specific exporter, matching the classical
+/// stack's convention).
 fn header_key(group: &crate::key_package_store::MlsGroup) -> Result<Vec<u8>> {
     group
         .export_secret(HEADER_KEY_LABEL, group.group_id(), HEADER_KEY_LEN)
+        .map(|secret| secret.as_bytes().to_vec())
+        .map_err(|_| TwoMlsPqError::Mls)
+}
+
+/// Derive the PQ side-band header key for a group at its current `pq_epoch`:
+/// `exportSecret(pq_label, group_id, 32)` on the PQ half. Same exporter shape as
+/// `header_key` (both halves are `Group<_>`), a distinct label, and keyed by the PQ
+/// clock so the side-band's outer seal rotates with the PQ ratchet, not classical
+/// traffic.
+fn header_key_pq(group: &crate::key_package_store::PqMlsGroup) -> Result<Vec<u8>> {
+    group
+        .export_secret(HEADER_KEY_PQ_LABEL, group.group_id(), HEADER_KEY_LEN)
         .map(|secret| secret.as_bytes().to_vec())
         .map_err(|_| TwoMlsPqError::Mls)
 }
@@ -1323,23 +1358,74 @@ impl SessionInner {
         Ok(())
     }
 
+    /// Capture my send-PQ group's header key at its current `pq_epoch` into the PQ
+    /// receive window. Idempotent per `pq_epoch`; a no-op until the send-PQ half exists
+    /// (deferred on the acceptor until the A.4 bootstrap). Called wherever the send-PQ
+    /// group is created or its `pq_epoch` advances — group creation (`initiate`,
+    /// `pq_bootstrap_respond`), the A.3 bind (`pq_ratchet_bind`), and the A.5 commits
+    /// (`pq_rekey_respond` / `pq_rekey_apply`). Retention is a plain keep-newest window
+    /// (these are session-owned secrets; the PQ side-band has no rendezvous and no
+    /// mls-rs-retention story to follow).
+    fn record_pq_header_key(&mut self) -> Result<()> {
+        let Some(send) = self.send_group.as_ref() else {
+            return Ok(());
+        };
+        let Some(send_pq) = send.pq.as_ref() else {
+            return Ok(());
+        };
+        let epoch = send_pq.current_epoch();
+        if self.recv_header_keys_pq.contains_key(&epoch) {
+            return Ok(());
+        }
+        self.recv_header_keys_pq
+            .insert(epoch, header_key_pq(send_pq)?);
+        // Keep only the newest PQ_HEADER_WINDOW epochs.
+        while self.recv_header_keys_pq.len() > PQ_HEADER_WINDOW {
+            if let Some(&oldest) = self.recv_header_keys_pq.keys().next() {
+                self.recv_header_keys_pq.remove(&oldest);
+            }
+        }
+        Ok(())
+    }
+
     /// Seal an outbound frame under the header key of MY recv group (the peer's send
     /// group) at its current classical epoch: `[random nonce][AEAD ct+tag]`, empty AAD.
     /// The peer opens it from its own send-group window (`recv_header_keys`). Requires a
     /// recv group — the one pre-establishment frame (the initiator's initial welcome on
     /// the invitation channel) has no symmetric key and is not sealed here.
     fn seal(&self, frame: &[u8]) -> Result<Vec<u8>> {
-        use mls_rs::CipherSuiteProvider;
         let recv = self
             .recv_group
             .as_ref()
             .ok_or(TwoMlsPqError::SessionNotEstablished)?;
-        let key = header_key(&recv.classical)?;
+        self.seal_with(&header_key(&recv.classical)?, frame)
+    }
+
+    /// Seal a PQ side-band frame under the PQ family — `header_key_pq(recv_group.pq)` at
+    /// its current `pq_epoch`, the peer opening it from its own send-PQ window. Falls back
+    /// to the classical `seal` when the recv-PQ group does not exist yet: the only such
+    /// frame is the pre-A.4 `BOOTSTRAP_KP` (its recv-PQ is the group the bootstrap is
+    /// creating), a one-time establishment frame whose cadence is irrelevant, and the
+    /// receiver opens it from its classical window via the dual-window `try_open`.
+    fn seal_side_band(&self, frame: &[u8]) -> Result<Vec<u8>> {
+        let recv = self
+            .recv_group
+            .as_ref()
+            .ok_or(TwoMlsPqError::SessionNotEstablished)?;
+        match recv.pq.as_ref() {
+            Some(pq) => self.seal_with(&header_key_pq(pq)?, frame),
+            None => self.seal(frame),
+        }
+    }
+
+    /// Seal `frame` under `key`: `[random nonce][AEAD ct+tag]`, empty AAD.
+    fn seal_with(&self, key: &[u8], frame: &[u8]) -> Result<Vec<u8>> {
+        use mls_rs::CipherSuiteProvider;
         let cs = providers::classical_aead_suite()?;
         let mut out = vec![0u8; cs.aead_nonce_size()];
         cs.random_bytes(&mut out).map_err(|_| TwoMlsPqError::Mls)?;
         let ct = cs
-            .aead_seal(&key, frame, None, &out)
+            .aead_seal(key, frame, None, &out)
             .map_err(|_| TwoMlsPqError::Mls)?;
         out.extend_from_slice(&ct);
         Ok(out)
@@ -1373,9 +1459,16 @@ impl SessionInner {
             return Ok(None);
         }
         let (nonce, ct) = blob.split_at(nonce_size);
-        for key in self.recv_header_keys.values().rev() {
-            if let Ok(pt) = cs.aead_open(key, ct, None, nonce) {
-                return Ok(Some(pt.to_vec()));
+        // Both families use the same AEAD; only the key set differs. A message frame
+        // authenticates only under a classical-window key and a side-band frame only
+        // under a PQ-window key (the pre-A.4 BOOTSTRAP_KP under classical), so trying
+        // both windows resolves either without ambiguity. Newest epoch first in each.
+        let windows = [&self.recv_header_keys, &self.recv_header_keys_pq];
+        for keys in windows {
+            for key in keys.values().rev() {
+                if let Ok(pt) = cs.aead_open(key, ct, None, nonce) {
+                    return Ok(Some(pt.to_vec()));
+                }
             }
         }
         Ok(None)
@@ -1775,6 +1868,7 @@ fn build_session(
             retired_send_psks: Vec::new(),
             listen_rendezvous: BTreeMap::new(),
             recv_header_keys: BTreeMap::new(),
+            recv_header_keys_pq: BTreeMap::new(),
             send_group_storage,
             psk_stores,
             psk_stores_from,
@@ -1871,9 +1965,12 @@ impl TwoMlsPqSession {
             None,
         );
         // Seed the PSK ledger with the send group's establishment epoch, and capture
-        // the establishment epoch's listen address.
+        // the establishment epoch's listen address (and the send-PQ header key when the
+        // send-PQ half exists — the initiator's does at `initiate`; the acceptor's is
+        // deferred to the A.4 bootstrap, so this is a no-op there).
         session.lock().remember_send_psk()?;
         session.lock().record_listen_rendezvous()?;
+        session.lock().record_pq_header_key()?;
         Ok(session)
     }
 
@@ -1941,9 +2038,12 @@ impl TwoMlsPqSession {
             Some(crate::sha256(&welcome)),
         );
         // Seed the PSK ledger with the send group's establishment epoch, and capture
-        // the establishment epoch's listen address.
+        // the establishment epoch's listen address (and the send-PQ header key when the
+        // send-PQ half exists — the initiator's does at `initiate`; the acceptor's is
+        // deferred to the A.4 bootstrap, so this is a no-op there).
         session.lock().remember_send_psk()?;
         session.lock().record_listen_rendezvous()?;
+        session.lock().record_pq_header_key()?;
         Ok(session)
     }
 
@@ -2010,6 +2110,7 @@ impl TwoMlsPqSession {
         if wire
             .recv_header_keys
             .iter()
+            .chain(wire.recv_header_keys_pq.iter())
             .any(|e| e.key.len() != HEADER_KEY_LEN)
         {
             return Err(TwoMlsPqError::ArchiveInvalid);
@@ -2101,6 +2202,11 @@ impl TwoMlsPqSession {
                     .into_iter()
                     .map(|entry| (entry.epoch, entry.key))
                     .collect(),
+                recv_header_keys_pq: wire
+                    .recv_header_keys_pq
+                    .into_iter()
+                    .map(|entry| (entry.epoch, entry.key))
+                    .collect(),
                 send_group_storage,
                 psk_stores,
                 psk_stores_from,
@@ -2147,9 +2253,10 @@ impl TwoMlsPqSession {
     pub fn pq_take_pending_outbound(&self) -> Option<Vec<u8>> {
         let mut inner = self.lock();
         let frame = inner.pending_pq_outbound.take()?;
-        // Side-band frames are sealed like every other rendezvous-channel frame; the
-        // responder is always post-establishment here, so the seal key is available.
-        inner.seal(&frame).ok()
+        // Side-band frames seal under the PQ family (the responder is post-establishment,
+        // so its recv-PQ group exists); the classical fallback in `seal_side_band` is
+        // never hit here.
+        inner.seal_side_band(&frame).ok()
     }
 
     /// The send group's APQ epoch pair (PQ side-band, classical message group).
@@ -2195,9 +2302,10 @@ impl TwoMlsPqSession {
         let kp = inner.client.combiner().generate_pq_key_package()?;
         let mut msg = vec![PQ_BOOTSTRAP_KP_TAG];
         msg.extend_from_slice(&kp);
-        // Sealed like every rendezvous-channel frame; the `ready` check above guarantees
-        // the recv group exists.
-        inner.seal(&msg)
+        // Side-band frame. Pre-A.4 our recv-PQ (Group_B.pq) is the group the bootstrap
+        // is creating, so `seal_side_band` falls back to the classical seal for exactly
+        // this frame; the peer opens it from its classical window.
+        inner.seal_side_band(&msg)
     }
 
     /// A.4 responder — stand up the deferred send-group PQ half around the peer's key
@@ -2239,6 +2347,9 @@ impl TwoMlsPqSession {
         };
         inner.pq_turn_mine = true;
         inner.pending_pq_outbound = Some(frame);
+        // Our send-PQ half now exists (Group_B.pq) — capture its header key so we can
+        // open side-band frames the peer seals to it.
+        inner.record_pq_header_key()?;
         Ok(())
     }
 
@@ -2726,6 +2837,14 @@ impl TwoMlsPqSession {
                 .collect(),
             recv_header_keys: inner
                 .recv_header_keys
+                .iter()
+                .map(|(&epoch, key)| archive_wire::HeaderKeyEntry {
+                    epoch,
+                    key: key.clone(),
+                })
+                .collect(),
+            recv_header_keys_pq: inner
+                .recv_header_keys_pq
                 .iter()
                 .map(|(&epoch, key)| archive_wire::HeaderKeyEntry {
                     epoch,
@@ -4993,6 +5112,86 @@ mod tests {
         assert_ok!(alice.pq_ratchet_bind(ct, b"a".to_vec()));
         let bind = assert_some!(alice.pq_take_pending_outbound());
         assert_eq!(assert_ok!(bob.pq_ratchet_apply(bind)), b"a");
+    }
+
+    /// The point of the PQ family: a side-band frame is keyed by `pq_epoch`, so it
+    /// survives classical churn that evicts the message-path window — proving it does not
+    /// ride the (async) classical key. Contrast: a message frame from the same pre-churn
+    /// moment is evicted and no longer opens.
+    #[test]
+    fn test_side_band_survives_classical_churn() {
+        let (alice, bob) = establish_full();
+
+        // Capture two pre-churn frames Bob will try to open later: a message frame
+        // (classical-keyed) and a side-band EK (PQ-keyed).
+        assert_ok!(alice.prepare_to_encrypt(None));
+        let early_message = assert_ok!(alice.encrypt(b"early".to_vec())).cipher_text;
+        let ek = assert_ok!(alice.pq_ratchet_begin());
+
+        // Churn ONLY the classical ratchet, well past mls-rs epoch retention: Alice
+        // proposes, Bob commits Bob's send group each round, both stay in lockstep. No PQ
+        // activity, so `pq_epoch` — and Bob's PQ window — is untouched.
+        for _ in 0..10 {
+            assert_ok!(alice.prepare_to_encrypt(None));
+            let a = assert_ok!(alice.encrypt(b"churn".to_vec()));
+            let r = assert_some!(assert_ok!(bob.process_incoming(a.cipher_text)));
+            assert_ok!(bob.queue_proposal(assert_some!(r.proposal).digest));
+            assert!(assert_ok!(bob.prepare_to_encrypt(None)).did_commit);
+            let bc = assert_ok!(bob.encrypt(b"c".to_vec()));
+            assert_some!(assert_ok!(alice.process_incoming(bc.cipher_text)));
+        }
+
+        // The classical window has churned past the early message's epoch — it no longer
+        // opens…
+        assert!(
+            assert_ok!(bob.open_incoming(early_message)).is_none(),
+            "message-path window should have evicted the pre-churn epoch"
+        );
+        // …but the EK, keyed by the (unchanged) pq_epoch, still opens. If it rode the
+        // classical key it would have been evicted alongside the message frame.
+        assert_eq!(
+            assert_some!(assert_ok!(bob.open_incoming(ek))).kind,
+            super::OpenedFrameKind::PqSideBand {
+                kind: super::PqFrameKind::RatchetEphemeralKey
+            }
+        );
+    }
+
+    /// The pre-A.4 BOOTSTRAP_KP has no recv-PQ group yet, so it falls back to the
+    /// classical seal and opens via the classical window — still classifying as the
+    /// bootstrap side-band frame.
+    #[test]
+    fn test_bootstrap_kp_opens_via_classical_fallback() {
+        let (alice, bob) = establish_sessions();
+        let kp = assert_ok!(alice.pq_bootstrap_begin(None));
+        assert_eq!(
+            assert_some!(assert_ok!(bob.open_incoming(kp.clone()))).kind,
+            super::OpenedFrameKind::PqSideBand {
+                kind: super::PqFrameKind::BootstrapKeyPackage
+            }
+        );
+        // And the bootstrap completes through the sealed frames.
+        assert_ok!(bob.pq_bootstrap_respond(kp));
+        let bind = assert_some!(bob.pq_take_pending_outbound());
+        assert_ok!(alice.pq_bootstrap_apply(bind));
+        assert!(alice.is_fully_established() && bob.is_fully_established());
+    }
+
+    /// A restored session opens an in-flight side-band frame — the PQ window rides the
+    /// archive.
+    #[test]
+    fn test_restored_session_opens_in_flight_side_band() {
+        let (alice, bob) = establish_full();
+        let ek = assert_ok!(alice.pq_ratchet_begin());
+
+        // Bob archives and restores before opening the EK.
+        let restored = assert_ok!(TwoMlsPqSession::from_archive(assert_ok!(bob.archive())));
+        assert_eq!(
+            assert_some!(assert_ok!(restored.open_incoming(ek))).kind,
+            super::OpenedFrameKind::PqSideBand {
+                kind: super::PqFrameKind::RatchetEphemeralKey
+            }
+        );
     }
 
     /// The initiator's initial welcome (invitation channel) is NOT sealed — it has no
