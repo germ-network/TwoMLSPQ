@@ -546,17 +546,37 @@ mod tests {
         CombinerClient::new(client_id(), crypto()).unwrap()
     }
 
+    /// A rules-free mls-rs client (default `MlsRules`, plain basic identity provider,
+    /// same crypto) for crafting protocol-violating artifacts that a wired client can
+    /// no longer even build — the adversary's toolbox for the tests below.
+    fn rogue_client(id: Vec<u8>) -> mls_rs::Client<impl mls_rs::client_builder::MlsConfig> {
+        use mls_rs::identity::basic::{BasicCredential, BasicIdentityProvider};
+        use mls_rs::identity::SigningIdentity;
+        let provider = AwsLcCryptoProvider::new();
+        let cs = provider
+            .cipher_suite_provider(mls_rs::CipherSuite::CURVE25519_CHACHA)
+            .unwrap();
+        let (secret, public) = cs.signature_key_generate().unwrap();
+        let identity = SigningIdentity::new(BasicCredential::new(id).into_credential(), public);
+        mls_rs::client_builder::ClientBuilder::new()
+            .crypto_provider(provider)
+            .identity_provider(BasicIdentityProvider::new())
+            .signing_identity(identity, secret, mls_rs::CipherSuite::CURVE25519_CHACHA)
+            .build()
+    }
+
     /// Every group in this protocol is a 1:1 pair: a welcome whose tree carries more
     /// than two leaves (a shadow member planted at creation, whose credential would
-    /// otherwise be reportable as a sender identity) is rejected at join.
+    /// otherwise be reportable as a sender identity) is rejected at join. The crafting
+    /// needs a rules-free client — a wired client can no longer even BUILD the
+    /// two-Add creation commit (see `test_rules_reject_malformed_creation`).
     #[test]
     fn test_join_rejects_three_member_welcome() {
-        let alice = client();
+        let rogue = rogue_client(client_id());
         let bob = client();
         let carol = client();
 
-        let mut group = alice
-            .classical()
+        let mut group = rogue
             .create_group(ExtensionList::new(), ExtensionList::new(), None)
             .unwrap();
         let bob_kp =
@@ -575,6 +595,111 @@ mod tests {
         let welcome = commit.welcome_messages.first().unwrap().to_bytes().unwrap();
 
         assert!(join_group_from_welcome(bob.classical(), &welcome).is_err());
+    }
+
+    /// The rules make the same malformation unbuildable on a wired client: the
+    /// creation commit must be exactly one Add.
+    #[test]
+    fn test_rules_reject_malformed_creation() {
+        let alice = client();
+        let bob = client();
+        let carol = client();
+
+        let mut group = alice
+            .classical()
+            .create_group(ExtensionList::new(), ExtensionList::new(), None)
+            .unwrap();
+        let bob_kp =
+            MlsMessage::from_bytes(&bob.generate_classical_key_package().unwrap()).unwrap();
+        let carol_kp =
+            MlsMessage::from_bytes(&carol.generate_classical_key_package().unwrap()).unwrap();
+        assert!(group
+            .commit_builder()
+            .add_member(bob_kp)
+            .unwrap()
+            .add_member(carol_kp)
+            .unwrap()
+            .build()
+            .is_err());
+    }
+
+    /// Steady state forbids growth through EITHER side's commit: a peer commit
+    /// smuggling an Add is vetoed on receive BEFORE it is applied, and a wired
+    /// client cannot build one.
+    #[test]
+    fn test_rules_reject_add_in_steady_state() {
+        let alice = client();
+        let bob = client();
+        let carol = client();
+
+        // Honest pair.
+        let (mut alice_send, welcome) = create_group_with_member(
+            alice.classical(),
+            &bob.generate_classical_key_package().unwrap(),
+            &[],
+        )
+        .unwrap();
+        let mut bob_recv = join_group_from_welcome(bob.classical(), &welcome).unwrap();
+
+        // A wired client cannot even build the growth commit.
+        let carol_kp =
+            MlsMessage::from_bytes(&carol.generate_classical_key_package().unwrap()).unwrap();
+        assert!(alice_send
+            .commit_builder()
+            .add_member(carol_kp)
+            .unwrap()
+            .build()
+            .is_err());
+
+        // A rogue creator CAN build it — the victim must veto it on receive, before
+        // application (the roster still reads 2 afterwards).
+        let rogue = rogue_client(client_id());
+        let victim = client();
+        let mut rogue_group = rogue
+            .create_group(ExtensionList::new(), ExtensionList::new(), None)
+            .unwrap();
+        let victim_kp =
+            MlsMessage::from_bytes(&victim.generate_classical_key_package().unwrap()).unwrap();
+        let creation = rogue_group
+            .commit_builder()
+            .add_member(victim_kp)
+            .unwrap()
+            .build()
+            .unwrap();
+        rogue_group.apply_pending_commit().unwrap();
+        let welcome = creation
+            .welcome_messages
+            .first()
+            .unwrap()
+            .to_bytes()
+            .unwrap();
+        let mut victim_recv = join_group_from_welcome(victim.classical(), &welcome).unwrap();
+
+        let carol_kp2 =
+            MlsMessage::from_bytes(&carol.generate_classical_key_package().unwrap()).unwrap();
+        let growth = rogue_group
+            .commit_builder()
+            .add_member(carol_kp2)
+            .unwrap()
+            .build()
+            .unwrap();
+        rogue_group.apply_pending_commit().unwrap();
+        let growth_bytes = growth.commit_message.to_bytes().unwrap();
+
+        assert!(victim_recv
+            .process_incoming_message(MlsMessage::from_bytes(&growth_bytes).unwrap())
+            .is_err());
+        assert!(ensure_two_party(&victim_recv).is_ok());
+
+        // The honest pair still works.
+        let msg = alice_send
+            .encrypt_application_message(b"still-fine", vec![])
+            .unwrap()
+            .to_bytes()
+            .unwrap();
+        bob_recv
+            .process_incoming_message(MlsMessage::from_bytes(&msg).unwrap())
+            .unwrap();
     }
 
     /// The adopted persistence pattern end-to-end: archive per group through the group

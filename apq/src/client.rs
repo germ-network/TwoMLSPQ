@@ -9,7 +9,7 @@ use mls_rs::{
     client::Client,
     client_builder::{
         self, BaseConfig, WithCryptoProvider, WithGroupStateStorage, WithIdentityProvider,
-        WithKeyPackageRepo,
+        WithKeyPackageRepo, WithMlsRules,
     },
     identity::{
         basic::{BasicCredential, BasicIdentityProvider},
@@ -19,6 +19,7 @@ use mls_rs::{
 };
 use zeroize::Zeroizing;
 
+use crate::rules::TwoMlsRules;
 use crate::storage::PersistableGroupStorage;
 use crate::{CombinerError, Result};
 
@@ -185,11 +186,14 @@ pub struct CryptoConfig<C, P> {
 // archival, and so the caller can hold a handle to it: clones share one map, letting
 // session code inspect which prior epochs are still retained (the storage's retention
 // trim) — e.g. to expire per-epoch rendezvous addresses in lockstep with that window.
-pub type OurConfig<S, C> = WithGroupStateStorage<
-    PersistableGroupStorage,
-    WithKeyPackageRepo<
-        S,
-        WithIdentityProvider<BasicIdentityProvider, WithCryptoProvider<C, BaseConfig>>,
+pub type OurConfig<S, C> = WithMlsRules<
+    TwoMlsRules,
+    WithGroupStateStorage<
+        PersistableGroupStorage,
+        WithKeyPackageRepo<
+            S,
+            WithIdentityProvider<BasicIdentityProvider, WithCryptoProvider<C, BaseConfig>>,
+        >,
     >,
 >;
 pub type MlsClient<S, C> = Client<OurConfig<S, C>>;
@@ -492,6 +496,9 @@ fn build_client<S: KeyPackageStorage + Clone, C: CryptoProvider + Clone>(
         .identity_provider(BasicIdentityProvider::new())
         .key_package_repo(key_package_store)
         .group_state_storage(group_storage)
+        // The TwoMLS operation whitelist (see `rules.rs`): vetoes any commit — built
+        // or received — outside the protocol's fixed shape.
+        .mls_rules(TwoMlsRules)
         .signing_identity(signing_identity, secret_key, suite)
         .build()
 }

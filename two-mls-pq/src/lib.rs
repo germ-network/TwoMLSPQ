@@ -79,6 +79,16 @@ pub fn version() -> String {
 // Hardening: every join and applied peer commit now enforces the protocol's two-party
 // group shape (a crafted welcome/commit/proposal carrying extra leaves is rejected as
 // `Mls`).
+// Also in v9 (2026-07-10, group rules): `receive` gains `expected_remote: Option<Vec<u8>>`
+// — the identity the caller already expects the welcome from; a mismatched key package is
+// rejected as the new `RemoteIdentityMismatch` BEFORE any invitation state is claimed.
+// Unconditionally, the welcome's creator leaf must now match the supplied key package at
+// `receive`/`accept`, and an A.4 bootstrap key package must name the established peer
+// (both `RemoteIdentityMismatch`). Commits are now filtered against the TwoMLS operation
+// whitelist on both build and receive (creation = exactly one Add; steady state = at most
+// one peer-leaf Update + external PSKs; everything else rejected as `Mls`), and a stapled
+// or A.5 proposal that is not the peer's own-leaf Update is rejected at ingest
+// (`ProposalRejected`).
 const BINDING_CONTRACT_VERSION: u64 = 9;
 
 /// See `BINDING_CONTRACT_VERSION`. Exported so the Swift layer can verify the
@@ -373,6 +383,13 @@ pub enum TwoMlsPqError {
     /// `stage_rotation(vec![])`.
     #[error("principal client id must be non-empty")]
     InvalidClientId,
+    /// An establishment identity failed to match: the remote's key package does not carry
+    /// the identity the caller said it expects (`receive(expected_remote:)` — checked
+    /// before any invitation state is claimed, so the invitation stays fully reusable),
+    /// the welcome's creator leaf does not match the supplied key package, or an A.4
+    /// bootstrap key package names a principal that is not the established peer.
+    #[error("remote identity does not match the expected principal")]
+    RemoteIdentityMismatch,
 }
 
 /// SHA-256 over `bytes` — the single hashing primitive behind every digest this

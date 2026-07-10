@@ -22,6 +22,7 @@ pub mod archive;
 mod client;
 mod group;
 pub mod pq_ratchet;
+pub mod rules;
 pub mod storage;
 
 pub use client::{

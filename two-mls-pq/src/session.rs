@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use apq::storage::PersistableGroupStorage;
 use mls_rs::identity::SigningIdentity;
 use mls_rs::{
-    group::ReceivedMessage,
+    group::{proposal::Proposal, ProposalMessageDescription, ProposalSender, ReceivedMessage},
     psk::{ExternalPskId, PreSharedKey},
     storage_provider::in_memory::InMemoryPreSharedKeyStorage,
     GroupStateStorage, MlsMessage,
@@ -1009,11 +1009,14 @@ impl TwoMlsPqSession {
                 .as_mut()
                 .and_then(|g| g.pq.as_mut())
                 .ok_or(TwoMlsPqError::SessionNotReady)?;
+            let my_index = send_pq.current_member_index();
             match send_pq
                 .process_incoming_message(proposal_msg)
                 .map_err(|_| TwoMlsPqError::Mls)?
             {
                 ReceivedMessage::Proposal(desc) => {
+                    // Only the peer's own-leaf Update is a legitimate A.5 opener.
+                    require_peer_update(&desc, my_index)?;
                     rotated = (!desc.authenticated_data.is_empty()).then(|| ClientId {
                         bytes: desc.authenticated_data.clone(),
                     });
@@ -1134,11 +1137,13 @@ impl TwoMlsPqSession {
                         .as_mut()
                         .and_then(|g| g.pq.as_mut())
                         .ok_or(TwoMlsPqError::SessionNotReady)?;
+                    let my_index = send_pq.current_member_index();
                     match send_pq
                         .process_incoming_message(counter_msg)
                         .map_err(|_| TwoMlsPqError::Mls)?
                     {
-                        ReceivedMessage::Proposal(_) => {}
+                        // The counter slot may only carry the peer's own-leaf Update.
+                        ReceivedMessage::Proposal(desc) => require_peer_update(&desc, my_index)?,
                         _ => return Err(TwoMlsPqError::Mls),
                     }
                     let handoff = match handoff {
@@ -1953,6 +1958,21 @@ fn check_key_package_suite(kp: &[u8], expected: mls_rs::CipherSuite) -> Result<(
     }
 }
 
+/// Require that a processed proposal is an Update from the peer's leaf — the only
+/// proposal kind members of this protocol ever exchange. An MLS Update always covers
+/// its sender's own leaf, so a member sender other than ourselves pins it to the one
+/// other member (the rules filter re-checks the same at commit time; this rejects at
+/// ingest, before the proposal enters any cache).
+fn require_peer_update(desc: &ProposalMessageDescription, my_index: u32) -> Result<()> {
+    let is_update = matches!(desc.proposal, Proposal::Update(_));
+    let from_peer = matches!(desc.sender, ProposalSender::Member(index) if index != my_index);
+    if is_update && from_peer {
+        Ok(())
+    } else {
+        Err(TwoMlsPqError::ProposalRejected)
+    }
+}
+
 /// Validate the cipher suite(s) in an APQ welcome's already-decoded halves against the session's
 /// expected pair. An empty PQ half (the acceptor's A.4-deferred return welcome) validates the
 /// classical half only.
@@ -2116,6 +2136,26 @@ impl TwoMlsPqSession {
         validate_welcome_halves(client.combiner().cipher_suite(), &recv_classical, &recv_pq)?;
         let recv_group =
             join_combiner_group_from_halves(&recv_classical, &recv_pq, client.combiner())?;
+        // Bind the welcome to the supplied key package: the creator leaf of every joined
+        // half must carry the identity the key package names. Without this, a caller
+        // could be handed a welcome from one principal alongside a key package from
+        // another and silently establish against the wrong identity (the initiator's
+        // later welcome-join deliberately ADOPTS the creator id — that dedicated-
+        // principal exception is the acceptor→initiator direction, not this one).
+        {
+            let mine = recv_group.classical.current_member_index();
+            let creator_index = if mine == 0 { 1 } else { 0 };
+            if sender_client_id(&recv_group.classical, creator_index)? != their_id.bytes {
+                return Err(TwoMlsPqError::RemoteIdentityMismatch);
+            }
+            if let Some(pq) = recv_group.pq.as_ref() {
+                let mine = pq.current_member_index();
+                let creator_index = if mine == 0 { 1 } else { 0 };
+                if sender_client_id(pq, creator_index)? != their_id.bytes {
+                    return Err(TwoMlsPqError::RemoteIdentityMismatch);
+                }
+            }
+        }
         // The invitation's key package has served its one purpose: mls-rs obtained it to join
         // the receive group. The store is only that serving interface, so drop the acceptor's
         // key-package material now — nothing migrates from the invitation into the session (or
@@ -2457,6 +2497,12 @@ impl TwoMlsPqSession {
         // Validate the peer's PQ key package suite before building a group around it — an early,
         // clear CipherSuiteMismatch rather than a late opaque mls-rs error.
         check_key_package_suite(kp, inner.suite.pq)?;
+        // The bootstrap KP must name the established peer: the new PQ half's added leaf
+        // becomes a sender identity this library reports, so an unexpected principal is
+        // rejected before any group is stood up around it.
+        if parse_mls_key_package(kp.to_vec())?.client_id != inner.their_state.client_id() {
+            return Err(TwoMlsPqError::RemoteIdentityMismatch);
+        }
         let client = inner.client.clone();
         // The new PQ half resolves PSKs from the CURRENT client's stores (A.4 runs on
         // the principal a Phase 8 rotation may have installed) — track them.
@@ -3067,12 +3113,17 @@ impl TwoMlsPqSession {
             .send_group
             .as_mut()
             .ok_or(TwoMlsPqError::SessionNotReady)?;
+        let my_index = send.classical.current_member_index();
         match send
             .classical
             .process_incoming_message(msg)
             .map_err(|_| TwoMlsPqError::Mls)?
         {
-            ReceivedMessage::Proposal(_) => {}
+            // The only proposal a peer legitimately sends is an Update of its OWN
+            // leaf. Reject anything else at ingest, before it enters the commit cache
+            // — the rules filter would veto the eventual commit anyway, but this
+            // fails early with a precise error.
+            ReceivedMessage::Proposal(desc) => require_peer_update(&desc, my_index)?,
             _ => return Err(TwoMlsPqError::Mls),
         }
         inner.queued_proposal = Some(digest);
@@ -3918,6 +3969,24 @@ mod tests {
         (alice, bob)
     }
 
+    /// A bootstrap key package naming a principal other than the established peer is
+    /// rejected before any PQ group is stood up around it: the new half's added leaf
+    /// becomes a sender identity this library reports, so it must be the peer's.
+    #[test]
+    fn test_bootstrap_kp_from_unknown_principal_rejected() {
+        let (_alice, bob) = establish_confirmed_sessions();
+        let mallory = make_client();
+        let mallory_pq_kp = make_combiner_kp(&mallory).pq;
+        let mut frame = vec![super::PQ_BOOTSTRAP_KP_TAG];
+        frame.extend_from_slice(&mallory_pq_kp);
+        assert_err!(
+            bob.pq_bootstrap_respond(frame),
+            TwoMlsPqError::RemoteIdentityMismatch
+        );
+        // The turn state is untouched — the peer's real bootstrap still works.
+        assert!(!bob.my_pq_turn());
+    }
+
     #[test]
     fn test_pq_ratchet_turn_flips_to_responder() {
         let (alice, bob) = establish_full();
@@ -4415,7 +4484,8 @@ mod tests {
         let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
         let welcome_a = alice_session.test_initial_welcome();
         let token = b"spawn-token".to_vec();
-        let bob_session = assert_ok!(bob_inv.receive(welcome_a, alice_kp, token.clone(), None));
+        let bob_session =
+            assert_ok!(bob_inv.receive(welcome_a, alice_kp, token.clone(), None, None));
 
         let restored = round_trip(&bob_session);
         assert!(assert_ok!(restored.forwarded(token)).is_none());
@@ -5425,7 +5495,8 @@ mod tests {
         assert_eq!(opened.app_payload, Some(app));
         assert_eq!(opened.welcome.first(), Some(&super::APQ_TAG));
 
-        let bob_s = assert_ok!(bob_inv.receive(opened.welcome, alice_kp, b"tok".to_vec(), None));
+        let bob_s =
+            assert_ok!(bob_inv.receive(opened.welcome, alice_kp, b"tok".to_vec(), None, None));
         // Bob's return welcome is symmetric-sealed (Bob has the recv group) and opens on
         // Alice's window to the APQWelcome.
         let welcome_b = assert_some!(bob_s.pending_outbound());
@@ -5452,7 +5523,7 @@ mod tests {
         let alice_s = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
         let opened = assert_ok!(bob_inv.open_initial(assert_some!(alice_s.pending_outbound())));
         assert_eq!(opened.app_payload, None);
-        assert_ok!(bob_inv.receive(opened.welcome, alice_kp, b"tok".to_vec(), None));
+        assert_ok!(bob_inv.receive(opened.welcome, alice_kp, b"tok".to_vec(), None, None));
     }
 
     /// Establishment-time principal selection: `receive(new_client_id: Some)` creates the
@@ -5479,7 +5550,8 @@ mod tests {
             opened.welcome,
             alice_kp,
             b"tok".to_vec(),
-            Some(dedicated.clone())
+            Some(dedicated.clone()),
+            None
         ));
 
         // The acceptor's principal is the dedicated agent from birth — no Pending state,
@@ -5548,11 +5620,12 @@ mod tests {
                 opened.welcome.clone(),
                 alice_kp.clone(),
                 b"tok".to_vec(),
-                Some(Vec::new())
+                Some(Vec::new()),
+                None
             ),
             Err(TwoMlsPqError::InvalidClientId)
         ));
-        assert_ok!(bob_inv.receive(opened.welcome, alice_kp, b"tok".to_vec(), None));
+        assert_ok!(bob_inv.receive(opened.welcome, alice_kp, b"tok".to_vec(), None, None));
 
         let (alice_c, _bob_c) = establish_confirmed_sessions();
         assert!(matches!(
@@ -5583,7 +5656,8 @@ mod tests {
             opened.welcome,
             alice_kp,
             b"tok".to_vec(),
-            Some(dedicated.clone())
+            Some(dedicated.clone()),
+            None
         ));
 
         let welcome_b = assert_some!(bob_s.pending_outbound());
@@ -5621,7 +5695,8 @@ mod tests {
             opened.welcome,
             alice_kp,
             b"tok".to_vec(),
-            Some(dedicated.clone())
+            Some(dedicated.clone()),
+            None
         ));
 
         // Confirm both directions (each side processes a peer frame).
@@ -5771,7 +5846,7 @@ mod tests {
             None
         ));
         let opened = assert_ok!(bob_inv.open_initial(assert_some!(alice_s.pending_outbound())));
-        assert_ok!(bob_inv.receive(opened.welcome, alice_kp, b"tok".to_vec(), None));
+        assert_ok!(bob_inv.receive(opened.welcome, alice_kp, b"tok".to_vec(), None, None));
 
         // Carol's later envelope can no longer be opened — the KP′ material is spent.
         let carol_s = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&carol), bob_kp, None));
