@@ -8,22 +8,27 @@
 import CommProtocol
 import Foundation
 
-//abstracts the TwoMLS API surface that PersistedTwoMLS depends on,
-//so that we can sub out different implementations (classical to PQ)
-public enum AbstractTwoMLS {
-	public typealias ClientID = Data
-	public typealias GroupID = Data
-	//should be 32 bytes
-	public typealias RendezvousID = Data
+public protocol Archivable {
+	associatedtype Archive: Codable, Sendable
 
-	public protocol Session {
+	init(archive: Archive) throws
+	var archive: Archive { get throws }
+}
+
+//abstracts the TwoMLS API surface PersistedTwoMLS depends on, so different
+//implementations (classical to PQ) can be subbed in
+extension AbstractTwoMLS {
+	public protocol Session: Archivable {
+		// `Session` is intentionally decoupled from `Invitation`: a session comes from
+		// an invitation but never needs to name its type, and binding it here forced
+		// every backend's session to expose a *generic* invitation — conflicting with
+		// app-side invitation roles (anchor/card) that wrap `Invitation` independently.
+		// The forward link remains: `Invitation` still names its `Session`
+		// (see AbstractTwoMLS+Client.swift).
+
 		var proposalContext: TypedDigest? { get }
 		//this is an exported secret with width 32 bytes
 		var sendRendezvous: RendezvousID? { get throws }
-
-		associatedtype Archive: Codable, Sendable
-		init(archive: Archive) throws
-		var archive: Archive { get throws }
 
 		associatedtype PrepareEncryptResult: PrepareEncryptResultProtocol
 		func prepareToEncrypt(
@@ -55,7 +60,8 @@ public enum AbstractTwoMLS {
 		var cipherText: Data { get }
 		var sender: ClientID { get }
 		var recipient: ClientID { get }
-		var epoch: UInt64 { get }
+		//the APQ epoch pair (pq_epoch / t_epoch), see AbstractTwoMLS+PQRatchet.swift
+		var epochs: APQEpochs { get }
 	}
 
 	//pass the sender client identity along with the appmessage
