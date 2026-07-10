@@ -40,11 +40,8 @@ struct APIDemo {
 		//of our send group. Listening works from birth; there is nowhere to
 		//*post* until the peer's return welcome stands up our recv group
 		let (_, listenAtBirth) = try localSession.shouldListenOn()
-		guard try localSession.sendRendezvous == nil,
-			listenAtBirth.count == 1
-		else {
-			throw TestErrors.unexpected
-		}
+		#expect(try localSession.sendRendezvous == nil)
+		#expect(listenAtBirth.count == 1)
 
 		//deliver the HPKE-sealed combined welcome to the invitation
 		//(the initiator cannot staple an app message before establishment)
@@ -62,14 +59,12 @@ struct APIDemo {
 		//side's post address appears in the other side's listen set
 		let (localGroupId, localListen) = try localSession.shouldListenOn()
 		let (remoteGroupId, remoteListen) = try remoteSession.shouldListenOn()
-		guard !localGroupId.isEmpty, !remoteGroupId.isEmpty,
-			let localPost = try localSession.sendRendezvous,
-			let remotePost = try remoteSession.sendRendezvous,
-			remoteListen.values.contains(localPost),
-			localListen.values.contains(remotePost)
-		else {
-			throw TestErrors.unexpected
-		}
+		#expect(!localGroupId.isEmpty)
+		#expect(!remoteGroupId.isEmpty)
+		let localPost = try #require(try localSession.sendRendezvous)
+		let remotePost = try #require(try remoteSession.sendRendezvous)
+		#expect(remoteListen.values.contains(localPost))
+		#expect(localListen.values.contains(remotePost))
 
 		//localSesson and remoteSession should both be in a consistent state:
 		//local APQ send group, remote classical send group derived from
@@ -83,12 +78,9 @@ struct APIDemo {
 		//local will now also send, slowly, a PQ keyPackage so that remote
 		//can stand up their own APQ group
 		//the PQ side-band is a separate capability from the base Session
-		guard
-			let localPQ = localSession as? any AbstractTwoMLS.PQRatchetingSession,
-			let remotePQ = remoteSession as? any AbstractTwoMLS.PQRatchetingSession
-		else {
-			throw TestErrors.unexpected
-		}
+		//PQSession always conforms; take the abstract PQ view directly
+		let localPQ = localSession as any AbstractTwoMLS.PQRatchetingSession
+		let remotePQ = remoteSession as any AbstractTwoMLS.PQRatchetingSession
 
 		//local holds the turn and owes the PQ bootstrap of remote's send group
 		guard localPQ.turn == .weInitiate else {
@@ -115,9 +107,8 @@ struct APIDemo {
 			throw TestErrors.unexpected
 		}
 		_ = try localPQ.ingest(remoteReply.payload)
-		guard localPQ.isFullyEstablished, remotePQ.isFullyEstablished else {
-			throw TestErrors.unexpected
-		}
+		#expect(localPQ.isFullyEstablished)
+		#expect(remotePQ.isFullyEstablished)
 
 		try localSession.exchange(with: remoteSession)
 
@@ -127,38 +118,28 @@ struct APIDemo {
 		//migrates onto it, and older epochs stay listed for in-flight traffic
 		_ = try remoteSession.prepareToEncrypt(proposing: nil)
 		let updFrame = try remoteSession.encrypt(appMessage: Data("upd".utf8))
-		guard
-			let updDecrypted = try localSession.processIncoming(
-				ciphertext: updFrame.cipherText),
-			let offered = updDecrypted.proposal
-		else {
-			throw TestErrors.unexpected
-		}
+		let updDecrypted = try #require(
+			try localSession.processIncoming(ciphertext: updFrame.cipherText))
+		let offered = try #require(updDecrypted.proposal)
 		try localSession.queueProposal(digest: offered.digest)
 		_ = try localSession.prepareToEncrypt(proposing: nil)
 		let commitFrame = try localSession.encrypt(appMessage: Data("commit".utf8))
 		_ = try remoteSession.processIncoming(ciphertext: commitFrame.cipherText)
 
 		let (_, localListenLater) = try localSession.shouldListenOn()
-		guard localListenLater.count == localListen.count + 1,
-			let remotePostLater = try remoteSession.sendRendezvous,
-			remotePostLater != remotePost,
-			localListenLater.values.contains(remotePostLater),
-			localListenLater.values.contains(remotePost)
-		else {
-			throw TestErrors.unexpected
-		}
+		#expect(localListenLater.count == localListen.count + 1)
+		let remotePostLater = try #require(try remoteSession.sendRendezvous)
+		#expect(remotePostLater != remotePost)
+		#expect(localListenLater.values.contains(remotePostLater))
+		#expect(localListenLater.values.contains(remotePost))
 
 		//the encrypt result reports the APQ epoch pair (pq side-band / classical
 		//message group) — the initiator's full pair after its commit — and the
 		//commit's classical epoch keys the listen address the commit minted
-		guard
+		#expect(
 			commitFrame.epochs
-				== AbstractTwoMLS.APQEpochs(pqEpoch: 1, classicalEpoch: 2),
-			localListenLater[commitFrame.epochs.classicalEpoch] == remotePostLater
-		else {
-			throw TestErrors.unexpected
-		}
+				== AbstractTwoMLS.APQEpochs(pqEpoch: 1, classicalEpoch: 2))
+		#expect(localListenLater[commitFrame.epochs.classicalEpoch] == remotePostLater)
 
 		//A.5 rekey: updatePath commits run on the PQ groups alone, so the
 		//classical ratchet is never blocked behind a large ML-KEM updatePath.
@@ -174,9 +155,8 @@ struct APIDemo {
 			throw TestErrors.unexpected
 		}
 		_ = try localPQ.ingest(rekeyFinal.payload)
-		guard localPQ.epochs.pqEpoch == 2, remotePQ.epochs.pqEpoch == 2 else {
-			throw TestErrors.unexpected
-		}
+		#expect(localPQ.epochs.pqEpoch == 2)
+		#expect(remotePQ.epochs.pqEpoch == 2)
 
 		//and the session still messages both ways on the rekeyed groups
 		try localSession.exchange(with: remoteSession)
@@ -216,14 +196,10 @@ struct RotationDemo {
 		let prep = try remoteSession.prepareToEncrypt(proposing: dedicatedAgentId)
 		guard prep?.didCommit == true else { throw TestErrors.unexpected }
 		let frame = try remoteSession.encrypt(appMessage: Data("rotate".utf8))
-		guard
-			let decrypted = try localSession.processIncoming(
-				ciphertext: frame.cipherText),
-			decrypted.remoteCommit?.newSender == dedicatedAgentId,
-			decrypted.applicationMessage?.appMessageData == Data("rotate".utf8)
-		else {
-			throw TestErrors.unexpected
-		}
+		let decrypted = try #require(
+			try localSession.processIncoming(ciphertext: frame.cipherText))
+		#expect(decrypted.remoteCommit?.newSender == dedicatedAgentId)
+		#expect(decrypted.applicationMessage?.appMessageData == Data("rotate".utf8))
 
 		//messaging still flows both ways under the rotated agent
 		try localSession.exchange(with: remoteSession)
@@ -252,10 +228,9 @@ struct RotationDemo {
 		//a reply confirms the rotation on the acceptor's side
 		try localSession.send(to: remoteSession)
 
-		guard
-			let localPQ = localSession as? any AbstractTwoMLS.PQRatchetingSession,
-			let remotePQ = remoteSession as? any AbstractTwoMLS.PQRatchetingSession
-		else { throw TestErrors.unexpected }
+		//PQSession always conforms; take the abstract PQ view directly
+		let localPQ = localSession as any AbstractTwoMLS.PQRatchetingSession
+		let remotePQ = remoteSession as any AbstractTwoMLS.PQRatchetingSession
 
 		//A.4: local owes the bootstrap; remote's new send-PQ half is born under
 		//the dedicated agent
@@ -265,9 +240,8 @@ struct RotationDemo {
 			throw TestErrors.unexpected
 		}
 		_ = try localPQ.ingest(bootReply.payload)
-		guard remotePQ.isFullyEstablished, remotePQ.turn == .weInitiate else {
-			throw TestErrors.unexpected
-		}
+		#expect(remotePQ.isFullyEstablished)
+		#expect(remotePQ.turn == .weInitiate)
 
 		//A.3 cannot carry a rotation — no updatePath rides the ratchet
 		guard (try? remotePQ.begin(.ratchet, rotating: dedicatedAgentId)) == nil else {
@@ -278,8 +252,8 @@ struct RotationDemo {
 		//the dedicated agent; local observes the announced credential
 		let rekey = try remotePQ.begin(.rekey, rotating: dedicatedAgentId)
 		let rekeyIn1 = try localPQ.ingest(rekey.payload)
-		guard rekeyIn1.kind == .rekey, rekeyIn1.rotatedCredential == dedicatedAgentId
-		else { throw TestErrors.unexpected }
+		#expect(rekeyIn1.kind == .rekey)
+		#expect(rekeyIn1.rotatedCredential == dedicatedAgentId)
 		guard let rekeyReply = try localPQ.advance(after: rekeyIn1) else {
 			throw TestErrors.unexpected
 		}
@@ -289,9 +263,8 @@ struct RotationDemo {
 			throw TestErrors.unexpected
 		}
 		_ = try localPQ.ingest(rekeyFinal.payload)
-		guard localPQ.epochs.pqEpoch == 2, remotePQ.epochs.pqEpoch == 2 else {
-			throw TestErrors.unexpected
-		}
+		#expect(localPQ.epochs.pqEpoch == 2)
+		#expect(remotePQ.epochs.pqEpoch == 2)
 
 		//the rekeyed, rotated groups keep working — and a rotation-less rekey
 		//(local's turn) reports no credential
@@ -349,9 +322,8 @@ struct ForwardRoutingDemo {
 				try remote.currentInvitation.decodeHeader(
 					ciphertext: encryptedCombinedWelcome)
 		else { throw TestErrors.unexpected }
-		guard groupId.identifier.count == 32, !mlsMessageData.isEmpty else {
-			throw TestErrors.unexpected
-		}
+		#expect(groupId.identifier.count == 32)
+		#expect(!mlsMessageData.isEmpty)
 
 		//the spawned session acknowledges the replay — nothing new inside
 		guard try remoteSession.forwarded(headerDecrypted: mlsMessageData) == nil else {
@@ -433,14 +405,15 @@ struct SessionArchiveDemo {
 }
 
 //The suite classifier: a combiner blob reports its PQ half; anything unparseable
-//collapses to the `0` sentinel (0 is not an advertised suite).
+//returns nil (no magic sentinel).
 struct CipherSuiteParsingTests {
 	@Test func combinerKeyPackageReportsItsPqSuite() throws {
 		let invitation = try AbstractTwoMLS.PQInvitation(
 			archive: try AbstractTwoMLS.PQClient(clientId: .mock()).makeInvitation()
 		)
-		let suite = AbstractTwoMLS.PQClient.parseKeyPackageSuite(
-			encoded: invitation.encodedKeyPackage
+		let suite = try #require(
+			AbstractTwoMLS.PQClient.parseKeyPackageSuite(
+				encoded: invitation.encodedKeyPackage)
 		)
 		#expect(suite == 0xFDEA)  // ML-KEM-768
 		#expect(AbstractTwoMLS.PQClient.supportedSuites.contains(suite))
@@ -451,12 +424,11 @@ struct CipherSuiteParsingTests {
 		#expect(AbstractTwoMLS.PQClient.supportedSuites == [0x0003, 0xFDEA])
 	}
 
-	@Test func unparseableKeyPackageYieldsZeroSentinel() {
+	@Test func unparseableKeyPackageReturnsNil() {
 		#expect(
 			AbstractTwoMLS.PQClient.parseKeyPackageSuite(
-				encoded: Data([0xDE, 0xAD, 0xBE, 0xEF])) == 0
+				encoded: Data([0xDE, 0xAD, 0xBE, 0xEF])) == nil
 		)
-		#expect(!AbstractTwoMLS.PQClient.supportedSuites.contains(0))
 	}
 }
 
@@ -563,11 +535,9 @@ extension AbstractTwoMLS.Client {
 	) throws -> (Invitation.Session, encryptedCombinedWelcome: Data) {
 		//local parses the keyPackage
 		//APQ: this should be an APQKeyPackage
-		let keyPackageSuite = Self.parseKeyPackageSuite(
-			encoded: encodedRemoteKpkg
-		)
-
-		guard Self.supportedSuites.contains(keyPackageSuite) else {
+		guard let keyPackageSuite = Self.parseKeyPackageSuite(encoded: encodedRemoteKpkg),
+			Self.supportedSuites.contains(keyPackageSuite)
+		else {
 			throw TestErrors.unexpected
 		}
 

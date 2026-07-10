@@ -520,8 +520,13 @@ extension AbstractTwoMLS {
 					spawnToken: combinedWelcomeDigest.wireFormat
 				))
 
-			// Fail open on the stapled message — the session proceeds even if the
-			// staple does not process (mirrors the classical receiveWelcome).
+			// Fail open on the stapled message, deliberately: the staple is an untrusted,
+			// optional early-delivery of the acceptor's first app message. One that fails
+			// to decrypt/parse is dropped — the session still establishes and the peer
+			// re-sends in-band — so ignoring a staple we can't process carries no security
+			// loss (it isn't authenticated to this group yet). For the PQ backend
+			// `stapledMessage` is in fact always nil (the initiator can't staple
+			// pre-establishment), so this is defensive parity with classical receiveWelcome.
 			let plaintext: Data? = stapledMessage.flatMap { staple in
 				guard let result = try? session.processIncoming(ciphertext: staple)
 				else { return nil }
@@ -565,14 +570,14 @@ extension AbstractTwoMLS {
 
 		public static func parseKeyPackageSuite(
 			encoded: Data
-		) -> AbstractTwoMLS.RawSuites {
+		) -> AbstractTwoMLS.RawSuites? {
 			// An opaque combiner blob reports its PQ half's suite; fall back to a bare
-			// MLS key package message.
+			// MLS key package message. Returns nil when the bytes are neither — callers
+			// distinguish "unparseable" from a real suite without a magic 0 sentinel.
 			if let pair = try? decodeCombinerKeyPackage(bytes: encoded) {
-				return (try? parseMlsKeyPackage(bytes: pair.pq).cipherSuite.value())
-					?? 0
+				return try? parseMlsKeyPackage(bytes: pair.pq).cipherSuite.value()
 			}
-			return (try? parseMlsKeyPackage(bytes: encoded).cipherSuite.value()) ?? 0
+			return try? parseMlsKeyPackage(bytes: encoded).cipherSuite.value()
 		}
 
 		public static var supportedSuites: [AbstractTwoMLS.RawSuites] {

@@ -27,7 +27,8 @@ public enum AbstractTwoMLS {
 
 		func makeInvitation() throws -> Invitation.Archive
 
-		static func parseKeyPackageSuite(encoded: Data) -> RawSuites
+		//nil when `encoded` is not a parseable (combiner or bare MLS) key package
+		static func parseKeyPackageSuite(encoded: Data) -> RawSuites?
 
 		static var supportedSuites: [RawSuites] { get }
 
