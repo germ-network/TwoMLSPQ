@@ -73,7 +73,7 @@ struct LifecycleTests {
 		let remoteRecv = try #require(remoteBase.receiveGroupId())
 		#expect(!remoteRecv.classical.bytes.isEmpty)
 		#expect(!remoteRecv.pq.bytes.isEmpty)
-		// Each side's view of the peer matches the peer's self-view (both in sync).
+		// Each side's view of the peer matches the peer's self-view.
 		#expect(localBase.myPrincipalState() == remoteBase.theirPrincipalState())
 		#expect(remoteBase.myPrincipalState() == localBase.theirPrincipalState())
 

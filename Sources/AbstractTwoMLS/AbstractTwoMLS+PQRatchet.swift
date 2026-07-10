@@ -5,9 +5,7 @@
 //  Created by Mark @ Germ on 6/23/26.
 //
 //  The PQ side-band state machine for the AbstractTwoMLS family, aligned with
-//  docs/08-twoMLSPQ-APQ.md Appendix A. Replaces the earlier three weak Session
-//  members (currentPQInflight / received(pqProposal:) / received(pqCommit:))
-//  with an explicit, operation-typed flow.
+//  docs/08-twoMLSPQ-APQ.md Appendix A.
 //
 //  PQ messages are whole `Data` here; chunking and reassembly are the
 //  transport's job, below this layer.
@@ -48,7 +46,7 @@ extension AbstractTwoMLS {
 		case rekey  // A.5 — updatePath commit (+ credential rotation), isolated
 	}
 
-	// MARK: - PQ messages (whole; transport frames/reassembles below)
+	// MARK: - PQ messages
 
 	/// An outbound PQ payload. Whole bytes — chunking is the transport's job.
 	public struct PQOutbound: Sendable {

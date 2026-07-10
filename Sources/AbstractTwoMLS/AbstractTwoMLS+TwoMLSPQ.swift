@@ -6,25 +6,24 @@
 //
 //  Conforms the TwoMLSPQ UniFFI types to the AbstractTwoMLS protocol surface.
 //
-//  Because the abstraction speaks in `Data`/`TypedDigest` while TwoMLSPQ wraps
-//  identity bytes in single-field structs (`ClientId`, …), and because
-//  several abstract members collide with the generated methods only on return
-//  type, the conformances are provided by thin adapter types in the
-//  `AbstractTwoMLS` namespace rather than by extending the generated classes
-//  directly. The generated module stays pristine.
+//  The abstraction speaks `Data`/`TypedDigest` while TwoMLSPQ wraps identity
+//  bytes in single-field structs (`ClientId`, …), and several abstract members
+//  collide with the generated methods only on return type — so the conformances
+//  are thin adapter types in the `AbstractTwoMLS` namespace rather than
+//  extensions on the generated classes. The generated module stays pristine.
 //
-//  Status (as of the TwoMLSPQ 0.0.10 binding):
-//   - `PQSession`, the six result adapters, `PQClient`, and `PQInvitation` are wired,
-//     including routing (`shouldListenOn`/`sendRendezvous`), the true APQ epoch pair
-//     on encrypt results, A.5 rekey (`begin(.rekey)`), agent rotation —
-//     `receive(newClientId:)` stages the dedicated agent, `prepareToEncrypt(proposing:)`
-//     commits the Phase 8 handoff, `begin(.rekey/.finishBootstrap, rotating:)` moves
-//     the PQ leaves (the peer reads `PQInbound.rotatedCredential`) — and forward
-//     routing: a replayed initial frame decodes as `.forward` via the invitation's
-//     spawn-token table (`combinedWelcomeDigest` doubles as the opaque token) and the
-//     spawned session acknowledges it through `forwarded(headerDecrypted:)`.
+//  Status (TwoMLSPQ 0.0.10 binding):
+//   - `PQSession`, the six result adapters, `PQClient`, and `PQInvitation` are wired:
+//     routing (`shouldListenOn`/`sendRendezvous`), the true APQ epoch pair on encrypt
+//     results, A.5 rekey (`begin(.rekey)`); agent rotation — `receive(newClientId:)`
+//     stages the dedicated agent, `prepareToEncrypt(proposing:)` commits the Phase 8
+//     handoff, `begin(.rekey/.finishBootstrap, rotating:)` moves the PQ leaves (the
+//     peer reads `PQInbound.rotatedCredential`); forward routing — a replayed initial
+//     frame decodes as `.forward` via the invitation's spawn-token table
+//     (`combinedWelcomeDigest` doubles as the opaque token), acknowledged by the
+//     spawned session via `forwarded(headerDecrypted:)`.
 //   - Session archive/restore is total: `PQSession.archive` / `init(archive:)` ride
-//     TwoMLSPQ 0.0.10's self-contained `fromArchive(archive:)` (no owning client).
+//     0.0.10's self-contained `fromArchive(archive:)` (no owning client).
 //
 
 import CommProtocol
@@ -203,10 +202,9 @@ extension AbstractTwoMLS {
 		}
 
 		public init(archive: Data) throws {
-			// TwoMLSPQ 0.0.10 made session restore total and self-contained:
-			// `fromArchive(archive:)` reconstructs the session from the blob alone,
-			// with no owning client. (Seal-before-persisting + latest-only discipline
-			// is the caller's, mirroring invitation archives.)
+			// `fromArchive(archive:)` (TwoMLSPQ 0.0.10) restores from the blob alone —
+			// no owning client. Seal-before-persisting + latest-only discipline is the
+			// caller's, as with invitation archives.
 			self.init(
 				try TwoMlsPqSession.fromArchive(
 					archive: TwoMLSPQ.Archive(bytes: archive)))
@@ -265,11 +263,10 @@ extension AbstractTwoMLS {
 			AbstractTwoMLS.GroupID, [UInt64: AbstractTwoMLS.RendezvousID]
 		) {
 			let channels = try base.shouldListenOn()
-			// CombinerGroupId carries both halves; the abstraction wants a single
-			// GroupID. Use the classical half: it exists from group creation for
-			// both roles, whereas the acceptor's PQ half is empty until the A.4
-			// bootstrap — keying app listen-state off it would hand the app an
-			// empty id that then changes mid-session.
+			// CombinerGroupId carries both halves; the abstraction wants one GroupID.
+			// Use the classical half: it exists from creation for both roles, whereas
+			// the acceptor's PQ half is empty until the A.4 bootstrap — keying app
+			// listen-state off it would hand out an empty id that changes mid-session.
 			let groupId = channels.sendGroup.classical.bytes
 			let rendezvous = Dictionary(
 				channels.rendezvousByEpoch.map {
@@ -398,9 +395,9 @@ extension AbstractTwoMLS {
 extension AbstractTwoMLS {
 
 	/// Opaque Codable archive for a PQ invitation: the `TwoMlsPqInvitation` archive bytes —
-	/// the signing identity, both combiner key packages' private material, and the consumed
-	/// set. The combiner's two key packages are opaque to the abstraction, and the archive
-	/// on its own restores a fully receivable invitation.
+	/// signing identity, both combiner key packages' private material (opaque to the
+	/// abstraction), and the consumed set. The archive alone restores a fully receivable
+	/// invitation.
 	public struct PQInvitationArchive: Codable, Sendable {
 		public var bytes: Data
 
@@ -434,8 +431,8 @@ extension AbstractTwoMLS {
 		// MARK: Invitation
 
 		public init(clientId: AbstractTwoMLS.ClientID) throws {
-			// A fresh invitation: mint a client for this identity, have it generate and
-			// capture a combiner key package, and hold the resulting self-contained archive.
+			// Fresh invitation: mint a client for this identity and capture a combiner
+			// key package into a self-contained archive.
 			let archive = try TwoMlsPqPrincipal(clientId: clientId).generateInvitation(lastResort: true)
 			self.init(base: try TwoMlsPqInvitation(archive: archive))
 		}
@@ -463,11 +460,11 @@ extension AbstractTwoMLS {
 				aad: nil
 			)
 			// The digest doubles as the FFI's opaque spawn token: receive() keyed the
-			// invitation's forward table with it, so a transport re-delivery of an
-			// already-accepted frame routes to the spawned session (its receive group
-			// — the group this frame's welcome created) instead of re-surfacing as a
-			// fresh AppWelcome. The digest/sha256 convention lives entirely on this
-			// side of the FFI; the Rust crate never interprets the token.
+			// forward table with it, so a transport re-delivery of an already-accepted
+			// frame routes to the spawned session (the group this frame's welcome
+			// created) instead of re-surfacing as a fresh AppWelcome. The sha256
+			// convention lives entirely on this side; the Rust crate never interprets
+			// the token.
 			let digest = TypedDigest(prefix: .sha256, over: decrypted)
 			if let spawned = base.forwardGroupId(spawnToken: digest.wireFormat) {
 				return .forward(
@@ -505,10 +502,9 @@ extension AbstractTwoMLS {
 
 			// Joins both halves from the APQ welcome and stands up the bound return
 			// send group; the invitation dedups repeat welcomes per remote. The
-			// combined-welcome digest travels as the FFI's opaque spawn token: it keys
-			// the invitation's forward table, so a transport re-delivery of the same
-			// initial frame decodes as `.forward` to this session (`decodeHeader`
-			// recomputes the digest over the decrypted frame and looks it up).
+			// combined-welcome digest keys the forward table as the FFI's opaque spawn
+			// token, so a transport re-delivery of the same initial frame decodes as
+			// `.forward` to this session.
 			// CONTRACT: callers must pass `decodeHeader`'s `appWelcomeDigest` back
 			// verbatim as `combinedWelcomeDigest` — a digest over anything other than
 			// the exact header-decrypted frame bytes (e.g. a re-serialized welcome)
@@ -520,13 +516,12 @@ extension AbstractTwoMLS {
 					spawnToken: combinedWelcomeDigest.wireFormat
 				))
 
-			// Fail open on the stapled message, deliberately: the staple is an untrusted,
-			// optional early-delivery of the acceptor's first app message. One that fails
-			// to decrypt/parse is dropped — the session still establishes and the peer
-			// re-sends in-band — so ignoring a staple we can't process carries no security
-			// loss (it isn't authenticated to this group yet). For the PQ backend
-			// `stapledMessage` is in fact always nil (the initiator can't staple
-			// pre-establishment), so this is defensive parity with classical receiveWelcome.
+			// Deliberately fail open on the staple: an untrusted, optional early-delivery
+			// of the acceptor's first app message. One that fails to decrypt/parse is
+			// dropped — the session still establishes and the peer re-sends in-band —
+			// with no security loss (it isn't authenticated to this group yet). For the
+			// PQ backend `stapledMessage` is always nil (the initiator can't staple
+			// pre-establishment); this is defensive parity with classical receiveWelcome.
 			let plaintext: Data? = stapledMessage.flatMap { staple in
 				guard let result = try? session.processIncoming(ciphertext: staple)
 				else { return nil }

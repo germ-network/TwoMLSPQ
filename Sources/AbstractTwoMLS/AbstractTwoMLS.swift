@@ -15,16 +15,16 @@ public protocol Archivable {
 	var archive: Archive { get throws }
 }
 
-//abstracts the TwoMLS API surface that PersistedTwoMLS depends on,
-//so that we can sub out different implementations (classical to PQ)
+//abstracts the TwoMLS API surface PersistedTwoMLS depends on, so different
+//implementations (classical to PQ) can be subbed in
 extension AbstractTwoMLS {
 	public protocol Session: Archivable {
-		// `Session` is intentionally decoupled from `Invitation`. A session is produced
-		// from an invitation, but the session never needs to name the invitation type —
-		// binding it here forced every backend's session to expose a *generic*
-		// invitation, which conflicts with app-side invitation roles (anchor/card) that
-		// wrap `Invitation` independently. The forward link remains: `Invitation` still
-		// names its `Session` (see AbstractTwoMLS+Client.swift).
+		// `Session` is intentionally decoupled from `Invitation`: a session comes from
+		// an invitation but never needs to name its type, and binding it here forced
+		// every backend's session to expose a *generic* invitation — conflicting with
+		// app-side invitation roles (anchor/card) that wrap `Invitation` independently.
+		// The forward link remains: `Invitation` still names its `Session`
+		// (see AbstractTwoMLS+Client.swift).
 
 		var proposalContext: TypedDigest? { get }
 		//this is an exported secret with width 32 bytes

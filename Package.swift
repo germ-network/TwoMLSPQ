@@ -7,11 +7,10 @@ let package = Package(
 	name: "AbstractTwoMLS",
 	platforms: [.iOS(.v17), .macOS(.v15)],
 	products: [
-		// Vend all three modules: the abstraction plus each concrete UniFFI wrapper.
-		// The wrappers must be separate modules — each generated wrapper imports its own
-		// `*FFI` C module, and both FFI modules declare a C `RustBuffer` / `ForeignBytes`
-		// / `RustCallStatus`. Importing both into one Swift module makes those types
-		// ambiguous; isolating each wrapper in its own module resolves it.
+		// Vend the abstraction plus each concrete UniFFI wrapper. The wrappers must be
+		// separate modules: each imports its own `*FFI` C module, and both FFI modules
+		// declare a C `RustBuffer` / `ForeignBytes` / `RustCallStatus` — ambiguous if
+		// imported into one Swift module.
 		.library(
 			name: "AbstractTwoMLS",
 			targets: ["AbstractTwoMLS", "TwoMLSPQ"]
@@ -63,9 +62,9 @@ let package = Package(
 			//
 			// LOCAL DEV: swap in the sibling checkout's local build while iterating on
 			// TwoMLSPQ. After every Rust change, rebuild with `scripts/buildIosDynamic.sh`
-			// and re-sync Sources/TwoMLSPQ/two_mls_pq.swift from TwoMLSPQ/bindings/
-			// (uniffi verifies a binding↔binary checksum at init, so binary + binding
-			// MUST come from the same build). Keep that swap uncommitted.
+			// and re-sync Sources/TwoMLSPQ/two_mls_pq.swift from TwoMLSPQ/bindings/ —
+			// binary + binding MUST come from the same build (see above). Keep that
+			// swap uncommitted.
 			// path: "../TwoMLSPQ/buildIos/TwoMLSPQ.xcframework"
 			url:
 				"https://github.com/germ-network/TwoMLSPQ/releases/download/0.0.10/TwoMLSPQ.xcframework.zip",

@@ -66,19 +66,14 @@ struct APIDemo {
 		#expect(remoteListen.values.contains(localPost))
 		#expect(localListen.values.contains(remotePost))
 
-		//localSesson and remoteSession should both be in a consistent state:
-		//local APQ send group, remote classical send group derived from
-		//the local APQ send group
+		//consistent state so far: local holds an APQ send group; remote's classical
+		//send group derives from it. Local fetched remote's (A)PQ keyPackage, formed
+		//the (A)PQ group, sent the APQ welcome, and stapled a proposal for the
+		//classical keyPackage backing remote's send group. It will now also send,
+		//slowly, a PQ keyPackage so remote can stand up its own APQ group.
 
-		//local so far:
-		//- fetched an (A)PQ keyPackage for remote
-		//- formed an (A)PQ group and sent the APQ welcome
-		//- staped a proposal for a classical keyPackage for remote to setup their send
-		//  group with
-		//local will now also send, slowly, a PQ keyPackage so that remote
-		//can stand up their own APQ group
-		//the PQ side-band is a separate capability from the base Session
-		//PQSession always conforms; take the abstract PQ view directly
+		//the PQ side-band is a separate capability from the base Session;
+		//PQSession always conforms, so take the abstract PQ view directly
 		let localPQ = localSession as any AbstractTwoMLS.PQRatchetingSession
 		let remotePQ = remoteSession as any AbstractTwoMLS.PQRatchetingSession
 
