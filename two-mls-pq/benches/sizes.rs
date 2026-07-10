@@ -27,7 +27,7 @@ fn main() {
     let envelope_a = alice_s.pending_outbound().unwrap();
     let opened = bob_inv.open_initial(envelope_a.clone()).unwrap();
     let bob_s = bob_inv
-        .receive(opened.welcome, alice_kp, b"sizes".to_vec(), None)
+        .receive(opened.welcome, alice_kp, b"sizes".to_vec(), None, None)
         .unwrap();
     let welcome_b = bob_s.pending_outbound().unwrap();
     alice_s.process_incoming(welcome_b.clone()).unwrap();
@@ -65,7 +65,7 @@ fn main() {
         let envelope = a_s.pending_outbound().unwrap();
         let opened = b_inv.open_initial(envelope).unwrap();
         let b_s = b_inv
-            .receive(opened.welcome, a_kp, b"sizes-pq".to_vec(), None)
+            .receive(opened.welcome, a_kp, b"sizes-pq".to_vec(), None, None)
             .unwrap();
         let wb = b_s.pending_outbound().unwrap();
         a_s.process_incoming(wb).unwrap();

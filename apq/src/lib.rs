@@ -19,9 +19,11 @@
 //! [`CombinerError::UnsupportedCipherSuite`].
 
 pub mod archive;
+pub mod authentication;
 mod client;
 mod group;
 pub mod pq_ratchet;
+pub mod rules;
 pub mod storage;
 
 pub use client::{

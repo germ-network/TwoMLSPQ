@@ -50,12 +50,13 @@ The receiving side of a published key package — no live client required.
   identity, the key package's private material, the consumed-remote set, the
   spawned-group forward table, and the processed-welcome ledger.
 - `client_id()`, `combiner_key_package()` — what to publish.
-- `receive(welcome, their_key_package, spawn_token, new_client_id) -> TwoMlsPqSession`
-  — establish from a remote initiator's welcome; rejects a re-delivered welcome
-  (byte-identical, via the processed-welcome ledger) and a repeat remote (both
-  `DuplicateWelcome`), and, for a single-use invitation whose key package has already
-  been consumed, any further welcome (`InvitationSpent`). `spawn_token` is an opaque,
-  replay-stable identifier for the initial frame, keying the forward table.
+- `receive(welcome, their_key_package, spawn_token, new_client_id, expected_remote)
+  -> TwoMlsPqSession` — establish from a remote initiator's welcome; rejects a
+  re-delivered welcome (byte-identical, via the processed-welcome ledger) and a
+  repeat remote (both `DuplicateWelcome`), and, for a single-use invitation whose key
+  package has already been consumed, any further welcome (`InvitationSpent`).
+  `spawn_token` is an opaque, replay-stable identifier for the initial frame, keying
+  the forward table.
   `new_client_id` is an optional **dedicated per-session principal**: when `Some`, the
   spawned session's send group is created under a freshly-minted principal carrying
   that ClientId (signing keys minted internally, as with `stage_rotation`), so the
@@ -63,6 +64,12 @@ The receiving side of a published key package — no live client required.
   commit, so nothing can displace the welcome staple. The receive-group join still
   uses the invitation identity (the welcome was addressed to its key package), and
   the session id still derives from the founding pair, so both sides agree on it.
+  `expected_remote` is the identity the caller already expects the welcome from
+  (Germ validates it from the decrypted initial frame): a key package naming anyone
+  else is rejected as `RemoteIdentityMismatch` **before any invitation state is
+  claimed**, so the invitation stays fully reusable. Independently of it, the
+  welcome's creator leaf must match the supplied key package (see
+  [Group Rules](./group-rules.md)).
 - `forward_group_id(spawn_token) -> Option<MlsGroupId>` — resolve a replayed
   initial frame to the spawned session's receive group (its classical message-half id).
 - `processed_welcome_group_id(welcome) -> Option<MlsGroupId>` — the content-keyed
@@ -104,8 +111,17 @@ State: `is_established`, `is_fully_established`, `has_receive_group`,
 `pending_outbound` (the standalone copy of the own welcome — no longer consumed by
 `encrypt`; the welcome also rides every pre-commit frame as the staple), `epochs`.
 
-Messaging: `prepare_to_encrypt`, `encrypt`, `process_incoming`, `proposal_context`,
-`queue_proposal`, `stage_rotation`.
+Messaging: `prepare_to_encrypt(proposing)` — `Some(id)` selects which staged rotation
+candidate this round's Upd proposes (`None` re-proposes the current identity; the
+commit path is unchanged); `encrypt`; `process_incoming`; `proposal_context`;
+`queue_proposal` — approve the peer's Upd (single-occupancy running tally,
+latest-wins; validates then leaves the proposal cache untouched, so a rejected call is
+a no-op and a replacement never doubles up; dropped when the send epoch advances via an
+A.3 bind); `queued_remote_successor() -> Option<ClientId>` — the credential currently
+queued, for the app's replace policy; `stage_rotation` — mints a successor candidate
+(re-staging adds candidates, never evicting a sent one; overflow beyond the in-flight
+window defers to a single slot and is proposed next round; the peer's commit picks the
+winner). See [Group Rules](./group-rules.md) for the Authentication Service semantics.
 
 Header encryption: `open_incoming(blob) -> Option<OpenedFrame { kind, frame }>` removes
 the outer seal from a rendezvous-channel blob and returns the plaintext `frame` plus a
@@ -149,11 +165,18 @@ All failures map to the flat `TwoMlsPqError` enum (`Mls`, `InvalidKeyPackage`,
 `MissingWelcome`, `PskBinding`, `PqNotAvailable`, `SessionNotEstablished`,
 `SessionNotReady`, `ProposalRejected`, `DecryptionFailed`, `DuplicateWelcome`,
 `InvitationSpent`, `ArchiveInvalid`, `UnsupportedCipherSuite`, `CipherSuiteMismatch`,
-`EpochDesync`, `UnexpectedWelcome`, `InvalidClientId`). mls-rs error types never cross
-the FFI boundary. `InvalidClientId` rejects an empty principal id supplied to
-`receive(new_client_id:)` or `stage_rotation` — empty is reserved (it is the
-ratchet-commit authenticated-data discriminator, so an empty id could never be
-announced to the peer).
+`EpochDesync`, `UnexpectedWelcome`, `InvalidClientId`, `RemoteIdentityMismatch`,
+`CredentialRejected`).
+mls-rs error types never cross the FFI boundary. `InvalidClientId` rejects an empty
+principal id supplied to `receive(new_client_id:)` or `stage_rotation` — empty is
+reserved (it is the ratchet-commit authenticated-data discriminator, so an empty id
+could never be announced to the peer). `RemoteIdentityMismatch` is an establishment
+identity-binding failure: an `expected_remote` the key package does not name, a
+welcome whose creator leaf differs from the supplied key package, or an A.4
+bootstrap key package naming a principal that is not the established peer (see
+[Group Rules](./group-rules.md)). `CredentialRejected` is the Authentication
+Service's refusal (an unauthorized credential succession) — retryable where it arises
+from a staple: authorize (`queue_proposal` on a fresh delivery) and reprocess.
 `EpochDesync` means a stapled commit is more than one epoch ahead of the receive group
 (the bridging commit no longer rides any frame) — a reconnect condition, distinct from the
 transient `DecryptionFailed`. `UnexpectedWelcome` means a welcome differing from the one a
