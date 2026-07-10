@@ -74,8 +74,8 @@ struct LifecycleTests {
 		#expect(!remoteRecv.classical.bytes.isEmpty)
 		#expect(!remoteRecv.pq.bytes.isEmpty)
 		// Each side's view of the peer matches the peer's self-view (both in sync).
-		#expect(localBase.myAgentState() == remoteBase.theirAgentState())
-		#expect(remoteBase.myAgentState() == localBase.theirAgentState())
+		#expect(localBase.myPrincipalState() == remoteBase.theirPrincipalState())
+		#expect(remoteBase.myPrincipalState() == localBase.theirPrincipalState())
 
 		// Routing: remote can post immediately — its post address is the recv
 		// group's current exporter, which is the same MLS group as the initiator's

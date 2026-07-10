@@ -25,7 +25,7 @@ struct PQInvitationReceiveTests {
 		// Initiator (raw FFI): decode the acceptor's opaque published key package
 		// and form the send group. The initiator cannot encrypt until both groups
 		// are established, so there is no stapled message at receive time.
-		let initiator = try TwoMlsPqIdentity(clientId: AbstractTwoMLS.ClientID.mock())
+		let initiator = try TwoMlsPqPrincipal(clientId: AbstractTwoMLS.ClientID.mock())
 		let acceptorPair = try decodeCombinerKeyPackage(bytes: invitation.encodedKeyPackage)
 		let initiatorSession = try TwoMlsPqSession.initiate(
 			client: initiator,
@@ -72,7 +72,7 @@ struct PQInvitationReceiveTests {
 			archive: try AbstractTwoMLS.PQClient(clientId: .mock()).makeInvitation()
 		)
 
-		let initiator = try TwoMlsPqIdentity(clientId: AbstractTwoMLS.ClientID.mock())
+		let initiator = try TwoMlsPqPrincipal(clientId: AbstractTwoMLS.ClientID.mock())
 		let acceptorPair = try decodeCombinerKeyPackage(bytes: invitation.encodedKeyPackage)
 		let initiatorSession = try TwoMlsPqSession.initiate(
 			client: initiator,
@@ -111,7 +111,7 @@ struct PQInvitationReceiveTests {
 			archive: try AbstractTwoMLS.PQClient(clientId: .mock()).makeInvitation()
 		)
 
-		let initiator = try TwoMlsPqIdentity(clientId: AbstractTwoMLS.ClientID.mock())
+		let initiator = try TwoMlsPqPrincipal(clientId: AbstractTwoMLS.ClientID.mock())
 		let acceptorPair = try decodeCombinerKeyPackage(bytes: invitation.encodedKeyPackage)
 		let initiatorSession = try TwoMlsPqSession.initiate(
 			client: initiator,

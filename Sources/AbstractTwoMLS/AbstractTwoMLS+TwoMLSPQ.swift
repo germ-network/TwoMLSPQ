@@ -63,7 +63,11 @@ public enum TwoMLSPQConformanceError: Error {
 /// first client/invitation construction.
 // v2: TwoMlsPqDigest removed from the FFI — digests are raw 32-byte SHA-256 values,
 // typed on this side by `liftDigest`.
-private let expectedBindingContract: UInt64 = 3
+// v3: TwoMlsPqError gained UnsupportedCipherSuite.
+// v4: TwoMlsPqError gained CipherSuiteMismatch; MlsCipherSuite.isSupported -> isCombinerPq;
+//     AgentState -> PrincipalState.
+// v5: TwoMlsPqError gained InvitationSpent; generateInvitation gained a lastResort flag.
+private let expectedBindingContract: UInt64 = 5
 
 enum TwoMLSPQBindingContract {
 	static let verified: Void = {
@@ -432,7 +436,7 @@ extension AbstractTwoMLS {
 		public init(clientId: AbstractTwoMLS.ClientID) throws {
 			// A fresh invitation: mint a client for this identity, have it generate and
 			// capture a combiner key package, and hold the resulting self-contained archive.
-			let archive = try TwoMlsPqIdentity(clientId: clientId).generateInvitation()
+			let archive = try TwoMlsPqPrincipal(clientId: clientId).generateInvitation(lastResort: true)
 			self.init(base: try TwoMlsPqInvitation(archive: archive))
 		}
 
@@ -528,9 +532,7 @@ extension AbstractTwoMLS {
 			// The handoff commits when the app drives the first reply with
 			// `prepareToEncrypt(proposing: newClientId)`; the PQ leaves catch up at
 			// the next `begin(.rekey, rotating: newClientId)` (A.5).
-			try session.base.stageRotation(
-				newClient: TwoMlsPqIdentity(clientId: newClientId)
-			)
+			try session.base.stageRotation(newClientId: newClientId)
 
 			return (session, plaintext)
 		}
@@ -544,21 +546,21 @@ extension AbstractTwoMLS {
 	public struct PQClient: AbstractTwoMLS.Client {
 		public typealias Invitation = PQInvitation
 
-		let base: TwoMLSPQ.TwoMlsPqIdentity
+		let base: TwoMLSPQ.TwoMlsPqPrincipal
 
-		init(base: TwoMLSPQ.TwoMlsPqIdentity) {
+		init(base: TwoMLSPQ.TwoMlsPqPrincipal) {
 			_ = TwoMLSPQBindingContract.verified
 			self.base = base
 		}
 
 		public init(clientId: AbstractTwoMLS.ClientID) throws {
-			self.init(base: try TwoMlsPqIdentity(clientId: clientId))
+			self.init(base: try TwoMlsPqPrincipal(clientId: clientId))
 		}
 
 		public func makeInvitation() throws -> PQInvitation.Archive {
 			// The client captures a combiner key package into a self-contained invitation
 			// archive; it keeps no key-package private material.
-			PQInvitationArchive(bytes: try base.generateInvitation())
+			PQInvitationArchive(bytes: try base.generateInvitation(lastResort: true))
 		}
 
 		public static func parseKeyPackageSuite(

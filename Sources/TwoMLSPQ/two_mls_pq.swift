@@ -554,11 +554,14 @@ public protocol MlsCipherSuiteProtocol: AnyObject, Sendable {
     func isCombinerClassical()  -> Bool
     
     /**
-     * True if this suite is handled by TwoMLS as the PQ component of a session.
-     * Use `is_combiner_classical` to identify the classical half of a Combiner pair
+     * True if this suite is the post-quantum (ML-KEM-768) component of a Combiner pair — the
+     * PQ half TwoMLS handles. Use `is_combiner_classical` to identify the classical half
      * before routing — do not route a Combiner classical KP to mls-rs-uniffi-ios.
+     *
+     * (Renamed from `is_supported` in binding contract v4: the name always meant "is the PQ
+     * combiner suite", not "is a supported suite".)
      */
-    func isSupported()  -> Bool
+    func isCombinerPq()  -> Bool
     
     /**
      * The raw IANA-registered (or private-range) u16 value.
@@ -679,13 +682,16 @@ open func isCombinerClassical() -> Bool  {
 }
     
     /**
-     * True if this suite is handled by TwoMLS as the PQ component of a session.
-     * Use `is_combiner_classical` to identify the classical half of a Combiner pair
+     * True if this suite is the post-quantum (ML-KEM-768) component of a Combiner pair — the
+     * PQ half TwoMLS handles. Use `is_combiner_classical` to identify the classical half
      * before routing — do not route a Combiner classical KP to mls-rs-uniffi-ios.
+     *
+     * (Renamed from `is_supported` in binding contract v4: the name always meant "is the PQ
+     * combiner suite", not "is a supported suite".)
      */
-open func isSupported() -> Bool  {
+open func isCombinerPq() -> Bool  {
     return try!  FfiConverterBool.lift(try! rustCall() {
-    uniffi_two_mls_pq_fn_method_mlsciphersuite_is_supported(
+    uniffi_two_mls_pq_fn_method_mlsciphersuite_is_combiner_pq(
             self.uniffiCloneHandle(),$0
     )
 })
@@ -753,256 +759,41 @@ public func FfiConverterTypeMlsCipherSuite_lower(_ value: MlsCipherSuite) -> UIn
 
 
 /**
- * Holds an agent identity (ClientId) and mints MLS key packages and invitations for
- * publication. The ClientId is the Basic Credential that identifies this agent as a
- * leaf node in MLS groups; the MLS signing key is generated internally and is
- * independent of it.
- *
- * Unlike mls-rs's monolithic per-credential `Client`, this object is *not* the hub
- * for group operations: `generate_invitation` captures key-package private material
- * into a self-contained `TwoMlsPqInvitation` and purges this identity's copies, and
- * group state lives inside `TwoMlsPqSession`s (which hold their own internal client
- * objects). See the book's Concepts chapter for the object model.
- *
- * Thin UniFFI wrapper around `apq::CombinerClient`; the MLS plumbing lives in the
- * `apq` crate.
- */
-public protocol TwoMlsPqIdentityProtocol: AnyObject, Sendable {
-    
-    /**
-     * The ClientId (opaque identity bytes) for this agent.
-     */
-    func clientId()  -> ClientId
-    
-    /**
-     * Generate a paired classical (0x0003) + PQ (0xFDEA) key package bundle
-     * for use in the APQ/Combiner construction.
-     */
-    func generateCombinerKeyPackage() throws  -> CombinerKeyPackage
-    
-    /**
-     * Generate a combiner key package and capture it, with the signing identity, into a
-     * self-contained [`TwoMlsPqInvitation`] archive. The identity keeps no key-package
-     * private data — the Invitation owns it. Publish the invitation's `combinerKeyPackage`
-     * and reconstruct the receiving side with `TwoMlsPqInvitation(archive:)`.
-     */
-    func generateInvitation() throws  -> Data
-    
-    /**
-     * Generate a fresh KeyPackage for the given cipher suite.
-     * Returns MLS-encoded bytes suitable for publication.
-     * The corresponding HPKE private key is retained internally for group joins.
-     */
-    func generateKeyPackage(suite: MlsCipherSuite) throws  -> Data
-    
-}
-/**
- * Holds an agent identity (ClientId) and mints MLS key packages and invitations for
- * publication. The ClientId is the Basic Credential that identifies this agent as a
- * leaf node in MLS groups; the MLS signing key is generated internally and is
- * independent of it.
- *
- * Unlike mls-rs's monolithic per-credential `Client`, this object is *not* the hub
- * for group operations: `generate_invitation` captures key-package private material
- * into a self-contained `TwoMlsPqInvitation` and purges this identity's copies, and
- * group state lives inside `TwoMlsPqSession`s (which hold their own internal client
- * objects). See the book's Concepts chapter for the object model.
- *
- * Thin UniFFI wrapper around `apq::CombinerClient`; the MLS plumbing lives in the
- * `apq` crate.
- */
-open class TwoMlsPqIdentity: TwoMlsPqIdentityProtocol, @unchecked Sendable {
-    fileprivate let handle: UInt64
-
-    /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
-#if swift(>=5.8)
-    @_documentation(visibility: private)
-#endif
-    public struct NoHandle {
-        public init() {}
-    }
-
-    // TODO: We'd like this to be `private` but for Swifty reasons,
-    // we can't implement `FfiConverter` without making this `required` and we can't
-    // make it `required` without making it `public`.
-#if swift(>=5.8)
-    @_documentation(visibility: private)
-#endif
-    required public init(unsafeFromHandle handle: UInt64) {
-        self.handle = handle
-    }
-
-    // This constructor can be used to instantiate a fake object.
-    // - Parameter noHandle: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
-    //
-    // - Warning:
-    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing handle the FFI lower functions will crash.
-#if swift(>=5.8)
-    @_documentation(visibility: private)
-#endif
-    public init(noHandle: NoHandle) {
-        self.handle = 0
-    }
-
-#if swift(>=5.8)
-    @_documentation(visibility: private)
-#endif
-    public func uniffiCloneHandle() -> UInt64 {
-        return try! rustCall { uniffi_two_mls_pq_fn_clone_twomlspqidentity(self.handle, $0) }
-    }
-    /**
-     * Create a TwoMlsPqIdentity for the given ClientId, generating a fresh agent signing
-     * key internally. `client_id` is opaque identity bytes, independent of any key.
-     */
-public convenience init(clientId: Data)throws  {
-    let handle =
-        try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
-    uniffi_two_mls_pq_fn_constructor_twomlspqidentity_new(
-        FfiConverterData.lower(clientId),$0
-    )
-}
-    self.init(unsafeFromHandle: handle)
-}
-
-    deinit {
-        if handle == 0 {
-            // Mock objects have handle=0 don't try to free them
-            return
-        }
-
-        try! rustCall { uniffi_two_mls_pq_fn_free_twomlspqidentity(handle, $0) }
-    }
-
-    
-
-    
-    /**
-     * The ClientId (opaque identity bytes) for this agent.
-     */
-open func clientId() -> ClientId  {
-    return try!  FfiConverterTypeClientId_lift(try! rustCall() {
-    uniffi_two_mls_pq_fn_method_twomlspqidentity_client_id(
-            self.uniffiCloneHandle(),$0
-    )
-})
-}
-    
-    /**
-     * Generate a paired classical (0x0003) + PQ (0xFDEA) key package bundle
-     * for use in the APQ/Combiner construction.
-     */
-open func generateCombinerKeyPackage()throws  -> CombinerKeyPackage  {
-    return try  FfiConverterTypeCombinerKeyPackage_lift(try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
-    uniffi_two_mls_pq_fn_method_twomlspqidentity_generate_combiner_key_package(
-            self.uniffiCloneHandle(),$0
-    )
-})
-}
-    
-    /**
-     * Generate a combiner key package and capture it, with the signing identity, into a
-     * self-contained [`TwoMlsPqInvitation`] archive. The identity keeps no key-package
-     * private data — the Invitation owns it. Publish the invitation's `combinerKeyPackage`
-     * and reconstruct the receiving side with `TwoMlsPqInvitation(archive:)`.
-     */
-open func generateInvitation()throws  -> Data  {
-    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
-    uniffi_two_mls_pq_fn_method_twomlspqidentity_generate_invitation(
-            self.uniffiCloneHandle(),$0
-    )
-})
-}
-    
-    /**
-     * Generate a fresh KeyPackage for the given cipher suite.
-     * Returns MLS-encoded bytes suitable for publication.
-     * The corresponding HPKE private key is retained internally for group joins.
-     */
-open func generateKeyPackage(suite: MlsCipherSuite)throws  -> Data  {
-    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
-    uniffi_two_mls_pq_fn_method_twomlspqidentity_generate_key_package(
-            self.uniffiCloneHandle(),
-        FfiConverterTypeMlsCipherSuite_lower(suite),$0
-    )
-})
-}
-    
-
-    
-}
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public struct FfiConverterTypeTwoMlsPqIdentity: FfiConverter {
-    typealias FfiType = UInt64
-    typealias SwiftType = TwoMlsPqIdentity
-
-    public static func lift(_ handle: UInt64) throws -> TwoMlsPqIdentity {
-        return TwoMlsPqIdentity(unsafeFromHandle: handle)
-    }
-
-    public static func lower(_ value: TwoMlsPqIdentity) -> UInt64 {
-        return value.uniffiCloneHandle()
-    }
-
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> TwoMlsPqIdentity {
-        let handle: UInt64 = try readInt(&buf)
-        return try lift(handle)
-    }
-
-    public static func write(_ value: TwoMlsPqIdentity, into buf: inout [UInt8]) {
-        writeInt(&buf, lower(value))
-    }
-}
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeTwoMlsPqIdentity_lift(_ handle: UInt64) throws -> TwoMlsPqIdentity {
-    return try FfiConverterTypeTwoMlsPqIdentity.lift(handle)
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeTwoMlsPqIdentity_lower(_ value: TwoMlsPqIdentity) -> UInt64 {
-    return FfiConverterTypeTwoMlsPqIdentity.lower(value)
-}
-
-
-
-
-
-
-/**
  * The receiving/holding side of a published combiner key package: a self-contained
  * invitation that owns one key package's private material plus the signing identity, and
- * can turn a remote initiator's welcome into a session with no live `TwoMlsPqIdentity`. The
+ * can turn a remote initiator's welcome into a session with no live `TwoMlsPqPrincipal`. The
  * Rust analogue of the classical `MLSInvitationClientV2`.
  *
- * The private key-package material lives here (not in a `TwoMlsPqIdentity`); each `receive`
- * rebuilds a stateless client from the archived invitation, so one invitation can service
- * multiple welcomes. A remote whose welcome has already been consumed is rejected.
+ * The private key-package material lives here (not in a `TwoMlsPqPrincipal`); each `receive`
+ * rebuilds a stateless client from the archived invitation. A *last-resort* invitation can
+ * service multiple welcomes (its key package is retained), bounded only by the per-remote
+ * at-most-once guard; a *single-use* invitation accepts exactly one welcome, then drops its
+ * key package (a later `receive` fails `InvitationSpent`). A remote whose welcome has
+ * already been consumed is rejected with `DuplicateWelcome`.
  */
 public protocol TwoMlsPqInvitationProtocol: AnyObject, Sendable {
     
     /**
-     * Serialise the invitation's signing identity + key-package private material, plus the
-     * consumed-remote set and the spawned-group forward table so the transport dedup
-     * guard and replay routing survive a restore.
+     * Serialise the invitation's signing identity + key-package private material (or, once a
+     * single-use invitation is spent, the absence of it), plus the consumed-remote set and
+     * the spawned-group forward table so the transport dedup guard and replay routing survive
+     * a restore.
+     *
+     * Each field is cloned out under its own lock and released before encoding, so no two of
+     * the invitation's locks are ever held at once — this keeps a consistent global lock
+     * order with `receive` and rules out a lock-order inversion.
      */
     func archive() throws  -> Data
     
     /**
-     * The agent's ClientId.
+     * The principal's ClientId.
      */
     func clientId()  -> ClientId
     
     /**
-     * The published (public) combiner key package to hand to a remote initiator.
+     * The published (public) combiner key package to hand to a remote initiator. Still
+     * available after a single-use invitation is spent (the published key package is public);
+     * only the private material is dropped on consume.
      */
     func combinerKeyPackage()  -> CombinerKeyPackage
     
@@ -1019,14 +810,17 @@ public protocol TwoMlsPqInvitationProtocol: AnyObject, Sendable {
      * HPKE-decrypt data sealed to this invitation's (classical) key package init key — the
      * initial routing-header pattern from classical TwoMLS. `info` defaults to the
      * ClientId; `kem_output` and `ciphertext` are the two components of the HPKE ciphertext
-     * (kept separate so this stays agnostic to any outer wire framing).
+     * (kept separate so this stays agnostic to any outer wire framing). Fails with
+     * `InvitationSpent` once a single-use invitation has been consumed — its captured PQ
+     * key-package material, and thus the init key this opens with, is then gone.
      */
     func hpkeOpen(kemOutput: Data, ciphertext: Data, info: Data?, aad: Data?) throws  -> Data
     
     /**
      * Receive a remote initiator's APQWelcome and establish the session using this
      * invitation's captured key package. Rejects a second welcome from the same remote
-     * (`DuplicateWelcome`).
+     * (`DuplicateWelcome`); a single-use invitation whose key package has already been
+     * consumed rejects every further welcome, from any remote (`InvitationSpent`).
      *
      * `spawn_token` is an opaque, caller-chosen, replay-stable identifier for the
      * initial frame this welcome arrived in (the Swift adapter passes the app's
@@ -1041,12 +835,15 @@ public protocol TwoMlsPqInvitationProtocol: AnyObject, Sendable {
 /**
  * The receiving/holding side of a published combiner key package: a self-contained
  * invitation that owns one key package's private material plus the signing identity, and
- * can turn a remote initiator's welcome into a session with no live `TwoMlsPqIdentity`. The
+ * can turn a remote initiator's welcome into a session with no live `TwoMlsPqPrincipal`. The
  * Rust analogue of the classical `MLSInvitationClientV2`.
  *
- * The private key-package material lives here (not in a `TwoMlsPqIdentity`); each `receive`
- * rebuilds a stateless client from the archived invitation, so one invitation can service
- * multiple welcomes. A remote whose welcome has already been consumed is rejected.
+ * The private key-package material lives here (not in a `TwoMlsPqPrincipal`); each `receive`
+ * rebuilds a stateless client from the archived invitation. A *last-resort* invitation can
+ * service multiple welcomes (its key package is retained), bounded only by the per-remote
+ * at-most-once guard; a *single-use* invitation accepts exactly one welcome, then drops its
+ * key package (a later `receive` fails `InvitationSpent`). A remote whose welcome has
+ * already been consumed is rejected with `DuplicateWelcome`.
  */
 open class TwoMlsPqInvitation: TwoMlsPqInvitationProtocol, @unchecked Sendable {
     fileprivate let handle: UInt64
@@ -1088,7 +885,7 @@ open class TwoMlsPqInvitation: TwoMlsPqInvitationProtocol, @unchecked Sendable {
         return try! rustCall { uniffi_two_mls_pq_fn_clone_twomlspqinvitation(self.handle, $0) }
     }
     /**
-     * Restore an invitation from its archive (from `TwoMlsPqIdentity.generateInvitation` or
+     * Restore an invitation from its archive (from `TwoMlsPqPrincipal.generateInvitation` or
      * `archive()`).
      */
 public convenience init(archive: Data)throws  {
@@ -1114,9 +911,14 @@ public convenience init(archive: Data)throws  {
 
     
     /**
-     * Serialise the invitation's signing identity + key-package private material, plus the
-     * consumed-remote set and the spawned-group forward table so the transport dedup
-     * guard and replay routing survive a restore.
+     * Serialise the invitation's signing identity + key-package private material (or, once a
+     * single-use invitation is spent, the absence of it), plus the consumed-remote set and
+     * the spawned-group forward table so the transport dedup guard and replay routing survive
+     * a restore.
+     *
+     * Each field is cloned out under its own lock and released before encoding, so no two of
+     * the invitation's locks are ever held at once — this keeps a consistent global lock
+     * order with `receive` and rules out a lock-order inversion.
      */
 open func archive()throws  -> Data  {
     return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
@@ -1127,7 +929,7 @@ open func archive()throws  -> Data  {
 }
     
     /**
-     * The agent's ClientId.
+     * The principal's ClientId.
      */
 open func clientId() -> ClientId  {
     return try!  FfiConverterTypeClientId_lift(try! rustCall() {
@@ -1138,7 +940,9 @@ open func clientId() -> ClientId  {
 }
     
     /**
-     * The published (public) combiner key package to hand to a remote initiator.
+     * The published (public) combiner key package to hand to a remote initiator. Still
+     * available after a single-use invitation is spent (the published key package is public);
+     * only the private material is dropped on consume.
      */
 open func combinerKeyPackage() -> CombinerKeyPackage  {
     return try!  FfiConverterTypeCombinerKeyPackage_lift(try! rustCall() {
@@ -1168,7 +972,9 @@ open func forwardGroupId(spawnToken: Data) -> MlsGroupId?  {
      * HPKE-decrypt data sealed to this invitation's (classical) key package init key — the
      * initial routing-header pattern from classical TwoMLS. `info` defaults to the
      * ClientId; `kem_output` and `ciphertext` are the two components of the HPKE ciphertext
-     * (kept separate so this stays agnostic to any outer wire framing).
+     * (kept separate so this stays agnostic to any outer wire framing). Fails with
+     * `InvitationSpent` once a single-use invitation has been consumed — its captured PQ
+     * key-package material, and thus the init key this opens with, is then gone.
      */
 open func hpkeOpen(kemOutput: Data, ciphertext: Data, info: Data?, aad: Data?)throws  -> Data  {
     return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
@@ -1185,7 +991,8 @@ open func hpkeOpen(kemOutput: Data, ciphertext: Data, info: Data?, aad: Data?)th
     /**
      * Receive a remote initiator's APQWelcome and establish the session using this
      * invitation's captured key package. Rejects a second welcome from the same remote
-     * (`DuplicateWelcome`).
+     * (`DuplicateWelcome`); a single-use invitation whose key package has already been
+     * consumed rejects every further welcome, from any remote (`InvitationSpent`).
      *
      * `spawn_token` is an opaque, caller-chosen, replay-stable identifier for the
      * initial frame this welcome arrived in (the Swift adapter passes the app's
@@ -1256,12 +1063,272 @@ public func FfiConverterTypeTwoMlsPqInvitation_lower(_ value: TwoMlsPqInvitation
 
 
 /**
+ * Holds a principal (ClientId) and mints MLS key packages and invitations for
+ * publication. The ClientId is the Basic Credential that identifies this principal as a
+ * leaf node in MLS groups; the MLS signing key is generated internally and is
+ * independent of it.
+ *
+ * Unlike mls-rs's monolithic per-credential `Client`, this object is *not* the hub
+ * for group operations: `generate_invitation` captures key-package private material
+ * into a self-contained `TwoMlsPqInvitation` and purges this identity's copies, and
+ * group state lives inside `TwoMlsPqSession`s (which hold their own internal client
+ * objects). See the book's Concepts chapter for the object model.
+ *
+ * Thin UniFFI wrapper around `apq::CombinerClient`; the MLS plumbing lives in the
+ * `apq` crate.
+ */
+public protocol TwoMlsPqPrincipalProtocol: AnyObject, Sendable {
+    
+    /**
+     * The ClientId (opaque identity bytes) for this principal.
+     */
+    func clientId()  -> ClientId
+    
+    /**
+     * Generate a paired classical (0x0003) + PQ (0xFDEA) key package bundle
+     * for use in the APQ/Combiner construction.
+     */
+    func generateCombinerKeyPackage() throws  -> CombinerKeyPackage
+    
+    /**
+     * Generate a combiner key package and capture it, with the signing identity, into a
+     * self-contained [`TwoMlsPqInvitation`] archive. The identity keeps no key-package
+     * private data — the Invitation owns it. Publish the invitation's `combinerKeyPackage`
+     * and reconstruct the receiving side with `TwoMlsPqInvitation(archive:)`.
+     *
+     * `last_resort` chooses the key package's lifetime, which TwoMLS manages itself rather
+     * than via mls-rs's on-the-wire last-resort extension: `true` retains the key package so
+     * the invitation can accept many welcomes; `false` makes it single-use (consumed, and its
+     * secret material dropped from the archive, after the first accepted session — a later
+     * `receive` then fails `InvitationSpent`).
+     */
+    func generateInvitation(lastResort: Bool) throws  -> Data
+    
+    /**
+     * Generate a fresh KeyPackage for the given cipher suite.
+     * Returns MLS-encoded bytes suitable for publication.
+     * The corresponding HPKE private key is retained internally for group joins.
+     */
+    func generateKeyPackage(suite: MlsCipherSuite) throws  -> Data
+    
+}
+/**
+ * Holds a principal (ClientId) and mints MLS key packages and invitations for
+ * publication. The ClientId is the Basic Credential that identifies this principal as a
+ * leaf node in MLS groups; the MLS signing key is generated internally and is
+ * independent of it.
+ *
+ * Unlike mls-rs's monolithic per-credential `Client`, this object is *not* the hub
+ * for group operations: `generate_invitation` captures key-package private material
+ * into a self-contained `TwoMlsPqInvitation` and purges this identity's copies, and
+ * group state lives inside `TwoMlsPqSession`s (which hold their own internal client
+ * objects). See the book's Concepts chapter for the object model.
+ *
+ * Thin UniFFI wrapper around `apq::CombinerClient`; the MLS plumbing lives in the
+ * `apq` crate.
+ */
+open class TwoMlsPqPrincipal: TwoMlsPqPrincipalProtocol, @unchecked Sendable {
+    fileprivate let handle: UInt64
+
+    /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoHandle {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromHandle handle: UInt64) {
+        self.handle = handle
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noHandle: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing handle the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noHandle: NoHandle) {
+        self.handle = 0
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiCloneHandle() -> UInt64 {
+        return try! rustCall { uniffi_two_mls_pq_fn_clone_twomlspqprincipal(self.handle, $0) }
+    }
+    /**
+     * Create a TwoMlsPqPrincipal for the given ClientId, generating a fresh signing
+     * key internally. `client_id` is opaque identity bytes, independent of any key.
+     */
+public convenience init(clientId: Data)throws  {
+    let handle =
+        try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
+    uniffi_two_mls_pq_fn_constructor_twomlspqprincipal_new(
+        FfiConverterData.lower(clientId),$0
+    )
+}
+    self.init(unsafeFromHandle: handle)
+}
+
+    deinit {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
+            return
+        }
+
+        try! rustCall { uniffi_two_mls_pq_fn_free_twomlspqprincipal(handle, $0) }
+    }
+
+    
+
+    
+    /**
+     * The ClientId (opaque identity bytes) for this principal.
+     */
+open func clientId() -> ClientId  {
+    return try!  FfiConverterTypeClientId_lift(try! rustCall() {
+    uniffi_two_mls_pq_fn_method_twomlspqprincipal_client_id(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * Generate a paired classical (0x0003) + PQ (0xFDEA) key package bundle
+     * for use in the APQ/Combiner construction.
+     */
+open func generateCombinerKeyPackage()throws  -> CombinerKeyPackage  {
+    return try  FfiConverterTypeCombinerKeyPackage_lift(try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
+    uniffi_two_mls_pq_fn_method_twomlspqprincipal_generate_combiner_key_package(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * Generate a combiner key package and capture it, with the signing identity, into a
+     * self-contained [`TwoMlsPqInvitation`] archive. The identity keeps no key-package
+     * private data — the Invitation owns it. Publish the invitation's `combinerKeyPackage`
+     * and reconstruct the receiving side with `TwoMlsPqInvitation(archive:)`.
+     *
+     * `last_resort` chooses the key package's lifetime, which TwoMLS manages itself rather
+     * than via mls-rs's on-the-wire last-resort extension: `true` retains the key package so
+     * the invitation can accept many welcomes; `false` makes it single-use (consumed, and its
+     * secret material dropped from the archive, after the first accepted session — a later
+     * `receive` then fails `InvitationSpent`).
+     */
+open func generateInvitation(lastResort: Bool)throws  -> Data  {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
+    uniffi_two_mls_pq_fn_method_twomlspqprincipal_generate_invitation(
+            self.uniffiCloneHandle(),
+        FfiConverterBool.lower(lastResort),$0
+    )
+})
+}
+    
+    /**
+     * Generate a fresh KeyPackage for the given cipher suite.
+     * Returns MLS-encoded bytes suitable for publication.
+     * The corresponding HPKE private key is retained internally for group joins.
+     */
+open func generateKeyPackage(suite: MlsCipherSuite)throws  -> Data  {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
+    uniffi_two_mls_pq_fn_method_twomlspqprincipal_generate_key_package(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeMlsCipherSuite_lower(suite),$0
+    )
+})
+}
+    
+
+    
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeTwoMlsPqPrincipal: FfiConverter {
+    typealias FfiType = UInt64
+    typealias SwiftType = TwoMlsPqPrincipal
+
+    public static func lift(_ handle: UInt64) throws -> TwoMlsPqPrincipal {
+        return TwoMlsPqPrincipal(unsafeFromHandle: handle)
+    }
+
+    public static func lower(_ value: TwoMlsPqPrincipal) -> UInt64 {
+        return value.uniffiCloneHandle()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> TwoMlsPqPrincipal {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+    public static func write(_ value: TwoMlsPqPrincipal, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTwoMlsPqPrincipal_lift(_ handle: UInt64) throws -> TwoMlsPqPrincipal {
+    return try FfiConverterTypeTwoMlsPqPrincipal.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTwoMlsPqPrincipal_lower(_ value: TwoMlsPqPrincipal) -> UInt64 {
+    return FfiConverterTypeTwoMlsPqPrincipal.lower(value)
+}
+
+
+
+
+
+
+/**
  * A TwoMLSPQ session holding two asymmetric Combiner send groups.
  */
 public protocol TwoMlsPqSessionProtocol: AnyObject, Sendable {
     
     func activeSessionId()  -> SessionId
     
+    /**
+     * Serialise the session for persistence; restore with `from_archive`. Archive is
+     * **total** — a session is ALWAYS archivable, in any state, so this never refuses.
+     *
+     * The bytes are **plaintext secret material** (the current signing identity, group
+     * snapshots including signing keys and epoch secrets, the PSK ledger, and any
+     * mid-round KEM material) — seal them before persisting (`apq::archive::seal` is the
+     * provided tool; the key belongs in the platform keystore). An archive is a **move,
+     * not a copy**: any further use of the live session (or of a second restore) rewinds
+     * the sender ratchet, which re-derives AEAD keys/nonces for new plaintexts. The
+     * caller owns single-use/latest-only discipline, as with invitation archives.
+     *
+     * A mid-A.3 PQ round is serialized whole (`Initiating` holds the decapsulation key,
+     * `Responding` the held shared secret). This does not weaken the ratchet in a way
+     * the archive doesn't already: the blob carries the PSK ledger, epoch secrets, and
+     * leaf signing keys, and the seal-before-persisting contract covers the round
+     * material alongside them; the marginal exposure is at most one round of PCS against
+     * an archive thief who already holds the epoch secrets. The alternative is unsound:
+     * a responder that discarded its held secret could never process the initiator's
+     * incoming bind (0x0F) — a permanent side-band desync — so serialization is the only
+     * correct choice.
+     */
     func archive() throws  -> Archive
     
     /**
@@ -1299,13 +1366,13 @@ public protocol TwoMlsPqSessionProtocol: AnyObject, Sendable {
      */
     func isFullyEstablished()  -> Bool
     
-    func myAgentState()  -> AgentState
-    
     /**
      * Whose move the PQ side-band is: true when this side owes the next operation.
      * The initiator owes the A.4 bootstrap; completing an operation passes the turn.
      */
     func myPqTurn()  -> Bool
+    
+    func myPrincipalState()  -> PrincipalState
     
     /**
      * Welcome bytes to deliver to the remote party to complete group establishment.
@@ -1325,7 +1392,7 @@ public protocol TwoMlsPqSessionProtocol: AnyObject, Sendable {
      * up its deferred send-group PQ half. The key package's private material is retained
      * in this client, so the returned welcome can be joined by `pq_bootstrap_apply`.
      *
-     * `rotating` must name the session's CURRENT agent (like `pq_rekey_begin`); the KP'
+     * `rotating` must name the session's CURRENT principal (like `pq_rekey_begin`); the KP'
      * below is generated by that client, so the new leaf carries its credential without
      * further work — the check is all a bootstrap-time handoff needs.
      */
@@ -1380,11 +1447,11 @@ public protocol TwoMlsPqSessionProtocol: AnyObject, Sendable {
      * responder commits.
      *
      * `rotating` is the A.5 credential handoff: it must name the session's CURRENT
-     * agent (a Phase 8 rotation has already swapped `self.client` to it), and the Upd'
-     * then moves our leaf's signing key to that agent, announcing its ClientId in the
+     * principal (a Phase 8 rotation has already swapped `self.client` to it), and the Upd'
+     * then moves our leaf's signing key to that principal, announcing its ClientId in the
      * proposal's authenticated_data — the same announcement convention as the Phase 8
      * classical rotation commit. The leaf's credential BYTES stay what they were:
-     * `BasicIdentityProvider` requires a stable identity across leaf updates, so agent
+     * `BasicIdentityProvider` requires a stable identity across leaf updates, so principal
      * identity travels at the announcement level, not in the Basic Credential.
      */
     func pqRekeyBegin(rotating: ClientId?) throws  -> Data
@@ -1398,9 +1465,9 @@ public protocol TwoMlsPqSessionProtocol: AnyObject, Sendable {
      * Returns the ClientId the initiator announced in the Upd's authenticated_data when
      * this rekey carries an A.5 credential handoff (see `pq_rekey_begin`), else `None`.
      * By the time this returns, the initiator's leaf in our send-PQ has already moved
-     * to the new agent's signing key. The classical Phase 8 commit remains the
+     * to the new principal's signing key. The classical Phase 8 commit remains the
      * authoritative identity-rotation channel — this reports the PQ half catching up
-     * and does not touch the session's agent state.
+     * and does not touch the session's principal state.
      */
     func pqRekeyRespond(updMsg: Data) throws  -> ClientId?
     
@@ -1476,12 +1543,18 @@ public protocol TwoMlsPqSessionProtocol: AnyObject, Sendable {
     func shouldListenOn() throws  -> ListenChannels
     
     /**
-     * Register a new agent client for the next rotation commit.
-     * Call before `prepare_to_encrypt(Some(new_client.client_id()))`.
+     * Stage a new principal for the next rotation commit, minting its signing keys
+     * internally: the MLS signing keys are session-owned state, so the app supplies only
+     * the opaque ClientId. Call before `prepare_to_encrypt(Some(new_client_id))`, which
+     * commits the handoff.
+     *
+     * Idempotent-ish, matching the classical `propose`: staging the id already staged is
+     * a no-op (the existing staged identity — and its freshly minted keys — is kept); a
+     * different id replaces the staged identity.
      */
-    func stageRotation(newClient: TwoMlsPqIdentity) throws 
+    func stageRotation(newClientId: Data) throws 
     
-    func theirAgentState()  -> AgentState
+    func theirPrincipalState()  -> PrincipalState
     
 }
 /**
@@ -1541,11 +1614,19 @@ open class TwoMlsPqSession: TwoMlsPqSessionProtocol, @unchecked Sendable {
     /**
      * Join a session from an APQWelcome produced by the remote `initiate`.
      * Retrieve this party's return Welcome via `pending_outbound`.
+     *
+     * `client` must be dedicated to the acceptor role: `accept` clears its key-package store
+     * once the join has consumed the invitation key package (so nothing migrates into the
+     * session archive). Do NOT reuse one `TwoMlsPqPrincipal` for both `initiate` and a direct
+     * `accept` — `initiate` retains its return-group key package in that same store for the
+     * peer's return welcome, and this clear would drop it. The normal entry point,
+     * `TwoMlsPqInvitation::receive`, always builds a fresh invitation-derived client, so this
+     * only concerns direct callers of `accept`.
      */
-public static func accept(client: TwoMlsPqIdentity, welcome: Data, theirKeyPackage: CombinerKeyPackage)throws  -> TwoMlsPqSession  {
+public static func accept(client: TwoMlsPqPrincipal, welcome: Data, theirKeyPackage: CombinerKeyPackage)throws  -> TwoMlsPqSession  {
     return try  FfiConverterTypeTwoMlsPqSession_lift(try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
     uniffi_two_mls_pq_fn_constructor_twomlspqsession_accept(
-        FfiConverterTypeTwoMlsPqIdentity_lower(client),
+        FfiConverterTypeTwoMlsPqPrincipal_lower(client),
         FfiConverterData.lower(welcome),
         FfiConverterTypeCombinerKeyPackage_lower(theirKeyPackage),$0
     )
@@ -1553,13 +1634,17 @@ public static func accept(client: TwoMlsPqIdentity, welcome: Data, theirKeyPacka
 }
     
     /**
-     * Restore a session from a serialised archive.
+     * Restore a session from a serialised archive (see `archive` for the single-use
+     * contract). Self-contained: the archive carries the session's signing identity, so
+     * restore rebuilds the exact client internally — no client argument, matching the
+     * classical stack's fully-internalized MLS state. The rebuilt client is byte-exact
+     * (same ClientId and signing keys), giving continuity for any group or leaf created
+     * after the restore; the group snapshots supply their own signing keys as before.
      */
-public static func fromArchive(archive: Archive, client: TwoMlsPqIdentity)throws  -> TwoMlsPqSession  {
+public static func fromArchive(archive: Archive)throws  -> TwoMlsPqSession  {
     return try  FfiConverterTypeTwoMlsPqSession_lift(try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
     uniffi_two_mls_pq_fn_constructor_twomlspqsession_from_archive(
-        FfiConverterTypeArchive_lower(archive),
-        FfiConverterTypeTwoMlsPqIdentity_lower(client),$0
+        FfiConverterTypeArchive_lower(archive),$0
     )
 })
 }
@@ -1568,10 +1653,10 @@ public static func fromArchive(archive: Archive, client: TwoMlsPqIdentity)throws
      * Create a session as the initiating party targeting `their_key_package`.
      * Retrieve the outbound APQWelcome bytes via `pending_outbound`.
      */
-public static func initiate(client: TwoMlsPqIdentity, theirKeyPackage: CombinerKeyPackage)throws  -> TwoMlsPqSession  {
+public static func initiate(client: TwoMlsPqPrincipal, theirKeyPackage: CombinerKeyPackage)throws  -> TwoMlsPqSession  {
     return try  FfiConverterTypeTwoMlsPqSession_lift(try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
     uniffi_two_mls_pq_fn_constructor_twomlspqsession_initiate(
-        FfiConverterTypeTwoMlsPqIdentity_lower(client),
+        FfiConverterTypeTwoMlsPqPrincipal_lower(client),
         FfiConverterTypeCombinerKeyPackage_lower(theirKeyPackage),$0
     )
 })
@@ -1587,6 +1672,28 @@ open func activeSessionId() -> SessionId  {
 })
 }
     
+    /**
+     * Serialise the session for persistence; restore with `from_archive`. Archive is
+     * **total** — a session is ALWAYS archivable, in any state, so this never refuses.
+     *
+     * The bytes are **plaintext secret material** (the current signing identity, group
+     * snapshots including signing keys and epoch secrets, the PSK ledger, and any
+     * mid-round KEM material) — seal them before persisting (`apq::archive::seal` is the
+     * provided tool; the key belongs in the platform keystore). An archive is a **move,
+     * not a copy**: any further use of the live session (or of a second restore) rewinds
+     * the sender ratchet, which re-derives AEAD keys/nonces for new plaintexts. The
+     * caller owns single-use/latest-only discipline, as with invitation archives.
+     *
+     * A mid-A.3 PQ round is serialized whole (`Initiating` holds the decapsulation key,
+     * `Responding` the held shared secret). This does not weaken the ratchet in a way
+     * the archive doesn't already: the blob carries the PSK ledger, epoch secrets, and
+     * leaf signing keys, and the seal-before-persisting contract covers the round
+     * material alongside them; the marginal exposure is at most one round of PCS against
+     * an archive thief who already holds the epoch secrets. The alternative is unsound:
+     * a responder that discarded its held secret could never process the initiator's
+     * incoming bind (0x0F) — a permanent side-band desync — so serialization is the only
+     * correct choice.
+     */
 open func archive()throws  -> Archive  {
     return try  FfiConverterTypeArchive_lift(try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
     uniffi_two_mls_pq_fn_method_twomlspqsession_archive(
@@ -1668,14 +1775,6 @@ open func isFullyEstablished() -> Bool  {
 })
 }
     
-open func myAgentState() -> AgentState  {
-    return try!  FfiConverterTypeAgentState_lift(try! rustCall() {
-    uniffi_two_mls_pq_fn_method_twomlspqsession_my_agent_state(
-            self.uniffiCloneHandle(),$0
-    )
-})
-}
-    
     /**
      * Whose move the PQ side-band is: true when this side owes the next operation.
      * The initiator owes the A.4 bootstrap; completing an operation passes the turn.
@@ -1683,6 +1782,14 @@ open func myAgentState() -> AgentState  {
 open func myPqTurn() -> Bool  {
     return try!  FfiConverterBool.lift(try! rustCall() {
     uniffi_two_mls_pq_fn_method_twomlspqsession_my_pq_turn(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+open func myPrincipalState() -> PrincipalState  {
+    return try!  FfiConverterTypePrincipalState_lift(try! rustCall() {
+    uniffi_two_mls_pq_fn_method_twomlspqsession_my_principal_state(
             self.uniffiCloneHandle(),$0
     )
 })
@@ -1718,7 +1825,7 @@ open func pqBootstrapApply(bindMsg: Data)throws   {try rustCallWithError(FfiConv
      * up its deferred send-group PQ half. The key package's private material is retained
      * in this client, so the returned welcome can be joined by `pq_bootstrap_apply`.
      *
-     * `rotating` must name the session's CURRENT agent (like `pq_rekey_begin`); the KP'
+     * `rotating` must name the session's CURRENT principal (like `pq_rekey_begin`); the KP'
      * below is generated by that client, so the new leaf carries its credential without
      * further work — the check is all a bootstrap-time handoff needs.
      */
@@ -1819,11 +1926,11 @@ open func pqRekeyApply(msg: Data)throws  -> Bool  {
      * responder commits.
      *
      * `rotating` is the A.5 credential handoff: it must name the session's CURRENT
-     * agent (a Phase 8 rotation has already swapped `self.client` to it), and the Upd'
-     * then moves our leaf's signing key to that agent, announcing its ClientId in the
+     * principal (a Phase 8 rotation has already swapped `self.client` to it), and the Upd'
+     * then moves our leaf's signing key to that principal, announcing its ClientId in the
      * proposal's authenticated_data — the same announcement convention as the Phase 8
      * classical rotation commit. The leaf's credential BYTES stay what they were:
-     * `BasicIdentityProvider` requires a stable identity across leaf updates, so agent
+     * `BasicIdentityProvider` requires a stable identity across leaf updates, so principal
      * identity travels at the announcement level, not in the Basic Credential.
      */
 open func pqRekeyBegin(rotating: ClientId?)throws  -> Data  {
@@ -1844,9 +1951,9 @@ open func pqRekeyBegin(rotating: ClientId?)throws  -> Data  {
      * Returns the ClientId the initiator announced in the Upd's authenticated_data when
      * this rekey carries an A.5 credential handoff (see `pq_rekey_begin`), else `None`.
      * By the time this returns, the initiator's leaf in our send-PQ has already moved
-     * to the new agent's signing key. The classical Phase 8 commit remains the
+     * to the new principal's signing key. The classical Phase 8 commit remains the
      * authoritative identity-rotation channel — this reports the PQ half catching up
-     * and does not touch the session's agent state.
+     * and does not touch the session's principal state.
      */
 open func pqRekeyRespond(updMsg: Data)throws  -> ClientId?  {
     return try  FfiConverterOptionTypeClientId.lift(try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
@@ -1979,20 +2086,26 @@ open func shouldListenOn()throws  -> ListenChannels  {
 }
     
     /**
-     * Register a new agent client for the next rotation commit.
-     * Call before `prepare_to_encrypt(Some(new_client.client_id()))`.
+     * Stage a new principal for the next rotation commit, minting its signing keys
+     * internally: the MLS signing keys are session-owned state, so the app supplies only
+     * the opaque ClientId. Call before `prepare_to_encrypt(Some(new_client_id))`, which
+     * commits the handoff.
+     *
+     * Idempotent-ish, matching the classical `propose`: staging the id already staged is
+     * a no-op (the existing staged identity — and its freshly minted keys — is kept); a
+     * different id replaces the staged identity.
      */
-open func stageRotation(newClient: TwoMlsPqIdentity)throws   {try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
+open func stageRotation(newClientId: Data)throws   {try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
     uniffi_two_mls_pq_fn_method_twomlspqsession_stage_rotation(
             self.uniffiCloneHandle(),
-        FfiConverterTypeTwoMlsPqIdentity_lower(newClient),$0
+        FfiConverterData.lower(newClientId),$0
     )
 }
 }
     
-open func theirAgentState() -> AgentState  {
-    return try!  FfiConverterTypeAgentState_lift(try! rustCall() {
-    uniffi_two_mls_pq_fn_method_twomlspqsession_their_agent_state(
+open func theirPrincipalState() -> PrincipalState  {
+    return try!  FfiConverterTypePrincipalState_lift(try! rustCall() {
+    uniffi_two_mls_pq_fn_method_twomlspqsession_their_principal_state(
             self.uniffiCloneHandle(),$0
     )
 })
@@ -3167,7 +3280,7 @@ public func FfiConverterTypeSessionId_lower(_ value: SessionId) -> RustBuffer {
  * was sent but the opposing side has not yet committed their half.
  */
 
-public enum AgentState: Equatable, Hashable {
+public enum PrincipalState: Equatable, Hashable {
     
     case sync(clientId: ClientId
     )
@@ -3181,16 +3294,16 @@ public enum AgentState: Equatable, Hashable {
 }
 
 #if compiler(>=6)
-extension AgentState: Sendable {}
+extension PrincipalState: Sendable {}
 #endif
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public struct FfiConverterTypeAgentState: FfiConverterRustBuffer {
-    typealias SwiftType = AgentState
+public struct FfiConverterTypePrincipalState: FfiConverterRustBuffer {
+    typealias SwiftType = PrincipalState
 
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> AgentState {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PrincipalState {
         let variant: Int32 = try readInt(&buf)
         switch variant {
         
@@ -3204,7 +3317,7 @@ public struct FfiConverterTypeAgentState: FfiConverterRustBuffer {
         }
     }
 
-    public static func write(_ value: AgentState, into buf: inout [UInt8]) {
+    public static func write(_ value: PrincipalState, into buf: inout [UInt8]) {
         switch value {
         
         
@@ -3226,15 +3339,15 @@ public struct FfiConverterTypeAgentState: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public func FfiConverterTypeAgentState_lift(_ buf: RustBuffer) throws -> AgentState {
-    return try FfiConverterTypeAgentState.lift(buf)
+public func FfiConverterTypePrincipalState_lift(_ buf: RustBuffer) throws -> PrincipalState {
+    return try FfiConverterTypePrincipalState.lift(buf)
 }
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public func FfiConverterTypeAgentState_lower(_ value: AgentState) -> RustBuffer {
-    return FfiConverterTypeAgentState.lower(value)
+public func FfiConverterTypePrincipalState_lower(_ value: PrincipalState) -> RustBuffer {
+    return FfiConverterTypePrincipalState.lower(value)
 }
 
 
@@ -3255,11 +3368,25 @@ public enum TwoMlsPqError: Swift.Error, Equatable, Hashable, Foundation.Localize
     case ArchiveInvalid
     case DuplicateWelcome
     /**
+     * A single-use (not last-resort) invitation whose key package has already been consumed
+     * by an accepted session. Distinct from `DuplicateWelcome` (a per-remote replay guard):
+     * a spent invitation rejects *every* further `receive`, from any remote. The app should
+     * discard it. A last-resort invitation never reports this.
+     */
+    case InvitationSpent
+    /**
      * The build's crypto provider cannot supply a required cipher suite — a build or
      * provider-configuration bug caught at client construction (see
      * `two-mls-pq/src/providers.rs`), never a runtime condition of a healthy binary.
      */
     case UnsupportedCipherSuite
+    /**
+     * A peer key package or welcome carries a cipher-suite pair that does not match the
+     * session's fixed suite (or is not a coherent APQ combination). Distinct from
+     * `PqNotAvailable` (peer offers no PQ half at all) and `UnsupportedCipherSuite` (a local
+     * provider gap): here the peer's suites are the wrong ones.
+     */
+    case CipherSuiteMismatch
 
     
 
@@ -3300,7 +3427,9 @@ public struct FfiConverterTypeTwoMlsPqError: FfiConverterRustBuffer {
         case 9: return .DecryptionFailed
         case 10: return .ArchiveInvalid
         case 11: return .DuplicateWelcome
-        case 12: return .UnsupportedCipherSuite
+        case 12: return .InvitationSpent
+        case 13: return .UnsupportedCipherSuite
+        case 14: return .CipherSuiteMismatch
 
          default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -3357,8 +3486,16 @@ public struct FfiConverterTypeTwoMlsPqError: FfiConverterRustBuffer {
             writeInt(&buf, Int32(11))
         
         
-        case .UnsupportedCipherSuite:
+        case .InvitationSpent:
             writeInt(&buf, Int32(12))
+        
+        
+        case .UnsupportedCipherSuite:
+            writeInt(&buf, Int32(13))
+        
+        
+        case .CipherSuiteMismatch:
+            writeInt(&buf, Int32(14))
         
         }
     }
@@ -3699,7 +3836,7 @@ public func parseCombinerKeyPackage(kp: CombinerKeyPackage)throws  -> ParsedComb
 }
 /**
  * Parse an MLS-encoded KeyPackage and extract its client identity and cipher suite.
- * Use `is_supported` on the returned suite to decide which library should handle it.
+ * Use `is_combiner_pq` on the returned suite to decide which library should handle it.
  */
 public func parseMlsKeyPackage(bytes: Data)throws  -> MlsKeyPackage  {
     return try  FfiConverterTypeMlsKeyPackage_lift(try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
@@ -3745,52 +3882,52 @@ private let initializationResult: InitializationResult = {
     if (uniffi_two_mls_pq_checksum_func_parse_combiner_key_package() != 43275) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_func_parse_mls_key_package() != 21071) {
+    if (uniffi_two_mls_pq_checksum_func_parse_mls_key_package() != 1919) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_mlsciphersuite_is_combiner_classical() != 42584) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_mlsciphersuite_is_supported() != 26983) {
+    if (uniffi_two_mls_pq_checksum_method_mlsciphersuite_is_combiner_pq() != 50060) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_mlsciphersuite_value() != 46029) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqidentity_client_id() != 35115) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqinvitation_archive() != 62389) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqidentity_generate_combiner_key_package() != 38496) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqinvitation_client_id() != 2420) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqidentity_generate_invitation() != 22557) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqidentity_generate_key_package() != 28625) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqinvitation_archive() != 5365) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqinvitation_client_id() != 34545) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqinvitation_combiner_key_package() != 28961) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqinvitation_combiner_key_package() != 32092) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqinvitation_forward_group_id() != 59815) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqinvitation_hpke_open() != 30342) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqinvitation_hpke_open() != 32139) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqinvitation_receive() != 3744) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqinvitation_receive() != 39852) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_two_mls_pq_checksum_method_twomlspqprincipal_client_id() != 3607) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_two_mls_pq_checksum_method_twomlspqprincipal_generate_combiner_key_package() != 56530) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_two_mls_pq_checksum_method_twomlspqprincipal_generate_invitation() != 5215) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_two_mls_pq_checksum_method_twomlspqprincipal_generate_key_package() != 11085) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_active_session_id() != 37750) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_archive() != 11184) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_archive() != 10843) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_encrypt() != 3107) {
@@ -3811,10 +3948,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_is_fully_established() != 13237) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_my_agent_state() != 25081) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_my_pq_turn() != 39545) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_my_pq_turn() != 39545) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_my_principal_state() != 54784) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pending_outbound() != 44057) {
@@ -3823,7 +3960,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_bootstrap_apply() != 21917) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_bootstrap_begin() != 50696) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_bootstrap_begin() != 39142) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_bootstrap_respond() != 18544) {
@@ -3844,10 +3981,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_rekey_apply() != 12895) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_rekey_begin() != 20828) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_rekey_begin() != 28020) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_rekey_respond() != 45130) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_rekey_respond() != 8045) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_take_pending_outbound() != 34962) {
@@ -3874,10 +4011,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_should_listen_on() != 52215) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_stage_rotation() != 26561) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_stage_rotation() != 6588) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_their_agent_state() != 37009) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_their_principal_state() != 51428) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_constructor_mlsciphersuite_ml_kem_768() != 8052) {
@@ -3892,19 +4029,19 @@ private let initializationResult: InitializationResult = {
     if (uniffi_two_mls_pq_checksum_constructor_mlsciphersuite_x25519_chacha() != 46953) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_constructor_twomlspqidentity_new() != 34886) {
+    if (uniffi_two_mls_pq_checksum_constructor_twomlspqinvitation_new() != 14507) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_constructor_twomlspqinvitation_new() != 7113) {
+    if (uniffi_two_mls_pq_checksum_constructor_twomlspqprincipal_new() != 59164) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_constructor_twomlspqsession_accept() != 63097) {
+    if (uniffi_two_mls_pq_checksum_constructor_twomlspqsession_accept() != 52518) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_constructor_twomlspqsession_from_archive() != 37084) {
+    if (uniffi_two_mls_pq_checksum_constructor_twomlspqsession_from_archive() != 2320) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_constructor_twomlspqsession_initiate() != 36084) {
+    if (uniffi_two_mls_pq_checksum_constructor_twomlspqsession_initiate() != 24191) {
         return InitializationResult.apiChecksumMismatch
     }
 
