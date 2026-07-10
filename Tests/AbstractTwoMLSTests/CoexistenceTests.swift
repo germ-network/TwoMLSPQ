@@ -23,7 +23,8 @@ import TwoMLSPQ  // post-quantum two-mls-pq
 		clientConfig: config
 	)
 
-	// Exercise each runtime again with both objects live.
+	// Re-exercise the PQ runtime with the legacy object still alive. The legacy client is
+	// kept live (its construction above already exercised its runtime) to prove coexistence.
 	let pqIdAgain = pqClient.clientId()
 	#expect(pqId.bytes == pqIdAgain.bytes)
 	_ = legacyClient

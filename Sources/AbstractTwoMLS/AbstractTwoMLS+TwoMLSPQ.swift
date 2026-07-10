@@ -268,6 +268,8 @@ extension AbstractTwoMLS {
 			// the acceptor's PQ half is empty until the A.4 bootstrap — keying app
 			// listen-state off it would hand out an empty id that changes mid-session.
 			let groupId = channels.sendGroup.classical.bytes
+			// rendezvousByEpoch has one address per epoch, so keys are unique; the closure is a
+			// defensive tie-break that shouldn't fire — keep the first (arbitrary but stable).
 			let rendezvous = Dictionary(
 				channels.rendezvousByEpoch.map {
 					($0.epoch, $0.rendezvousId.bytes)
@@ -432,7 +434,8 @@ extension AbstractTwoMLS {
 
 		public init(clientId: AbstractTwoMLS.ClientID) throws {
 			// Fresh invitation: mint a client for this identity and capture a combiner
-			// key package into a self-contained archive.
+			// key package into a self-contained archive. Last-resort (reusable), so a
+			// single-use invitation's `InvitationSpent` never surfaces here.
 			let archive = try TwoMlsPqPrincipal(clientId: clientId).generateInvitation(lastResort: true)
 			self.init(base: try TwoMlsPqInvitation(archive: archive))
 		}
@@ -559,7 +562,8 @@ extension AbstractTwoMLS {
 
 		public func makeInvitation() throws -> PQInvitation.Archive {
 			// The client captures a combiner key package into a self-contained invitation
-			// archive; it keeps no key-package private material.
+			// archive; it keeps no key-package private material. Last-resort
+			// (reusable) — a single-use invitation's `InvitationSpent` is unreachable here.
 			PQInvitationArchive(bytes: try base.generateInvitation(lastResort: true))
 		}
 

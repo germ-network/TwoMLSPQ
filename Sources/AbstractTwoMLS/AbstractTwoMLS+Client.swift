@@ -81,7 +81,7 @@ public enum AbstractTwoMLS {
 			remoteClientId: ClientID,
 			welcomeToken: WelcomeToken,
 			stapledMessage: Data?,
-			newClientId: AbstractTwoMLS.ClientID,
+			newClientId: ClientID
 		) throws -> (Session, plaintext: Data?)
 	}
 
