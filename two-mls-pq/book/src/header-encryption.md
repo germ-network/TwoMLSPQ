@@ -1,21 +1,40 @@
-# Header Encryption (design)
+# Header Encryption
 
-> **Status: design for review — not implemented.** Nothing in this chapter is on the
-> wire today. The only shipped piece is the `hpke_seal_to_key_package` /
-> `TwoMlsPqInvitation::hpke_open` pair (the §A.1 envelope primitive), which currently
-> has no caller in either this crate or AbstractTwoMLS.
+> **Status: the symmetric steady-state layer is implemented** (every
+> rendezvous-channel frame leaves the library sealed; the host removes the seal with
+> `open_incoming`). Two pieces described below remain design-only and are called out
+> where they appear: (1) the **PQ-family side-band keys** — the shipped code seals the
+> side-band under the same classical family as the message path (see *Key schedule* →
+> *One key family, as shipped*); (2) the **first-frame envelope inside `initiate`** —
+> the initiator's initial welcome is still enveloped host-side via the shipped
+> `hpke_seal_to_key_package` / `TwoMlsPqInvitation::hpke_open` pair (see *Establishment
+> walkthrough*).
 
 MLS PrivateMessage encrypts the message *content*, but its framing is plaintext:
 `group_id`, `epoch`, `content_type`, and the entire `authenticated_data` field travel
 in the clear (RFC 9420 §6.3). TwoMLSPQ's own frame layer adds a plaintext tag byte on
-top. This chapter specifies an outer encryption layer — *header encryption* — that
+top. This chapter specifies the outer encryption layer — *header encryption* — that
 makes every outbound blob a single opaque ciphertext, following the scheme the
 classical stack (multiMLS-Swift `TwoMLS`) already ships.
 
 **Sequencing:** the wire-format rework (always-staple the send-group commit; one
-message-frame shape; retagging) **landed first** — tag values below refer to the
-reworked [Wire Format](./wire-format.md). Header encryption applies on top of those
-frames; its rules are per-*stream* (message path vs. PQ side-band), not per-tag.
+message-frame shape; retagging) landed first — tag values below refer to the reworked
+[Wire Format](./wire-format.md). Header encryption is applied on top of those frames;
+its rules are per-*stream* (message path vs. PQ side-band), not per-tag.
+
+**As shipped, in one paragraph.** `TwoMlsPqSession::encrypt`, `pending_outbound` (once
+a recv group exists), `pq_take_pending_outbound`, and the `pq_*_begin` returns all emit
+`[12-byte random nonce][ChaCha20-Poly1305 ct+tag]` over the whole frame, keyed by
+`exportSecret("germ.network.twomlspq.headerKey.v1", group_id, 32)` on the recv group's
+classical half at its current epoch. The receiver's `open_incoming(blob) ->
+Option<OpenedFrame { kind, frame }>` trial-decrypts over a per-epoch window of its own
+send group's header keys (captured beside the listen addresses, archived, retained by
+the same rule), returns the plaintext `frame` plus a routing `kind`
+(`Message` or `PqSideBand { PqFrameKind }`), and the host routes `frame` to the
+existing plaintext entry points — which also transparently open a sealed blob passed
+straight through, so a host may skip `open_incoming` for the message path. The
+initiator's initial welcome (invitation channel, no symmetric key yet) is the one
+frame not sealed here.
 
 ## What leaks today
 
@@ -137,6 +156,25 @@ EnvelopeFrame = [kem_output][AEAD ct+tag]             ; establishment only (HPKE
 
 ### Key schedule
 
+#### One key family, as shipped
+
+The implementation seals **every** frame — message path and PQ side-band alike — under
+the single classical family below, keyed on the recv group's classical half. This
+diverges from the two-family design in the rest of this section (which keeps a separate
+PQ-half family for the side-band). The rationale for collapsing to one family: the
+side-band is post-establishment and turn-based, so the classical recv-group key is
+always available and its window already tolerates the same crossing; sealing the
+side-band under it needs no second key schedule, no `pq_epoch` window, and no pre-A.4
+fallback. The only property given up is "side-band header keys rotate with `pq_epoch`":
+they rotate with the *classical* epoch instead, which advances every routine round, so
+a side-band frame's metadata protection still refreshes constantly — just not
+*immediately* at an A.5 re-key that touches only the PQ epoch. The two-family scheme
+below is retained as the documented refinement (it buys immediate side-band PCS at A.5
+and PQ-family domain separation); it is a drop-in change to the seal/window key
+selection, not a wire change.
+
+#### The two-family design (refinement)
+
 Two key families, one per stream — the **message path** keys from the classical
 halves and rotates with the classical epoch; the **PQ side-band** keys from the PQ
 halves and rotates with `pq_epoch`, so PQ operations stay aligned with the state
@@ -182,95 +220,86 @@ HeaderKeyPQ(G, e) = exportSecret(label = "germ.network.twomlspq.headerKey.pq.v1"
 
 ### Send rule
 
+*As shipped: all frames below seal under the one classical family (`HeaderKey`), not
+the split families named here. The `HeaderKeyPQ` references are the two-family
+refinement.*
+
 - **Message-path frames** (0x01 standalone welcomes and 0x03 message frames —
   `encrypt`'s output, welcome-or-commit staple included): seal under
   `HeaderKey(recv_group, current classical epoch)`.
-- **PQ side-band frames** (0x05–0x11): seal under `HeaderKeyPQ(recv_group,
-  current pq_epoch)` — the *opposite PQ group* (my receive-PQ = the peer's
-  send-PQ), keeping side-band protection aligned with the PQ epoch. This covers
-  both the responder frames surfaced by `pq_take_pending_outbound` (0x07, 0x0D,
-  0x11) **and the initiator frames returned directly by `pq_ratchet_begin`
-  (0x05), `pq_bootstrap_begin` (0x0B), and `pq_rekey_begin` (0x0F)** — the latter
-  are easy to miss because they bypass `EncryptResult`; leaving them plaintext
-  would fingerprint every PQ exchange by its first frame.
-  - *No chicken-and-egg anywhere in the side-band:* the A.3 BIND carries a PQ
-    commit for the *initiator's send-PQ* but seals under the *receive-PQ*
-    exporter, which that exchange never advances; REKEY_UPD carries only a
-    proposal; the responder's REKEY_COMMIT advances its *own* send-PQ, not the
-    sealing group; and the initiator's final REKEY_COMMIT seals under the epoch
-    the responder's Commit' just confirmed on both sides.
-  - *Pre-A.4 fallback:* before the bootstrap completes, only one shared PQ group
-    exists (Group_A.pq) — the initiator's BOOTSTRAP_KP (0x0B, and any resend)
-    seals under `HeaderKeyPQ(Group_A.pq)`, my own *send*-PQ group in that
-    direction. The turn-based side-band (one in-flight op) bounds how long the
-    fallback lives.
-- Both keys are recomputed live (exporters work at the current epoch, which is
+- **PQ side-band frames** (0x05–0x11): sealed the same way in the shipped code —
+  under `HeaderKey(recv_group, current classical epoch)`. This covers both the
+  responder frames surfaced by `pq_take_pending_outbound` (0x07, 0x0D, 0x11) **and
+  the initiator frames returned directly by `pq_ratchet_begin` (0x05),
+  `pq_bootstrap_begin` (0x0B), and `pq_rekey_begin` (0x0F)** — the latter are easy
+  to miss because they bypass `EncryptResult`; leaving them plaintext would
+  fingerprint every PQ exchange by its first frame.
+  - *Refinement — the PQ family:* sealing the side-band under `HeaderKeyPQ(recv_group,
+    current pq_epoch)` (the opposite PQ group) would align it with the PQ epoch. No
+    chicken-and-egg blocks it (the A.3 BIND commits the *initiator's* send-PQ but
+    seals under the never-advanced receive-PQ; REKEY_UPD carries only a proposal;
+    each REKEY_COMMIT seals under the confirmed epoch), and a pre-A.4 fallback to
+    the one shared Group_A.pq covers BOOTSTRAP_KP. Deferred; see *Open questions*.
+- The seal key is recomputed live (exporters work at the current epoch, which is
   exactly where the recv group sits); no send-side storage.
-- **Pre-establishment (initiator between `initiate` and the return welcome):** the
-  only permitted outbound is the enveloped first frame (below). Operations that can
-  emit other frames without a recv group today — `prepare_to_encrypt(Some(id))`
-  (rotation) and `pq_ratchet_begin` currently have no recv-group guard — **must be
-  guarded to return `SessionNotEstablished` pre-establishment**: there is no
-  symmetric key to seal them under, and their semantics before the peer has even
-  joined are dubious anyway. (The alternative — retaining the peer's KP′ on the
-  session and enveloping arbitrary pre-establishment frames — buys nothing the app
-  needs and complicates the invitation replay story.)
+- **Pre-establishment (initiator between `initiate` and the return welcome):** no
+  frame is sealed here because there is no recv group and thus no symmetric key. The
+  operations that could otherwise emit a frame are blocked: `prepare_to_encrypt`
+  needs the recv group to stage its proposal, rotation is additionally gated on
+  `peer_confirmed` (both from the wire-format rework), and `pq_ratchet_begin` now
+  returns `SessionNotEstablished` without a recv group. The one thing the initiator
+  *does* emit — its initial welcome — travels the invitation channel (below).
 - The acceptor always has a recv group from `accept()` onward, so *every* acceptor
   frame — including the first, whose staple slot carries `APQWelcome_B` — is
-  symmetric, sealed under `HeaderKey(Group_A, join epoch)`. The initiator can open
-  it: see below.
-- **Seal timing:** symmetric frames are sealed **on exit** — at the boundary where
-  bytes leave the library — so the acceptor's welcome rides raw in the message
-  frame's staple slot and the whole frame is sealed once (no double sealing). The
-  initiator's first frame is the one sealed-at-rest value (enveloped when composed,
-  stored sealed, `pending_outbound` returns it as-is).
+  symmetric, sealed under `HeaderKey(Group_A, join epoch)`. The initiator opens it
+  from its window: see below.
+- **Seal timing:** frames are sealed **on exit** — at the boundary where bytes leave
+  the library — so the acceptor's welcome rides raw in the message frame's staple
+  slot and the whole frame is sealed once (no double sealing). `pending_outbound`
+  seals only when a recv group exists, so the initiator's plaintext initial welcome
+  passes through and the acceptor's return welcome is sealed.
 
 ### Receive rule
 
-Maintain two **receive windows**, one per key family — because the peer seals under
-*their* recv groups, which are my send groups:
+As shipped there is **one receive window** — `recv_header_keys`, a
+`BTreeMap<epoch, key>` of `HeaderKey(send_group, e)` for each retained classical
+epoch `e` of my own send group (the peer seals under *their* recv group, which is my
+send group). Capture is live-at-epoch, exactly like `listen_rendezvous` (exporters
+cannot be derived retroactively): `record_listen_rendezvous` now captures the header
+key beside the rendezvous address in lockstep — same call sites (group creation, the
+A.2/rotation commits in `prepare_to_encrypt`, the A.3 bind, the
+`should_listen_on`/`archive` backstops), same retention (the send-group storage
+probe), so **a frame that can still be routed can still be opened** by construction:
+the header window is exactly the rendezvous listen window. (The two-family refinement
+would add a second, PQ-epoch-keyed window; see *Open questions*.)
 
-- **Message-path window**: `HeaderKey(send_group, e)` for each retained recent
-  classical epoch `e` of my own send group. Capture is live-at-epoch, exactly like
-  `listen_rendezvous` (exporters cannot be derived retroactively), and at the same
-  call sites: extend `record_listen_rendezvous` to capture
-  `(epoch, rendezvous_addr, header_key)` together — group creation, the
-  A.2/rotation commits in `prepare_to_encrypt`, the A.3 bind, and the
-  `should_listen_on`/`archive` backstops already enumerate every classical
-  send-epoch advance.
-- **Side-band window**: `HeaderKeyPQ(send_group, e)` for recent `pq_epoch`s of my
-  own send-PQ group, captured at every `pq_epoch` advance — bootstrap create/join,
-  the A.3 bind's PQ commit, the A.5 respond/apply commits. Two entries per PQ
-  group suffice (the side-band is turn-based with one in-flight op). Plus, until
-  the A.4 bootstrap turn completes, the pre-A.4 fallback candidate:
-  `HeaderKeyPQ(recv-PQ)` — the shared Group_A.pq — under which the peer's
-  BOOTSTRAP_KP (and any resend that crosses the bootstrap reply) arrives.
+Retention follows mls-rs's epoch retention because the two windows are kept in
+lockstep. That is the effective delivery bound (a frame at an epoch the routing window
+dropped could not have been routed to us), so decoupling the header window to a larger
+ledger-sized constant buys nothing today; it would matter only for a host with
+looser-than-per-epoch delivery, and is a one-line retention change if that arrives.
 
-Retention: header keys are session-owned 32-byte secrets with no mls-rs dependency,
-so the window is a session constant. **Ship it ledger-sized
-(`SEND_PSK_WINDOW = 8`)** rather than tied to mls-rs's epoch retention (currently
-4): the peer seals under my send group's epoch *as they last applied it* — exactly
-the lag the PSK ledger exists to absorb — and 8 keys cost 256 bytes. The routing
-window (which does follow mls-rs retention) stays the effective delivery bound
-today, giving the invariant:
+`open_incoming(blob)` trial-AEAD-opens against the window, newest epoch first (the
+common case is the newest or second-newest key; each trial is one ChaCha20-Poly1305
+open — DoS cost is bounded and linear in the window). On success it classifies the
+opened frame's leading tag into `OpenedFrameKind` (`Message` for 0x01/0x03,
+`PqSideBand { PqFrameKind }` for 0x05–0x11) and returns `OpenedFrame { kind, frame }`;
+the host routes `frame` by `kind`. On exhaustion it returns `Ok(None)` — the same
+"unknown, drop it" signal the reconnect path assigns, which trial decryption makes
+literal: an out-of-window frame and garbage are indistinguishable, by construction. An
+opened-but-unrecognized tag is `DecryptionFailed`.
 
-> **A frame that can still be routed can still be opened** — the header window is a
-> superset of the rendezvous listen window, and hosts with looser-than-per-epoch
-> delivery get the full ledger-sized tolerance instead of a silent gap.
+**Convenience:** `process_incoming` and the `pq_*` receivers transparently remove the
+seal if present (`open_or_raw`), so a host may pass the sealed blob straight through
+for the message path and skip the explicit `open_incoming` (it still needs
+`open_incoming` to *route* side-band frames). An already-opened frame passes through —
+it fails AEAD auth under every window key. This is a receiver convenience only; the
+metadata-hiding property is a sender guarantee (every outbound frame is sealed), so
+accepting an opened frame downgrades nothing an observer sees.
 
-Opening an incoming blob = trial AEAD-open against both windows, newest first (the
-common case is the newest or second-newest message-path key; each trial is one
-ChaCha20-Poly1305 open — DoS cost is bounded and linear in the combined window).
-**Which key family opens the blob doubles as the routing signal**: a side-band key
-implies a PQ side-band frame, a message-path key implies `process_incoming`
-territory — corroborated by the inner tag byte. On success, dispatch the plaintext
-frame exactly as today. On exhaustion return `Ok(None)` — the same "unknown epoch"
-semantics the planned reconnect path assigns, which trial decryption makes
-literal: an out-of-window frame and garbage are indistinguishable, by
-construction. **Observability caveat:** desyncs that today fail loudly
-(`DecryptionFailed` from mls-rs) become silent `None`s at this layer; the
-implementation should count trial-decrypt exhaustions (a debug counter or log
-hook), or hosts lose their main desync diagnostic.
+**Observability caveat:** desyncs that mls-rs would once have surfaced loudly can read
+as a silent `None` here; a host tracking liveness should treat a run of `None`s on a
+live session as a reconnect signal.
 
 Frames that cross a commit in flight are covered by the window: if the peer sealed
 under my send group's epoch `n` while my `n → n+1` commit was in transit to them,
@@ -285,76 +314,66 @@ the crate's constructor names).
 
 1. **Alice `initiate`** — builds Group_A; captures `HeaderKey(Group_A, e₀)` into her
    receive window (piggybacked on the existing `record_listen_rendezvous` call).
-   `initiate` gains an `app_payload: Option<Vec<u8>>` parameter (mirroring the
-   classical stack, where the app welcome is a group-creation parameter):
-   `pending_outbound` returns **one envelope over the composed first frame**
-   `[app_payload ∥ APQWelcome_A]`, sealed to Bob's KP′. Without this, the host's
-   app-layer welcome — the most linkable first-frame metadata (identity
-   introduction, signed keys) — would ride outside the envelope, or the host would
-   have to keep sealing the composed frame itself, making the internal envelope
-   redundant.
-2. **Bob's host calls `TwoMlsPqInvitation::open_initial(blob)`** — a new,
-   state-free decrypt-only method (the envelope opener, replacing raw `hpke_open`
-   in the main path): returns `{ app_payload, welcome }`. The host validates the
-   app-layer welcome and computes the spawn token over the **decrypted** frame —
-   the token must be replay-stable across *re-sends*, and a re-sent envelope has a
-   fresh HPKE ephemeral (different outer bytes, identical plaintext), so sealed
-   bytes cannot key the forward table. Then `receive(welcome, their_kp,
-   spawn_token)` proceeds unchanged on plaintext, preserving the existing contract
-   that the app decides *before* the library joins.
+   `pending_outbound` returns the plaintext `APQWelcome_A`. **As shipped, the
+   initiator's initial welcome is enveloped host-side** with the exported
+   `hpke_seal_to_key_package` (sealed to Bob's KP′), because it travels the
+   invitation channel and there is no symmetric key yet.
+   *Refinement (deferred):* moving the envelope inside `initiate` — with an
+   `app_payload` parameter so the host's app-layer welcome (the most linkable
+   first-frame metadata) is sealed *with* the MLS welcome — is the parity change the
+   classical stack has; it changes the published-KP consumption contract, so it is
+   left as a follow-up (see *Open questions*).
+2. **Bob's host** opens the envelope with `TwoMlsPqInvitation::hpke_open` (the
+   invitation holds the KP′ private material), validates the app-layer welcome, and
+   computes the spawn token over the **decrypted** frame — the token must be
+   replay-stable across re-sends, and a re-sent envelope has a fresh HPKE ephemeral
+   (different outer bytes, identical plaintext), so sealed bytes cannot key the
+   forward table. Then `receive(welcome, their_kp, spawn_token)` joins.
 3. **Bob `receive`/`accept`** — joins Group_A, builds Group_B classical; captures
    `HeaderKey(Group_B, e₀)` into his window. His send key is
    `HeaderKey(Group_A, join epoch)` — derivable immediately.
 4. **Bob's first frame** — a message frame with `APQWelcome_B` in its staple slot,
-   sealed under
-   `HeaderKey(Group_A, e₀)`. Alice's window (from step 1) opens it; she joins
-   Group_B; her send key becomes `HeaderKey(Group_B, current)`. Both directions are
-   now symmetric, and every subsequent frame — A.2 rounds, rotation, A.4 bootstrap
-   (whose PQ Welcome now needs no envelope of its own), A.3, A.5 — follows the
-   steady-state rules. Side-band keying starts on the same schedule: Group_A.pq is
-   shared from step 3, carrying the bootstrap exchange (with the pre-A.4 fallback
-   for BOOTSTRAP_KP), and Group_B.pq keys join the rotation once the bootstrap
-   lands it.
+   sealed under `HeaderKey(Group_A, e₀)`. Alice's window (from step 1) opens it; she
+   joins Group_B; her send key becomes `HeaderKey(Group_B, current)`. Both directions
+   are now symmetric, and every subsequent frame — A.2 rounds, rotation, A.4
+   bootstrap (whose PQ Welcome rides a sealed side-band frame, no envelope of its
+   own), A.3, A.5 — follows the steady-state rules.
 
-Replays and re-sends: `forward_group_id(spawn_token)` remains a pure table lookup.
-A **last-resort** invitation can always `open_initial` a replayed or re-sent first
-frame, recompute the token, and forward. A **spent single-use** invitation has lost
-the KP′ private material, cannot open, cannot compute the token — its replays are
-dropped as undecryptable rather than forwarded. Hosts that need replay
-acknowledgment after consumption must use last-resort invitations. (This is an
-existing property of the §A.1 envelope, now explicit.)
+Replays and re-sends: `forward_group_id(spawn_token)` remains a pure table lookup,
+and the content-keyed `processed_welcome_group_id` resolves a re-delivered welcome
+directly. A **spent single-use** invitation has lost the KP′ private material and can
+no longer `hpke_open` a replayed envelope; hosts that need replay acknowledgment after
+consumption use last-resort invitations. (This is an existing property of the §A.1
+envelope.)
 
-Direct `accept()` keeps its plaintext-welcome signature and becomes a test/embedded
-entry point: callers holding a sealed envelope must go through an invitation
-(`open_initial` needs the KP′ private material, which only invitations hold).
+Direct `accept()` keeps its plaintext-welcome signature (a test/embedded entry point);
+the normal path is `TwoMlsPqInvitation::receive`.
 
 ### Host routing and the API
 
-Today the host routes PQ side-band frames to `pq_*` entry points by the leading tag
-byte, which header encryption hides. The wire boundary therefore moves one step:
+The host used to route PQ side-band frames to `pq_*` entry points by the leading tag
+byte, which header encryption hides. The wire boundary moved one step:
 
-- **`open_incoming(blob) -> OpenedFrame { kind, frame }`** — new session method: one
-  trial-decrypt pass over both receive windows, returning the plaintext frame plus
-  its kind. `kind` must classify the **full** tag set — standalone welcomes (0x01),
-  message frames (0x03), and PQ side-band (0x05–0x11) — so the host can route to
-  `process_incoming` / `pq_ratchet_*` / `pq_rekey_*` / `pq_bootstrap_*` as today;
-  those entry points keep their plaintext-frame signatures. The key family that
-  opened the blob pre-sorts side-band from message-path; the inner tag byte refines
-  it. (The shipped `pq_frame_kind` classifier covers the side-band subset, 0x05–0x11;
-  this needs the superset, applied *after* opening.) `forwarded(spawn_token)` is
-  untouched — it already takes the token, not bytes.
+- **`open_incoming(blob) -> Option<OpenedFrame { kind, frame }>`** — the session
+  method: one trial-decrypt pass over the receive window, returning the plaintext
+  frame plus its `kind` (`OpenedFrameKind::Message` for 0x01/0x03,
+  `PqSideBand { PqFrameKind }` for 0x05–0x11), or `None` if no window key opens it.
+  The host routes `frame` by `kind` to `process_incoming` / `pq_ratchet_*` /
+  `pq_rekey_*` / `pq_bootstrap_*`; those entry points keep their plaintext-frame
+  signatures (and additionally auto-open a sealed blob, per the receive rule).
+  `forwarded(spawn_token)` is untouched — it takes the token, not bytes.
 - **Outbound is sealed inside the library** at every exit: `EncryptResult
-  .cipher_text`, `pending_outbound()`, `pq_take_pending_outbound()`, **and the
-  direct returns of `pq_ratchet_begin` / `pq_bootstrap_begin` / `pq_rekey_begin`**.
-  The exported `hpke_seal_to_key_package` / `hpke_open` pair stays (other stacks
-  use the pattern), but the main path no longer requires the host to touch either.
-- **Archive**: both receive windows ride in the session archive next to
-  `listen_rendezvous` (parallel `(epoch, key)` lists; entries validated to 32
-  bytes on restore, like rendezvous addresses). Pre-release, so the layout change
-  simply invalidates old archives per the existing `SESSION_ARCHIVE_VERSION`
-  policy. The initiator's pre-return-welcome state needs no extra machinery: her
-  window entry was captured at `initiate`, and her sealed first frame is already
-  the persisted `pending_outbound` value.
+  .cipher_text`, `pending_outbound()` (once a recv group exists),
+  `pq_take_pending_outbound()`, and the direct returns of `pq_ratchet_begin` /
+  `pq_bootstrap_begin` / `pq_rekey_begin`. The exported `hpke_seal_to_key_package` /
+  `hpke_open` pair stays for the initiator's initial welcome and other stacks.
+- **Archive**: the receive window (`recv_header_keys`) rides in the session archive
+  next to `listen_rendezvous` (a parallel `(epoch, key)` list; entries validated to
+  32 bytes on restore, like rendezvous addresses). `SESSION_ARCHIVE_VERSION` bumped
+  to 3; pre-release, so old archives simply fail to decode and regenerate.
+- **Contract**: `BINDING_CONTRACT_VERSION` bumped to 7 — the FFI gains
+  `open_incoming` and the `OpenedFrame` / `OpenedFrameKind` types, and every
+  outbound blob is now sealed.
 
 ### What this layer does and does not provide
 
@@ -376,37 +395,45 @@ is safe here because every candidate key is honestly derived and secret; the
 partitioning-oracle failure mode requires attacker-chosen keys, which this scheme
 never has.
 
-## Implementation sketch
+## What shipped (implementation)
 
-1. `providers.rs`: add `classical_envelope_suite()` beside `pq_envelope_suite()`
-   (classical `CipherSuiteProvider` for `aead_seal`/`aead_open`/`random_bytes`).
-2. `session.rs`: `header_key(group)` and `header_key_pq(group)` beside
-   `rendezvous_secret`; `seal_frame` / `try_open_frame` (both windows); extend
-   `record_listen_rendezvous` to capture the classical header key per epoch into a
-   ledger-sized window, and add the mirror capture for `HeaderKeyPQ` at every
-   `pq_epoch` advance (bootstrap create/join, A.3 bind, A.5 respond/apply); seal
-   at every outbound exit (`encrypt`, `pending_outbound`,
+1. `providers.rs`: `classical_aead_suite()` beside `pq_envelope_suite()` (classical
+   `CipherSuiteProvider` for `aead_seal`/`aead_open`/`random_bytes`).
+2. `session.rs`: `header_key(group)` beside `rendezvous_secret`; `SessionInner::seal`
+   / `try_open` / `open_or_raw`; `record_listen_rendezvous` captures the header key
+   per epoch into `recv_header_keys` in lockstep with the listen address; seal at
+   every outbound exit (`encrypt`, `pending_outbound` when a recv group exists,
    `pq_take_pending_outbound`, `pq_ratchet_begin`, `pq_bootstrap_begin`,
-   `pq_rekey_begin` — side-band exits use the PQ key); guard `prepare_rotation`
-   and `pq_ratchet_begin` on an established recv group; add `open_incoming` with
-   the full-tag `FrameKind`; add `app_payload` to `initiate` and envelope the
-   composed first frame.
-3. `invitation.rs` / `key_packages.rs`: add `open_initial`; fix the two stale
-   comments claiming the envelope uses the *classical* init key (it seals to and
-   opens with the **PQ** half's — `hpke_seal_to_key_package`, `hpke_open`).
-4. Archive: parallel `(epoch, header_key)` entries for both windows; 32-byte
-   validation on restore.
-5. Tests: cross-commit frame crossing (both directions); multi-commit lag to the
-   window edge; window eviction; restored sessions opening in-flight frames;
-   re-sent (fresh-ephemeral) first frames deduplicating via the token;
-   replay-after-spent behavior; sealed `pq_*_begin` outputs under the PQ key
-   (including BOOTSTRAP_KP under the pre-A.4 fallback, and rekey frames opening
-   across the pq_epoch bump); pre-establishment rotation/ratchet guards; a fixture
-   asserting sealed frames carry no plaintext MLS bytes.
+   `pq_rekey_begin`); `pq_ratchet_begin` guarded on the recv group; `open_incoming`
+   with `OpenedFrameKind`; `process_incoming` and the `pq_*` receivers `open_or_raw`
+   their input.
+3. Archive: `recv_header_keys` as `(epoch, key)` entries, 32-byte validated on
+   restore; `SESSION_ARCHIVE_VERSION` → 3, `BINDING_CONTRACT_VERSION` → 7.
+4. Tests: sealed frames carry no plaintext framing; cross-commit crossing; restored
+   session opens an in-flight frame; garbage → `None`; sealed side-band opens and
+   classifies + full A.3 round through sealed frames; initial welcome unsealed vs.
+   return welcome sealed; and every pre-existing flow driven through the seal.
+
+Not yet implemented (see *Open questions*): the PQ-family side-band keys, and moving
+the initial-welcome envelope (with `app_payload`) inside `initiate`.
 
 ## Open questions
 
-1. **Hybrid envelope for the very first frame?** The §A.1 envelope is PQ-only —
+1. **PQ-family side-band keys.** As shipped, side-band frames seal under the classical
+   family (see *Key schedule → One key family*). Switching them to `HeaderKeyPQ`
+   (PQ-half exporter, `pq_epoch`-keyed, with a second receive window and the pre-A.4
+   fallback) buys immediate side-band PCS at an A.5 re-key and PQ-family domain
+   separation. It is a drop-in change to the seal/window key selection — no wire
+   change — deferred as not worth its complexity for the metadata-only side-band
+   until a use for immediate-A.5 side-band PCS appears.
+2. **Initial-welcome envelope inside `initiate` (with `app_payload`).** The initial
+   welcome is enveloped host-side today. Moving it into the library — sealing
+   `[app_payload ∥ APQWelcome_A]` to Bob's KP′ so the host's app-layer welcome
+   (identity introduction, signed keys) rides inside the envelope — matches the
+   classical stack's parity and needs a new `open_initial` on the invitation. It
+   changes the published-KP consumption contract, so it should ride the same release
+   as its first real host adoption.
+3. **Hybrid envelope for the very first frame?** The §A.1 envelope is PQ-only —
    the inverse of the classical stack's X25519-only envelope. A nested seal
    (classical HPKE inside the PQ envelope, both init keys are already in the
    published pair) would make first-frame *metadata* survive a break of either KEM,

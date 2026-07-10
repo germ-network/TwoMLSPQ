@@ -98,3 +98,15 @@ pub(crate) fn pq_envelope_suite(
     pq().cipher_suite_provider(pq_cipher_suite())
         .ok_or(TwoMlsPqError::Mls)
 }
+
+/// The suite provider backing the header-encryption AEAD (the outer symmetric seal over
+/// every rendezvous-channel frame) — the classical suite of the pinned provider, so the
+/// AEAD is ChaCha20-Poly1305 and the nonce/key sizes track the pinned suite.
+pub(crate) fn classical_aead_suite(
+) -> Result<impl mls_rs::CipherSuiteProvider<Error = impl std::error::Error + Send + Sync + 'static>>
+{
+    use mls_rs::CryptoProvider;
+    classical()
+        .cipher_suite_provider(APQ_SUITE.classical)
+        .ok_or(TwoMlsPqError::Mls)
+}

@@ -91,6 +91,16 @@ State: `is_established`, `is_fully_established`, `has_receive_group`,
 Messaging: `prepare_to_encrypt`, `encrypt`, `process_incoming`, `proposal_context`,
 `queue_proposal`, `stage_rotation`.
 
+Header encryption: `open_incoming(blob) -> Option<OpenedFrame { kind, frame }>` removes
+the outer seal from a rendezvous-channel blob and returns the plaintext `frame` plus a
+routing `kind` (`OpenedFrameKind::Message` → `process_incoming`; `PqSideBand { kind }`
+→ the named `pq_*` method); `None` means no key opened it (drop it). Every outbound
+blob (`EncryptResult.cipher_text`, `pending_outbound`, `pq_take_pending_outbound`, the
+`pq_*_begin` returns) is already sealed. `process_incoming` and the `pq_*` receivers
+also accept a sealed blob directly (they open it transparently), so `open_incoming` is
+strictly required only to *route* side-band frames. See
+[Header Encryption](./header-encryption.md).
+
 Transport routing: `should_listen_on() -> ListenChannels` (send-group ids + one
 rendezvous address per retained epoch), `send_rendezvous()` (where to post),
 `forwarded(spawn_token)` (acknowledge a replayed initial frame routed here by the
