@@ -94,6 +94,9 @@ extension AbstractTwoMLS {
 
 	/// Explicit initiator/responder flow for the PQ side-band, replacing
 	/// currentPQInflight() / received(pqProposal:) / received(pqCommit:).
+	// Sendable is sound (the wrapped uniffi `TwoMlsPqSession` is `@unchecked Sendable`:
+	// Rust Send+Sync, FFI calls lock-serialized) — but it buys memory safety, not ordering.
+	// The begin → ingest → advance ratchet has one parked reply slot: drive it sequentially.
 	public protocol PQRatchet: Sendable {
 		var turn: PQTurn { get }
 		var epochs: APQEpochs { get }
