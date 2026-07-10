@@ -416,10 +416,13 @@ never has.
 
 ## What shipped (implementation)
 
-1. `providers.rs`: `classical_aead_suite()` beside `pq_envelope_suite()` (classical
-   `CipherSuiteProvider` for `aead_seal`/`aead_open`/`random_bytes`).
-2. `session.rs`: `header_key(group)` and `header_key_pq(pq_group)` beside
-   `rendezvous_secret`; `SessionInner::seal` / `seal_side_band` (PQ-or-classical
+1. `providers.rs`: `HEADER_AEAD_SUITE` (the single configured header-AEAD cipher suite)
+   and `header_aead_suite()` beside `pq_envelope_suite()` — the `CipherSuiteProvider`
+   whose `aead_seal`/`aead_open`/`random_bytes`/`aead_key_size`/`aead_nonce_size` back
+   the seal.
+2. `session.rs`: `header_key(group)` and `header_key_pq(pq_group)` (length =
+   `header_key_len()` = the header AEAD's key size) beside `rendezvous_secret`;
+   `SessionInner::seal` / `seal_side_band` (PQ-or-classical
    fallback) / `try_open` (both windows) / `open_or_raw`; `record_listen_rendezvous`
    captures the classical header key into `recv_header_keys`, and `record_pq_header_key`
    captures the PQ header key into `recv_header_keys_pq` at each `pq_epoch` advance
@@ -469,9 +472,9 @@ Not yet implemented (see *Open questions*): moving the initial-welcome envelope 
    `HeaderKeyPQ` — classical cover, closing the one non-hybrid derivation. It is
    protocol-level (changes commit contents on both sides), so it belongs to a Combiner
    revision, not the header layer.
-4. **Receive-side AD checking** (from the stapling assessment): should the PARTIAL
-   handler verify the app message's AD against the stapled proposal's digest, and
-   the rotation handler against the commit, restoring the classical stack's
+4. **Receive-side AD checking** (from the stapling assessment): should the
+   message-frame handler verify the app message's AD against the stapled proposal's
+   digest (and, on a rotation commit, against the commit), restoring the classical stack's
    peer-level mix-and-match checks? Orthogonal to header encryption but adjacent —
    deciding it in the same review avoids re-opening the frame contract twice.
 5. **Padding.** Out of scope here, but the uniform blob makes a future
