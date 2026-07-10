@@ -168,6 +168,102 @@ const PQ_BOOTSTRAP_BIND_TAG: u8 = 0x13;
 const PQ_REKEY_UPD_TAG: u8 = 0x15;
 const PQ_REKEY_COMMIT_TAG: u8 = 0x17;
 
+/// The seven PQ side-band frame kinds the host routes through `TwoMlsPqSession::ingest`
+/// (the `begin`/`ingest`/`advance` surface in the AbstractTwoMLS adapter). Exported so the
+/// host classifies a frame from THIS binary via [`pq_frame_kind`] instead of hardcoding the
+/// tag bytes: the tags stay defined once, above, and a renumber can no longer drift out of
+/// sync with a hand-copied host switch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum PqFrameKind {
+    /// 0x0B — A.3 ratchet: the initiator's ML-KEM encapsulation key.
+    RatchetEphemeralKey,
+    /// 0x0D — A.3 ratchet: the responder's ciphertext.
+    RatchetCiphertext,
+    /// 0x0F — A.3 ratchet: the bind (`[pq partial-commit][classical commit][app]`).
+    RatchetBind,
+    /// 0x11 — A.4 bootstrap: this side's PQ key package.
+    BootstrapKeyPackage,
+    /// 0x13 — A.4 bootstrap: the reply (PQ welcome + APQ-PSK bind commit).
+    BootstrapBind,
+    /// 0x15 — A.5 rekey: the initiator's Upd' proposal.
+    RekeyUpdate,
+    /// 0x17 — A.5 rekey: the responder's `[Commit'][counter-Upd'-or-empty]` reply.
+    RekeyCommit,
+}
+
+/// Classify a PQ side-band frame by its leading tag byte (`message[0]`). Returns `None` for
+/// any byte that is not one of the seven side-band tags — the host treats that as a malformed
+/// side-band frame. Single source of truth for the wire tags: the host dispatches on the
+/// returned kind rather than matching raw bytes it would otherwise have to keep in sync here.
+#[uniffi::export]
+pub fn pq_frame_kind(tag: u8) -> Option<PqFrameKind> {
+    Some(match tag {
+        PQ_EK_TAG => PqFrameKind::RatchetEphemeralKey,
+        PQ_CT_TAG => PqFrameKind::RatchetCiphertext,
+        PQ_BIND_TAG => PqFrameKind::RatchetBind,
+        PQ_BOOTSTRAP_KP_TAG => PqFrameKind::BootstrapKeyPackage,
+        PQ_BOOTSTRAP_BIND_TAG => PqFrameKind::BootstrapBind,
+        PQ_REKEY_UPD_TAG => PqFrameKind::RekeyUpdate,
+        PQ_REKEY_COMMIT_TAG => PqFrameKind::RekeyCommit,
+        _ => return None,
+    })
+}
+
+#[cfg(test)]
+mod pq_frame_kind_tests {
+    use super::*;
+
+    #[test]
+    fn classifies_every_side_band_tag() {
+        assert_eq!(
+            pq_frame_kind(PQ_EK_TAG),
+            Some(PqFrameKind::RatchetEphemeralKey)
+        );
+        assert_eq!(
+            pq_frame_kind(PQ_CT_TAG),
+            Some(PqFrameKind::RatchetCiphertext)
+        );
+        assert_eq!(pq_frame_kind(PQ_BIND_TAG), Some(PqFrameKind::RatchetBind));
+        assert_eq!(
+            pq_frame_kind(PQ_BOOTSTRAP_KP_TAG),
+            Some(PqFrameKind::BootstrapKeyPackage)
+        );
+        assert_eq!(
+            pq_frame_kind(PQ_BOOTSTRAP_BIND_TAG),
+            Some(PqFrameKind::BootstrapBind)
+        );
+        assert_eq!(
+            pq_frame_kind(PQ_REKEY_UPD_TAG),
+            Some(PqFrameKind::RekeyUpdate)
+        );
+        assert_eq!(
+            pq_frame_kind(PQ_REKEY_COMMIT_TAG),
+            Some(PqFrameKind::RekeyCommit)
+        );
+    }
+
+    #[test]
+    fn rejects_non_side_band_tags() {
+        // Classical/APQ envelope tags and the gaps between side-band tags are not side-band frames.
+        for tag in [
+            0x00,
+            APQ_TAG,
+            BUNDLED_TAG,
+            PARTIAL_TAG,
+            STAPLED_WELCOME_TAG,
+            0x0A,
+            0x12,
+            0xFF,
+        ] {
+            assert_eq!(
+                pq_frame_kind(tag),
+                None,
+                "tag {tag:#x} must not classify as side-band"
+            );
+        }
+    }
+}
+
 /// PQ ratchet round state carried between the messages of one exchange.
 enum PqInflight {
     /// Initiator holds the ephemeral (decapsulation key) until it receives the ciphertext.
