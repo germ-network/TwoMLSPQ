@@ -2,7 +2,9 @@
 
 This is a narrative overview; the authoritative reference is rustdoc
 (`cargo doc -p two-mls-pq --open`). All exported names are flat because UniFFI has no
-module paths — hence the `TwoMlsPq*` / `Combiner*` / `Mls*` prefixes.
+module paths — hence the `TwoMlsPq*` / `Combiner*` / `Mls*` prefixes (`Combiner*` is
+the code-name prefix for the APQ pieces — e.g. `CombinerKeyPackage`, an APQ group's
+paired key packages).
 
 ## Binding contract
 

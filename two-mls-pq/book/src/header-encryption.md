@@ -468,8 +468,8 @@ never has.
    *content*, leaving only its metadata. A reverse (classical→PQ) PSK injection at the
    A.3/A.5 PQ commits would give the PQ groups' key schedules — and hence
    `HeaderKeyPQ` — classical cover, closing the one non-hybrid derivation. It is
-   protocol-level (changes commit contents on both sides), so it belongs to a Combiner
-   revision, not the header layer.
+   protocol-level (changes commit contents on both sides), so it belongs to a revision
+   of the APQ binding, not the header layer.
 3. **Receive-side AD checking** (from the stapling assessment): should the
    message-frame handler verify the app message's AD against the stapled proposal's
    digest (and, on a rotation commit, against the commit), restoring the classical stack's

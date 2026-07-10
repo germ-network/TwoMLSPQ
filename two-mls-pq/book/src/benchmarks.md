@@ -32,7 +32,7 @@ open target/criterion/report/index.html   # macOS
 
 | Bench file | Measures |
 |------------|----------|
-| `kp_generation` | single key-package and combiner-pair generation |
+| `kp_generation` | single key-package and paired (classical + PQ) key-package generation |
 | `establishment` | `initiate`, and the full `initiate`/`accept`/join handshake |
 | `messaging` | steady-state partial-commit send, and a send→decrypt round trip |
 
