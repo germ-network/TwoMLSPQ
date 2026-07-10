@@ -144,10 +144,21 @@ SealedFrame   = [12-byte random nonce][AEAD ct+tag]   ; steady state (symmetric)
 EnvelopeFrame = [kem_output][AEAD ct+tag]             ; establishment only (HPKE)
 ```
 
-- The AEAD is the **classical half's suite AEAD** (ChaCha20-Poly1305 for the pinned
-  `0x0003`), invoked through the classical `CipherSuiteProvider` — cipher agility
-  follows the pinned suite, consistent with the suite-binding work. Empty AAD. The
-  plaintext is the entire existing frame (tag byte included), unchanged.
+- The AEAD is a **single configured choice for the whole header layer**
+  (`providers::HEADER_AEAD_SUITE`, ChaCha20-Poly1305 today), *not* inherited from the
+  group whose exporter produced the key. Both families — message-path (classical
+  exporter) and PQ side-band (PQ exporter) — seal with this one AEAD; the two-family
+  split only chooses which group half derives the key. The key length
+  (`header_key_len` = the AEAD's `aead_key_size`) and the nonce length
+  (`aead_nonce_size`) are both read from the chosen suite, so swapping the header AEAD
+  is a one-line change with nothing downstream assuming a specific cipher or size.
+  Empty AAD; the plaintext is the entire existing frame (tag byte included), unchanged.
+  - *Why not the group's AEAD:* the PQ suite's AEAD is AES-128-GCM (128-bit key);
+    sealing the side-band with the classical ChaCha20-Poly1305 (256-bit key) gives it
+    the stronger primitive and better post-quantum headroom — matching the group's own
+    AEAD there would be a downgrade. The header AEAD is a build-level constant (both
+    parties must agree; there is no negotiation), so a per-deployment change is a
+    recompile, and runtime negotiation would be a separate protocol addition.
 - The HPKE envelope is the shipped §A.1 primitive: `hpke_seal` under the
   `0xFDEA` suite to the **PQ init key in the recipient's published KP′**, `info` =
   recipient ClientId. The two forms carry no discriminator; they never share a

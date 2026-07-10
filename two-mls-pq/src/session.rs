@@ -1256,33 +1256,44 @@ fn rendezvous_secret(group: &crate::key_package_store::MlsGroup) -> Result<Vec<u
 //     `pq_epoch` — `header_key_pq` / `recv_header_keys_pq`.
 // The one exception is the pre-A.4 BOOTSTRAP_KP, whose recv-PQ group does not exist yet;
 // it falls back to the classical seal (see `SessionInner::seal_side_band`).
+//
+// The two families only choose which group HALF derives the key; the AEAD that consumes
+// it is a single configured choice (`providers::HEADER_AEAD_SUITE`), independent of the
+// group suites, and the key length is that AEAD's key size (`header_key_len`) — so the
+// header seal is crypto-agile as its own layer.
 const HEADER_KEY_LABEL: &[u8] = b"germ.network.twomlspq.headerKey.v1";
 const HEADER_KEY_PQ_LABEL: &[u8] = b"germ.network.twomlspq.headerKey.pq.v1";
-const HEADER_KEY_LEN: usize = 32;
 // PQ header window depth: the side-band is turn-based with one op in flight, so `pq_epoch`
 // advances slowly; a few recent keys cover any lag. Session-owned secrets, so this is a
 // plain "keep newest N", not tied to mls-rs retention or the (classical-only) rendezvous.
 const PQ_HEADER_WINDOW: usize = 4;
 
+/// The header key length: the key size of the configured header AEAD
+/// (`providers::HEADER_AEAD_SUITE`), so the exporter output always matches whatever cipher
+/// seals the frame — no hardcoded assumption of a 32-byte (ChaCha) key.
+fn header_key_len() -> Result<usize> {
+    use mls_rs::CipherSuiteProvider;
+    Ok(providers::header_aead_suite()?.aead_key_size())
+}
+
 /// Derive the message-path header key for a group at its current classical epoch:
-/// `exportSecret(label, group_id, 32)` on the classical half. Context = the group id
-/// (domain separation on top of the group-specific exporter, matching the classical
-/// stack's convention).
+/// `exportSecret(label, group_id, header_key_len())` on the classical half. Context = the
+/// group id (domain separation on top of the group-specific exporter, matching the
+/// classical stack's convention).
 fn header_key(group: &crate::key_package_store::MlsGroup) -> Result<Vec<u8>> {
     group
-        .export_secret(HEADER_KEY_LABEL, group.group_id(), HEADER_KEY_LEN)
+        .export_secret(HEADER_KEY_LABEL, group.group_id(), header_key_len()?)
         .map(|secret| secret.as_bytes().to_vec())
         .map_err(|_| TwoMlsPqError::Mls)
 }
 
 /// Derive the PQ side-band header key for a group at its current `pq_epoch`:
-/// `exportSecret(pq_label, group_id, 32)` on the PQ half. Same exporter shape as
-/// `header_key` (both halves are `Group<_>`), a distinct label, and keyed by the PQ
-/// clock so the side-band's outer seal rotates with the PQ ratchet, not classical
-/// traffic.
+/// `exportSecret(pq_label, group_id, header_key_len())` on the PQ half. Same exporter shape
+/// as `header_key` (both halves are `Group<_>`), a distinct label, and keyed by the PQ
+/// clock so the side-band's outer seal rotates with the PQ ratchet, not classical traffic.
 fn header_key_pq(group: &crate::key_package_store::PqMlsGroup) -> Result<Vec<u8>> {
     group
-        .export_secret(HEADER_KEY_PQ_LABEL, group.group_id(), HEADER_KEY_LEN)
+        .export_secret(HEADER_KEY_PQ_LABEL, group.group_id(), header_key_len()?)
         .map(|secret| secret.as_bytes().to_vec())
         .map_err(|_| TwoMlsPqError::Mls)
 }
@@ -1421,7 +1432,7 @@ impl SessionInner {
     /// Seal `frame` under `key`: `[random nonce][AEAD ct+tag]`, empty AAD.
     fn seal_with(&self, key: &[u8], frame: &[u8]) -> Result<Vec<u8>> {
         use mls_rs::CipherSuiteProvider;
-        let cs = providers::classical_aead_suite()?;
+        let cs = providers::header_aead_suite()?;
         let mut out = vec![0u8; cs.aead_nonce_size()];
         cs.random_bytes(&mut out).map_err(|_| TwoMlsPqError::Mls)?;
         let ct = cs
@@ -1453,7 +1464,7 @@ impl SessionInner {
     /// partitioning oracle).
     fn try_open(&self, blob: &[u8]) -> Result<Option<Vec<u8>>> {
         use mls_rs::CipherSuiteProvider;
-        let cs = providers::classical_aead_suite()?;
+        let cs = providers::header_aead_suite()?;
         let nonce_size = cs.aead_nonce_size();
         if blob.len() < nonce_size {
             return Ok(None);
@@ -2107,11 +2118,12 @@ impl TwoMlsPqSession {
         {
             return Err(TwoMlsPqError::ArchiveInvalid);
         }
+        let hk_len = header_key_len()?;
         if wire
             .recv_header_keys
             .iter()
             .chain(wire.recv_header_keys_pq.iter())
-            .any(|e| e.key.len() != HEADER_KEY_LEN)
+            .any(|e| e.key.len() != hk_len)
         {
             return Err(TwoMlsPqError::ArchiveInvalid);
         }
@@ -5094,6 +5106,25 @@ mod tests {
     }
 
     /// A sealed PQ side-band frame opens and classifies to the right `pq_*` kind, and the
+    /// The header key length tracks the configured header AEAD's key size — so a future
+    /// change of `HEADER_AEAD_SUITE` to a different-key-length cipher can't silently
+    /// desync key derivation from the seal. (Sanity for the crypto-agility wiring; today
+    /// both are 32 for ChaCha20-Poly1305.)
+    #[test]
+    fn test_header_key_len_matches_aead() {
+        use mls_rs::CipherSuiteProvider;
+        let aead_key_size = assert_ok!(crate::providers::header_aead_suite()).aead_key_size();
+        assert_eq!(assert_ok!(super::header_key_len()), aead_key_size);
+
+        // A derived header key is exactly that length.
+        let (alice, _bob) = establish_sessions();
+        assert_ok!(alice.prepare_to_encrypt(None));
+        let sealed = assert_ok!(alice.encrypt(b"x".to_vec())).cipher_text;
+        // Sealed length = nonce + plaintext + tag; nonce size also tracks the suite.
+        let cs = assert_ok!(crate::providers::header_aead_suite());
+        assert!(sealed.len() > cs.aead_nonce_size());
+    }
+
     /// full A.3 round drives end-to-end through sealed frames.
     #[test]
     fn test_sealed_side_band_opens_and_classifies() {
