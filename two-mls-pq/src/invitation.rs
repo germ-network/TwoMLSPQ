@@ -26,6 +26,12 @@ const INVITATION_VERSION: u8 = 2;
 /// app's combined-welcome digest, but any replay-stable byte string works).
 pub(crate) type SpawnedGroups = BTreeMap<Vec<u8>, Vec<u8>>;
 
+/// The processed-welcome ledger: SHA-256 of the exact welcome bytes `receive` accepted →
+/// the spawned session's receive-group classical (message-half) id. Welcomes cannot be
+/// assumed to arrive exactly once — a re-delivered welcome resolves here (content-keyed,
+/// no host token convention needed) instead of erroring or re-spawning.
+pub(crate) type ProcessedWelcomes = BTreeMap<Vec<u8>, Vec<u8>>;
+
 // In its own module because the derive-generated impls reference the std `Result`, which the
 // crate-local `Result` alias imported above would shadow.
 mod wire {
@@ -69,13 +75,15 @@ mod wire {
 
     /// The persisted form of a `TwoMlsPqInvitation`: the framed invitation blob (kept framed
     /// so the version/suite header stays where `CombinerInvitation::decode` expects it)
-    /// followed by the consumed-remote ids and the spawned-group forward table.
+    /// followed by the consumed-remote ids, the spawned-group forward table, and the
+    /// processed-welcome ledger.
     #[derive(MlsSize, MlsEncode, MlsDecode)]
     pub(super) struct InvitationArchive {
         #[mls_codec(with = "mls_rs_codec::byte_vec")]
         pub(super) invitation: Vec<u8>,
         pub(super) consumed: Vec<Vec<u8>>,
         pub(super) spawned: Vec<SpawnedEntry>,
+        pub(super) processed: Vec<ProcessedEntry>,
     }
 
     /// One spawned-group forward-table entry: an opaque spawn token → the spawned
@@ -87,10 +95,20 @@ mod wire {
         #[mls_codec(with = "mls_rs_codec::byte_vec")]
         pub(super) classical: Vec<u8>,
     }
+
+    /// One processed-welcome ledger entry: SHA-256 of the accepted welcome bytes → the
+    /// spawned session's receive-group classical (message-half) id.
+    #[derive(MlsSize, MlsEncode, MlsDecode)]
+    pub(super) struct ProcessedEntry {
+        #[mls_codec(with = "mls_rs_codec::byte_vec")]
+        pub(super) digest: Vec<u8>,
+        #[mls_codec(with = "mls_rs_codec::byte_vec")]
+        pub(super) classical: Vec<u8>,
+    }
 }
 
 pub(crate) use wire::CombinerInvitation;
-use wire::{InvitationArchive, SpawnedEntry};
+use wire::{InvitationArchive, ProcessedEntry, SpawnedEntry};
 
 impl CombinerInvitation {
     /// Encode to an opaque blob: `[version][classical u16 BE][pq u16 BE]` header, then the
@@ -121,14 +139,16 @@ impl CombinerInvitation {
 }
 
 /// The single encoder for a `TwoMlsPqInvitation`'s persisted form ([`InvitationArchive`]):
-/// the framed invitation blob, the consumed-remote ids, then the spawned-group forward
-/// table. `BTreeSet`/`BTreeMap` iteration gives a deterministic byte order. Used by both
-/// `generate_invitation` (empty sets) and `archive`; `decode_archive` is the sole reader,
-/// so the layout lives in exactly one place.
+/// the framed invitation blob, the consumed-remote ids, the spawned-group forward table,
+/// then the processed-welcome ledger. `BTreeSet`/`BTreeMap` iteration gives a
+/// deterministic byte order. Used by both `generate_invitation` (empty sets) and
+/// `archive`; `decode_archive` is the sole reader, so the layout lives in exactly one
+/// place.
 pub(crate) fn encode_archive(
     invitation: &CombinerInvitation,
     consumed: &BTreeSet<Vec<u8>>,
     spawned: &SpawnedGroups,
+    processed: &ProcessedWelcomes,
 ) -> Result<Vec<u8>> {
     InvitationArchive {
         invitation: invitation.encode()?,
@@ -140,6 +160,13 @@ pub(crate) fn encode_archive(
                 classical: classical.clone(),
             })
             .collect(),
+        processed: processed
+            .iter()
+            .map(|(digest, classical)| ProcessedEntry {
+                digest: digest.clone(),
+                classical: classical.clone(),
+            })
+            .collect(),
     }
     .mls_encode_to_vec()
     .map_err(|_| TwoMlsPqError::ArchiveInvalid)
@@ -147,7 +174,12 @@ pub(crate) fn encode_archive(
 
 pub(crate) fn decode_archive(
     bytes: &[u8],
-) -> Result<(CombinerInvitation, BTreeSet<Vec<u8>>, SpawnedGroups)> {
+) -> Result<(
+    CombinerInvitation,
+    BTreeSet<Vec<u8>>,
+    SpawnedGroups,
+    ProcessedWelcomes,
+)> {
     let mut rest = bytes;
     let archive =
         InvitationArchive::mls_decode(&mut rest).map_err(|_| TwoMlsPqError::ArchiveInvalid)?;
@@ -161,7 +193,12 @@ pub(crate) fn decode_archive(
         .into_iter()
         .map(|e| (e.token, e.classical))
         .collect();
-    Ok((invitation, consumed, spawned))
+    let processed = archive
+        .processed
+        .into_iter()
+        .map(|e| (e.digest, e.classical))
+        .collect();
+    Ok((invitation, consumed, spawned, processed))
 }
 
 /// Generate a combiner key package on `client` and capture its private material into a

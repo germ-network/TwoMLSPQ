@@ -5,7 +5,7 @@ use zeroize::Zeroizing;
 
 use crate::invitation::{
     combiner_from_invitation, decode_archive, encode_archive, generate_combiner_invitation,
-    CombinerInvitation, SpawnedGroups,
+    CombinerInvitation, ProcessedWelcomes, SpawnedGroups,
 };
 use crate::key_package_store::{
     CombinerClient, KeyPackageSecret, MlsClient, PqMlsClient, SyntheticKeyPackageStore,
@@ -135,6 +135,7 @@ impl TwoMlsPqPrincipal {
             &generate_combiner_invitation(&self.inner, last_resort)?,
             &BTreeSet::new(),
             &SpawnedGroups::new(),
+            &ProcessedWelcomes::new(),
         )
     }
 }
@@ -268,10 +269,11 @@ pub struct HpkeSealed {
     pub ciphertext: Vec<u8>,
 }
 
-/// HPKE-seal `plaintext` to a published combiner key package's (classical) init key — the
-/// sender side of the initial routing-header pattern; the holder of the key package's
-/// invitation opens it with `TwoMlsPqInvitation::hpke_open`. `info` defaults to the key
-/// package's credential (the recipient's ClientId), matching `hpke_open`'s default.
+/// HPKE-seal `plaintext` to a published combiner key package's **PQ half** init key (spec
+/// §A.1: the envelope is sealed to the PQ EK in KP′, under the PQ suite) — the sender side
+/// of the initial routing-header pattern; the holder of the key package's invitation opens
+/// it with `TwoMlsPqInvitation::hpke_open`. `info` defaults to the key package's credential
+/// (the recipient's ClientId), matching `hpke_open`'s default.
 #[uniffi::export]
 pub fn hpke_seal_to_key_package(
     key_package: CombinerKeyPackage,
@@ -358,6 +360,12 @@ pub struct TwoMlsPqInvitation {
     // routes it to the owning session instead of treating it as a fresh welcome.
     // Persisted in `archive()` so forwarding survives a restore.
     spawned: Mutex<SpawnedGroups>,
+    // The processed-welcome ledger: SHA-256 of each accepted welcome's exact bytes → the
+    // spawned session's receive-group classical id. Welcomes cannot be assumed to arrive
+    // exactly once; a re-delivered welcome resolves here (content-keyed — no host token
+    // convention required, unlike `spawned`) instead of erroring or re-spawning.
+    // Persisted in `archive()`.
+    processed: Mutex<ProcessedWelcomes>,
 }
 
 #[uniffi::export]
@@ -366,11 +374,12 @@ impl TwoMlsPqInvitation {
     /// `archive()`).
     #[uniffi::constructor]
     pub fn new(archive: Vec<u8>) -> Result<Arc<Self>> {
-        let (invitation, consumed, spawned) = decode_archive(&archive)?;
+        let (invitation, consumed, spawned, processed) = decode_archive(&archive)?;
         Ok(Arc::new(Self {
             invitation: Mutex::new(invitation),
             consumed: Mutex::new(consumed),
             spawned: Mutex::new(spawned),
+            processed: Mutex::new(processed),
         }))
     }
 
@@ -394,7 +403,12 @@ impl TwoMlsPqInvitation {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        encode_archive(&invitation, &consumed, &spawned)
+        let processed = self
+            .processed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        encode_archive(&invitation, &consumed, &spawned, &processed)
     }
 
     /// The principal's ClientId.
@@ -432,6 +446,20 @@ impl TwoMlsPqInvitation {
         their_key_package: CombinerKeyPackage,
         spawn_token: Vec<u8>,
     ) -> Result<Arc<TwoMlsPqSession>> {
+        // Content-keyed idempotency, checked before anything is claimed or reserved: a
+        // welcome these exact bytes already spawned a session from is a re-delivery, not
+        // a fresh invite — the caller resolves it via `processed_welcome_group_id` and
+        // routes to the owning session.
+        let welcome_digest = crate::sha256(&welcome);
+        if self
+            .processed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&welcome_digest)
+        {
+            return Err(TwoMlsPqError::DuplicateWelcome);
+        }
+
         let their_id = parse_mls_key_package(their_key_package.classical.clone())?.client_id;
 
         // Claim this invitation's captured key package for the attempt. This is the single-use
@@ -470,14 +498,19 @@ impl TwoMlsPqInvitation {
         match TwoMlsPqPrincipal::from_combiner_invitation(&snapshot)
             .and_then(|client| TwoMlsPqSession::accept(client, welcome, their_key_package))
             .and_then(|session| {
-                // Enter the spawn in the forward table; the acceptor always has a
-                // receive group straight out of `accept`, but any failure in this
-                // bookkeeping must release the reservation like a failed accept.
+                // Enter the spawn in the forward table and the welcome in the
+                // processed ledger; the acceptor always has a receive group straight
+                // out of `accept`, but any failure in this bookkeeping must release
+                // the reservation like a failed accept.
                 let gid = session.receive_group_id().ok_or(TwoMlsPqError::Mls)?;
                 self.spawned
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .insert(spawn_token.clone(), gid.classical.bytes);
+                    .insert(spawn_token.clone(), gid.classical.bytes.clone());
+                self.processed
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(welcome_digest.clone(), gid.classical.bytes);
                 session.set_spawn_token(spawn_token);
                 Ok(session)
             }) {
@@ -510,12 +543,29 @@ impl TwoMlsPqInvitation {
             })
     }
 
-    /// HPKE-decrypt data sealed to this invitation's (classical) key package init key — the
-    /// initial routing-header pattern from classical TwoMLS. `info` defaults to the
-    /// ClientId; `kem_output` and `ciphertext` are the two components of the HPKE ciphertext
-    /// (kept separate so this stays agnostic to any outer wire framing). Fails with
-    /// `InvitationSpent` once a single-use invitation has been consumed — its captured PQ
-    /// key-package material, and thus the init key this opens with, is then gone.
+    /// Resolve a welcome against the processed-welcome ledger: `Some` names the receive
+    /// group (classical, message-half id) of the session this invitation already spawned
+    /// from these exact welcome bytes — a re-delivery, to be routed to the owning session
+    /// rather than passed to `receive` (which would reject it as `DuplicateWelcome`).
+    /// `None` means the welcome is fresh. The content-keyed counterpart of
+    /// `forward_group_id`: this one needs no host token convention, only the bytes.
+    pub fn processed_welcome_group_id(&self, welcome: Vec<u8>) -> Option<MlsGroupId> {
+        self.processed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&crate::sha256(&welcome))
+            .map(|classical| MlsGroupId {
+                bytes: classical.clone(),
+            })
+    }
+
+    /// HPKE-decrypt data sealed to this invitation's **PQ half** key package init key (spec
+    /// §A.1; counterpart of `hpke_seal_to_key_package`) — the initial routing-header pattern
+    /// inherited from classical TwoMLS, which sealed to its classical init key. `info`
+    /// defaults to the ClientId; `kem_output` and `ciphertext` are the two components of the
+    /// HPKE ciphertext (kept separate so this stays agnostic to any outer wire framing).
+    /// Fails with `InvitationSpent` once a single-use invitation has been consumed — its
+    /// captured PQ key-package material, and thus the init key this opens with, is then gone.
     pub fn hpke_open(
         &self,
         kem_output: Vec<u8>,
@@ -727,6 +777,53 @@ mod tests {
             bob_inv.receive(welcome_a, alice_kp, b"token".to_vec()),
             crate::TwoMlsPqError::DuplicateWelcome
         );
+    }
+
+    #[test]
+    fn test_invitation_processed_welcome_ledger_resolves_redelivery() {
+        use crate::session::TwoMlsPqSession;
+        use crate::test_utils::{make_client, make_combiner_kp};
+        use std::sync::Arc;
+
+        let alice = make_client();
+        let bob = make_client();
+        let alice_kp = make_combiner_kp(&alice);
+
+        let bob_inv = assert_ok!(super::TwoMlsPqInvitation::new(assert_ok!(
+            bob.generate_invitation(true)
+        )));
+        let bob_kp = bob_inv.combiner_key_package();
+
+        let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp));
+        let welcome_a = assert_some!(alice_session.pending_outbound());
+
+        // Fresh welcome: no ledger entry yet.
+        assert!(bob_inv
+            .processed_welcome_group_id(welcome_a.clone())
+            .is_none());
+
+        let bob_session =
+            assert_ok!(bob_inv.receive(welcome_a.clone(), alice_kp.clone(), b"token".to_vec()));
+
+        // A re-delivered welcome resolves — content-keyed, no host token convention —
+        // to the spawned session's receive group…
+        let gid = assert_some!(bob_inv.processed_welcome_group_id(welcome_a.clone()));
+        assert_eq!(
+            gid.bytes,
+            assert_some!(bob_session.receive_group_id()).classical.bytes
+        );
+        // …and `receive` itself rejects it up front, before claiming or reserving
+        // anything.
+        assert_err!(
+            bob_inv.receive(welcome_a.clone(), alice_kp, b"token2".to_vec()),
+            crate::TwoMlsPqError::DuplicateWelcome
+        );
+
+        // The ledger survives the archive round-trip.
+        let restored = assert_ok!(super::TwoMlsPqInvitation::new(
+            assert_ok!(bob_inv.archive())
+        ));
+        assert_some!(restored.processed_welcome_group_id(welcome_a));
     }
 
     #[test]

@@ -42,10 +42,25 @@ struct SessionInner {
     recv_group: Option<CombinerGroup>,
     pending_outbound: Option<Vec<u8>>,
     pending_proposal_hash: Option<Vec<u8>>,
-    /// Send-group commit to bundle with the next outbound app message (rotation, or epoch advance).
-    pending_commit_message: Option<Vec<u8>>,
+    /// The staple every outbound message frame carries: the send group's latest classical
+    /// commit (ratchet, rotation, or A.3 bind), or — until the first commit exists — the
+    /// send group's own APQWelcome. Never empty once the send group exists; re-sent on
+    /// every frame so any single received frame heals the peer up to our current epoch.
+    current_staple: Vec<u8>,
     /// Upd(self) proposal for the peer's send group, stapled onto the next outbound frame.
     pending_proposal_message: Option<Vec<u8>>,
+    /// True once we have successfully processed a message frame from the peer. A message
+    /// frame carries the peer's Upd proposal, which can only be created on their recv
+    /// group — so receipt proves they joined our send group. Gates unilateral rotation
+    /// commits, which must never displace a welcome staple the peer may still need.
+    peer_confirmed: bool,
+    /// SHA-256 of the welcome our recv group was joined from (`None` until then). Welcomes
+    /// are re-delivered as a matter of course (the peer re-staples until its first commit,
+    /// plus optional standalone delivery), so processing keys off this record: a matching
+    /// arrival is skipped idempotently, a *different* welcome on a live recv group is an
+    /// error. The joined group id itself needs no separate record — it is live on
+    /// `recv_group`.
+    joined_welcome_digest: Option<Vec<u8>>,
     /// The peer's stapled Upd proposal awaiting app approval (digest, proposal bytes). It
     /// enters our send group's proposal cache only via `queue_proposal`.
     offered_proposal: Option<(Vec<u8>, Vec<u8>)>,
@@ -124,20 +139,20 @@ pub struct TwoMlsPqSession {
 }
 
 // APQWelcome wire format (0x01) + encode/decode live in the `apq` crate (imported above).
-// Rotation commit+app: [0x03 tag][u32-LE commit-len][commit][u32-LE app-len][app]
-// Used only for Phase 8 principal rotation (no PSK refresh).
-const BUNDLED_TAG: u8 = 0x03;
-// A.2 ratchet frame: [0x05 tag][send-commit][Upd(sender) proposal][app], each section
-// u32-LE length-prefixed (see encode_ratchet; sections may be empty — routine rounds
-// carry no commit). Per A.2 the sender commits in its OWN send group; the receiver
-// applies that commit to its recv group and stages the stapled Upd for app approval.
-const PARTIAL_TAG: u8 = 0x05;
-// 0x07 was the pre-A.2 full-bundle frame (send + recv commits); retired — the tag
-// stays reserved so old frames are rejected rather than misparsed.
-// Stapled welcome: [0x09 tag][u32-LE welcome-len][APQWelcome bytes][inner frame bytes].
-// The acceptor staples its return APQWelcome onto its first app frame; the inner frame is an
-// ordinary tagged frame (0x05/0x03/raw). First round only — consumed after one send.
-const STAPLED_WELCOME_TAG: u8 = 0x09;
+// The APQWelcome appears both as a standalone frame (invitation channel, and optional
+// standalone delivery of the acceptor's return welcome) and as the message frame's staple
+// slot until the sender's first commit exists.
+//
+// Message frame: [0x03 tag][staple][Upd(sender) proposal][app], each section u32-LE
+// length-prefixed and NEVER empty (see encode_message_frame). The one message-path frame:
+// `staple` is the sender's latest send-group classical commit, re-stapled on every frame
+// until superseded — or the send group's APQWelcome until the first commit exists. The
+// slot self-discriminates by first byte (an APQWelcome starts 0x01, an MLSMessage 0x00).
+// A rotation is not a frame kind: it is a commit whose authenticated_data carries the new
+// ClientId (ratchet commits have empty AD). Per A.2 the sender commits in its OWN send
+// group; the receiver applies the stapled commit to its recv group idempotently and stages
+// the stapled Upd for app approval.
+const MESSAGE_FRAME_TAG: u8 = 0x03;
 // Rendezvous derivation, shared with the classical backend so both stacks address
 // transport channels the same way: exportSecret(label, context, 32) on a group's
 // classical half. Both members of a group derive identical values; outsiders cannot.
@@ -145,28 +160,28 @@ const RENDEZVOUS_LABEL: &[u8] = b"rendezvous";
 const RENDEZVOUS_CONTEXT: &[u8] = b"TwoMLS";
 const RENDEZVOUS_LEN: usize = 32;
 // PQ ratchet (architecture-diagrams PR #2 §A.3), cryptokit only:
-// 0x0B carries the initiator's ML-KEM encapsulation key, 0x0D the responder's ciphertext,
-// 0x0F the bind = [pq partial-commit][classical commit][app], all length-prefixed.
-const PQ_EK_TAG: u8 = 0x0B;
-const PQ_CT_TAG: u8 = 0x0D;
-const PQ_BIND_TAG: u8 = 0x0F;
+// 0x05 carries the initiator's ML-KEM encapsulation key, 0x07 the responder's ciphertext,
+// 0x09 the bind = [pq partial-commit][classical commit][app], all length-prefixed.
+const PQ_EK_TAG: u8 = 0x05;
+const PQ_CT_TAG: u8 = 0x07;
+const PQ_BIND_TAG: u8 = 0x09;
 
 /// A.4 bootstrap: this side's PQ key package, sent so the peer can stand up its deferred
 /// send-group PQ half.
-const PQ_BOOTSTRAP_KP_TAG: u8 = 0x11;
+const PQ_BOOTSTRAP_KP_TAG: u8 = 0x0B;
 
-/// A.4 bootstrap reply: the new PQ group's welcome plus the classical APQ-PSK bind commit.
-const PQ_BOOTSTRAP_BIND_TAG: u8 = 0x13;
+/// A.4 bootstrap reply: the new PQ group's welcome (PQ-groups-only; no classical commit).
+const PQ_BOOTSTRAP_BIND_TAG: u8 = 0x0D;
 
 // A.5 rekey (architecture-diagrams §A.5), cryptokit only — updatePath commits run on the
 // PQ groups alone so the classical ratchet is never blocked behind a large ML-KEM
-// updatePath. 0x15 carries the initiator's Upd' proposal for the responder's send-PQ;
-// 0x17 = [Commit'][counter-Upd'-or-empty], length-prefixed — the responder's reply
+// updatePath. 0x0F carries the initiator's Upd' proposal for the responder's send-PQ;
+// 0x11 = [Commit'][counter-Upd'-or-empty], length-prefixed — the responder's reply
 // carries its counter-proposal, the initiator's final commit an empty slot. Each Commit'
 // cross-injects a PSK exported from the opposite PQ send group; the bumped pq_epoch
 // reconciles into APQInfo at the next A.3 bind (no AppDataUpdate rides these commits).
-const PQ_REKEY_UPD_TAG: u8 = 0x15;
-const PQ_REKEY_COMMIT_TAG: u8 = 0x17;
+const PQ_REKEY_UPD_TAG: u8 = 0x0F;
+const PQ_REKEY_COMMIT_TAG: u8 = 0x11;
 
 /// The seven PQ side-band frame kinds the host routes through `TwoMlsPqSession::ingest`
 /// (the `begin`/`ingest`/`advance` surface in the AbstractTwoMLS adapter). Exported so the
@@ -175,19 +190,19 @@ const PQ_REKEY_COMMIT_TAG: u8 = 0x17;
 /// sync with a hand-copied host switch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum PqFrameKind {
-    /// 0x0B — A.3 ratchet: the initiator's ML-KEM encapsulation key.
+    /// 0x05 — A.3 ratchet: the initiator's ML-KEM encapsulation key.
     RatchetEphemeralKey,
-    /// 0x0D — A.3 ratchet: the responder's ciphertext.
+    /// 0x07 — A.3 ratchet: the responder's ciphertext.
     RatchetCiphertext,
-    /// 0x0F — A.3 ratchet: the bind (`[pq partial-commit][classical commit][app]`).
+    /// 0x09 — A.3 ratchet: the bind (`[pq partial-commit][classical commit][app]`).
     RatchetBind,
-    /// 0x11 — A.4 bootstrap: this side's PQ key package.
+    /// 0x0B — A.4 bootstrap: this side's PQ key package.
     BootstrapKeyPackage,
-    /// 0x13 — A.4 bootstrap: the reply (PQ welcome + APQ-PSK bind commit).
+    /// 0x0D — A.4 bootstrap: the reply (the new PQ group's welcome).
     BootstrapBind,
-    /// 0x15 — A.5 rekey: the initiator's Upd' proposal.
+    /// 0x0F — A.5 rekey: the initiator's Upd' proposal.
     RekeyUpdate,
-    /// 0x17 — A.5 rekey: the responder's `[Commit'][counter-Upd'-or-empty]` reply.
+    /// 0x11 — A.5 rekey: the responder's `[Commit'][counter-Upd'-or-empty]` reply.
     RekeyCommit,
 }
 
@@ -244,17 +259,9 @@ mod pq_frame_kind_tests {
 
     #[test]
     fn rejects_non_side_band_tags() {
-        // Classical/APQ envelope tags and the gaps between side-band tags are not side-band frames.
-        for tag in [
-            0x00,
-            APQ_TAG,
-            BUNDLED_TAG,
-            PARTIAL_TAG,
-            STAPLED_WELCOME_TAG,
-            0x0A,
-            0x12,
-            0xFF,
-        ] {
+        // Bare-MLS first byte, the APQWelcome and message-frame tags, gaps/evens between
+        // side-band tags, and the first unused odd value are not side-band frames.
+        for tag in [0x00, APQ_TAG, MESSAGE_FRAME_TAG, 0x0A, 0x12, 0x13, 0xFF] {
             assert_eq!(
                 pq_frame_kind(tag),
                 None,
@@ -437,8 +444,13 @@ mod archive_wire {
         pub(super) listen_rendezvous: Vec<ListenEntry>,
         pub(super) pending_outbound: Option<Vec<u8>>,
         pub(super) pending_proposal_hash: Option<Vec<u8>>,
-        pub(super) pending_commit_message: Option<Vec<u8>>,
+        /// The commit-or-welcome staple every outbound frame re-sends. Never empty on a
+        /// valid archive (validated on restore: non-empty, first byte 0x00 or 0x01).
+        #[mls_codec(with = "mls_rs_codec::byte_vec")]
+        pub(super) current_staple: Vec<u8>,
         pub(super) pending_proposal_message: Option<Vec<u8>>,
+        pub(super) peer_confirmed: bool,
+        pub(super) joined_welcome_digest: Option<Vec<u8>>,
         pub(super) offered_proposal: Option<OfferedProposal>,
         pub(super) queued_proposal: Option<Vec<u8>>,
         /// A rotation staged by `stage_rotation` but not yet committed: the successor
@@ -616,7 +628,7 @@ fn encode_pq_bind(pq_commit: Vec<u8>, classical_commit: Vec<u8>, app: Vec<u8>) -
     out
 }
 
-/// Encode the A.4 bootstrap reply: `[0x13][pq_welcome…]`. PQ-groups-only per the spec —
+/// Encode the A.4 bootstrap reply: `[0x0D][pq_welcome…]`. PQ-groups-only per the spec —
 /// no classical commit rides along; ASG-PQ binds into ASG-cl at the next A.3 ratchet.
 fn encode_bootstrap_bind(pq_welcome: Vec<u8>) -> Vec<u8> {
     let mut out = Vec::with_capacity(1 + pq_welcome.len());
@@ -642,7 +654,7 @@ fn decode_pq_bind(bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
     Ok((pq_commit, classical_commit, app))
 }
 
-/// Encode an A.5 rekey Commit' frame: `[0x17][commit][counter-Upd'-or-empty]`.
+/// Encode an A.5 rekey Commit' frame: `[0x11][commit][counter-Upd'-or-empty]`.
 fn encode_pq_rekey_commit(commit: Vec<u8>, counter_proposal: Vec<u8>) -> Vec<u8> {
     let mut out = Vec::with_capacity(1 + 8 + commit.len() + counter_proposal.len());
     out.push(PQ_REKEY_COMMIT_TAG);
@@ -663,7 +675,7 @@ fn decode_pq_rekey_commit(bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
 #[uniffi::export]
 impl TwoMlsPqSession {
     /// Initiator step 1 — generate an ML-KEM ephemeral and return the encapsulation-key message
-    /// (tag 0x0B). The decapsulation key is held until the ciphertext arrives.
+    /// (tag 0x05). The decapsulation key is held until the ciphertext arrives.
     pub fn pq_ratchet_begin(&self) -> Result<Vec<u8>> {
         let mut inner = self.lock();
         if inner.pq_inflight.is_some() {
@@ -677,7 +689,7 @@ impl TwoMlsPqSession {
     }
 
     /// Responder — encapsulate a fresh secret to the initiator's EK, hold it, and return the
-    /// ciphertext message (tag 0x0D).
+    /// ciphertext message (tag 0x07).
     pub fn pq_ratchet_respond(&self, ek_msg: Vec<u8>) -> Result<()> {
         let (&tag, ek) = ek_msg.split_first().ok_or(TwoMlsPqError::Mls)?;
         if tag != PQ_EK_TAG {
@@ -697,7 +709,7 @@ impl TwoMlsPqSession {
 
     /// Initiator step 2 — decapsulate S, inject it into the send group's PQ half via a pathless
     /// commit, bind the exported apq_psk into the classical half, and staple an app message.
-    /// Returns the bind frame (tag 0x0F).
+    /// Returns the bind frame (tag 0x09).
     pub fn pq_ratchet_bind(&self, ct_msg: Vec<u8>, app: Vec<u8>) -> Result<()> {
         let (&tag, ct) = ct_msg.split_first().ok_or(TwoMlsPqError::Mls)?;
         if tag != PQ_CT_TAG {
@@ -705,6 +717,13 @@ impl TwoMlsPqSession {
         }
         let mut inner = self.lock();
         if inner.pending_pq_outbound.is_some() {
+            return Err(TwoMlsPqError::SessionNotReady);
+        }
+        // Staple-stacking guard: a prepared-but-unsent classical commit is sitting in
+        // `current_staple` waiting for its `encrypt`. The bind commit below would replace
+        // it, and a displaced commit never rides a frame again — the peer would hit the
+        // epoch-ahead desync with zero loss on the wire. Retriable: bind after `encrypt`.
+        if inner.pending_proposal_hash.is_some() {
             return Err(TwoMlsPqError::SessionNotReady);
         }
         // Capture the departing epoch's PSK before the classical bind commit below.
@@ -751,6 +770,11 @@ impl TwoMlsPqSession {
             .map_err(|_| TwoMlsPqError::Mls)?;
         // Our send group advanced: record the new epoch's PSK in the session ledger.
         inner.remember_send_psk()?;
+        // The bind's classical commit becomes the staple subsequent message frames
+        // re-send — if the BIND frame itself is lost, the classical stream still heals.
+        // (A message frame can overtake the BIND; the peer then lacks the APQ-PSK and the
+        // staple fails retriably until the BIND lands — same as today's ordering.)
+        inner.current_staple = cl_commit.clone();
         // Our operation is complete once the peer applies; the turn passes.
         inner.pq_turn_mine = false;
         inner.pending_pq_outbound = Some(encode_pq_bind(pq_commit, cl_commit, app_ct));
@@ -799,7 +823,7 @@ impl TwoMlsPqSession {
     }
 
     /// A.5 initiator — propose Upd'(self) into the peer's send-PQ (our recv mirror) and
-    /// return the 0x15 frame. Requires both PQ halves live (post-A.4 only), the turn, and
+    /// return the 0x0F frame. Requires both PQ halves live (post-A.4 only), the turn, and
     /// no other side-band operation in flight. Proposal only: no epochs move until the
     /// responder commits.
     ///
@@ -865,7 +889,7 @@ impl TwoMlsPqSession {
 
     /// A.5 responder — commit the initiator's Upd' on our own send-PQ with an updatePath
     /// and a PSK exported from our recv-PQ mirror (the initiator derives the same PSK from
-    /// its send-PQ), then park the `[Commit'][counter-Upd'(self)]` frame (0x17) for pickup
+    /// its send-PQ), then park the `[Commit'][counter-Upd'(self)]` frame (0x11) for pickup
     /// via `pq_take_pending_outbound`.
     ///
     /// Returns the ClientId the initiator announced in the Upd's authenticated_data when
@@ -946,10 +970,10 @@ impl TwoMlsPqSession {
         Ok(rotated)
     }
 
-    /// Apply an A.5 rekey Commit' (0x17). As the initiator mid-operation (frame carries
+    /// Apply an A.5 rekey Commit' (0x11). As the initiator mid-operation (frame carries
     /// the counter-Upd'), apply the peer's commit to our recv mirror, commit the
     /// counter-Upd' on our own send-PQ with the freshly-exported cross-PSK, park the
-    /// final 0x17, and return `true` (pick it up via `pq_take_pending_outbound`). As the
+    /// final 0x11, and return `true` (pick it up via `pq_take_pending_outbound`). As the
     /// responder (empty counter slot), apply the final commit, take the turn, and return
     /// `false` — the operation is complete.
     pub fn pq_rekey_apply(&self, msg: Vec<u8>) -> Result<bool> {
@@ -1092,66 +1116,40 @@ impl TwoMlsPqSession {
     }
 }
 
-fn encode_stapled_welcome(welcome: &[u8], inner: Vec<u8>) -> Vec<u8> {
-    let mut out = Vec::with_capacity(1 + 4 + welcome.len() + inner.len());
-    out.push(STAPLED_WELCOME_TAG);
-    out.extend_from_slice(&(welcome.len() as u32).to_le_bytes());
-    out.extend_from_slice(welcome);
-    out.extend_from_slice(&inner);
-    out
-}
-
-fn decode_stapled_welcome(bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
-    let (&tag, rest) = bytes.split_first().ok_or(TwoMlsPqError::Mls)?;
-    if tag != STAPLED_WELCOME_TAG {
-        return Err(TwoMlsPqError::Mls);
-    }
-    if rest.len() < 4 {
-        return Err(TwoMlsPqError::Mls);
-    }
-    let w_len = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
-    let rest = &rest[4..];
-    if rest.len() < w_len {
-        return Err(TwoMlsPqError::Mls);
-    }
-    Ok((rest[..w_len].to_vec(), rest[w_len..].to_vec()))
-}
-
-fn encode_bundled(commit: Vec<u8>, app: Vec<u8>) -> Vec<u8> {
-    let mut out = Vec::with_capacity(1 + 4 + commit.len() + 4 + app.len());
-    out.push(BUNDLED_TAG);
-    push_section(&mut out, &commit);
-    push_section(&mut out, &app);
-    out
-}
-
-fn decode_bundled(bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
-    let (&tag, rest) = bytes.split_first().ok_or(TwoMlsPqError::Mls)?;
-    if tag != BUNDLED_TAG {
-        return Err(TwoMlsPqError::Mls);
-    }
-    let [commit, app] = read_sections::<2>(rest)?;
-    Ok((commit, app))
-}
-
-/// A.2 ratchet frame (0x05): own-send-group commit + Upd(self) proposal for the peer's
-/// send group + app message. An empty section is permitted (e.g. rotation-less proposal).
-fn encode_ratchet(commit: Vec<u8>, proposal: Vec<u8>, app: Vec<u8>) -> Vec<u8> {
-    let mut out = Vec::with_capacity(1 + 12 + commit.len() + proposal.len() + app.len());
-    out.push(PARTIAL_TAG);
-    push_section(&mut out, &commit);
+/// The one message-path frame (0x03): `[staple][Upd(sender) proposal][app]`, every
+/// section non-empty. `staple` is the sender's latest send-group classical commit — or
+/// the send group's APQWelcome until the first commit exists — re-sent on every frame so
+/// any single received frame brings the peer up to the sender's current epoch.
+fn encode_message_frame(staple: &[u8], proposal: Vec<u8>, app: Vec<u8>) -> Vec<u8> {
+    debug_assert!(!staple.is_empty() && !proposal.is_empty() && !app.is_empty());
+    let mut out = Vec::with_capacity(1 + 12 + staple.len() + proposal.len() + app.len());
+    out.push(MESSAGE_FRAME_TAG);
+    push_section(&mut out, staple);
     push_section(&mut out, &proposal);
     push_section(&mut out, &app);
     out
 }
 
-fn decode_ratchet(bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+fn decode_message_frame(bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
     let (&tag, rest) = bytes.split_first().ok_or(TwoMlsPqError::Mls)?;
-    if tag != PARTIAL_TAG {
+    if tag != MESSAGE_FRAME_TAG {
         return Err(TwoMlsPqError::Mls);
     }
-    let [commit, proposal, app] = read_sections::<3>(rest)?;
-    Ok((commit, proposal, app))
+    let [staple, proposal, app] = read_sections::<3>(rest)?;
+    // No section is optional in this format: an empty section is a retired-shape or
+    // malformed frame, rejected here rather than surfacing as a downstream MLS error.
+    if staple.is_empty() || proposal.is_empty() || app.is_empty() {
+        return Err(TwoMlsPqError::Mls);
+    }
+    Ok((staple, proposal, app))
+}
+
+/// Fuzzing entry for the message-frame decoder — the attacker-facing frame parser (see
+/// `fuzz/fuzz_targets/message_frame_decode.rs`). Not API; hidden and exposed only so the
+/// out-of-workspace fuzz crate can reach the otherwise-private decoder.
+#[doc(hidden)]
+pub fn fuzz_decode_message_frame(bytes: &[u8]) {
+    let _ = decode_message_frame(bytes);
 }
 
 /// The rendezvous exporter both routing surfaces derive:
@@ -1295,11 +1293,72 @@ impl SessionInner {
         Ok(())
     }
 
+    /// Join the recv groups from an APQWelcome — idempotently. Welcomes cannot be assumed
+    /// to arrive exactly once: the peer re-staples its welcome on every message frame
+    /// until its first commit, and hosts may also deliver the standalone copy. Processing
+    /// therefore keys off the recorded digest of the welcome we actually joined from:
+    /// - first delivery → join, record the digest;
+    /// - byte-identical re-delivery → no-op (the join consumed the one key package, so a
+    ///   second attempt would fail, and must never be reached);
+    /// - a *different* welcome while the recv group is live → `UnexpectedWelcome` (an
+    ///   unexpected re-invite on an established session).
+    fn process_welcome(&mut self, welcome: &[u8]) -> Result<()> {
+        let digest = crate::sha256(welcome);
+        if self.recv_group.is_some() {
+            return if self.joined_welcome_digest.as_deref() == Some(digest.as_slice()) {
+                Ok(())
+            } else {
+                Err(TwoMlsPqError::UnexpectedWelcome)
+            };
+        }
+
+        let client = self.client.clone();
+        // The joins below resolve PSKs from the CURRENT client's stores (a Phase 8
+        // rotation may have replaced the constructing client) — track them first.
+        self.track_psk_stores(&client);
+
+        // Live-inject the session-held cross-party TwoMLS-PSKs (our send group's
+        // recent epochs) before joining the peer's bound groups.
+        if self.send_group.is_some() {
+            self.inject_send_psks()?;
+        }
+
+        let (classical_welcome, pq_welcome) = decode_apq_welcome(welcome)?;
+        // Reject a welcome whose suite(s) don't match this session's fixed pair before
+        // joining — an early, clear failure instead of an opaque late mls-rs error.
+        validate_welcome_halves(self.suite, &classical_welcome, &pq_welcome)?;
+        // An empty PQ slot is the acceptor's deferred (A.4) return welcome: join the
+        // classical group only; the PQ half arrives with the bootstrap flow.
+        let recv_group = if pq_welcome.is_empty() {
+            let classical = join_group_from_welcome(client.classical(), &classical_welcome)?;
+            CombinerGroup::from_client(client.combiner(), classical, None)
+        } else {
+            // Join the PQ group first, then re-derive the intra-party APQ-PSK from it.
+            let pq = join_group_from_welcome(client.pq(), &pq_welcome)?;
+            let (psk_id, psk) = export_psk(&pq)?;
+            self.register_psk(&psk_id, &psk);
+            // Join the classical group (bound with the cross-party + APQ PSKs).
+            let classical = join_group_from_welcome(client.classical(), &classical_welcome)?;
+            CombinerGroup::from_client(client.combiner(), classical, Some(pq))
+        };
+        self.recv_group = Some(recv_group);
+        self.joined_welcome_digest = Some(digest);
+        Ok(())
+    }
+
     /// Phase 8: encode a rotation commit on the CLASSICAL send group with `new_id` in
     /// authenticated_data (the PQ side-band is untouched; its epoch advances only on A.3/A.4
     /// rounds). This advances the classical send epoch, which is why the PSK ledger brackets
     /// the commit below.
     fn prepare_rotation(&mut self, new_id: ClientId) -> Result<crate::PrepareEncryptResult> {
+        // A rotation commit is unilateral — nothing forces the peer to have joined our
+        // send group first — and it displaces the welcome staple. Gate it on receipt of
+        // a message frame (whose Upd proposal can only be created on the peer's recv
+        // group, proving the join), so the peer is never stranded welcome-less.
+        if !self.peer_confirmed {
+            return Err(TwoMlsPqError::SessionNotReady);
+        }
+
         let new_client = self
             .pending_new_client
             .take()
@@ -1309,20 +1368,52 @@ impl SessionInner {
             return Err(TwoMlsPqError::SessionNotReady);
         }
 
+        // mls-rs auto-includes cached proposals in any commit, so an app-approved queued
+        // Upd (fed into the send group's cache by `queue_proposal`) rides this rotation
+        // commit whether or not we account for it. Account for it: take the digest,
+        // refresh the cross-party PSK exactly as a ratchet commit would, and report the
+        // consumption — a dangling digest would make the next ratchet round build a
+        // spurious empty PSK-commit and misreport `committed_remote_client_id`.
+        let folded_proposal = self.queued_proposal.take().is_some();
+
         // Capture the departing epoch's PSK before committing past it: a peer frame in
         // flight may reference it, and mls-rs can only export the current epoch.
         self.remember_send_psk()?;
+
+        let psk_id = if folded_proposal {
+            let psk_id = {
+                let recv = self
+                    .recv_group
+                    .as_ref()
+                    .ok_or(TwoMlsPqError::SessionNotReady)?;
+                let (psk_id, psk) = export_psk(&recv.classical)?;
+                let send = self
+                    .send_group
+                    .as_ref()
+                    .ok_or(TwoMlsPqError::SessionNotReady)?;
+                send.register_psk(&psk_id, &psk);
+                psk_id
+            };
+            Some(psk_id)
+        } else {
+            None
+        };
 
         let commit_output = {
             let send = self
                 .send_group
                 .as_mut()
                 .ok_or(TwoMlsPqError::SessionNotReady)?;
-            send.classical
+            let mut builder = send
+                .classical
                 .commit_builder()
-                .authenticated_data(new_id.bytes.clone())
-                .build()
-                .map_err(|_| TwoMlsPqError::Mls)?
+                .authenticated_data(new_id.bytes.clone());
+            if let Some(psk_id) = &psk_id {
+                builder = builder
+                    .add_external_psk(psk_id.clone())
+                    .map_err(|_| TwoMlsPqError::Mls)?;
+            }
+            builder.build().map_err(|_| TwoMlsPqError::Mls)?
         };
         {
             let send = self
@@ -1332,20 +1423,21 @@ impl SessionInner {
             send.classical
                 .apply_pending_commit()
                 .map_err(|_| TwoMlsPqError::Mls)?;
+            // The commit consumed the one-shot recv-group PSK; drop it from the store.
+            if let Some(psk_id) = &psk_id {
+                send.forget_psk(psk_id);
+            }
         }
 
         // Our send group advanced: record the new epoch's PSK in the session ledger.
         self.remember_send_psk()?;
 
-        let commit_bytes = commit_output
+        // The rotation commit becomes the staple every subsequent frame re-sends until
+        // the next commit supersedes it.
+        self.current_staple = commit_output
             .commit_message
             .to_bytes()
             .map_err(|_| TwoMlsPqError::Mls)?;
-        // The rotation stages a commit, not a proposal: the binding value is the
-        // SHA-256 of the commit message itself (`encrypt` carries it as the app
-        // message's authenticated data).
-        let proposal_hash = crate::sha256(&commit_bytes);
-        self.pending_commit_message = Some(commit_bytes);
 
         let old_id = self.my_state.client_id();
         self.my_state = PrincipalState::Pending {
@@ -1354,11 +1446,31 @@ impl SessionInner {
         };
         self.client = new_client;
 
+        // A rotation round is an ordinary round whose commit also announces the handoff
+        // (in its authenticated_data): stage the routine Upd(self) like any other round,
+        // and bind its hash — skipping it would skip a beat of the peer's ratchet.
+        let proposal_msg = {
+            let recv = self
+                .recv_group
+                .as_mut()
+                .ok_or(TwoMlsPqError::SessionNotReady)?;
+            recv.classical
+                .propose_update(Vec::new())
+                .map_err(|_| TwoMlsPqError::Mls)?
+        };
+        let proposal_bytes = proposal_msg.to_bytes().map_err(|_| TwoMlsPqError::Mls)?;
+        let proposal_hash = crate::sha256(&proposal_bytes);
+        self.pending_proposal_message = Some(proposal_bytes);
         self.pending_proposal_hash = Some(proposal_hash.clone());
 
+        let their_id = self.their_state.client_id();
         Ok(crate::PrepareEncryptResult {
             proposal_hash,
-            committed_remote_client_id: None,
+            committed_remote_client_id: if folded_proposal {
+                Some(their_id)
+            } else {
+                None
+            },
             did_commit: true,
         })
     }
@@ -1422,12 +1534,11 @@ impl SessionInner {
             }
             // Our send group advanced: record the new epoch's PSK in the session ledger.
             self.remember_send_psk()?;
-            self.pending_commit_message = Some(
-                commit_output
-                    .commit_message
-                    .to_bytes()
-                    .map_err(|_| TwoMlsPqError::Mls)?,
-            );
+            // The new commit becomes the staple every frame re-sends until superseded.
+            self.current_staple = commit_output
+                .commit_message
+                .to_bytes()
+                .map_err(|_| TwoMlsPqError::Mls)?;
         }
 
         // Upd(self) into the peer's send group — a proposal only; the peer commits it.
@@ -1459,6 +1570,9 @@ impl SessionInner {
     }
 }
 
+// Two constructors' shared assembly — the parameter list mirrors their divergent
+// inputs one-to-one, so a params struct would just restate it with extra ceremony.
+#[allow(clippy::too_many_arguments)]
 fn build_session(
     client: Arc<TwoMlsPqPrincipal>,
     send_group: Option<CombinerGroup>,
@@ -1467,6 +1581,7 @@ fn build_session(
     session_id: SessionId,
     their_id: ClientId,
     initiated: bool,
+    joined_welcome_digest: Option<Vec<u8>>,
 ) -> Arc<TwoMlsPqSession> {
     let my_id = client.client_id();
     let suite = client.combiner().cipher_suite();
@@ -1476,6 +1591,9 @@ fn build_session(
         client.combiner().pq().secret_store(),
     ];
     let psk_stores_from = Arc::clone(&client);
+    // The own APQWelcome doubles as the initial staple until the first send-group commit
+    // replaces it (both constructors have it in hand as `pending_outbound`).
+    let current_staple = pending_outbound.clone().unwrap_or_default();
     Arc::new(TwoMlsPqSession {
         inner: Mutex::new(SessionInner {
             client,
@@ -1484,8 +1602,10 @@ fn build_session(
             recv_group,
             pending_outbound,
             pending_proposal_hash: None,
-            pending_commit_message: None,
+            current_staple,
             pending_proposal_message: None,
+            peer_confirmed: false,
+            joined_welcome_digest,
             offered_proposal: None,
             queued_proposal: None,
             pending_new_client: None,
@@ -1593,6 +1713,7 @@ impl TwoMlsPqSession {
             session_id,
             their_id,
             true,
+            None,
         );
         // Seed the PSK ledger with the send group's establishment epoch, and capture
         // the establishment epoch's listen address.
@@ -1659,6 +1780,10 @@ impl TwoMlsPqSession {
             session_id,
             their_id,
             false,
+            // Record which welcome the recv group was joined from: welcomes are
+            // re-delivered as a matter of course, and this digest is what makes the
+            // repeats skip idempotently instead of re-joining.
+            Some(crate::sha256(&welcome)),
         );
         // Seed the PSK ledger with the send group's establishment epoch, and capture
         // the establishment epoch's listen address.
@@ -1713,6 +1838,10 @@ impl TwoMlsPqSession {
                 .queued_proposal
                 .as_deref()
                 .is_some_and(|d| !digest_ok(d))
+            || wire
+                .joined_welcome_digest
+                .as_deref()
+                .is_some_and(|d| !digest_ok(d))
         {
             return Err(TwoMlsPqError::ArchiveInvalid);
         }
@@ -1721,6 +1850,14 @@ impl TwoMlsPqSession {
             .iter()
             .any(|e| e.addr.len() != RENDEZVOUS_LEN)
         {
+            return Err(TwoMlsPqError::ArchiveInvalid);
+        }
+        // The staple is never empty on a live session (set at construction), and its
+        // first byte is one of the two staple forms: APQWelcome (0x01) or MLSMessage
+        // (0x00). This check also structurally rejects pre-v2 archive layouts, whose
+        // bytes can otherwise alias into these fields (an Option-None byte reads as an
+        // empty byte_vec).
+        if !matches!(wire.current_staple.first(), Some(&0x00) | Some(&APQ_TAG)) {
             return Err(TwoMlsPqError::ArchiveInvalid);
         }
 
@@ -1771,8 +1908,10 @@ impl TwoMlsPqSession {
                 recv_group,
                 pending_outbound: wire.pending_outbound,
                 pending_proposal_hash: wire.pending_proposal_hash,
-                pending_commit_message: wire.pending_commit_message,
+                current_staple: wire.current_staple,
                 pending_proposal_message: wire.pending_proposal_message,
+                peer_confirmed: wire.peer_confirmed,
+                joined_welcome_digest: wire.joined_welcome_digest,
                 offered_proposal: wire.offered_proposal.map(|o| (o.digest, o.proposal)),
                 queued_proposal: wire.queued_proposal,
                 pending_new_client,
@@ -1845,7 +1984,7 @@ impl TwoMlsPqSession {
             })
     }
 
-    /// A.4 initiator — emit this side's PQ key package (tag 0x11) so the peer can stand
+    /// A.4 initiator — emit this side's PQ key package (tag 0x0B) so the peer can stand
     /// up its deferred send-group PQ half. The key package's private material is retained
     /// in this client, so the returned welcome can be joined by `pq_bootstrap_apply`.
     ///
@@ -1878,8 +2017,10 @@ impl TwoMlsPqSession {
     }
 
     /// A.4 responder — stand up the deferred send-group PQ half around the peer's key
-    /// package, bind its exported APQ-PSK into the classical half, and return the
-    /// bootstrap frame (tag 0x13). Taking this turn makes the next operation ours.
+    /// package and return the bootstrap frame (tag 0x0D) carrying its Welcome.
+    /// PQ-groups-only: no classical commit rides here — the new half's APQ-PSK reaches
+    /// the classical group at the next A.3 bind. Taking this turn makes the next
+    /// operation ours.
     pub fn pq_bootstrap_respond(&self, kp_msg: Vec<u8>) -> Result<()> {
         let (&tag, kp) = kp_msg.split_first().ok_or(TwoMlsPqError::Mls)?;
         if tag != PQ_BOOTSTRAP_KP_TAG {
@@ -1917,8 +2058,9 @@ impl TwoMlsPqSession {
     }
 
     /// A.4 initiator completion — join the peer's new PQ group (our key package's
-    /// private material is retained in this client), register its APQ-PSK, and apply
-    /// the classical bind on the recv group. The turn passes to the peer.
+    /// private material is retained in this client) and register its APQ-PSK.
+    /// PQ-groups-only, like the responder side: no classical commit is applied here.
+    /// The turn passes to the peer.
     pub fn pq_bootstrap_apply(&self, bind_msg: Vec<u8>) -> Result<()> {
         let pq_welcome = decode_bootstrap_bind(&bind_msg)?;
         let mut inner = self.lock();
@@ -2003,7 +2145,11 @@ impl TwoMlsPqSession {
     /// Encrypt `app_message` using the PQ send group.
     /// Must be called after `prepare_to_encrypt`; the pending proposal hash is used as
     /// authenticated data and cleared on return.
-    /// When a commit was staged (did_commit: true), the output is a bundled commit+app message.
+    /// The output is always one message frame `[staple][proposal][app]`: the staple (our
+    /// latest send-group commit, or our APQWelcome until the first commit) rides every
+    /// frame, so a peer that missed a frame is healed by the next one. `pending_outbound`
+    /// is NOT consumed here — the staple carries the welcome; the standalone copy stays
+    /// available for hosts that also deliver it separately (processing is idempotent).
     pub fn encrypt(&self, app_message: Vec<u8>) -> Result<EncryptResult> {
         let mut inner = self.lock();
 
@@ -2028,32 +2174,16 @@ impl TwoMlsPqSession {
             (bytes, epochs)
         };
 
-        let cipher_text = match (
-            inner.pending_commit_message.take(),
-            inner.pending_proposal_message.take(),
-        ) {
-            // A.2 ratchet round: own-send-group commit + Upd(self) proposal for the peer.
-            (Some(commit), Some(proposal)) => encode_ratchet(commit, proposal, app_bytes),
-            // Rotation commit only (credential handoff) → BUNDLED_TAG.
-            (Some(commit), None) => encode_bundled(commit, app_bytes),
-            // Proposal without a commit should not occur; carry it with an empty commit slot.
-            (None, Some(proposal)) => encode_ratchet(Vec::new(), proposal, app_bytes),
-            // bare app message (should not occur after prepare_to_encrypt, but safe fallback)
-            (None, None) => app_bytes,
-        };
-
-        // Welcome stapling: the acceptor (already has a recv group) rides its return APQWelcome
-        // on its first app frame, so the peer joins and decrypts in one shot. First round only —
-        // `pending_outbound` is consumed here. The initiator's welcome has no recv group yet and
-        // is delivered separately via `pending_outbound()` before the peer's `accept`.
-        let cipher_text = if inner.recv_group.is_some() {
-            match inner.pending_outbound.take() {
-                Some(welcome) => encode_stapled_welcome(&welcome, cipher_text),
-                None => cipher_text,
-            }
-        } else {
-            cipher_text
-        };
+        // Every prepare path stages a proposal, and the staple is set at construction —
+        // an empty slot here means encrypt was reached outside the prepare contract.
+        let proposal = inner
+            .pending_proposal_message
+            .take()
+            .ok_or(TwoMlsPqError::SessionNotReady)?;
+        if inner.current_staple.is_empty() {
+            return Err(TwoMlsPqError::SessionNotReady);
+        }
+        let cipher_text = encode_message_frame(&inner.current_staple, proposal, app_bytes);
 
         let sender = inner.my_state.client_id();
         let recipient = inner.their_state.client_id();
@@ -2068,87 +2198,113 @@ impl TwoMlsPqSession {
 
     /// Process an incoming message.
     ///
-    /// - APQWelcome (0x01) → join recv groups; `Ok(None)`
-    /// - Rotation commit+app (0x03) → apply the peer's rotation commit to
-    ///   `recv_group.classical`, then decrypt; `DecryptResult`
-    /// - A.2 ratchet frame (0x05) → apply the commit (if any) to `recv_group.classical`,
-    ///   stage the stapled Upd(sender) for app approval, decrypt; `DecryptResult`
-    /// - 0x07 (pre-A.2 full bundle) → retired; rejected rather than misparsed
-    /// - Stapled welcome (0x09) → join recv groups from the embedded APQWelcome, then
-    ///   process the inner frame
-    /// - Bare MLS ciphertext → decrypt on `recv_group.classical`; `DecryptResult`
+    /// - APQWelcome (0x01) → join recv groups, idempotently (a re-delivered welcome is a
+    ///   no-op); `Ok(None)`
+    /// - Message frame (0x03) `[staple][proposal][app]` → apply the staple idempotently
+    ///   (join from a welcome staple if this is its first delivery; apply a commit staple
+    ///   at the recv group's current epoch, skip an older one), decrypt the app message,
+    ///   and stage the stapled Upd(sender) for app approval; `DecryptResult`
     ///
-    /// PQ-ratchet frames (0x0B/0x0D/0x0F) are **not** handled here — the host must route them to
-    /// `pq_ratchet_respond`/`pq_ratchet_bind`/`pq_ratchet_apply` by their leading tag byte. Passing
-    /// one here returns `SessionNotReady` rather than attempting (and failing) MLS decryption.
+    /// A commit staple *ahead* of the recv group's next epoch is `EpochDesync`: the
+    /// bridging commit no longer rides any frame (only the sender's latest staples), so
+    /// the direction needs the reconnect path — surfaced before the app ciphertext is
+    /// touched, and distinguishable from a transient `DecryptionFailed`.
+    ///
+    /// PQ side-band frames (0x05–0x11) are **not** handled here — the host routes them to
+    /// the `pq_*` entry points by frame kind (`pq_frame_kind`). Passing one here returns
+    /// `SessionNotReady` rather than attempting (and failing) MLS decryption. Anything
+    /// else — including bare MLS ciphertext, which no longer occurs on the send path — is
+    /// rejected as `DecryptionFailed`.
     pub fn process_incoming(&self, ciphertext: Vec<u8>) -> Result<Option<DecryptResult>> {
-        // Stapled welcome: process the embedded APQWelcome (joins the recv group), then the
-        // inner app frame. Each sub-frame is a self-contained tagged frame.
-        if ciphertext.first() == Some(&STAPLED_WELCOME_TAG) {
-            let (welcome, inner_frame) = decode_stapled_welcome(&ciphertext)?;
-            self.process_incoming(welcome)?;
-            return self.process_incoming(inner_frame);
-        }
-
+        // Standalone APQWelcome: the initiator's welcome arrives this way over the
+        // invitation channel, and hosts may also deliver the acceptor's return welcome
+        // standalone. The same welcome also rides message-frame staples, so processing
+        // must be (and is) idempotent — see `process_welcome`.
         if ciphertext.first() == Some(&APQ_TAG) {
             let mut inner = self.lock();
-            let client = inner.client.clone();
-            // The joins below resolve PSKs from the CURRENT client's stores (a Phase 8
-            // rotation may have replaced the constructing client) — track them first.
-            inner.track_psk_stores(&client);
-
-            // Live-inject the session-held cross-party TwoMLS-PSKs (our send group's
-            // recent epochs) before joining the peer's bound groups.
-            if inner.send_group.is_some() {
-                inner.inject_send_psks()?;
-            }
-
-            let (classical_welcome, pq_welcome) = decode_apq_welcome(&ciphertext)?;
-            // Reject a welcome whose suite(s) don't match this session's fixed pair before
-            // joining — an early, clear failure instead of an opaque late mls-rs error.
-            validate_welcome_halves(inner.suite, &classical_welcome, &pq_welcome)?;
-            // An empty PQ slot is the acceptor's deferred (A.4) return welcome: join the
-            // classical group only; the PQ half arrives with the bootstrap flow.
-            if pq_welcome.is_empty() {
-                let classical = join_group_from_welcome(client.classical(), &classical_welcome)?;
-                inner.recv_group = Some(CombinerGroup::from_client(
-                    client.combiner(),
-                    classical,
-                    None,
-                ));
-                return Ok(None);
-            }
-            // Join the PQ group first, then re-derive the intra-party APQ-PSK from it.
-            let pq = join_group_from_welcome(client.pq(), &pq_welcome)?;
-            let (psk_id, psk) = export_psk(&pq)?;
-            inner.register_psk(&psk_id, &psk);
-            // Join the classical group (bound with the cross-party + APQ PSKs).
-            let classical = join_group_from_welcome(client.classical(), &classical_welcome)?;
-
-            inner.recv_group = Some(CombinerGroup::from_client(
-                client.combiner(),
-                classical,
-                Some(pq),
-            ));
+            inner.process_welcome(&ciphertext)?;
             return Ok(None);
         }
 
-        // A.2 ratchet frame: the sender committed in THEIR OWN send group (our recv
-        // group) and stapled an Upd(sender) proposal addressed to OUR send group.
-        // Apply the commit, decrypt the app message at the new epoch, and stage the
-        // proposal for app approval — it enters our send group only via `queue_proposal`.
-        if ciphertext.first() == Some(&PARTIAL_TAG) {
-            let (commit_bytes, proposal_bytes, app_bytes) = decode_ratchet(&ciphertext)?;
+        // The message frame: the sender's latest send-group staple (commit-or-welcome) +
+        // an Upd(sender) proposal addressed to OUR send group + the app message. Apply
+        // the staple idempotently, decrypt the app message, and stage the proposal for
+        // app approval — it enters our send group only via `queue_proposal`.
+        if ciphertext.first() == Some(&MESSAGE_FRAME_TAG) {
+            let (staple, proposal_bytes, app_bytes) = decode_message_frame(&ciphertext)?;
             let app_msg =
                 MlsMessage::from_bytes(&app_bytes).map_err(|_| TwoMlsPqError::DecryptionFailed)?;
 
             let mut inner = self.lock();
 
-            // The sender's commit may bind the cross-party TwoMLS-PSK of our send group —
-            // possibly at an epoch we've since moved past (their frame can cross one of
-            // our commits). Live-inject the session-held ledger before processing.
-            if inner.send_group.is_some() {
-                inner.inject_send_psks()?;
+            // The staple slot self-discriminates: an APQWelcome starts 0x01, an
+            // MLSMessage 0x00. Track whether THIS frame advanced the recv group, and any
+            // rotation handoff announced in the commit's authenticated_data.
+            let mut staple_applied = false;
+            let mut new_sender: Option<ClientId> = None;
+
+            if staple.first() == Some(&APQ_TAG) {
+                // Welcome staple: joins on first delivery, skips repeats. The sender
+                // re-staples its welcome until its first commit exists, so repeats are
+                // the common case, not an anomaly.
+                inner.process_welcome(&staple)?;
+            } else {
+                let commit_msg =
+                    MlsMessage::from_bytes(&staple).map_err(|_| TwoMlsPqError::DecryptionFailed)?;
+                let commit_epoch = commit_msg.epoch().ok_or(TwoMlsPqError::DecryptionFailed)?;
+                let current_epoch = inner
+                    .recv_group
+                    .as_ref()
+                    .ok_or(TwoMlsPqError::SessionNotEstablished)?
+                    .classical
+                    .current_epoch();
+                match commit_epoch.cmp(&current_epoch) {
+                    // Already applied off an earlier frame — the staple rides every
+                    // frame precisely so repeats are cheap skips.
+                    std::cmp::Ordering::Less => {}
+                    std::cmp::Ordering::Equal => {
+                        // The commit may bind the cross-party TwoMLS-PSK of our send
+                        // group — possibly at an epoch we've since moved past (their
+                        // frame can cross one of our commits). Live-inject the
+                        // session-held ledger before processing.
+                        if inner.send_group.is_some() {
+                            inner.inject_send_psks()?;
+                        }
+                        let recv = inner
+                            .recv_group
+                            .as_mut()
+                            .ok_or(TwoMlsPqError::SessionNotEstablished)?;
+                        let commit_auth_data = match recv
+                            .classical
+                            .process_incoming_message(commit_msg)
+                            .map_err(|_| TwoMlsPqError::DecryptionFailed)?
+                        {
+                            ReceivedMessage::Commit(desc) => desc.authenticated_data,
+                            _ => return Err(TwoMlsPqError::DecryptionFailed),
+                        };
+                        staple_applied = true;
+                        // A ratchet commit has empty authenticated_data; a rotation
+                        // commit carries the new principal's ClientId there.
+                        if !commit_auth_data.is_empty() {
+                            new_sender = Some(ClientId {
+                                bytes: commit_auth_data,
+                            });
+                        }
+                    }
+                    std::cmp::Ordering::Greater => {
+                        // The peer is more than one commit ahead of us: the bridging
+                        // commit no longer rides any frame (only the latest staples).
+                        // Not transient — surface the desync before touching the app
+                        // ciphertext so the host can route to reconnect.
+                        return Err(TwoMlsPqError::EpochDesync);
+                    }
+                }
+            }
+
+            if let Some(new_id) = &new_sender {
+                inner.their_state = PrincipalState::Sync {
+                    client_id: new_id.clone(),
+                };
             }
 
             let (app_data, sender_id, epoch, group_id) = {
@@ -2156,18 +2312,6 @@ impl TwoMlsPqSession {
                     .recv_group
                     .as_mut()
                     .ok_or(TwoMlsPqError::SessionNotEstablished)?;
-                if !commit_bytes.is_empty() {
-                    let commit_msg = MlsMessage::from_bytes(&commit_bytes)
-                        .map_err(|_| TwoMlsPqError::DecryptionFailed)?;
-                    match recv
-                        .classical
-                        .process_incoming_message(commit_msg)
-                        .map_err(|_| TwoMlsPqError::DecryptionFailed)?
-                    {
-                        ReceivedMessage::Commit(_) => {}
-                        _ => return Err(TwoMlsPqError::DecryptionFailed),
-                    }
-                }
                 match recv
                     .classical
                     .process_incoming_message(app_msg)
@@ -2186,31 +2330,34 @@ impl TwoMlsPqSession {
             };
 
             // Stage the stapled Upd(sender) proposal for app approval.
-            let proposal = if proposal_bytes.is_empty() {
-                None
-            } else {
-                let digest = crate::sha256(&proposal_bytes);
-                inner.offered_proposal = Some((digest.clone(), proposal_bytes));
-                Some(crate::QueuedRemoteProposal {
-                    digest,
-                    sender: sender_id.clone(),
-                    proposing: sender_id.clone(),
-                    // The ordering context is the SHA-256 of the receive group's
-                    // (classical, message-half) group id — `proposal_context`'s value.
-                    context: crate::sha256(&group_id),
-                })
-            };
+            let digest = crate::sha256(&proposal_bytes);
+            inner.offered_proposal = Some((digest.clone(), proposal_bytes));
+            let proposal = Some(crate::QueuedRemoteProposal {
+                digest,
+                sender: sender_id.clone(),
+                proposing: sender_id.clone(),
+                // The ordering context is the SHA-256 of the receive group's
+                // (classical, message-half) group id — `proposal_context`'s value.
+                context: crate::sha256(&group_id),
+            });
 
             inner.resolve_pending_rotation();
+            // A message frame carries the peer's Upd proposal, which can only be created
+            // on their recv group — receipt proves they joined our send group, so a
+            // unilateral rotation commit can no longer strand them welcome-less.
+            inner.peer_confirmed = true;
 
-            // A commit only rides a frame when it consumed our approved Upd proposal.
-            let remote_commit = if commit_bytes.is_empty() {
-                None
-            } else {
+            // Surfaced only on the frame whose staple was actually applied; repeats of
+            // the same commit are silent skips. (Known edge, pre-existing: if the staple
+            // applies but the app message fails in this same frame, `new_sender` is
+            // never surfaced — the retry skips the already-applied staple.)
+            let remote_commit = if staple_applied {
                 Some(CommitResult {
-                    new_sender: None,
+                    new_sender,
                     new_recipient: inner.my_state.client_id(),
                 })
+            } else {
+                None
             };
 
             return Ok(Some(DecryptResult {
@@ -2224,135 +2371,26 @@ impl TwoMlsPqSession {
             }));
         }
 
-        // Phase 8: rotation commit (BUNDLED_TAG) — send-group commit only, no PSK refresh.
-        if ciphertext.first() == Some(&BUNDLED_TAG) {
-            let (commit_bytes, app_bytes) = decode_bundled(&ciphertext)?;
-
-            let commit_msg = MlsMessage::from_bytes(&commit_bytes)
-                .map_err(|_| TwoMlsPqError::DecryptionFailed)?;
-            let app_msg =
-                MlsMessage::from_bytes(&app_bytes).map_err(|_| TwoMlsPqError::DecryptionFailed)?;
-
-            let mut inner = self.lock();
-
-            // Process commit — advances epoch in recv_group.classical.
-            let (_committer_index, commit_auth_data) = {
-                let recv = inner
-                    .recv_group
-                    .as_mut()
-                    .ok_or(TwoMlsPqError::SessionNotEstablished)?;
-                match recv
-                    .classical
-                    .process_incoming_message(commit_msg)
-                    .map_err(|_| TwoMlsPqError::DecryptionFailed)?
-                {
-                    ReceivedMessage::Commit(desc) => (desc.committer, desc.authenticated_data),
-                    _ => return Err(TwoMlsPqError::DecryptionFailed),
-                }
-            };
-
-            // Detect key rotation: a non-empty commit authenticated_data carries
-            // the new principal's ClientId bytes (set in prepare_to_encrypt Phase 8).
-            let new_sender = if commit_auth_data.is_empty() {
-                None
-            } else {
-                Some(ClientId {
-                    bytes: commit_auth_data,
-                })
-            };
-
-            if let Some(ref new_id) = new_sender {
-                inner.their_state = PrincipalState::Sync {
-                    client_id: new_id.clone(),
-                };
-            }
-
-            // Process the bundled app message in the new epoch.
-            let (app_data, sender_id, epoch) = {
-                let recv = inner
-                    .recv_group
-                    .as_mut()
-                    .ok_or(TwoMlsPqError::SessionNotEstablished)?;
-                match recv
-                    .classical
-                    .process_incoming_message(app_msg)
-                    .map_err(|_| TwoMlsPqError::DecryptionFailed)?
-                {
-                    ReceivedMessage::ApplicationMessage(desc) => {
-                        let sender = ClientId {
-                            bytes: sender_client_id(&recv.classical, desc.sender_index)?,
-                        };
-                        let ep = recv.classical.current_epoch();
-                        (desc.data().to_vec(), sender, ep)
-                    }
-                    _ => return Err(TwoMlsPqError::DecryptionFailed),
-                }
-            };
-
-            let my_id = inner.my_state.client_id();
-            inner.resolve_pending_rotation();
-
-            return Ok(Some(DecryptResult {
-                application_message: Some(MlsSenderMessage {
-                    app_message_data: app_data,
-                    sender_client_id: sender_id,
-                    epoch,
-                }),
-                proposal: None,
-                remote_commit: Some(CommitResult {
-                    new_sender,
-                    new_recipient: my_id,
-                }),
-            }));
+        // PQ side-band frames are driven through the dedicated `pq_*` API, not this
+        // method — they are stateful exchanges, not self-contained decryptable messages.
+        // Reject all seven explicitly so a host that misroutes one gets a clear signal
+        // instead of an opaque `DecryptionFailed`. See `pq_frame_kind`.
+        if ciphertext.first().copied().is_some_and(|b| {
+            b == PQ_EK_TAG
+                || b == PQ_CT_TAG
+                || b == PQ_BIND_TAG
+                || b == PQ_BOOTSTRAP_KP_TAG
+                || b == PQ_BOOTSTRAP_BIND_TAG
+                || b == PQ_REKEY_UPD_TAG
+                || b == PQ_REKEY_COMMIT_TAG
+        }) {
+            return Err(TwoMlsPqError::SessionNotReady);
         }
 
-        // PQ-ratchet frames (0x0B/0x0D/0x0F) are driven through the dedicated `pq_ratchet_*` API,
-        // not this method — they are a stateful KEM exchange, not a self-contained decryptable
-        // message. Reject them explicitly so a host that misroutes one gets a clear signal instead
-        // of an opaque `DecryptionFailed` from the MLS parser below. See `pq_ratchet_begin`.
-        if let Some(&b) = ciphertext.first() {
-            if b == PQ_EK_TAG || b == PQ_CT_TAG || b == PQ_BIND_TAG {
-                return Err(TwoMlsPqError::SessionNotReady);
-            }
-        }
-
-        // MLS messages start with version bytes (0x00 ...) — attempt decryption.
-        let msg =
-            MlsMessage::from_bytes(&ciphertext).map_err(|_| TwoMlsPqError::DecryptionFailed)?;
-
-        let mut inner = self.lock();
-        let recv = inner
-            .recv_group
-            .as_mut()
-            .ok_or(TwoMlsPqError::SessionNotEstablished)?;
-
-        let received = recv
-            .classical
-            .process_incoming_message(msg)
-            .map_err(|_| TwoMlsPqError::DecryptionFailed)?;
-
-        match received {
-            ReceivedMessage::ApplicationMessage(desc) => {
-                let sender_id = ClientId {
-                    bytes: sender_client_id(&recv.classical, desc.sender_index)?,
-                };
-                let epoch = recv.classical.current_epoch();
-                // Proposals travel as stapled messages (A.2), not authenticated_data.
-                let proposal = None;
-                let app_data = desc.data().to_vec();
-                inner.resolve_pending_rotation();
-                Ok(Some(DecryptResult {
-                    application_message: Some(MlsSenderMessage {
-                        app_message_data: app_data,
-                        sender_client_id: sender_id,
-                        epoch,
-                    }),
-                    proposal,
-                    remote_commit: None,
-                }))
-            }
-            _ => Ok(None),
-        }
+        // Nothing else is a valid frame. Bare MLS ciphertext no longer occurs on the
+        // send path (every outbound frame is a tagged message frame), so unrecognized
+        // plaintext fails loudly here rather than being fed to the MLS parser.
+        Err(TwoMlsPqError::DecryptionFailed)
     }
 
     /// The SHA-256 of the receive group's classical (message-half) group id — the
@@ -2400,7 +2438,7 @@ impl TwoMlsPqSession {
     /// material alongside them; the marginal exposure is at most one round of PCS against
     /// an archive thief who already holds the epoch secrets. The alternative is unsound:
     /// a responder that discarded its held secret could never process the initiator's
-    /// incoming bind (0x0F) — a permanent side-band desync — so serialization is the only
+    /// incoming bind (0x09) — a permanent side-band desync — so serialization is the only
     /// correct choice.
     pub fn archive(&self) -> Result<Archive> {
         use mls_rs::mls_rs_codec::{MlsEncode, MlsSize};
@@ -2463,8 +2501,10 @@ impl TwoMlsPqSession {
                 .collect(),
             pending_outbound: inner.pending_outbound.clone(),
             pending_proposal_hash: inner.pending_proposal_hash.clone(),
-            pending_commit_message: inner.pending_commit_message.clone(),
+            current_staple: inner.current_staple.clone(),
             pending_proposal_message: inner.pending_proposal_message.clone(),
+            peer_confirmed: inner.peer_confirmed,
+            joined_welcome_digest: inner.joined_welcome_digest.clone(),
             offered_proposal: inner.offered_proposal.as_ref().map(|(digest, proposal)| {
                 archive_wire::OfferedProposal {
                     digest: digest.clone(),
@@ -2612,7 +2652,9 @@ mod tests {
     use super::TwoMlsPqSession;
     use crate::{
         assert_err, assert_ok, assert_some,
-        test_utils::{establish_sessions, make_client, make_combiner_kp},
+        test_utils::{
+            establish_confirmed_sessions, establish_sessions, make_client, make_combiner_kp,
+        },
         PrincipalState, TwoMlsPqError,
     };
 
@@ -2805,7 +2847,7 @@ mod tests {
 
     #[test]
     fn test_rotation_commit_mints_new_listen_address() {
-        let (alice, bob) = establish_sessions();
+        let (alice, bob) = establish_confirmed_sessions();
         let before = assert_ok!(alice.should_listen_on());
         let bob_post_before = assert_some!(assert_ok!(bob.send_rendezvous()));
 
@@ -3247,7 +3289,7 @@ mod tests {
 
     #[test]
     fn test_pq_bootstrap_begin_rotating_requires_current_agent() {
-        let (alice, bob) = establish_sessions();
+        let (alice, bob) = establish_confirmed_sessions();
         let stranger = make_client();
         assert_err!(
             alice.pq_bootstrap_begin(Some(stranger.client_id())),
@@ -3310,7 +3352,7 @@ mod tests {
     /// Bob's apply both fail to find their PSKs after the client swap.
     #[test]
     fn test_pq_ratchet_completes_after_principal_rotation() {
-        let (alice, bob) = establish_sessions();
+        let (alice, bob) = establish_confirmed_sessions();
 
         // Rotate both agents, delivering each rotation commit so the peer's recv group
         // tracks the new epoch.
@@ -3339,7 +3381,7 @@ mod tests {
     /// Complete the A.4 bootstrap after establishment so both directions are full
     /// APQ — required before the deferred acceptor side can ratchet.
     fn establish_full() -> (Arc<TwoMlsPqSession>, Arc<TwoMlsPqSession>) {
-        let (alice, bob) = establish_sessions();
+        let (alice, bob) = establish_confirmed_sessions();
         let kp = assert_ok!(alice.pq_bootstrap_begin(None));
         assert_ok!(bob.pq_bootstrap_respond(kp));
         let bind = assert_some!(bob.pq_take_pending_outbound());
@@ -3364,6 +3406,61 @@ mod tests {
         assert_ok!(bob.pq_ratchet_bind(ct2, b"b1".to_vec()));
         let bind2 = assert_some!(bob.pq_take_pending_outbound());
         assert_eq!(assert_ok!(alice.pq_ratchet_apply(bind2)), b"b1");
+    }
+
+    #[test]
+    fn test_pq_ratchet_bind_guarded_while_commit_staged() {
+        let (alice, bob) = establish_full();
+        let ek = assert_ok!(alice.pq_ratchet_begin());
+        assert_ok!(bob.pq_ratchet_respond(ek));
+        let ct = assert_some!(bob.pq_take_pending_outbound());
+
+        // A prepared-but-unsent round holds the staple slot: the bind's classical
+        // commit must not displace a commit that has never ridden a frame (the peer
+        // would hit EpochDesync with zero loss on the wire).
+        assert_ok!(alice.prepare_to_encrypt(None));
+        assert_err!(
+            alice.pq_ratchet_bind(ct.clone(), b"app".to_vec()),
+            TwoMlsPqError::SessionNotReady
+        );
+
+        // Retriable: once the round's encrypt has gone out, the bind proceeds.
+        let enc = assert_ok!(alice.encrypt(b"round".to_vec()));
+        assert_some!(assert_ok!(bob.process_incoming(enc.cipher_text)));
+        assert_ok!(alice.pq_ratchet_bind(ct, b"app".to_vec()));
+        let bind = assert_some!(alice.pq_take_pending_outbound());
+        assert_eq!(assert_ok!(bob.pq_ratchet_apply(bind)), b"app");
+    }
+
+    #[test]
+    fn test_message_frame_overtaking_bind_fails_retriably() {
+        let (alice, bob) = establish_full();
+        // Alice's A.3 round: EK → CT → bind (staged, not yet delivered).
+        let ek = assert_ok!(alice.pq_ratchet_begin());
+        assert_ok!(bob.pq_ratchet_respond(ek));
+        let ct = assert_some!(bob.pq_take_pending_outbound());
+        assert_ok!(alice.pq_ratchet_bind(ct, b"bound".to_vec()));
+        let bind = assert_some!(alice.pq_take_pending_outbound());
+
+        // A message frame sent after the bind overtakes it in transit: its staple is
+        // the bind's classical commit, whose APQ-PSK Bob cannot resolve until the
+        // BIND itself lands.
+        assert_ok!(alice.prepare_to_encrypt(None));
+        let overtaking = assert_ok!(alice.encrypt(b"overtook".to_vec()));
+        assert_err!(
+            bob.process_incoming(overtaking.cipher_text.clone()),
+            TwoMlsPqError::DecryptionFailed
+        );
+
+        // The failed staple apply did not corrupt state: the BIND still applies…
+        assert_eq!(assert_ok!(bob.pq_ratchet_apply(bind)), b"bound");
+        // …and the retried frame decrypts (its staple is now an already-applied
+        // commit, skipped idempotently).
+        let res = assert_some!(assert_ok!(bob.process_incoming(overtaking.cipher_text)));
+        assert_eq!(
+            assert_some!(res.application_message).app_message_data,
+            b"overtook"
+        );
     }
 
     #[test]
@@ -3844,7 +3941,7 @@ mod tests {
     /// restore), and resolves to `Sync` once the peer's traffic confirms.
     #[test]
     fn test_archive_mid_rotation_restores_onto_new_client() {
-        let (alice_session, bob_session) = establish_sessions();
+        let (alice_session, bob_session) = establish_confirmed_sessions();
         message_round(&alice_session, &bob_session, b"before");
 
         // A fresh opaque ClientId for the successor principal (the app owns only the id; the
@@ -3926,7 +4023,7 @@ mod tests {
     /// the peer observes the new sender. (This path used to refuse `SessionNotReady`.)
     #[test]
     fn test_archive_with_staged_rotation_restores_and_commits() {
-        let (alice_session, bob_session) = establish_sessions();
+        let (alice_session, bob_session) = establish_confirmed_sessions();
         message_round(&alice_session, &bob_session, b"before");
 
         // Stage a rotation but do NOT commit it — the archive must carry the staged
@@ -3958,7 +4055,7 @@ mod tests {
     /// id twice keeps the existing staged identity; a different id replaces it.
     #[test]
     fn test_stage_rotation_same_id_is_idempotent() {
-        let (alice_session, _bob_session) = establish_sessions();
+        let (alice_session, _bob_session) = establish_confirmed_sessions();
         let id = make_client().client_id();
         assert_ok!(alice_session.stage_rotation(id.bytes.clone()));
         // Staging the same id again is a no-op and does not error.
@@ -3999,7 +4096,7 @@ mod tests {
 
     /// Total archive #3: archive mid-A.3 as the RESPONDER (after `pq_ratchet_respond`,
     /// holding the shared secret S). S survives the jump, so the restored responder
-    /// applies the initiator's bind (0x0F) cleanly — the desync that discarding S would
+    /// applies the initiator's bind (0x09) cleanly — the desync that discarding S would
     /// cause is exactly why S must be serialized.
     #[test]
     fn test_archive_mid_a3_as_responder_completes_after_restore() {
@@ -4226,7 +4323,7 @@ mod tests {
 
     #[test]
     fn test_principal_rotation_migrates_session_to_new_principal() {
-        let (alice_session, bob_session) = establish_sessions();
+        let (alice_session, bob_session) = establish_confirmed_sessions();
 
         let new_alice = make_client();
         let new_alice_id = new_alice.client_id();
@@ -4256,7 +4353,7 @@ mod tests {
 
     #[test]
     fn test_principal_rotation_resolves_pending_state_after_peer_reply() {
-        let (alice_session, bob_session) = establish_sessions();
+        let (alice_session, bob_session) = establish_confirmed_sessions();
 
         let new_alice = make_client();
         let new_alice_id = new_alice.client_id();
@@ -4304,7 +4401,7 @@ mod tests {
     /// processing alice's frame.
     #[test]
     fn test_psk_ledger_resolves_frame_that_crossed_a_commit() {
-        let (alice_session, bob_session) = establish_sessions();
+        let (alice_session, bob_session) = establish_confirmed_sessions();
 
         // Bob opens a routine round whose stapled Upd alice approves.
         assert_ok!(bob_session.prepare_to_encrypt(None));
@@ -4455,8 +4552,14 @@ mod tests {
         );
     }
 
+    /// Extract the staple section of a message frame (test-side peek).
+    fn frame_staple(frame: &[u8]) -> Vec<u8> {
+        let (staple, _, _) = assert_ok!(super::decode_message_frame(frame));
+        staple
+    }
+
     #[test]
-    fn test_welcome_stapled_in_first_round_only() {
+    fn test_welcome_staple_rides_until_first_commit_and_repeats_skip() {
         let alice = make_client();
         let bob = make_client();
         let alice_kp = make_combiner_kp(&alice);
@@ -4471,17 +4574,19 @@ mod tests {
             alice_kp
         ));
 
-        // Bob does NOT deliver welcome_b separately — his first app frame staples it.
+        // Bob does NOT deliver welcome_b separately — every pre-commit frame staples it.
         assert!(
             !alice_s.is_established(),
             "alice has no recv group before welcome_b"
         );
         assert_ok!(bob_s.prepare_to_encrypt(None));
         let first = assert_ok!(bob_s.encrypt(b"hello".to_vec())).cipher_text;
+        assert_eq!(first.first(), Some(&super::MESSAGE_FRAME_TAG));
+        let welcome_b = frame_staple(&first);
         assert_eq!(
-            first.first(),
-            Some(&super::STAPLED_WELCOME_TAG),
-            "first frame must staple the welcome"
+            welcome_b.first(),
+            Some(&super::APQ_TAG),
+            "pre-commit staple must be the welcome"
         );
 
         // Alice joins (from the stapled welcome) and decrypts in one shot.
@@ -4494,21 +4599,195 @@ mod tests {
             alice_s.is_established(),
             "alice should be established after the stapled welcome"
         );
-        // The welcome was consumed by the staple.
-        assert!(bob_s.pending_outbound().is_none());
+        // The welcome is NOT consumed by stapling: the standalone copy stays available
+        // for hosts that also deliver it separately…
+        let standalone = assert_some!(bob_s.pending_outbound());
+        // …and a late standalone delivery after the staple-join is an idempotent no-op.
+        assert!(assert_ok!(alice_s.process_incoming(standalone)).is_none());
 
-        // Subsequent frames are NOT stapled.
+        // Until Bob commits, every frame re-staples the same welcome — and the repeat
+        // skips idempotently on Alice's side.
         assert_ok!(bob_s.prepare_to_encrypt(None));
         let second = assert_ok!(bob_s.encrypt(b"world".to_vec())).cipher_text;
-        assert_ne!(
-            second.first(),
-            Some(&super::STAPLED_WELCOME_TAG),
-            "subsequent frames must not staple"
+        assert_eq!(
+            frame_staple(&second),
+            welcome_b,
+            "welcome staple repeats until the first commit"
         );
         let result2 = assert_some!(assert_ok!(alice_s.process_incoming(second)));
         assert_eq!(
             assert_some!(result2.application_message).app_message_data,
             b"world"
+        );
+
+        // Once Alice's stapled proposal is approved and Bob commits, the staple
+        // switches from the welcome to the commit.
+        assert_ok!(alice_s.prepare_to_encrypt(None));
+        let from_alice = assert_ok!(alice_s.encrypt(b"per-round".to_vec()));
+        let res = assert_some!(assert_ok!(bob_s.process_incoming(from_alice.cipher_text)));
+        assert_ok!(bob_s.queue_proposal(assert_some!(res.proposal).digest));
+        let prep = assert_ok!(bob_s.prepare_to_encrypt(None));
+        assert!(prep.did_commit);
+        let committed = assert_ok!(bob_s.encrypt(b"committed".to_vec())).cipher_text;
+        let staple = frame_staple(&committed);
+        assert_eq!(
+            staple.first(),
+            Some(&0x00),
+            "post-commit staple must be an MLS commit message"
+        );
+        let result3 = assert_some!(assert_ok!(alice_s.process_incoming(committed)));
+        assert_some!(result3.remote_commit);
+    }
+
+    #[test]
+    fn test_dropped_commit_frame_healed_by_next_staple() {
+        // The headline self-healing property: the frame that carries a commit is LOST,
+        // and the next frame's re-stapled commit brings the peer up to date anyway.
+        let (alice_session, bob_session) = establish_sessions();
+
+        // Alice proposes; Bob approves; Alice… no — BOB commits (he owns his send group).
+        assert_ok!(alice_session.prepare_to_encrypt(None));
+        let enc = assert_ok!(alice_session.encrypt(b"propose".to_vec()));
+        let result = assert_some!(assert_ok!(bob_session.process_incoming(enc.cipher_text)));
+        assert_ok!(bob_session.queue_proposal(assert_some!(result.proposal).digest));
+
+        let prep = assert_ok!(bob_session.prepare_to_encrypt(None));
+        assert!(prep.did_commit);
+        let lost = assert_ok!(bob_session.encrypt(b"lost frame".to_vec()));
+        drop(lost); // never delivered
+
+        // Bob's next round: no new commit (nothing queued), but the staple re-sends the
+        // last one; Alice applies it and decrypts this frame at the new epoch.
+        assert_ok!(bob_session.prepare_to_encrypt(None));
+        let healing = assert_ok!(bob_session.encrypt(b"healing frame".to_vec()));
+        let result = assert_some!(assert_ok!(
+            alice_session.process_incoming(healing.cipher_text)
+        ));
+        assert_eq!(
+            assert_some!(result.application_message).app_message_data,
+            b"healing frame"
+        );
+        // The re-stapled commit applied on this frame.
+        assert_some!(result.remote_commit);
+
+        // And the direction keeps flowing both ways afterwards.
+        assert_ok!(alice_session.prepare_to_encrypt(None));
+        let enc = assert_ok!(alice_session.encrypt(b"after".to_vec()));
+        assert_some!(assert_ok!(bob_session.process_incoming(enc.cipher_text)));
+    }
+
+    #[test]
+    fn test_epoch_ahead_staple_surfaces_desync() {
+        let (alice_session, bob_session) = establish_confirmed_sessions();
+
+        // Two unilateral rotation commits with the first frame lost: the staple that
+        // reaches Bob bridges only the LATEST commit, so his recv group cannot catch
+        // up from any frame — the desync must surface distinguishably, before the app
+        // ciphertext is touched.
+        let new_a1 = make_client().client_id();
+        assert_ok!(alice_session.stage_rotation(new_a1.bytes.clone()));
+        assert_ok!(alice_session.prepare_to_encrypt(Some(new_a1)));
+        drop(assert_ok!(alice_session.encrypt(b"lost".to_vec()))); // never delivered
+
+        let new_a2 = make_client().client_id();
+        assert_ok!(alice_session.stage_rotation(new_a2.bytes.clone()));
+        assert_ok!(alice_session.prepare_to_encrypt(Some(new_a2)));
+        let ahead = assert_ok!(alice_session.encrypt(b"ahead".to_vec()));
+
+        assert_err!(
+            bob_session.process_incoming(ahead.cipher_text),
+            TwoMlsPqError::EpochDesync
+        );
+    }
+
+    #[test]
+    fn test_rotation_requires_processed_peer_frame() {
+        // Freshly established (welcomes only, no message frames processed): a
+        // unilateral rotation commit would displace the welcome staple the peer may
+        // still need, so it is gated on peer confirmation.
+        let (alice_session, _bob_session) = establish_sessions();
+        let new_id = make_client().client_id();
+        assert_ok!(alice_session.stage_rotation(new_id.bytes.clone()));
+        assert_err!(
+            alice_session.prepare_to_encrypt(Some(new_id)),
+            TwoMlsPqError::SessionNotReady
+        );
+    }
+
+    #[test]
+    fn test_rotation_folds_queued_proposal() {
+        let (alice_session, bob_session) = establish_confirmed_sessions();
+
+        // Alice's routine frame staples an Upd; Bob approves it…
+        assert_ok!(alice_session.prepare_to_encrypt(None));
+        let enc = assert_ok!(alice_session.encrypt(b"propose".to_vec()));
+        let res = assert_some!(assert_ok!(bob_session.process_incoming(enc.cipher_text)));
+        assert_ok!(bob_session.queue_proposal(assert_some!(res.proposal).digest));
+
+        // …then rotates before any routine commit. mls-rs auto-includes the cached
+        // proposal in the rotation commit, so the fold is accounted for: the PSK
+        // refresh rides along and the consumption is reported.
+        let new_bob = make_client().client_id();
+        assert_ok!(bob_session.stage_rotation(new_bob.bytes.clone()));
+        let prep = assert_ok!(bob_session.prepare_to_encrypt(Some(new_bob.clone())));
+        assert!(prep.did_commit);
+        assert_eq!(
+            assert_some!(prep.committed_remote_client_id).bytes,
+            enc.sender.bytes
+        );
+        let enc2 = assert_ok!(bob_session.encrypt(b"rotated".to_vec()));
+
+        // Alice sees the rotation announcement, and the rotation round stages a
+        // routine proposal like any other round (no skipped ratchet beat).
+        let res = assert_some!(assert_ok!(alice_session.process_incoming(enc2.cipher_text)));
+        let commit = assert_some!(res.remote_commit);
+        assert_eq!(assert_some!(commit.new_sender).bytes, new_bob.bytes);
+        assert_some!(res.proposal);
+
+        // The queued digest was cleared by the fold: the next routine round has
+        // nothing to commit — no spurious empty PSK-commit.
+        assert_ok!(bob_session.prepare_to_encrypt(None));
+        let enc3 = assert_ok!(bob_session.encrypt(b"routine".to_vec()));
+        let res3 = assert_some!(assert_ok!(alice_session.process_incoming(enc3.cipher_text)));
+        assert!(res3.remote_commit.is_none(), "no spurious follow-up commit");
+    }
+
+    #[test]
+    fn test_different_welcome_on_live_session_rejected() {
+        let (alice_session, _bob_session) = establish_sessions();
+
+        // A welcome that is NOT the one Alice's recv group was joined from — from an
+        // unrelated establishment — is a mis-route, not a benign re-delivery.
+        let carol = make_client();
+        let dave = make_client();
+        let dave_kp = make_combiner_kp(&dave);
+        let carol_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&carol), dave_kp));
+        let foreign_welcome = assert_some!(carol_session.pending_outbound());
+
+        assert_err!(
+            alice_session.process_incoming(foreign_welcome),
+            TwoMlsPqError::UnexpectedWelcome
+        );
+    }
+
+    #[test]
+    fn test_archive_rejects_malformed_staple() {
+        use mls_rs::mls_rs_codec::{MlsDecode, MlsEncode};
+
+        let (alice_session, _bob_session) = establish_sessions();
+        let archive = assert_ok!(alice_session.archive());
+
+        // Strip the [version][suite×4] header, corrupt the staple, re-frame. The
+        // staple's first byte must be a welcome (0x01) or an MLSMessage (0x00) — the
+        // same check that structurally rejects pre-rework archive layouts.
+        let mut rest = &archive.bytes[5..];
+        let mut wire = assert_ok!(super::archive_wire::SessionArchive::mls_decode(&mut rest));
+        wire.current_staple = vec![0xFF];
+        let mut bytes = archive.bytes[..5].to_vec();
+        assert_ok!(wire.mls_encode(&mut bytes));
+        assert_err!(
+            TwoMlsPqSession::from_archive(crate::Archive { bytes }),
+            TwoMlsPqError::ArchiveInvalid
         );
     }
 
@@ -4676,7 +4955,7 @@ mod tests {
 
     #[test]
     fn test_my_principal_state_becomes_pending_after_rotation_commit() {
-        let (alice_session, _) = establish_sessions();
+        let (alice_session, _) = establish_confirmed_sessions();
         let new_alice = make_client();
         let new_id = new_alice.client_id();
         assert_ok!(alice_session.stage_rotation(new_alice.client_id().bytes));
@@ -4853,23 +5132,47 @@ mod tests {
         let welcome_b = assert_some!(bob_s.pending_outbound());
         assert_ok!(alice_s.process_incoming(welcome_b.clone()));
 
-        // Routine (partial) round — the steady-state frame.
+        // Pre-first-commit, the initiator's frames re-staple her full two-half APQ
+        // welcome — welcome-sized by design (the one unavoidably large staple; the
+        // peer skips the repeats). The steady state begins at her first commit.
         assert_ok!(alice_s.prepare_to_encrypt(None));
-        let partial = assert_ok!(alice_s.encrypt(b"the quick brown fox".to_vec())).cipher_text;
+        let pre_commit = assert_ok!(alice_s.encrypt(b"warm-up".to_vec()));
+        assert!(
+            pre_commit.cipher_text.len() > welcome_a.len(),
+            "pre-commit initiator frames carry the welcome staple"
+        );
+        assert_some!(assert_ok!(bob_s.process_incoming(pre_commit.cipher_text)));
+
+        // One round so Alice commits (consuming Bob's approved Upd): her staple
+        // switches from the welcome to her classical commit.
+        assert_ok!(bob_s.prepare_to_encrypt(None));
+        let from_bob = assert_ok!(bob_s.encrypt(b"bob-round".to_vec()));
+        let res = assert_some!(assert_ok!(alice_s.process_incoming(from_bob.cipher_text)));
+        assert_ok!(alice_s.queue_proposal(assert_some!(res.proposal).digest));
+        let prep = assert_ok!(alice_s.prepare_to_encrypt(None));
+        assert!(prep.did_commit);
+        let committing = assert_ok!(alice_s.encrypt(b"commit round".to_vec()));
+        assert_some!(assert_ok!(bob_s.process_incoming(committing.cipher_text)));
+
+        // Routine round in the steady state: the staple is the latest classical commit.
+        assert_ok!(alice_s.prepare_to_encrypt(None));
+        let routine = assert_ok!(alice_s.encrypt(b"the quick brown fox".to_vec())).cipher_text;
 
         eprintln!(
-            "[sizes] welcome_a={} B  welcome_b={} B  routine(0x05)={} B",
+            "[sizes] welcome_a={} B  welcome_b={} B  routine(0x03)={} B",
             welcome_a.len(),
             welcome_b.len(),
-            partial.len()
+            routine.len()
         );
 
-        // The routine frame must be classical-sized — no ML-KEM ciphertext in the steady state.
-        // (Pre-rework the routine frame carried ~4 KB of ML-KEM-768 under `cryptokit`.)
+        // The steady-state frame must be classical-sized even though it always carries
+        // a commit staple: a classical stapled commit has no PQ keys (PQ work rides
+        // partial PQ commits on the side-band; big ML-KEM updatePaths are isolated to
+        // A.5 on the PQ groups alone).
         assert!(
-            partial.len() < 2000,
+            routine.len() < 2000,
             "routine frame should be classical-sized, got {} B",
-            partial.len()
+            routine.len()
         );
     }
 
@@ -4919,56 +5222,75 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_bundled_truncated_returns_error() {
+    fn test_decode_message_frame_truncated_returns_error() {
         assert_err!(
-            super::decode_bundled(&[super::BUNDLED_TAG]),
+            super::decode_message_frame(&[super::MESSAGE_FRAME_TAG]),
             TwoMlsPqError::Mls
         );
     }
 
     #[test]
-    fn test_decode_ratchet_truncated_returns_error() {
-        assert_err!(
-            super::decode_ratchet(&[super::PARTIAL_TAG]),
-            TwoMlsPqError::Mls
-        );
-    }
-
-    #[test]
-    fn test_decode_ratchet_trailing_bytes_returns_error() {
-        let mut good = super::encode_ratchet(b"c".to_vec(), b"p".to_vec(), b"app".to_vec());
+    fn test_decode_message_frame_trailing_bytes_returns_error() {
+        let mut good = super::encode_message_frame(b"staple", b"p".to_vec(), b"app".to_vec());
         good.push(0xFF);
-        assert_err!(super::decode_ratchet(&good), TwoMlsPqError::Mls);
+        assert_err!(super::decode_message_frame(&good), TwoMlsPqError::Mls);
     }
 
     #[test]
-    fn test_encode_decode_bundled_roundtrip() {
-        let commit = b"commit-bytes".to_vec();
-        let app = b"app-bytes".to_vec();
-        let encoded = super::encode_bundled(commit.clone(), app.clone());
-        let (dec_commit, dec_app) = assert_ok!(super::decode_bundled(&encoded));
-        assert_eq!(dec_commit, commit);
-        assert_eq!(dec_app, app);
-    }
-
-    #[test]
-    fn test_encode_decode_ratchet_roundtrip() {
-        let commit = b"send-commit".to_vec();
+    fn test_encode_decode_message_frame_roundtrip() {
+        let staple = b"send-commit".to_vec();
         let proposal = b"upd-proposal".to_vec();
         let app = b"app-data".to_vec();
-        let encoded = super::encode_ratchet(commit.clone(), proposal.clone(), app.clone());
-        let (dec_c, dec_p, dec_app) = assert_ok!(super::decode_ratchet(&encoded));
-        assert_eq!(dec_c, commit);
+        let encoded = super::encode_message_frame(&staple, proposal.clone(), app.clone());
+        let (dec_s, dec_p, dec_app) = assert_ok!(super::decode_message_frame(&encoded));
+        assert_eq!(dec_s, staple);
         assert_eq!(dec_p, proposal);
         assert_eq!(dec_app, app);
     }
 
     #[test]
-    fn test_process_incoming_bundled_malformed_returns_error() {
+    fn test_decode_message_frame_rejects_empty_sections() {
+        // No section is optional: an empty slot is a retired shape (e.g. the old
+        // commitless ratchet frame) or a malformed frame. Built by hand — the encoder
+        // debug-asserts against empty sections, this exercises the decoder's guard.
+        for (s, p, a) in [
+            (&b""[..], &b"p"[..], &b"a"[..]),
+            (&b"s"[..], &b""[..], &b"a"[..]),
+            (&b"s"[..], &b"p"[..], &b""[..]),
+        ] {
+            let mut encoded = vec![super::MESSAGE_FRAME_TAG];
+            super::push_section(&mut encoded, s);
+            super::push_section(&mut encoded, p);
+            super::push_section(&mut encoded, a);
+            assert_err!(super::decode_message_frame(&encoded), TwoMlsPqError::Mls);
+        }
+    }
+
+    #[test]
+    fn test_process_incoming_malformed_message_frame_returns_error() {
         let (alice_session, _) = establish_sessions();
-        let fake = super::encode_bundled(b"junk".to_vec(), b"junk".to_vec());
+        // Sections parse, but the staple is neither a welcome (0x01) nor an MLS
+        // message (0x00) that decodes.
+        let fake = super::encode_message_frame(b"junk", b"junk".to_vec(), b"junk".to_vec());
         assert_err!(
             alice_session.process_incoming(fake),
+            TwoMlsPqError::DecryptionFailed
+        );
+    }
+
+    #[test]
+    fn test_process_incoming_bare_mls_and_unknown_tags_rejected() {
+        let (alice_session, _) = establish_sessions();
+        // Bare MLS ciphertext no longer occurs on the send path; unrecognized
+        // plaintext fails loudly instead of being fed to the MLS parser.
+        assert_err!(
+            alice_session.process_incoming(vec![0x00, 0x01, 0x02]),
+            TwoMlsPqError::DecryptionFailed
+        );
+        // The retired pre-rework tags (BUNDLED 0x03 is now the message frame, but the
+        // old STAPLED_WELCOME value 0x09 is now PQ BIND and 0x13 is unassigned).
+        assert_err!(
+            alice_session.process_incoming(vec![0x13, 0x00]),
             TwoMlsPqError::DecryptionFailed
         );
     }
