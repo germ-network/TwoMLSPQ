@@ -357,8 +357,24 @@ pub fn create_group_with_member<Cfg: MlsConfig>(
     Ok((group, welcome_bytes))
 }
 
+/// Every group in this protocol is a 1:1 pair — exactly two leaves, the creator and the
+/// added member. Enforce that shape wherever a group's roster is set or changed by peer
+/// input (joins, and applied peer commits): a crafted welcome or commit carrying extra
+/// leaves would otherwise plant shadow members whose credentials this library reports as
+/// sender identities, letting the peer make per-message attribution and the adopted
+/// principal state diverge. MLS authenticates that roster changes came from the peer —
+/// it cannot know the peer was never allowed to make them.
+pub fn ensure_two_party<Cfg: MlsConfig>(group: &Group<Cfg>) -> Result<()> {
+    if group.roster().members_iter().count() == 2 {
+        Ok(())
+    } else {
+        Err(CombinerError::Mls)
+    }
+}
+
 /// Join a group from an MLS-encoded Welcome message. Generic over the client's config, so
-/// it serves both the classical and the PQ half.
+/// it serves both the classical and the PQ half. Rejects a welcome whose tree is not the
+/// protocol's two-party shape (see [`ensure_two_party`]).
 pub fn join_group_from_welcome<Cfg: MlsConfig>(
     mls_client: &Client<Cfg>,
     welcome_bytes: &[u8],
@@ -367,6 +383,7 @@ pub fn join_group_from_welcome<Cfg: MlsConfig>(
     let (group, _) = mls_client
         .join_group(None, &welcome, None)
         .map_err(|_| CombinerError::Mls)?;
+    ensure_two_party(&group)?;
     Ok(group)
 }
 
@@ -527,6 +544,37 @@ mod tests {
 
     fn client() -> TestClient {
         CombinerClient::new(client_id(), crypto()).unwrap()
+    }
+
+    /// Every group in this protocol is a 1:1 pair: a welcome whose tree carries more
+    /// than two leaves (a shadow member planted at creation, whose credential would
+    /// otherwise be reportable as a sender identity) is rejected at join.
+    #[test]
+    fn test_join_rejects_three_member_welcome() {
+        let alice = client();
+        let bob = client();
+        let carol = client();
+
+        let mut group = alice
+            .classical()
+            .create_group(ExtensionList::new(), ExtensionList::new(), None)
+            .unwrap();
+        let bob_kp =
+            MlsMessage::from_bytes(&bob.generate_classical_key_package().unwrap()).unwrap();
+        let carol_kp =
+            MlsMessage::from_bytes(&carol.generate_classical_key_package().unwrap()).unwrap();
+        let commit = group
+            .commit_builder()
+            .add_member(bob_kp)
+            .unwrap()
+            .add_member(carol_kp)
+            .unwrap()
+            .build()
+            .unwrap();
+        group.apply_pending_commit().unwrap();
+        let welcome = commit.welcome_messages.first().unwrap().to_bytes().unwrap();
+
+        assert!(join_group_from_welcome(bob.classical(), &welcome).is_err());
     }
 
     /// The adopted persistence pattern end-to-end: archive per group through the group

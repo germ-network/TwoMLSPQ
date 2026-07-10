@@ -824,6 +824,9 @@ impl TwoMlsPqSession {
         send.classical
             .apply_pending_commit()
             .map_err(|_| TwoMlsPqError::Mls)?;
+        // Any cached peer proposal rode this commit: reject a roster change (only an
+        // Update is legitimate there).
+        apq::ensure_two_party(&send.classical)?;
         // The bind consumed the one-shot apq PSK; drop it from every store it was
         // registered into (the session registry plus the group-captured handles).
         send.forget_psk(&apq_psk_id);
@@ -877,6 +880,9 @@ impl TwoMlsPqSession {
         recv.classical
             .process_incoming_message(cl)
             .map_err(|_| TwoMlsPqError::Mls)?;
+        // Peer commits (the PQ partial above is checked inside `apply_injected_commit`)
+        // must never change the two-party shape.
+        apq::ensure_two_party(&recv.classical)?;
         // The bind consumed the one-shot apq PSK; drop it from every store it was
         // registered into (the session registry plus the group-captured handles).
         recv.forget_psk(&apq_psk_id);
@@ -1023,6 +1029,10 @@ impl TwoMlsPqSession {
             send_pq
                 .apply_pending_commit()
                 .map_err(|_| TwoMlsPqError::Mls)?;
+            // The commit folded the peer's Upd' from the cache: reject a roster change
+            // (only an Update is legitimate there — an Add would grow the roster
+            // through OUR commit).
+            apq::ensure_two_party(send_pq)?;
             out.commit_message
                 .to_bytes()
                 .map_err(|_| TwoMlsPqError::Mls)?
@@ -1099,6 +1109,8 @@ impl TwoMlsPqSession {
                         ReceivedMessage::Commit(_) => {}
                         _ => return Err(TwoMlsPqError::Mls),
                     }
+                    // A peer commit must never change the two-party shape.
+                    apq::ensure_two_party(&*recv_pq)?;
                     export_psk(&*recv_pq)?
                 };
                 inner.register_psk(&psk_id, &psk);
@@ -1154,6 +1166,9 @@ impl TwoMlsPqSession {
                     send_pq
                         .apply_pending_commit()
                         .map_err(|_| TwoMlsPqError::Mls)?;
+                    // The commit folded the peer-supplied counter proposal: reject a
+                    // roster change (only an Update is legitimate there).
+                    apq::ensure_two_party(send_pq)?;
                     out.commit_message
                         .to_bytes()
                         .map_err(|_| TwoMlsPqError::Mls)?
@@ -1181,6 +1196,8 @@ impl TwoMlsPqSession {
                     ReceivedMessage::Commit(_) => {}
                     _ => return Err(TwoMlsPqError::Mls),
                 }
+                // A peer commit must never change the two-party shape.
+                apq::ensure_two_party(recv_pq)?;
                 // We finished receiving this operation; the next one is ours to start.
                 inner.pq_turn_mine = true;
                 Ok(false)
@@ -1699,6 +1716,9 @@ impl SessionInner {
             send.classical
                 .apply_pending_commit()
                 .map_err(|_| TwoMlsPqError::Mls)?;
+            // A folded peer proposal must not have changed the two-party shape (see
+            // the ratchet-commit counterpart in `prepare_to_encrypt`).
+            apq::ensure_two_party(&send.classical)?;
             // The commit consumed the one-shot recv-group PSK; drop it from the store.
             if let Some(psk_id) = &psk_id {
                 send.forget_psk(psk_id);
@@ -1805,6 +1825,10 @@ impl SessionInner {
                 send.classical
                     .apply_pending_commit()
                     .map_err(|_| TwoMlsPqError::Mls)?;
+                // This commit folds the app-approved peer proposal from the cache: if
+                // the peer smuggled anything but an Update there (an Add would grow the
+                // roster through OUR commit), reject the result.
+                apq::ensure_two_party(&send.classical)?;
                 // The commit consumed the one-shot recv-group PSK; drop it from the store.
                 send.forget_psk(&psk_id);
             }
@@ -2665,7 +2689,24 @@ impl TwoMlsPqSession {
         // must be (and is) idempotent — see `process_welcome`.
         if ciphertext.first() == Some(&APQ_TAG) {
             let mut inner = self.lock();
+            let prior_their = inner.their_state.client_id();
             inner.process_welcome(&ciphertext)?;
+            let adopted_their = inner.their_state.client_id();
+            // A first-delivery join that adopts a different peer principal (the peer
+            // established under a dedicated per-session principal) must be observable
+            // on THIS delivery too, not only on the stapled one — otherwise which
+            // signal the app gets would depend on which copy of the welcome arrived
+            // first. Re-deliveries and unchanged-principal joins stay `None`.
+            if adopted_their != prior_their {
+                return Ok(Some(DecryptResult {
+                    application_message: None,
+                    proposal: None,
+                    remote_commit: Some(CommitResult {
+                        new_sender: Some(adopted_their),
+                        new_recipient: inner.my_state.client_id(),
+                    }),
+                }));
+            }
             return Ok(None);
         }
 
@@ -2735,6 +2776,10 @@ impl TwoMlsPqSession {
                             ReceivedMessage::Commit(desc) => desc.authenticated_data,
                             _ => return Err(TwoMlsPqError::DecryptionFailed),
                         };
+                        // A peer commit must never change the two-party shape (an Add
+                        // would plant a shadow member whose credential we would report
+                        // as a sender identity).
+                        apq::ensure_two_party(&recv.classical)?;
                         staple_applied = true;
                         // A ratchet commit has empty authenticated_data; a rotation
                         // commit carries the new principal's ClientId there.
@@ -2803,7 +2848,10 @@ impl TwoMlsPqSession {
             // Surfaced only on the frame whose staple was actually applied; repeats of
             // the same commit are silent skips. (Known edge, pre-existing: if the staple
             // applies but the app message fails in this same frame, `new_sender` is
-            // never surfaced — the retry skips the already-applied staple.)
+            // never surfaced — the retry skips the already-applied staple. This covers
+            // the welcome-join principal adoption above too: the event signal can be
+            // lost, so treat `their_principal_state()` as the truth and `new_sender`
+            // as a hint.)
             let remote_commit = if staple_applied {
                 Some(CommitResult {
                     new_sender,
@@ -3040,6 +3088,12 @@ impl TwoMlsPqSession {
     /// a no-op (the existing staged identity — and its freshly minted keys — is kept); a
     /// different id replaces the staged identity.
     pub fn stage_rotation(&self, new_client_id: Vec<u8>) -> Result<()> {
+        // Empty is reserved: the rotation commit announces the id in authenticated_data,
+        // and empty AD is the "ratchet commit" discriminator — the handoff would be
+        // structurally invisible to the peer.
+        if new_client_id.is_empty() {
+            return Err(TwoMlsPqError::InvalidClientId);
+        }
         let mut inner = self.lock();
         if inner
             .pending_new_client
@@ -5472,6 +5526,77 @@ mod tests {
         );
     }
 
+    /// Empty principal ids are reserved — the rotation-commit discriminator is "empty
+    /// authenticated_data = ratchet commit", so an empty id could never be announced —
+    /// and both entry points reject them up front. A rejected `receive` consumes
+    /// nothing: the same invitation immediately accepts a valid retry.
+    #[test]
+    fn test_empty_principal_id_rejected() {
+        use crate::key_packages::TwoMlsPqInvitation;
+        let alice = make_client();
+        let bob = make_client();
+        let alice_kp = make_combiner_kp(&alice);
+        let bob_inv = assert_ok!(TwoMlsPqInvitation::new(assert_ok!(
+            bob.generate_invitation(true)
+        )));
+        let bob_kp = bob_inv.combiner_key_package();
+
+        let alice_s = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
+        let opened = assert_ok!(bob_inv.open_initial(assert_some!(alice_s.pending_outbound())));
+        assert!(matches!(
+            bob_inv.receive(
+                opened.welcome.clone(),
+                alice_kp.clone(),
+                b"tok".to_vec(),
+                Some(Vec::new())
+            ),
+            Err(TwoMlsPqError::InvalidClientId)
+        ));
+        assert_ok!(bob_inv.receive(opened.welcome, alice_kp, b"tok".to_vec(), None));
+
+        let (alice_c, _bob_c) = establish_confirmed_sessions();
+        assert!(matches!(
+            alice_c.stage_rotation(Vec::new()),
+            Err(TwoMlsPqError::InvalidClientId)
+        ));
+    }
+
+    /// A standalone welcome delivery that adopts a dedicated peer principal surfaces the
+    /// handoff exactly like the stapled delivery — which copy of the welcome arrives
+    /// first must not decide whether the app sees the signal. A re-delivery is the
+    /// idempotent `None`.
+    #[test]
+    fn test_standalone_welcome_surfaces_dedicated_principal() {
+        use crate::key_packages::TwoMlsPqInvitation;
+        let alice = make_client();
+        let bob = make_client();
+        let alice_kp = make_combiner_kp(&alice);
+        let bob_inv = assert_ok!(TwoMlsPqInvitation::new(assert_ok!(
+            bob.generate_invitation(true)
+        )));
+        let bob_kp = bob_inv.combiner_key_package();
+
+        let alice_s = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
+        let opened = assert_ok!(bob_inv.open_initial(assert_some!(alice_s.pending_outbound())));
+        let dedicated = crate::test_utils::test_client_id();
+        let bob_s = assert_ok!(bob_inv.receive(
+            opened.welcome,
+            alice_kp,
+            b"tok".to_vec(),
+            Some(dedicated.clone())
+        ));
+
+        let welcome_b = assert_some!(bob_s.pending_outbound());
+        let res = assert_some!(assert_ok!(alice_s.process_incoming(welcome_b.clone())));
+        assert!(res.application_message.is_none());
+        assert!(res.proposal.is_none());
+        let commit = assert_some!(res.remote_commit);
+        assert_eq!(assert_some!(commit.new_sender).bytes, dedicated);
+        assert_eq!(alice_s.their_principal_state().client_id().bytes, dedicated);
+        // Re-delivery of the same (sealed) welcome: idempotent, silent.
+        assert!(assert_ok!(alice_s.process_incoming(welcome_b)).is_none());
+    }
+
     /// The dedicated-principal session drives the full lifecycle: cross-party PSK
     /// refreshes (full commits in both directions — the acceptor's recv group lives on
     /// the invitation-derived client's stores while its send group lives on the
@@ -5566,6 +5691,21 @@ mod tests {
         assert_eq!(
             assert_some!(res.application_message).app_message_data,
             b"post-restore".to_vec()
+        );
+
+        // Inbound after restore: Alice folds the restored session's Upd into a full
+        // commit (referencing the cross-party PSK ledger) — the restored receive
+        // mirror, now running under the single rebuilt dedicated client, must resolve
+        // the PSK and apply it.
+        let restored_upd = assert_some!(res.proposal);
+        assert_ok!(alice_s.queue_proposal(restored_upd.digest));
+        let prep = assert_ok!(alice_s.prepare_to_encrypt(None));
+        assert!(prep.did_commit);
+        let enc = assert_ok!(alice_s.encrypt(b"inbound-post-restore".to_vec()));
+        let res = assert_some!(assert_ok!(restored.process_incoming(enc.cipher_text)));
+        assert_eq!(
+            assert_some!(res.application_message).app_message_data,
+            b"inbound-post-restore".to_vec()
         );
     }
 

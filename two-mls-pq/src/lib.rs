@@ -69,9 +69,16 @@ pub fn version() -> String {
 // leaf carries the dedicated id), replacing the receive → stage_rotation →
 // prepare_to_encrypt(Some(_)) first-frame dance that the peer_confirmed gate now
 // (correctly) refuses. Semantics: joining the peer's send group adopts the creator
-// leaf's ClientId as `their_principal_state`, and the frame whose welcome staple
-// performed the join surfaces it as `remote_commit.new_sender` when it differs from
-// the invitation identity.
+// leaf's ClientId as `their_principal_state`, and the delivery that performed the join
+// surfaces it as `remote_commit.new_sender` when it differs from the invitation
+// identity — on the message frame whose staple joined, AND on a standalone welcome
+// (`process_incoming` then returns `Some(DecryptResult { remote_commit, .. })` instead
+// of `None`; re-deliveries and unchanged-principal joins stay `None`). TwoMlsPqError
+// gained `InvalidClientId` (an empty principal id supplied to `receive(new_client_id:)`
+// or `stage_rotation` — empty is reserved as the ratchet-commit AD discriminator).
+// Hardening: every join and applied peer commit now enforces the protocol's two-party
+// group shape (a crafted welcome/commit/proposal carrying extra leaves is rejected as
+// `Mls`).
 const BINDING_CONTRACT_VERSION: u64 = 9;
 
 /// See `BINDING_CONTRACT_VERSION`. Exported so the Swift layer can verify the
@@ -359,6 +366,13 @@ pub enum TwoMlsPqError {
     /// mis-route or an unexpected re-invite.
     #[error("a different welcome arrived for an already-joined receive group")]
     UnexpectedWelcome,
+    /// A principal ClientId supplied for announcement on the wire is empty. Empty is
+    /// reserved: the rotation-commit discriminator is "empty authenticated_data = ratchet
+    /// commit", so an empty id could never be announced or observed by the peer. Raised by
+    /// `TwoMlsPqInvitation::receive(new_client_id: Some(vec![]))` and
+    /// `stage_rotation(vec![])`.
+    #[error("principal client id must be non-empty")]
+    InvalidClientId,
 }
 
 /// SHA-256 over `bytes` — the single hashing primitive behind every digest this

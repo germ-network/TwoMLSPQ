@@ -99,11 +99,16 @@ Sending is two-phase so CommProtocol can bind a per-round proposal hash:
 - `application_message` — a decrypted app message.
 - `proposal` — the peer's stapled `Upd(sender)` proposal, offered for app approval
   (then `queue_proposal(digest)`).
-- `remote_commit` — a `CommitResult`, surfaced on the frame whose staple was applied
-  (e.g. peer rotated → `new_sender`); repeats of an already-applied staple are
-  silent skips.
-- `None` — a re-delivered welcome (standalone `0x01` already joined from), or a
-  message for an unknown epoch (reconnect path; see Planned Features).
+- `remote_commit` — a `CommitResult`, surfaced on the delivery that applied the staple
+  or performed the welcome join (peer rotated, or established under a dedicated
+  principal → `new_sender`); repeats of an already-applied staple are silent skips. A
+  *standalone* welcome that adopts a dedicated peer principal returns a `DecryptResult`
+  with only `remote_commit` set — the handoff is observable whichever copy of the
+  welcome arrives first. `new_sender` is an event hint; `their_principal_state()` is
+  the truth (the signal is lost if the same frame's app message fails).
+- `None` — a welcome that changed nothing to announce (a re-delivery already joined
+  from, or a first join under the peer's expected identity), or a message for an
+  unknown epoch (reconnect path; see Planned Features).
 
 A stapled commit *ahead* of the receive group's next epoch fails with `EpochDesync`
 before the app ciphertext is touched: the peer advanced more than one commit past us

@@ -494,7 +494,12 @@ impl TwoMlsPqInvitation {
         new_client_id: Option<Vec<u8>>,
     ) -> Result<Arc<TwoMlsPqSession>> {
         // Mint the dedicated principal before anything is claimed or reserved, so a
-        // failure here needs no rollback.
+        // failure here needs no rollback. Empty ids are reserved (the rotation-AD
+        // discriminator can never announce one) — reject rather than mint an
+        // unannounceable principal.
+        if new_client_id.as_deref().is_some_and(<[u8]>::is_empty) {
+            return Err(TwoMlsPqError::InvalidClientId);
+        }
         let session_client = new_client_id.map(TwoMlsPqPrincipal::new).transpose()?;
         // Content-keyed idempotency, checked before anything is claimed or reserved: a
         // welcome these exact bytes already spawned a session from is a re-delivery, not

@@ -130,6 +130,7 @@ pub fn inject_and_commit<Cfg: MlsConfig>(
     pq_group
         .apply_pending_commit()
         .map_err(|_| CombinerError::Mls)?;
+    crate::group::ensure_two_party(pq_group)?;
     // S is now folded into the new epoch; wipe it from the stores before re-exporting.
     drop(secret);
     let (apq_psk_id, apq_psk) = export_psk(pq_group)?;
@@ -154,6 +155,7 @@ pub fn apply_injected_commit<Cfg: MlsConfig>(
     pq_group
         .process_incoming_message(msg)
         .map_err(|_| CombinerError::Mls)?;
+    crate::group::ensure_two_party(pq_group)?;
     // S is now folded into the new epoch; wipe it before re-exporting.
     drop(secret);
     let (apq_psk_id, apq_psk) = export_psk(pq_group)?;

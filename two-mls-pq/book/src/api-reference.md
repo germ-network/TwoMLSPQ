@@ -149,7 +149,11 @@ All failures map to the flat `TwoMlsPqError` enum (`Mls`, `InvalidKeyPackage`,
 `MissingWelcome`, `PskBinding`, `PqNotAvailable`, `SessionNotEstablished`,
 `SessionNotReady`, `ProposalRejected`, `DecryptionFailed`, `DuplicateWelcome`,
 `InvitationSpent`, `ArchiveInvalid`, `UnsupportedCipherSuite`, `CipherSuiteMismatch`,
-`EpochDesync`, `UnexpectedWelcome`). mls-rs error types never cross the FFI boundary.
+`EpochDesync`, `UnexpectedWelcome`, `InvalidClientId`). mls-rs error types never cross
+the FFI boundary. `InvalidClientId` rejects an empty principal id supplied to
+`receive(new_client_id:)` or `stage_rotation` — empty is reserved (it is the
+ratchet-commit authenticated-data discriminator, so an empty id could never be
+announced to the peer).
 `EpochDesync` means a stapled commit is more than one epoch ahead of the receive group
 (the bridging commit no longer rides any frame) — a reconnect condition, distinct from the
 transient `DecryptionFailed`. `UnexpectedWelcome` means a welcome differing from the one a
