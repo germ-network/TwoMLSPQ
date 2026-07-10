@@ -57,7 +57,13 @@ pub fn version() -> String {
 // `kind` (`OpenedFrameKind`) to the existing plaintext entry points. The initiator's
 // initial welcome on the invitation channel is unchanged (host envelopes via
 // `hpke_seal_to_key_package`).
-const BINDING_CONTRACT_VERSION: u64 = 7;
+// v8 (2026-07-10): initiate-side envelope — `initiate` gains an `app_payload:
+// Option<Vec<u8>>` parameter and now returns its initial welcome via `pending_outbound`
+// already HPKE-enveloped (`[app_payload ∥ APQWelcome_A]` sealed to the peer's KP′); the
+// new `TwoMlsPqInvitation::open_initial(blob) -> InitialFrame { app_payload, welcome }`
+// opens it (decrypt-only, does not consume the invitation), replacing the raw
+// `hpke_open` + manual compose the host did before.
+const BINDING_CONTRACT_VERSION: u64 = 8;
 
 /// See `BINDING_CONTRACT_VERSION`. Exported so the Swift layer can verify the
 /// binding it was generated with matches the binary it loaded.

@@ -1,13 +1,13 @@
 # Header Encryption
 
-> **Status: the symmetric steady-state layer is implemented**, with **two key
-> families** — message-path frames sealed under the classical half (`HeaderKey`), PQ
-> side-band frames under the PQ half (`HeaderKeyPQ`), each keyed by its own ratchet's
-> epoch. Every rendezvous-channel frame leaves the library sealed; the host removes the
-> seal with `open_incoming`. One piece remains design-only: the **first-frame envelope
-> inside `initiate`** — the initiator's initial welcome is still enveloped host-side via
-> the shipped `hpke_seal_to_key_package` / `TwoMlsPqInvitation::hpke_open` pair (see
-> *Establishment walkthrough* and *Open questions*).
+> **Status: implemented.** Two key families — message-path frames sealed under the
+> classical half (`HeaderKey`), PQ side-band frames under the PQ half (`HeaderKeyPQ`),
+> each keyed by its own ratchet's epoch — plus the **initiator's first frame**, which
+> `initiate` now HPKE-envelopes in-library (`[app_payload ∥ APQWelcome_A]` sealed to the
+> peer's KP′) so the app-layer welcome is covered too; the peer opens it with
+> `TwoMlsPqInvitation::open_initial`. Every outbound blob is opaque. The only remaining
+> refinement is the *hybrid* nested envelope (open question #2) — the first-frame
+> envelope is PQ-only today.
 
 MLS PrivateMessage encrypts the message *content*, but its framing is plaintext:
 `group_id`, `epoch`, `content_type`, and the entire `authenticated_data` field travel
@@ -331,23 +331,23 @@ Alice initiates; Bob accepts (send groups per the [Session
 Lifecycle](./session-lifecycle.md); this inverts the §A.1 diagram's roles, matching
 the crate's constructor names).
 
-1. **Alice `initiate`** — builds Group_A; captures `HeaderKey(Group_A, e₀)` into her
-   receive window (piggybacked on the existing `record_listen_rendezvous` call).
-   `pending_outbound` returns the plaintext `APQWelcome_A`. **As shipped, the
-   initiator's initial welcome is enveloped host-side** with the exported
-   `hpke_seal_to_key_package` (sealed to Bob's KP′), because it travels the
-   invitation channel and there is no symmetric key yet.
-   *Refinement (deferred):* moving the envelope inside `initiate` — with an
-   `app_payload` parameter so the host's app-layer welcome (the most linkable
-   first-frame metadata) is sealed *with* the MLS welcome — is the parity change the
-   classical stack has; it changes the published-KP consumption contract, so it is
-   left as a follow-up (see *Open questions*).
-2. **Bob's host** opens the envelope with `TwoMlsPqInvitation::hpke_open` (the
-   invitation holds the KP′ private material), validates the app-layer welcome, and
-   computes the spawn token over the **decrypted** frame — the token must be
+1. **Alice `initiate(client, their_kp, app_payload)`** — builds Group_A; captures
+   `HeaderKey(Group_A, e₀)` into her receive window (piggybacked on the existing
+   `record_listen_rendezvous` call). It composes `[app_payload ∥ APQWelcome_A]` and
+   HPKE-seals it to Bob's KP′ inside the library, so `pending_outbound()` returns **one
+   opaque envelope** — the first frame's metadata, *including the app-layer welcome that
+   identifies the initiator*, is hidden without the host having to compose the envelope
+   itself. (The `current_staple` — the message-frame staple form the peer idempotently
+   skips — keeps the *plaintext* `APQWelcome_A`; only `pending_outbound` is the
+   envelope.)
+2. **Bob's host** opens it with `TwoMlsPqInvitation::open_initial(blob) -> { app_payload,
+   welcome }` (the invitation holds the KP′ private material; the call is decrypt-only
+   and does **not** consume a single-use invitation). It validates the app-layer welcome
+   and computes the spawn token over the **decrypted** frame — the token must be
    replay-stable across re-sends, and a re-sent envelope has a fresh HPKE ephemeral
-   (different outer bytes, identical plaintext), so sealed bytes cannot key the
-   forward table. Then `receive(welcome, their_kp, spawn_token)` joins.
+   (different outer bytes, identical plaintext), which is exactly why `open_initial`
+   returns the plaintext and the host keys the token on it. Then
+   `receive(welcome, their_kp, spawn_token)` joins.
 3. **Bob `receive`/`accept`** — joins Group_A, builds Group_B classical; captures
    `HeaderKey(Group_B, e₀)` into his window. His send key is
    `HeaderKey(Group_A, join epoch)` — derivable immediately.
@@ -361,12 +361,12 @@ the crate's constructor names).
 Replays and re-sends: `forward_group_id(spawn_token)` remains a pure table lookup,
 and the content-keyed `processed_welcome_group_id` resolves a re-delivered welcome
 directly. A **spent single-use** invitation has lost the KP′ private material and can
-no longer `hpke_open` a replayed envelope; hosts that need replay acknowledgment after
-consumption use last-resort invitations. (This is an existing property of the §A.1
-envelope.)
+no longer `open_initial` a replayed envelope; hosts that need replay acknowledgment
+after consumption use last-resort invitations.
 
-Direct `accept()` keeps its plaintext-welcome signature (a test/embedded entry point);
-the normal path is `TwoMlsPqInvitation::receive`.
+Direct `accept()` keeps its plaintext-welcome signature (a test/embedded entry point
+for callers that already hold a plaintext welcome); the normal path is
+`initiate(…, app_payload)` → `TwoMlsPqInvitation::open_initial` → `receive`.
 
 ### Host routing and the API
 
@@ -382,17 +382,18 @@ byte, which header encryption hides. The wire boundary moved one step:
   signatures (and additionally auto-open a sealed blob, per the receive rule).
   `forwarded(spawn_token)` is untouched — it takes the token, not bytes.
 - **Outbound is sealed inside the library** at every exit: `EncryptResult
-  .cipher_text`, `pending_outbound()` (once a recv group exists),
-  `pq_take_pending_outbound()`, and the direct returns of `pq_ratchet_begin` /
-  `pq_bootstrap_begin` / `pq_rekey_begin`. The exported `hpke_seal_to_key_package` /
-  `hpke_open` pair stays for the initiator's initial welcome and other stacks.
+  .cipher_text`, `pending_outbound()` (the acceptor's symmetric-sealed return welcome,
+  the initiator's HPKE envelope), `pq_take_pending_outbound()`, and the direct returns
+  of `pq_ratchet_begin` / `pq_bootstrap_begin` / `pq_rekey_begin`. The exported
+  `hpke_seal_to_key_package` / `hpke_open` pair stays for other stacks; the main path
+  now uses `initiate(…, app_payload)` / `open_initial`.
 - **Archive**: both receive windows (`recv_header_keys`, `recv_header_keys_pq`) ride
   in the session archive as parallel `(epoch, key)` lists, entries validated to 32
   bytes on restore. `SESSION_ARCHIVE_VERSION` bumped to 4; pre-release, so old
   archives simply fail to decode and regenerate.
-- **Contract**: `BINDING_CONTRACT_VERSION` bumped to 7 — the FFI gains
-  `open_incoming` and the `OpenedFrame` / `OpenedFrameKind` types, and every
-  outbound blob is now sealed.
+- **Contract**: `BINDING_CONTRACT_VERSION` bumped to 8 — the FFI gains `open_incoming`
+  / `OpenedFrame` / `OpenedFrameKind` (v7) and the `initiate` `app_payload` parameter,
+  `open_initial`, and `InitialFrame` (v8); every outbound blob is now opaque.
 
 ### What this layer does and does not provide
 
@@ -432,30 +433,27 @@ never has.
    `seal_side_band`); `pq_ratchet_begin` guarded on the recv group; `open_incoming`
    with `OpenedFrameKind`; `process_incoming` and the `pq_*` receivers `open_or_raw`
    their input.
-3. Archive: `recv_header_keys` and `recv_header_keys_pq` as `(epoch, key)` entries,
+3. First frame: `initiate` gains `app_payload: Option<Vec<u8>>` and HPKE-envelopes
+   `[app_payload ∥ APQWelcome_A]` to the peer's KP′ (`key_packages::seal_initial_envelope`),
+   returning it via `pending_outbound`; `TwoMlsPqInvitation::open_initial(blob) ->
+   InitialFrame { app_payload, welcome }` opens it (decrypt-only; does not consume the
+   invitation). `current_staple` keeps the plaintext welcome.
+4. Archive: `recv_header_keys` and `recv_header_keys_pq` as `(epoch, key)` entries,
    32-byte validated on restore; `SESSION_ARCHIVE_VERSION` → 4,
-   `BINDING_CONTRACT_VERSION` → 7 (unchanged by the PQ-family follow-up — no FFI shape
-   change).
-4. Tests: sealed frames carry no plaintext framing; cross-commit crossing; restored
+   `BINDING_CONTRACT_VERSION` → 8 (the `initiate` signature and `open_initial` /
+   `InitialFrame` are the FFI change; header encryption itself was 7).
+5. Tests: sealed frames carry no plaintext framing; cross-commit crossing; restored
    session opens an in-flight frame (message *and* side-band); garbage → `None`;
    sealed side-band opens and classifies + full A.3/A.4/A.5 through sealed frames;
    the side-band survives classical churn that evicts the message window (proving the
-   PQ family); the pre-A.4 `BOOTSTRAP_KP` opens via the classical fallback; initial
-   welcome unsealed vs. return welcome sealed.
-
-Not yet implemented (see *Open questions*): moving the initial-welcome envelope (with
-`app_payload`) inside `initiate`.
+   PQ family); the pre-A.4 `BOOTSTRAP_KP` opens via the classical fallback; the initial
+   envelope round-trips through `open_initial` (app_payload + welcome), a re-send
+   changes only the outer bytes, a spent invitation can't open, and the initiator's
+   staple stays the plaintext welcome.
 
 ## Open questions
 
-1. **Initial-welcome envelope inside `initiate` (with `app_payload`).** The initial
-   welcome is enveloped host-side today. Moving it into the library — sealing
-   `[app_payload ∥ APQWelcome_A]` to Bob's KP′ so the host's app-layer welcome
-   (identity introduction, signed keys) rides inside the envelope — matches the
-   classical stack's parity and needs a new `open_initial` on the invitation. It
-   changes the published-KP consumption contract, so it should ride the same release
-   as its first real host adoption.
-2. **Hybrid envelope for the very first frame?** The §A.1 envelope is PQ-only —
+1. **Hybrid envelope for the very first frame?** The §A.1 envelope is PQ-only —
    the inverse of the classical stack's X25519-only envelope. A nested seal
    (classical HPKE inside the PQ envelope, both init keys are already in the
    published pair) would make first-frame *metadata* survive a break of either KEM,
@@ -464,7 +462,7 @@ Not yet implemented (see *Open questions*): moving the initial-welcome envelope 
    and the app payload now inside the envelope). Recommended, but it changes the
    published-KP consumption contract, so it should ride the same release as the
    envelope's first real adoption.
-3. **Hybridizing the PQ groups** (the side-band trade-off): `HeaderKeyPQ` is
+2. **Hybridizing the PQ groups** (the side-band trade-off): `HeaderKeyPQ` is
    ML-KEM-only, so it falls to an ML-KEM-only break where the classical `HeaderKey`
    would not — accepted, because an ML-KEM break already exposes the side-band's
    *content*, leaving only its metadata. A reverse (classical→PQ) PSK injection at the
@@ -472,10 +470,10 @@ Not yet implemented (see *Open questions*): moving the initial-welcome envelope 
    `HeaderKeyPQ` — classical cover, closing the one non-hybrid derivation. It is
    protocol-level (changes commit contents on both sides), so it belongs to a Combiner
    revision, not the header layer.
-4. **Receive-side AD checking** (from the stapling assessment): should the
+3. **Receive-side AD checking** (from the stapling assessment): should the
    message-frame handler verify the app message's AD against the stapled proposal's
    digest (and, on a rotation commit, against the commit), restoring the classical stack's
    peer-level mix-and-match checks? Orthogonal to header encryption but adjacent —
    deciding it in the same review avoids re-opening the frame contract twice.
-5. **Padding.** Out of scope here, but the uniform blob makes a future
+4. **Padding.** Out of scope here, but the uniform blob makes a future
    fixed-bucket padding scheme purely additive.

@@ -1943,16 +1943,35 @@ impl TwoMlsPqSession {
     pub(crate) fn set_spawn_token(&self, token: Vec<u8>) {
         self.lock().spawn_token = Some(token);
     }
+
+    /// Test-only: the plaintext initial welcome — the initiator's `current_staple` before
+    /// its first commit, which is exactly the plaintext `APQWelcome_A`. Production delivers
+    /// this only inside the §A.1 envelope (`pending_outbound` → `TwoMlsPqInvitation::
+    /// open_initial`); tests that drive `accept`/`receive` directly use this to skip the
+    /// envelope round-trip. The real envelope path is exercised by `establish_sessions` and
+    /// the dedicated envelope tests.
+    #[cfg(test)]
+    pub(crate) fn test_initial_welcome(&self) -> Vec<u8> {
+        self.lock().current_staple.clone()
+    }
 }
 
 #[uniffi::export]
 impl TwoMlsPqSession {
     /// Create a session as the initiating party targeting `their_key_package`.
-    /// Retrieve the outbound APQWelcome bytes via `pending_outbound`.
+    ///
+    /// `app_payload` is the host's opaque app-layer welcome (identity introduction, signed
+    /// keys, …), or `None`. It is composed with the MLS welcome and HPKE-sealed to the
+    /// peer's KP′ inside the library, so `pending_outbound()` returns one opaque envelope —
+    /// the first frame's metadata (including the app-layer welcome that identifies the
+    /// initiator) is hidden without the host having to compose the envelope itself. The
+    /// peer recovers both halves with `TwoMlsPqInvitation::open_initial`, then joins with
+    /// `receive`.
     #[uniffi::constructor]
     pub fn initiate(
         client: Arc<TwoMlsPqPrincipal>,
         their_key_package: CombinerKeyPackage,
+        app_payload: Option<Vec<u8>>,
     ) -> Result<Arc<Self>> {
         validate_combiner_kp(client.combiner().cipher_suite(), &their_key_package)?;
         let their_parsed = parse_mls_key_package(their_key_package.classical.clone())?;
@@ -1965,16 +1984,31 @@ impl TwoMlsPqSession {
             client.combiner(),
         )?;
 
+        // The first frame has no symmetric key yet, so it is not header-sealed; instead the
+        // library HPKE-envelopes `[app_payload ∥ APQWelcome_A]` to the peer's KP′ (§A.1), and
+        // `pending_outbound` returns that opaque envelope. The peer opens it with
+        // `TwoMlsPqInvitation::open_initial`.
+        let envelope = crate::key_packages::seal_initial_envelope(
+            &their_key_package,
+            app_payload.as_deref(),
+            &apq_welcome,
+        )?;
+
         let session = build_session(
             client,
             Some(send_group),
             None,
+            // `build_session` seeds `current_staple` from this — it MUST be the plaintext
+            // `APQWelcome_A` (the message-frame staple form, first byte 0x01, that the peer
+            // idempotently skips), not the sealed envelope. `pending_outbound` is replaced
+            // with the envelope just below.
             Some(apq_welcome),
             session_id,
             their_id,
             true,
             None,
         );
+        session.lock().pending_outbound = Some(envelope);
         // Seed the PSK ledger with the send group's establishment epoch, and capture
         // the establishment epoch's listen address (and the send-PQ header key when the
         // send-PQ half exists — the initiator's does at `initiate`; the acceptor's is
@@ -3099,7 +3133,7 @@ mod tests {
         let alice = make_client();
         let bob = make_client();
         let bob_kp = make_combiner_kp(&bob);
-        let session = assert_ok!(TwoMlsPqSession::initiate(alice, bob_kp));
+        let session = assert_ok!(TwoMlsPqSession::initiate(alice, bob_kp, None));
         assert!(session.pending_outbound().is_some());
     }
 
@@ -3108,7 +3142,7 @@ mod tests {
         let alice = make_client();
         let bob = make_client();
         let bob_kp = make_combiner_kp(&bob);
-        let session = assert_ok!(TwoMlsPqSession::initiate(alice, bob_kp));
+        let session = assert_ok!(TwoMlsPqSession::initiate(alice, bob_kp, None));
         let first = session.pending_outbound();
         let second = session.pending_outbound();
         assert!(first.is_some());
@@ -3120,7 +3154,7 @@ mod tests {
         let alice = make_client();
         let bob = make_client();
         let bob_kp = make_combiner_kp(&bob);
-        let session = assert_ok!(TwoMlsPqSession::initiate(alice, bob_kp));
+        let session = assert_ok!(TwoMlsPqSession::initiate(alice, bob_kp, None));
         assert!(!session.is_established());
     }
 
@@ -3131,8 +3165,8 @@ mod tests {
         let alice_kp = make_combiner_kp(&alice);
         let bob_kp = make_combiner_kp(&bob);
 
-        let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp));
-        let apq_welcome_a = assert_some!(alice_session.pending_outbound());
+        let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
+        let apq_welcome_a = alice_session.test_initial_welcome();
 
         let bob_session = assert_ok!(TwoMlsPqSession::accept(bob, apq_welcome_a, alice_kp));
         assert!(bob_session.pending_outbound().is_some());
@@ -3157,7 +3191,7 @@ mod tests {
 
         // Initiator: listening works immediately (send group @ classical epoch 1);
         // nowhere to post until the return welcome stands up the recv group.
-        let alice_s = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp));
+        let alice_s = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
         let listen_a = assert_ok!(alice_s.should_listen_on());
         assert!(!listen_a.send_group.classical.bytes.is_empty());
         assert!(!listen_a.send_group.pq.bytes.is_empty());
@@ -3171,7 +3205,7 @@ mod tests {
 
         // Acceptor: posts immediately — its recv group is the initiator's send
         // group, so its post address is the initiator's listen address verbatim.
-        let welcome_a = assert_some!(alice_s.pending_outbound());
+        let welcome_a = alice_s.test_initial_welcome();
         let bob_s = assert_ok!(TwoMlsPqSession::accept(bob, welcome_a, alice_kp));
         let bob_post = assert_some!(assert_ok!(bob_s.send_rendezvous()));
         assert_eq!(
@@ -3960,7 +3994,7 @@ mod tests {
         let pq = assert_ok!(bob.generate_key_package(crate::MlsCipherSuite::x25519_chacha()));
         let bad_kp = crate::key_packages::CombinerKeyPackage { classical, pq };
         assert_err!(
-            TwoMlsPqSession::initiate(alice, bad_kp),
+            TwoMlsPqSession::initiate(alice, bad_kp, None),
             TwoMlsPqError::PqNotAvailable
         );
     }
@@ -3983,8 +4017,8 @@ mod tests {
         let alice_kp = make_combiner_kp(&alice);
         let bob_kp = make_combiner_kp(&bob);
 
-        let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp));
-        let apq_welcome_a = assert_some!(alice_session.pending_outbound());
+        let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
+        let apq_welcome_a = alice_session.test_initial_welcome();
 
         let bob_session = assert_ok!(TwoMlsPqSession::accept(
             Arc::clone(&bob),
@@ -4071,8 +4105,8 @@ mod tests {
         let bob = make_client();
         let alice_kp = make_combiner_kp(&alice);
         let bob_kp = make_combiner_kp(&bob);
-        let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp));
-        let welcome = assert_some!(alice_session.pending_outbound());
+        let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
+        let welcome = alice_session.test_initial_welcome();
         assert_ok!(TwoMlsPqSession::accept(bob, welcome, alice_kp));
     }
 
@@ -4082,8 +4116,8 @@ mod tests {
         let bob = make_client();
         let alice_kp = make_combiner_kp(&alice);
         let bob_kp = make_combiner_kp(&bob);
-        let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp));
-        let welcome = assert_some!(alice_session.pending_outbound());
+        let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
+        let welcome = alice_session.test_initial_welcome();
         let bob_session = assert_ok!(TwoMlsPqSession::accept(Arc::clone(&bob), welcome, alice_kp));
         assert!(bob_session.has_receive_group());
         assert!(bob_session.is_established());
@@ -4160,8 +4194,8 @@ mod tests {
         let alice_kp = make_combiner_kp(&alice);
         let bob_kp = make_combiner_kp(&bob);
 
-        let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp));
-        let welcome_a = assert_some!(alice_session.pending_outbound());
+        let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
+        let welcome_a = alice_session.test_initial_welcome();
 
         // Archive and restore the initiator BEFORE it has joined the return welcome.
         let restored_alice = round_trip(&alice_session);
@@ -4253,8 +4287,8 @@ mod tests {
             bob.generate_invitation(true)
         )));
         let bob_kp = bob_inv.combiner_key_package();
-        let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp));
-        let welcome_a = assert_some!(alice_session.pending_outbound());
+        let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
+        let welcome_a = alice_session.test_initial_welcome();
         let token = b"spawn-token".to_vec();
         let bob_session = assert_ok!(bob_inv.receive(welcome_a, alice_kp, token.clone()));
 
@@ -4535,7 +4569,7 @@ mod tests {
         let bob = make_client();
         let bob_kp = make_combiner_kp(&bob);
         // Initiator pre-return-welcome: no recv group, nowhere to post.
-        let session = assert_ok!(TwoMlsPqSession::initiate(alice, bob_kp));
+        let session = assert_ok!(TwoMlsPqSession::initiate(alice, bob_kp, None));
         assert!(assert_ok!(session.send_rendezvous()).is_none());
     }
 
@@ -4555,15 +4589,13 @@ mod tests {
 
     #[test]
     fn test_forwarded_refused_without_spawn_token() {
-        // Initiator sessions (and acceptor sessions built directly via `accept`, not
-        // through an invitation) carry no spawn token — nothing to match replays against.
-        let (alice_session, bob_session) = establish_sessions();
+        // An initiator session carries no spawn token — nothing to match replays against —
+        // so `forwarded` refuses. (An acceptor built through `TwoMlsPqInvitation::receive`
+        // does have one, keyed by the invitation; that path is covered by the forward-table
+        // tests.)
+        let (alice_session, _bob_session) = establish_sessions();
         assert_err!(
             alice_session.forwarded(vec![]),
-            TwoMlsPqError::SessionNotReady
-        );
-        assert_err!(
-            bob_session.forwarded(b"anything".to_vec()),
             TwoMlsPqError::SessionNotReady
         );
     }
@@ -4665,8 +4697,12 @@ mod tests {
         let bob_kp = make_combiner_kp(&bob);
         let carol_kp = make_combiner_kp(&carol);
 
-        let alice_bob = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp));
-        let alice_carol = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), carol_kp));
+        let alice_bob = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
+        let alice_carol = assert_ok!(TwoMlsPqSession::initiate(
+            Arc::clone(&alice),
+            carol_kp,
+            None
+        ));
 
         assert_ne!(
             alice_bob.active_session_id().bytes,
@@ -4813,8 +4849,8 @@ mod tests {
         let bob = make_client();
         let alice_kp = make_combiner_kp(&alice);
         let bob_kp = make_combiner_kp(&bob);
-        let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp));
-        let welcome_a = assert_some!(alice_session.pending_outbound());
+        let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
+        let welcome_a = alice_session.test_initial_welcome();
         let bob_session = assert_ok!(TwoMlsPqSession::accept(
             Arc::clone(&bob),
             welcome_a,
@@ -4948,8 +4984,8 @@ mod tests {
         let bob_kp = make_combiner_kp(&bob);
 
         // Alice initiates; her welcome_a is delivered separately so Bob can accept.
-        let alice_s = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp));
-        let welcome_a = assert_some!(alice_s.pending_outbound());
+        let alice_s = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
+        let welcome_a = alice_s.test_initial_welcome();
         let bob_s = assert_ok!(TwoMlsPqSession::accept(
             Arc::clone(&bob),
             welcome_a,
@@ -5228,28 +5264,159 @@ mod tests {
     /// The initiator's initial welcome (invitation channel) is NOT sealed — it has no
     /// symmetric key yet; the acceptor's return welcome (recv group live) IS sealed.
     #[test]
-    fn test_initial_welcome_unsealed_return_welcome_sealed() {
+    fn test_initial_envelope_roundtrip_return_welcome_sealed() {
+        use crate::key_packages::TwoMlsPqInvitation;
         let alice = make_client();
         let bob = make_client();
         let alice_kp = make_combiner_kp(&alice);
-        let bob_kp = make_combiner_kp(&bob);
+        let bob_inv = assert_ok!(TwoMlsPqInvitation::new(assert_ok!(
+            bob.generate_invitation(true)
+        )));
+        let bob_kp = bob_inv.combiner_key_package();
 
-        let alice_s = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp));
-        let welcome_a = assert_some!(alice_s.pending_outbound());
-        // Alice's initial welcome is plaintext APQWelcome bytes (host envelopes it).
-        assert_eq!(welcome_a.first(), Some(&super::APQ_TAG));
-
-        let bob_s = assert_ok!(TwoMlsPqSession::accept(
-            Arc::clone(&bob),
-            welcome_a,
-            alice_kp
+        // Alice's initial welcome is the §A.1 envelope over `[app_payload ∥ APQWelcome_A]`,
+        // sealed to Bob's KP′ inside `initiate` — an opaque blob, NOT the plaintext welcome.
+        let app = b"app-layer-welcome".to_vec();
+        let alice_s = assert_ok!(TwoMlsPqSession::initiate(
+            Arc::clone(&alice),
+            bob_kp,
+            Some(app.clone())
         ));
-        // Bob's return welcome is sealed (Bob already has the recv group) and opens on
+        let envelope = assert_some!(alice_s.pending_outbound());
+        assert_ne!(
+            envelope.first(),
+            Some(&super::APQ_TAG),
+            "the initial frame is the opaque envelope, not the plaintext welcome"
+        );
+        assert!(
+            !envelope
+                .windows(4)
+                .any(|w| w == &alice_s.test_initial_welcome()[..4]),
+            "the plaintext welcome must not appear in the envelope"
+        );
+
+        // Bob opens the envelope: app_payload round-trips, welcome is the plaintext APQWelcome.
+        let opened = assert_ok!(bob_inv.open_initial(envelope));
+        assert_eq!(opened.app_payload, Some(app));
+        assert_eq!(opened.welcome.first(), Some(&super::APQ_TAG));
+
+        let bob_s = assert_ok!(bob_inv.receive(opened.welcome, alice_kp, b"tok".to_vec()));
+        // Bob's return welcome is symmetric-sealed (Bob has the recv group) and opens on
         // Alice's window to the APQWelcome.
         let welcome_b = assert_some!(bob_s.pending_outbound());
         assert_ne!(welcome_b.first(), Some(&super::APQ_TAG));
         assert_eq!(
             open_frame(&alice_s, &welcome_b).first(),
+            Some(&super::APQ_TAG)
+        );
+    }
+
+    /// `app_payload: None` round-trips as `None` (empty section), and the welcome still
+    /// recovers.
+    #[test]
+    fn test_initial_envelope_no_app_payload() {
+        use crate::key_packages::TwoMlsPqInvitation;
+        let alice = make_client();
+        let bob = make_client();
+        let alice_kp = make_combiner_kp(&alice);
+        let bob_inv = assert_ok!(TwoMlsPqInvitation::new(assert_ok!(
+            bob.generate_invitation(true)
+        )));
+        let bob_kp = bob_inv.combiner_key_package();
+
+        let alice_s = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
+        let opened = assert_ok!(bob_inv.open_initial(assert_some!(alice_s.pending_outbound())));
+        assert_eq!(opened.app_payload, None);
+        assert_ok!(bob_inv.receive(opened.welcome, alice_kp, b"tok".to_vec()));
+    }
+
+    /// A re-sent envelope has a fresh HPKE ephemeral (different outer bytes) but the same
+    /// plaintext — so a spawn token computed over the opened frame is replay-stable, and a
+    /// last-resort invitation opens both.
+    #[test]
+    fn test_initial_envelope_resend_same_plaintext() {
+        use crate::key_packages::TwoMlsPqInvitation;
+        let alice = make_client();
+        let bob = make_client();
+        let bob_inv = assert_ok!(TwoMlsPqInvitation::new(assert_ok!(
+            bob.generate_invitation(true)
+        )));
+        let bob_kp = bob_inv.combiner_key_package();
+
+        // Two independent initiations to the same KP seal different outer bytes…
+        let a1 = assert_ok!(TwoMlsPqSession::initiate(
+            Arc::clone(&alice),
+            bob_kp.clone(),
+            Some(b"p".to_vec())
+        ));
+        let e1 = assert_some!(a1.pending_outbound());
+        let a2 = assert_ok!(TwoMlsPqSession::initiate(
+            Arc::clone(&alice),
+            bob_kp,
+            Some(b"p".to_vec())
+        ));
+        let e2 = assert_some!(a2.pending_outbound());
+        assert_ne!(
+            e1, e2,
+            "fresh HPKE ephemeral per seal → different outer bytes"
+        );
+        // …but each opens to an app_payload the host can key a stable token on.
+        assert_eq!(
+            assert_ok!(bob_inv.open_initial(e1)).app_payload,
+            Some(b"p".to_vec())
+        );
+        assert_eq!(
+            assert_ok!(bob_inv.open_initial(e2)).app_payload,
+            Some(b"p".to_vec())
+        );
+    }
+
+    /// A spent single-use invitation cannot `open_initial` (its KP′ material is gone), so
+    /// replays after consumption are dropped as undecryptable.
+    #[test]
+    fn test_spent_invitation_cannot_open_initial() {
+        use crate::key_packages::TwoMlsPqInvitation;
+        let alice = make_client();
+        let carol = make_client();
+        let bob = make_client();
+        let alice_kp = make_combiner_kp(&alice);
+        let bob_inv = assert_ok!(TwoMlsPqInvitation::new(assert_ok!(
+            bob.generate_invitation(false)
+        )));
+        let bob_kp = bob_inv.combiner_key_package();
+
+        // Alice consumes the single-use invitation.
+        let alice_s = assert_ok!(TwoMlsPqSession::initiate(
+            Arc::clone(&alice),
+            bob_kp.clone(),
+            None
+        ));
+        let opened = assert_ok!(bob_inv.open_initial(assert_some!(alice_s.pending_outbound())));
+        assert_ok!(bob_inv.receive(opened.welcome, alice_kp, b"tok".to_vec()));
+
+        // Carol's later envelope can no longer be opened — the KP′ material is spent.
+        let carol_s = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&carol), bob_kp, None));
+        assert_err!(
+            bob_inv.open_initial(assert_some!(carol_s.pending_outbound())),
+            TwoMlsPqError::InvitationSpent
+        );
+    }
+
+    /// The initiator's message-frame staple stays the plaintext `APQWelcome_A` (first byte
+    /// 0x01) even though `pending_outbound` is the opaque envelope — the two are
+    /// deliberately split in `initiate`.
+    #[test]
+    fn test_initiator_staple_is_plaintext_welcome() {
+        let alice = make_client();
+        let bob = make_client();
+        let bob_kp = make_combiner_kp(&bob);
+        let alice_s = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
+        assert_eq!(
+            alice_s.test_initial_welcome().first(),
+            Some(&super::APQ_TAG)
+        );
+        assert_ne!(
+            assert_some!(alice_s.pending_outbound()).first(),
             Some(&super::APQ_TAG)
         );
     }
@@ -5376,8 +5543,9 @@ mod tests {
         let carol = make_client();
         let dave = make_client();
         let dave_kp = make_combiner_kp(&dave);
-        let carol_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&carol), dave_kp));
-        let foreign_welcome = assert_some!(carol_session.pending_outbound());
+        let carol_session =
+            assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&carol), dave_kp, None));
+        let foreign_welcome = carol_session.test_initial_welcome();
 
         assert_err!(
             alice_session.process_incoming(foreign_welcome),
@@ -5471,7 +5639,7 @@ mod tests {
         let alice = make_client();
         let bob = make_client();
         let bob_kp = make_combiner_kp(&bob);
-        let session = assert_ok!(TwoMlsPqSession::initiate(alice, bob_kp));
+        let session = assert_ok!(TwoMlsPqSession::initiate(alice, bob_kp, None));
         assert_err!(
             session.prepare_to_encrypt(None),
             TwoMlsPqError::SessionNotReady
@@ -5504,7 +5672,7 @@ mod tests {
         let alice = make_client();
         let bob = make_client();
         let bob_kp = make_combiner_kp(&bob);
-        let session = assert_ok!(TwoMlsPqSession::initiate(alice, bob_kp));
+        let session = assert_ok!(TwoMlsPqSession::initiate(alice, bob_kp, None));
         assert!(session.receive_group_id().is_none());
     }
 
@@ -5520,7 +5688,7 @@ mod tests {
         let alice = make_client();
         let bob = make_client();
         let bob_kp = make_combiner_kp(&bob);
-        let session = assert_ok!(TwoMlsPqSession::initiate(alice, bob_kp));
+        let session = assert_ok!(TwoMlsPqSession::initiate(alice, bob_kp, None));
         assert!(!session.has_receive_group());
     }
 
@@ -5530,8 +5698,8 @@ mod tests {
         let bob = make_client();
         let alice_kp = make_combiner_kp(&alice);
         let bob_kp = make_combiner_kp(&bob);
-        let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp));
-        let welcome = assert_some!(alice_session.pending_outbound());
+        let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
+        let welcome = alice_session.test_initial_welcome();
         let bob_session = assert_ok!(TwoMlsPqSession::accept(bob, welcome, alice_kp));
         assert!(bob_session.has_receive_group());
     }
@@ -5541,7 +5709,7 @@ mod tests {
         let alice = make_client();
         let bob = make_client();
         let bob_kp = make_combiner_kp(&bob);
-        let session = assert_ok!(TwoMlsPqSession::initiate(alice, bob_kp));
+        let session = assert_ok!(TwoMlsPqSession::initiate(alice, bob_kp, None));
         assert!(session.proposal_context().is_none());
     }
 
@@ -5560,7 +5728,7 @@ mod tests {
         let alice_id = alice.client_id();
         let bob = make_client();
         let bob_kp = make_combiner_kp(&bob);
-        let session = assert_ok!(TwoMlsPqSession::initiate(alice, bob_kp));
+        let session = assert_ok!(TwoMlsPqSession::initiate(alice, bob_kp, None));
         assert!(matches!(
             session.my_principal_state(),
             PrincipalState::Sync { .. }
@@ -5737,8 +5905,8 @@ mod tests {
         let alice_kp = make_combiner_kp(&alice);
         let bob_kp = make_combiner_kp(&bob);
 
-        let alice_s = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp));
-        let welcome_a = assert_some!(alice_s.pending_outbound());
+        let alice_s = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
+        let welcome_a = alice_s.test_initial_welcome();
         let bob_s = assert_ok!(TwoMlsPqSession::accept(
             Arc::clone(&bob),
             welcome_a.clone(),
@@ -5924,7 +6092,7 @@ mod tests {
             pq: assert_ok!(peer.generate_key_package(MlsCipherSuite::x25519_chacha())),
         };
         assert_err!(
-            TwoMlsPqSession::initiate(Arc::clone(&alice), both_classical),
+            TwoMlsPqSession::initiate(Arc::clone(&alice), both_classical, None),
             TwoMlsPqError::PqNotAvailable
         );
 
@@ -5935,7 +6103,7 @@ mod tests {
             pq: assert_ok!(peer.generate_key_package(MlsCipherSuite::x25519_chacha())),
         };
         assert_err!(
-            TwoMlsPqSession::initiate(Arc::clone(&alice), swapped),
+            TwoMlsPqSession::initiate(Arc::clone(&alice), swapped, None),
             TwoMlsPqError::CipherSuiteMismatch
         );
     }
@@ -5945,8 +6113,8 @@ mod tests {
         let alice = make_client();
         let bob = make_client();
         let bob_kp = make_combiner_kp(&bob);
-        let alice_s = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp));
-        let welcome = assert_some!(alice_s.pending_outbound());
+        let alice_s = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
+        let welcome = alice_s.test_initial_welcome();
         // Swap the welcome's two halves so each slot's cleartext cipher suite is wrong for the
         // acceptor's expected pair — caught pre-join, not as a late decrypt failure.
         let (classical, pq) = assert_ok!(apq::decode_apq_welcome(&welcome));

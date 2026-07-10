@@ -61,9 +61,14 @@ The receiving side of a published key package — no live client required.
 - `processed_welcome_group_id(welcome) -> Option<MlsGroupId>` — the content-keyed
   counterpart: resolve a re-delivered welcome by the digest of its exact bytes, no
   host token convention needed.
-- `hpke_open(kem_output, ciphertext, info, aad)` — decrypt data sealed to the
-  invitation's key package (the initial routing-header pattern); the counterpart
-  free function is `hpke_seal_to_key_package`.
+- `open_initial(blob) -> InitialFrame { app_payload, welcome }` — open the initiator's
+  first frame (the §A.1 envelope `initiate` produced), recovering the app-layer welcome
+  and the MLS `welcome` to pass to `receive`. Decrypt-only and does **not** consume the
+  invitation (validate before joining); `InvitationSpent` once a single-use invitation
+  is consumed. The main receive path is `open_initial` → validate → `receive`.
+- `hpke_open(kem_output, ciphertext, info, aad)` — the lower-level decrypt used by
+  `open_initial`, kept exported for other stacks; the counterpart free function is
+  `hpke_seal_to_key_package`.
 
 ## Parsing & routing helpers
 
@@ -78,8 +83,12 @@ The receiving side of a published key package — no live client required.
 
 ## `TwoMlsPqSession`
 
-Constructors: `initiate`, `accept`, `from_archive(archive)` — self-contained: the
-archive carries the session's signing identity, so restore rebuilds the exact client
+Constructors: `initiate(client, their_key_package, app_payload)` — `app_payload` is the
+host's opaque app-layer welcome (or `None`), composed with the MLS welcome and
+HPKE-enveloped to the peer's KP′ so `pending_outbound` is one opaque blob the peer opens
+with `TwoMlsPqInvitation::open_initial`; `accept(client, welcome, their_key_package)` —
+the plaintext-welcome path (tests/embedded); `from_archive(archive)` — self-contained:
+the archive carries the session's signing identity, so restore rebuilds the exact client
 internally (no client argument), byte-exact in ClientId and signing keys. The restored
 groups still sign with the keys embedded in their snapshots.
 
