@@ -74,13 +74,24 @@ sequence is driven by the classical ratchet itself:
 1. **Candidates ride the Upd proposals.** `stage_rotation(new_id)` mints a successor
    principal and authorizes it; `prepare_to_encrypt(Some(id))` selects which staged
    candidate this frame's Upd(self) carries (its new leaf bears the candidate's
-   credential). Different frames may propose different candidates. The frame's
-   proposal section is self-describing — the receiver surfaces the candidate as
-   `QueuedRemoteProposal.proposing` *before* the proposal touches any group, and
+   credential). Different frames may propose different candidates. A candidate that has
+   been proposed on the wire is **never evicted** — the peer may commit any of them, and
+   only the proposer holds the winner's signing key. Staging beyond the in-flight window
+   parks the request in a single deferred slot (a newer stage replaces it) and it is
+   proposed automatically on the next routine round once a canonicalization frees a slot.
+   The frame's proposal section is self-describing — the receiver surfaces the candidate
+   as `QueuedRemoteProposal.proposing` *before* the proposal touches any group, and
    `queue_proposal` verifies the declared identity against the Update's actual leaf.
 2. **The app's approval is the authorization.** `queue_proposal` is the running tally:
    approving a proposal authorizes its credential as the peer's next; a later approval
-   replaces the tally.
+   replaces the tally (single-occupancy, latest-wins — the app owns ordering).
+   `queued_remote_successor()` returns the currently-queued credential so the app can
+   decide whether to replace it or keep it. Approval validates the proposal and then
+   leaves the group's proposal cache **untouched** (it re-applies the one approved
+   proposal only at commit), so a rejected approval is a no-op and a replacement never
+   accumulates a second Update. The tally is epoch-locked: it is dropped when our send
+   epoch advances by an A.3 bind, and the app re-approves from the peer's fresh offer
+   (the receiver may freely drop — the proposer re-sends every round).
 3. **The commit defines the canonical next credential.** When the receiver's commit
    folds the chosen Upd, that credential becomes the sender's canonical identity
    (`committed_remote_client_id`, `their_principal_state`). The staple back

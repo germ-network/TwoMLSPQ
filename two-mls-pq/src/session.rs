@@ -64,12 +64,26 @@ struct SessionInner {
     /// carries. It enters our send group's proposal cache only via `queue_proposal`.
     offered_proposal: Option<(Vec<u8>, Vec<u8>, Vec<u8>)>,
     /// The app-approved proposal awaiting our next commit: `(digest, proposing)`.
-    queued_proposal: Option<(Vec<u8>, Vec<u8>)>,
-    /// Staged rotation candidates, oldest → newest (window `CANDIDATE_WINDOW`). Frames
-    /// in flight may each propose a different candidate, and the peer's commit picks
-    /// the winner — so every in-flight candidate's minted principal is retained until
-    /// canonicalization prunes them all.
+    /// The one app-approved peer proposal awaiting our next commit: `(digest,
+    /// proposing, proposal bytes)`. Validated and **un-cached** at `queue_proposal`
+    /// time (nothing lingers in the send group's cache), then re-applied to the send
+    /// group at commit — so replacing the slot is a clean overwrite and only ever one
+    /// Update is folded. Single occupancy, latest-wins, cleared on a recv-epoch advance.
+    queued_proposal: Option<(Vec<u8>, Vec<u8>, Vec<u8>)>,
+    /// In-flight rotation candidates, oldest → newest, admission-bounded at
+    /// `CANDIDATE_WINDOW`. Frames in flight may each propose a different candidate and
+    /// the peer's commit picks the winner, so a proposed candidate's principal is
+    /// **never evicted** — it is retained until canonicalization prunes the whole set
+    /// (dropping a still-committable candidate would strand the session: the peer could
+    /// commit a credential whose signing key we no longer hold).
     staged_candidates: Vec<Arc<TwoMlsPqPrincipal>>,
+    /// A single deferred rotation request parked while `staged_candidates` is full
+    /// (id only; the principal is minted on promotion). Bounding the in-flight pool by
+    /// deferral rather than eviction keeps every sent candidate committable. Promoted —
+    /// and proposed in place of the default self-refresh — on the next routine round
+    /// once a canonicalization frees a window slot. A newer `stage_rotation` replaces
+    /// it (a deferred id was never on the wire).
+    deferred_candidate: Option<Vec<u8>>,
     /// The session-canonical Authentication Service state (both parties' credential
     /// sequences). Every client this session drives resolves to it via its rebindable
     /// `AuthView` — the auth analogue of `track_psk_stores`.
@@ -451,13 +465,16 @@ mod archive_wire {
         pub(super) message: Vec<u8>,
     }
 
-    /// The app-approved proposal awaiting our next commit.
+    /// The app-approved proposal awaiting our next commit (digest, proposing, and the
+    /// proposal message bytes re-applied at commit).
     #[derive(MlsSize, MlsEncode, MlsDecode)]
     pub(super) struct WireQueuedProposal {
         #[mls_codec(with = "mls_rs_codec::byte_vec")]
         pub(super) digest: Vec<u8>,
         #[mls_codec(with = "mls_rs_codec::byte_vec")]
         pub(super) proposing: Vec<u8>,
+        #[mls_codec(with = "mls_rs_codec::byte_vec")]
+        pub(super) proposal: Vec<u8>,
     }
 
     /// A session-owned signing identity on the wire: the ClientId, each MLS half's signing
@@ -563,6 +580,8 @@ mod archive_wire {
         /// Rotation candidates staged by `stage_rotation` and not yet resolved: the
         /// minted successor identities, rebuilt on restore into `staged_candidates`.
         pub(super) staged_candidates: Vec<SigningIdentityBlob>,
+        /// A parked next-rotation request (id only) not yet promoted to in-flight.
+        pub(super) deferred_candidate: Option<Vec<u8>>,
         /// The Authentication Service state: both parties' credential sequences.
         pub(super) auth_mine: WirePartySequence,
         pub(super) auth_theirs: WirePartySequence,
@@ -873,8 +892,8 @@ impl TwoMlsPqSession {
         send.classical
             .apply_pending_commit()
             .map_err(|_| TwoMlsPqError::Mls)?;
-        // Any cached peer proposal rode this commit: reject a roster change (only an
-        // Update is legitimate there).
+        // The bind is a bare PSK commit (the queued peer proposal is not cached — it is
+        // re-applied only at the routine fold), so the roster is unchanged; assert it.
         apq::ensure_two_party(&send.classical)?;
         // The bind consumed the one-shot apq PSK; drop it from every store it was
         // registered into (the session registry plus the group-captured handles).
@@ -890,6 +909,12 @@ impl TwoMlsPqSession {
             .map_err(|_| TwoMlsPqError::Mls)?
             .to_bytes()
             .map_err(|_| TwoMlsPqError::Mls)?;
+        // This commit advanced our send-group epoch, so any queued or offered peer
+        // proposal (an Update bound to the prior send epoch) is now stale and cannot be
+        // committed — drop it. The peer re-proposes at the new epoch once it observes
+        // this bind's staple (the receiver freely drops; the proposer re-sends).
+        inner.queued_proposal = None;
+        inner.offered_proposal = None;
         // Our send group advanced: record the new epoch's PSK in the session ledger.
         inner.remember_send_psk()?;
         // The bind's classical commit becomes the staple subsequent message frames
@@ -1784,6 +1809,19 @@ impl SessionInner {
                     None
                 }
             };
+            // Re-apply the one approved peer proposal (validated and un-cached at
+            // `queue_proposal`), so the commit folds exactly it — build immediately, so
+            // only ever one Update is cached at build time.
+            if let Some((_, _, proposal_bytes)) = &folded {
+                let msg = MlsMessage::from_bytes(proposal_bytes).map_err(|_| TwoMlsPqError::Mls)?;
+                let send = self
+                    .send_group
+                    .as_mut()
+                    .ok_or(TwoMlsPqError::SessionNotReady)?;
+                send.classical
+                    .process_incoming_message(msg)
+                    .map_err(map_credential_err)?;
+            }
             let commit_output = {
                 let send = self
                     .send_group
@@ -1816,7 +1854,7 @@ impl SessionInner {
             }
             // OUR commit of the peer's approved Upd is the canonical step of THEIR
             // credential sequence: the committed credential defines their next identity.
-            if let Some((_, proposing)) = &folded {
+            if let Some((_, proposing, _)) = &folded {
                 if *proposing != self.their_state.client_id().bytes {
                     self.with_auth(|core| core.theirs.commit(proposing.clone()));
                     self.their_state = PrincipalState::Sync {
@@ -1841,6 +1879,26 @@ impl SessionInner {
         // the recv-group leaf still lags it (converging e.g. the dedicated
         // establishment principal into the founding leaf); otherwise a plain key
         // refresh of the unchanged leaf.
+        // Steer a deferred rotation onto this round: when the app did not explicitly
+        // select a candidate and a slot has freed (a prior canonicalization cleared the
+        // pool), promote the parked request — mint, admit, authorize — and propose it
+        // this round in place of the default self-refresh.
+        let selected = match selected {
+            Some(id) => Some(id),
+            None if self.staged_candidates.len() < CANDIDATE_WINDOW => {
+                match self.deferred_candidate.take() {
+                    Some(id) => {
+                        let candidate = TwoMlsPqPrincipal::new(id.clone())?;
+                        candidate.combiner().auth_view().rebind(&self.auth_core);
+                        self.with_auth(|core| core.mine.authorize(id.clone()));
+                        self.staged_candidates.push(candidate);
+                        Some(ClientId { bytes: id })
+                    }
+                    None => None,
+                }
+            }
+            None => None,
+        };
         let proposing_client = match &selected {
             Some(id) => Some(Arc::clone(
                 self.staged_candidates
@@ -1944,6 +2002,7 @@ fn build_session(
             offered_proposal: None,
             queued_proposal: None,
             staged_candidates: Vec::new(),
+            deferred_candidate: None,
             auth_core,
             pq_inflight: None,
             session_id,
@@ -2457,8 +2516,11 @@ impl TwoMlsPqSession {
                 offered_proposal: wire
                     .offered_proposal
                     .map(|o| (o.digest, o.proposal, o.proposing)),
-                queued_proposal: wire.queued_proposal.map(|q| (q.digest, q.proposing)),
+                queued_proposal: wire
+                    .queued_proposal
+                    .map(|q| (q.digest, q.proposing, q.proposal)),
                 staged_candidates,
+                deferred_candidate: wire.deferred_candidate,
                 auth_core: auth_core_restored,
                 pq_inflight,
                 session_id: SessionId {
@@ -3195,77 +3257,80 @@ impl TwoMlsPqSession {
             None => None,
         };
 
-        let archive = archive_wire::SessionArchive {
-            session_id: inner.session_id.bytes.clone(),
-            client,
-            my_state: wire_principal_state(&inner.my_state),
-            their_state: wire_principal_state(&inner.their_state),
-            pq_turn_mine: inner.pq_turn_mine,
-            spawn_token: inner.spawn_token.clone(),
-            send_group,
-            recv_group,
-            send_psk_ledger: inner
-                .send_psk_ledger
-                .iter()
-                .map(|(id, psk)| archive_wire::PskEntry {
-                    id: id.clone(),
-                    psk: psk.clone(),
-                })
-                .collect(),
-            retired_send_psks: inner.retired_send_psks.clone(),
-            listen_rendezvous: inner
-                .listen_rendezvous
-                .iter()
-                .map(|(&epoch, addr)| archive_wire::ListenEntry {
-                    epoch,
-                    addr: addr.clone(),
-                })
-                .collect(),
-            recv_header_keys: inner
-                .recv_header_keys
-                .iter()
-                .map(|(&epoch, key)| archive_wire::HeaderKeyEntry {
-                    epoch,
-                    key: key.clone(),
-                })
-                .collect(),
-            recv_header_keys_pq: inner
-                .recv_header_keys_pq
-                .iter()
-                .map(|(&epoch, key)| archive_wire::HeaderKeyEntry {
-                    epoch,
-                    key: key.clone(),
-                })
-                .collect(),
-            pending_outbound: inner.pending_outbound.clone(),
-            pending_proposal_hash: inner.pending_proposal_hash.clone(),
-            current_staple: inner.current_staple.clone(),
-            pending_proposal_message: inner.pending_proposal_message.as_ref().map(
-                |(proposing, message)| archive_wire::WireStagedProposal {
-                    proposing: proposing.clone(),
-                    message: message.clone(),
-                },
-            ),
-            joined_welcome_digest: inner.joined_welcome_digest.clone(),
-            offered_proposal: inner.offered_proposal.as_ref().map(
-                |(digest, proposal, proposing)| archive_wire::OfferedProposal {
-                    digest: digest.clone(),
-                    proposal: proposal.clone(),
-                    proposing: proposing.clone(),
-                },
-            ),
-            queued_proposal: inner.queued_proposal.as_ref().map(|(digest, proposing)| {
-                archive_wire::WireQueuedProposal {
-                    digest: digest.clone(),
-                    proposing: proposing.clone(),
-                }
-            }),
-            staged_candidates,
-            auth_mine,
-            auth_theirs,
-            pending_pq_outbound: inner.pending_pq_outbound.clone(),
-            pq_inflight,
-        };
+        let archive =
+            archive_wire::SessionArchive {
+                session_id: inner.session_id.bytes.clone(),
+                client,
+                my_state: wire_principal_state(&inner.my_state),
+                their_state: wire_principal_state(&inner.their_state),
+                pq_turn_mine: inner.pq_turn_mine,
+                spawn_token: inner.spawn_token.clone(),
+                send_group,
+                recv_group,
+                send_psk_ledger: inner
+                    .send_psk_ledger
+                    .iter()
+                    .map(|(id, psk)| archive_wire::PskEntry {
+                        id: id.clone(),
+                        psk: psk.clone(),
+                    })
+                    .collect(),
+                retired_send_psks: inner.retired_send_psks.clone(),
+                listen_rendezvous: inner
+                    .listen_rendezvous
+                    .iter()
+                    .map(|(&epoch, addr)| archive_wire::ListenEntry {
+                        epoch,
+                        addr: addr.clone(),
+                    })
+                    .collect(),
+                recv_header_keys: inner
+                    .recv_header_keys
+                    .iter()
+                    .map(|(&epoch, key)| archive_wire::HeaderKeyEntry {
+                        epoch,
+                        key: key.clone(),
+                    })
+                    .collect(),
+                recv_header_keys_pq: inner
+                    .recv_header_keys_pq
+                    .iter()
+                    .map(|(&epoch, key)| archive_wire::HeaderKeyEntry {
+                        epoch,
+                        key: key.clone(),
+                    })
+                    .collect(),
+                pending_outbound: inner.pending_outbound.clone(),
+                pending_proposal_hash: inner.pending_proposal_hash.clone(),
+                current_staple: inner.current_staple.clone(),
+                pending_proposal_message: inner.pending_proposal_message.as_ref().map(
+                    |(proposing, message)| archive_wire::WireStagedProposal {
+                        proposing: proposing.clone(),
+                        message: message.clone(),
+                    },
+                ),
+                joined_welcome_digest: inner.joined_welcome_digest.clone(),
+                offered_proposal: inner.offered_proposal.as_ref().map(
+                    |(digest, proposal, proposing)| archive_wire::OfferedProposal {
+                        digest: digest.clone(),
+                        proposal: proposal.clone(),
+                        proposing: proposing.clone(),
+                    },
+                ),
+                queued_proposal: inner.queued_proposal.as_ref().map(
+                    |(digest, proposing, proposal)| archive_wire::WireQueuedProposal {
+                        digest: digest.clone(),
+                        proposing: proposing.clone(),
+                        proposal: proposal.clone(),
+                    },
+                ),
+                staged_candidates,
+                deferred_candidate: inner.deferred_candidate.clone(),
+                auth_mine,
+                auth_theirs,
+                pending_pq_outbound: inner.pending_pq_outbound.clone(),
+                pq_inflight,
+            };
 
         // Exact-size preallocation: a growing Vec would strand unwiped partial copies of
         // the secrets in freed allocations. The final `Archive.bytes` handed across the
@@ -3295,43 +3360,59 @@ impl TwoMlsPqSession {
             inner.offered_proposal = Some((offered, proposal_bytes, proposing));
             return Err(TwoMlsPqError::ProposalRejected);
         }
-        // Approving the proposal IS the app's authorization of the credential it
-        // carries (the running tally: a later queue replaces this authorization when
-        // the commit hasn't happened yet).
-        inner.with_auth(|core| core.theirs.authorize(proposing.clone()));
+        // Validate the proposal, then leave the send group's cache untouched. Only
+        // `process_incoming_message` authenticates the sender's signature and leaf — and
+        // it caches the proposal — so process to validate, then immediately
+        // `clear_proposal_cache`. The session's single queued slot is the source of
+        // truth; the approved proposal is re-applied to the group at commit. So a
+        // rejected call mutates nothing (no lingering authorization, no cached Update to
+        // poison the next commit), and replacing the slot is a clean overwrite (the
+        // previous approval left nothing cached — avoiding the two-Update `BadUpdate`).
         let msg = MlsMessage::from_bytes(&proposal_bytes).map_err(|_| TwoMlsPqError::Mls)?;
         let send = inner
             .send_group
             .as_mut()
             .ok_or(TwoMlsPqError::SessionNotReady)?;
         let my_index = send.classical.current_member_index();
-        match send
-            .classical
-            .process_incoming_message(msg)
-            .map_err(map_credential_err)?
-        {
-            // The only proposal a peer legitimately sends is an Update of its OWN
-            // leaf. Reject anything else at ingest, before it enters the commit cache
-            // — the rules filter would veto the eventual commit anyway, but this
-            // fails early with a precise error. The frame-declared candidate identity
-            // must be the credential the Update's leaf actually carries.
-            ReceivedMessage::Proposal(desc) => {
-                require_peer_update(&desc, my_index)?;
-                let leaf_id = match &desc.proposal {
-                    Proposal::Update(update) => match &update.signing_identity().credential {
-                        mls_rs::identity::Credential::Basic(basic) => basic.identifier.clone(),
-                        _ => return Err(TwoMlsPqError::ProposalRejected),
-                    },
-                    _ => return Err(TwoMlsPqError::ProposalRejected),
-                };
-                if leaf_id != proposing {
-                    return Err(TwoMlsPqError::ProposalRejected);
-                }
-            }
+        let processed = send.classical.process_incoming_message(msg);
+        send.classical.clear_proposal_cache();
+        // The only proposal a peer legitimately sends is an Update of its OWN leaf, and
+        // the frame-declared candidate must be the credential the Update's leaf actually
+        // carries. Reject anything else — after the cache is already cleared.
+        let desc = match processed.map_err(map_credential_err)? {
+            ReceivedMessage::Proposal(desc) => desc,
             _ => return Err(TwoMlsPqError::Mls),
+        };
+        require_peer_update(&desc, my_index)?;
+        let leaf_id = match &desc.proposal {
+            Proposal::Update(update) => match &update.signing_identity().credential {
+                mls_rs::identity::Credential::Basic(basic) => basic.identifier.clone(),
+                _ => return Err(TwoMlsPqError::ProposalRejected),
+            },
+            _ => return Err(TwoMlsPqError::ProposalRejected),
+        };
+        if leaf_id != proposing {
+            return Err(TwoMlsPqError::ProposalRejected);
         }
-        inner.queued_proposal = Some((digest, proposing));
+        // Validation passed: approving the proposal IS the app's authorization of the
+        // credential it carries (the running tally — a later queue replaces both the
+        // authorization and the queued proposal while no commit has happened).
+        inner.with_auth(|core| core.theirs.authorize(proposing.clone()));
+        inner.queued_proposal = Some((digest, proposing, proposal_bytes));
         Ok(())
+    }
+
+    /// The remote credential currently queued for the next commit (the app's running
+    /// tally), or `None`. Lets the app decide whether a newly-received proposal should
+    /// replace it (queue the newer one) or be kept (do nothing); the library's own
+    /// policy is latest-wins, and the slot is cleared when the recv epoch advances.
+    pub fn queued_remote_successor(&self) -> Option<ClientId> {
+        self.lock()
+            .queued_proposal
+            .as_ref()
+            .map(|(_, proposing, _)| ClientId {
+                bytes: proposing.clone(),
+            })
     }
 
     /// Stage a new principal for the next rotation commit, minting its signing keys
@@ -3350,22 +3431,30 @@ impl TwoMlsPqSession {
             return Err(TwoMlsPqError::InvalidClientId);
         }
         let mut inner = self.lock();
+        // Already in flight, or already the parked next request → no-op.
         if inner
             .staged_candidates
             .iter()
             .any(|staged| staged.client_id().bytes == new_client_id)
+            || inner.deferred_candidate.as_deref() == Some(new_client_id.as_slice())
         {
             return Ok(());
         }
-        let candidate = TwoMlsPqPrincipal::new(new_client_id.clone())?;
-        // The candidate's clients resolve to the session-canonical AS core, and the id
-        // becomes an app-authorized successor for OUR sequence — the peer's provider
-        // learns it from the proposal we send, ours needs it for the local commit apply.
-        candidate.combiner().auth_view().rebind(&inner.auth_core);
-        inner.with_auth(|core| core.mine.authorize(new_client_id.clone()));
-        inner.staged_candidates.push(candidate);
-        while inner.staged_candidates.len() > CANDIDATE_WINDOW {
-            inner.staged_candidates.remove(0);
+        if inner.staged_candidates.len() < CANDIDATE_WINDOW {
+            // Admit into the in-flight pool: mint, rebind the candidate's clients to the
+            // session-canonical AS core, and authorize the id for OUR sequence (the peer's
+            // provider learns it from the proposal we send; ours needs it for the local
+            // commit apply). It is proposable this round via `prepare_to_encrypt(Some(id))`.
+            let candidate = TwoMlsPqPrincipal::new(new_client_id.clone())?;
+            candidate.combiner().auth_view().rebind(&inner.auth_core);
+            inner.with_auth(|core| core.mine.authorize(new_client_id.clone()));
+            inner.staged_candidates.push(candidate);
+        } else {
+            // Pool full — never evict a sent candidate. Park this request in the single
+            // deferred slot; it is promoted and proposed on the next routine round once a
+            // canonicalization frees a slot. Not authorized yet (it is not on the wire),
+            // keeping `mine.authorized_next` aligned with the retained principals.
+            inner.deferred_candidate = Some(new_client_id.clone());
         }
         let old = inner.my_state.client_id();
         inner.my_state = PrincipalState::Pending {
@@ -3676,6 +3765,180 @@ mod tests {
             party.my_principal_state(),
             PrincipalState::Sync { .. }
         ));
+    }
+
+    /// Approving a proposal, then approving a different one before committing, folds
+    /// only the second (no two-Update `BadUpdate`): `queue_proposal` un-caches, so the
+    /// replaced tally leaves nothing in the send-group cache. `queued_remote_successor`
+    /// reflects the replacement.
+    #[test]
+    fn test_queue_proposal_replace_tally() {
+        let (alice, bob) = establish_confirmed_sessions();
+        // Alice stages two candidates and proposes each on its own frame.
+        let id1 = make_client().client_id();
+        let id2 = make_client().client_id();
+        assert_ok!(alice.stage_rotation(id1.bytes.clone()));
+        assert_ok!(alice.prepare_to_encrypt(Some(id1.clone())));
+        let f1 = assert_ok!(alice.encrypt(b"c1".to_vec()));
+        assert_ok!(alice.stage_rotation(id2.bytes.clone()));
+        assert_ok!(alice.prepare_to_encrypt(Some(id2.clone())));
+        let f2 = assert_ok!(alice.encrypt(b"c2".to_vec()));
+
+        // Bob approves c1, then c2 (replace) before committing.
+        let g1 = assert_some!(assert_ok!(bob.process_incoming(f1.cipher_text)));
+        assert_ok!(bob.queue_proposal(assert_some!(g1.proposal).digest));
+        assert_eq!(bob.queued_remote_successor(), Some(id1.clone()));
+        let g2 = assert_some!(assert_ok!(bob.process_incoming(f2.cipher_text)));
+        assert_ok!(bob.queue_proposal(assert_some!(g2.proposal).digest));
+        assert_eq!(bob.queued_remote_successor(), Some(id2.clone()));
+
+        // The commit folds only c2 (no BadUpdate) and canonicalizes c2.
+        assert!(assert_ok!(bob.prepare_to_encrypt(None)).did_commit);
+        assert_eq!(bob.their_principal_state().client_id(), id2);
+        assert!(bob.queued_remote_successor().is_none());
+        let staple = assert_ok!(bob.encrypt(b"commit".to_vec()));
+        let res = assert_some!(assert_ok!(alice.process_incoming(staple.cipher_text)));
+        assert_eq!(assert_some!(res.remote_commit).new_recipient, id2);
+        assert_eq!(alice.my_principal_state().client_id(), id2);
+    }
+
+    /// A proposal whose self-describing candidate id does not match the Update's actual
+    /// leaf is rejected, and the rejection is a **no-op**: nothing is authorized, nothing
+    /// is cached, and a subsequent honest approval + commit still succeeds.
+    #[test]
+    fn test_queue_proposal_declared_mismatch_is_noop() {
+        let (alice, bob) = establish_confirmed_sessions();
+        // Craft a frame whose declared `proposing` differs from the Upd's leaf: stage a
+        // real candidate (leaf carries id_real) but relabel the section as id_fake.
+        let id_real = make_client().client_id();
+        assert_ok!(alice.stage_rotation(id_real.bytes.clone()));
+        assert_ok!(alice.prepare_to_encrypt(Some(id_real.clone())));
+        let frame = assert_ok!(alice.encrypt(b"real".to_vec()));
+
+        // Open Alice's frame on Bob, decode the proposal section, relabel `proposing`,
+        // re-encode, re-seal — a hostile/buggy sender.
+        let opened = assert_some!(assert_ok!(bob.open_incoming(frame.cipher_text.clone())));
+        let (staple, section, app) = super::decode_message_frame(&opened.frame).unwrap();
+        let (_declared, proposal_msg) = super::decode_proposal_section(&section).unwrap();
+        let id_fake = make_client().client_id().bytes;
+        let bad_section = super::encode_proposal_section(&id_fake, &proposal_msg);
+        let bad_frame = super::encode_message_frame(&staple, bad_section, app);
+        let bad_sealed = alice.lock().seal(&bad_frame).unwrap();
+
+        let got = assert_some!(assert_ok!(bob.process_incoming(bad_sealed)));
+        let offered = assert_some!(got.proposal);
+        assert_eq!(offered.proposing.bytes, id_fake);
+        // Approving the mismatched offer is rejected, and leaves NO state behind.
+        assert_err!(
+            bob.queue_proposal(offered.digest),
+            TwoMlsPqError::ProposalRejected
+        );
+        assert!(bob.queued_remote_successor().is_none());
+
+        // An honest round still commits cleanly afterward (no poisoned cache / auth):
+        // Alice re-proposes id_real on a FRESH frame (the mislabelled one's app message
+        // was already consumed).
+        assert_ok!(alice.prepare_to_encrypt(Some(id_real.clone())));
+        let honest = assert_ok!(alice.encrypt(b"honest".to_vec()));
+        let g2 = assert_some!(assert_ok!(bob.process_incoming(honest.cipher_text)));
+        let real = assert_some!(g2.proposal);
+        assert_eq!(real.proposing, id_real);
+        assert_ok!(bob.queue_proposal(real.digest));
+        assert!(assert_ok!(bob.prepare_to_encrypt(None)).did_commit);
+        assert_eq!(bob.their_principal_state().client_id(), id_real);
+    }
+
+    /// The queued tally is epoch-scoped: an A.3 bind advances our send epoch, so the
+    /// queued peer proposal (bound to the prior epoch) is dropped rather than committed
+    /// stale on the next fold.
+    #[test]
+    fn test_queued_proposal_cleared_on_bind() {
+        let (alice, bob) = establish_full();
+        // Bob proposes a candidate; Alice approves it (the running tally).
+        let id_b = make_client().client_id();
+        assert_ok!(bob.stage_rotation(id_b.bytes.clone()));
+        assert_ok!(bob.prepare_to_encrypt(Some(id_b.clone())));
+        let f = assert_ok!(bob.encrypt(b"propose".to_vec()));
+        let got = assert_some!(assert_ok!(alice.process_incoming(f.cipher_text)));
+        assert_ok!(alice.queue_proposal(assert_some!(got.proposal).digest));
+        assert_eq!(alice.queued_remote_successor(), Some(id_b));
+
+        // Alice (the PQ initiator after A.4) runs an A.3 ratchet: the bind commits on her
+        // send group, advancing its epoch and clearing the now-stale tally.
+        let ek = assert_ok!(alice.pq_ratchet_begin());
+        assert_ok!(bob.pq_ratchet_respond(ek));
+        let ct = assert_some!(bob.pq_take_pending_outbound());
+        assert_ok!(alice.pq_ratchet_bind(ct, b"app".to_vec()));
+        assert!(alice.queued_remote_successor().is_none());
+    }
+
+    /// A candidate that was proposed on the wire is never evicted: staging beyond the
+    /// in-flight window defers overflow rather than dropping a sent candidate, so the
+    /// peer can commit the very first one and the proposer still holds its principal.
+    /// (This is the adversarial-review repro, now resolved.)
+    #[test]
+    fn test_sent_candidate_not_evicted() {
+        let (alice, bob) = establish_confirmed_sessions();
+        let mut ids = Vec::new();
+        let mut first_frame = None;
+        // Stage super::CANDIDATE_WINDOW + 2 candidates. Only the first super::CANDIDATE_WINDOW are in
+        // flight (proposable); the rest defer.
+        for i in 0..(super::CANDIDATE_WINDOW + 2) {
+            let id = make_client().client_id();
+            assert_ok!(alice.stage_rotation(id.bytes.clone()));
+            if i < super::CANDIDATE_WINDOW {
+                assert_ok!(alice.prepare_to_encrypt(Some(id.clone())));
+                let frame = assert_ok!(alice.encrypt(format!("cand{i}").into_bytes()));
+                if i == 0 {
+                    first_frame = Some(frame);
+                }
+            }
+            ids.push(id);
+        }
+        // The peer commits the FIRST candidate — not evicted despite two later stages.
+        let got = assert_some!(assert_ok!(
+            bob.process_incoming(assert_some!(first_frame).cipher_text)
+        ));
+        let offered = assert_some!(got.proposal);
+        assert_eq!(offered.proposing, ids[0]);
+        assert_ok!(bob.queue_proposal(offered.digest));
+        assert!(assert_ok!(bob.prepare_to_encrypt(None)).did_commit);
+        let staple = assert_ok!(bob.encrypt(b"commit".to_vec()));
+        // Alice canonicalizes onto ids[0] cleanly — no CredentialRejected, no desync.
+        let res = assert_some!(assert_ok!(alice.process_incoming(staple.cipher_text)));
+        assert_eq!(assert_some!(res.remote_commit).new_recipient, ids[0]);
+        assert_eq!(alice.my_principal_state().client_id(), ids[0]);
+    }
+
+    /// After a canonicalization frees a window slot, a deferred candidate is promoted
+    /// and proposed on the next routine round without an explicit selection.
+    #[test]
+    fn test_deferred_candidate_promoted_next_round() {
+        let (alice, bob) = establish_confirmed_sessions();
+        // Fill the window and defer one more.
+        let mut ids = Vec::new();
+        for _ in 0..(super::CANDIDATE_WINDOW + 1) {
+            ids.push(make_client().client_id());
+        }
+        for id in &ids {
+            assert_ok!(alice.stage_rotation(id.bytes.clone()));
+        }
+        let deferred = ids.last().unwrap().clone();
+        // Propose + commit the first in-flight candidate to clear the pool.
+        assert_ok!(alice.prepare_to_encrypt(Some(ids[0].clone())));
+        let f = assert_ok!(alice.encrypt(b"c0".to_vec()));
+        let got = assert_some!(assert_ok!(bob.process_incoming(f.cipher_text)));
+        assert_ok!(bob.queue_proposal(assert_some!(got.proposal).digest));
+        assert!(assert_ok!(bob.prepare_to_encrypt(None)).did_commit);
+        let staple = assert_ok!(bob.encrypt(b"commit".to_vec()));
+        assert_some!(assert_ok!(alice.process_incoming(staple.cipher_text)));
+        assert_eq!(alice.my_principal_state().client_id(), ids[0]);
+
+        // The window is now clear. A plain routine round auto-proposes the deferred id.
+        assert_ok!(alice.prepare_to_encrypt(None));
+        let f2 = assert_ok!(alice.encrypt(b"routine".to_vec()));
+        let got2 = assert_some!(assert_ok!(bob.process_incoming(f2.cipher_text)));
+        assert_eq!(assert_some!(got2.proposal).proposing, deferred);
     }
 
     /// Different frames may propose different candidates; the peer's commit picks the

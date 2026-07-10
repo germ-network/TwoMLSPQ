@@ -103,6 +103,14 @@ pub fn version() -> String {
 // `CredentialRejected` (AS refusal, retryable from a staple). The session archive
 // carries the AS sequences and staged candidates (SESSION_ARCHIVE_VERSION -> 5; v4
 // blobs fail ArchiveInvalid per prerelease policy).
+// Also in v9 (2026-07-10, candidate lifecycle): staged rotation candidates are never
+// evicted (a sent candidate the peer may still commit is retained until
+// canonicalization); overflow beyond the in-flight window parks in a single deferred
+// slot and is proposed on the next routine round. `queue_proposal` validates then
+// `clear_proposal_cache`s (nothing is cached until the fold re-applies it), so a
+// rejected call is a no-op and replacing the running tally is a clean overwrite; the
+// tally is dropped when the send epoch advances via an A.3 bind. New exported getter
+// `queued_remote_successor() -> Option<ClientId>` surfaces the current tally.
 const BINDING_CONTRACT_VERSION: u64 = 9;
 
 /// See `BINDING_CONTRACT_VERSION`. Exported so the Swift layer can verify the

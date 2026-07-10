@@ -137,7 +137,12 @@ tally), and its next commit **canonicalizes** it: `committed_remote_client_id` a
 commit staple's return canonicalizes the proposer (`remote_commit.new_recipient`,
 `my_principal_state` → `Sync { new }`, the session swaps to the winning principal).
 Because rotation rides the proposal slot, it can be offered on the very first frame —
-it can never displace the welcome staple.
+it can never displace the welcome staple. A candidate proposed on the wire is never
+dropped (the peer may commit any of them); staging beyond the in-flight window parks
+the request in a single deferred slot and proposes it on the next routine round once a
+slot frees. On the receiver, `queue_proposal` is a single-occupancy latest-wins tally
+(`queued_remote_successor()` reveals it), epoch-locked so it is dropped when the send
+epoch advances by an A.3 bind.
 
 The winner's other leaves **lag and catch up**: the proposer's own send-group leaf
 moves at its next approved commit (the peer observes `new_sender` on that staple, and

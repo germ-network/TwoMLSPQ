@@ -114,11 +114,14 @@ State: `is_established`, `is_fully_established`, `has_receive_group`,
 Messaging: `prepare_to_encrypt(proposing)` — `Some(id)` selects which staged rotation
 candidate this round's Upd proposes (`None` re-proposes the current identity; the
 commit path is unchanged); `encrypt`; `process_incoming`; `proposal_context`;
-`queue_proposal` — approving the peer's Upd also authorizes the credential it carries
-(`QueuedRemoteProposal.proposing`, the candidate identity, surfaced before the
-proposal touches any group); `stage_rotation` — mints a successor candidate
-(re-staging adds candidates; the peer's commit picks the winner). See
-[Group Rules](./group-rules.md) for the Authentication Service semantics.
+`queue_proposal` — approve the peer's Upd (single-occupancy running tally,
+latest-wins; validates then leaves the proposal cache untouched, so a rejected call is
+a no-op and a replacement never doubles up; dropped when the send epoch advances via an
+A.3 bind); `queued_remote_successor() -> Option<ClientId>` — the credential currently
+queued, for the app's replace policy; `stage_rotation` — mints a successor candidate
+(re-staging adds candidates, never evicting a sent one; overflow beyond the in-flight
+window defers to a single slot and is proposed next round; the peer's commit picks the
+winner). See [Group Rules](./group-rules.md) for the Authentication Service semantics.
 
 Header encryption: `open_incoming(blob) -> Option<OpenedFrame { kind, frame }>` removes
 the outer seal from a rendezvous-channel blob and returns the plaintext `frame` plus a
