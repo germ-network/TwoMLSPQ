@@ -357,9 +357,10 @@ struct ForwardRoutingDemo {
 		guard try remoteSession.forwarded(headerDecrypted: mlsMessageData) == nil else {
 			throw TestErrors.unexpected
 		}
-		//a mis-routed forward is refused (the initiator session has no spawn token)
-		guard (try? localSession.forwarded(headerDecrypted: mlsMessageData)) == nil else {
-			throw TestErrors.unexpected
+		//a mis-routed forward is refused: an initiator-side session has no spawn token,
+		//so `forwarded` must *throw* (SessionNotReady) — not silently return nil.
+		#expect(throws: (any Error).self) {
+			try localSession.forwarded(headerDecrypted: mlsMessageData)
 		}
 
 		//forwarding survives invitation archive/restore
@@ -428,6 +429,82 @@ struct SessionArchiveDemo {
 		// not the now-archived `remoteSession`.
 		try localSession.send(to: restored)
 		try restored.send(to: localSession)
+	}
+}
+
+//The suite classifier: a combiner blob reports its PQ half; anything unparseable
+//collapses to the `0` sentinel (0 is not an advertised suite).
+struct CipherSuiteParsingTests {
+	@Test func combinerKeyPackageReportsItsPqSuite() throws {
+		let invitation = try AbstractTwoMLS.PQInvitation(
+			archive: try AbstractTwoMLS.PQClient(clientId: .mock()).makeInvitation()
+		)
+		let suite = AbstractTwoMLS.PQClient.parseKeyPackageSuite(
+			encoded: invitation.encodedKeyPackage
+		)
+		#expect(suite == 0xFDEA)  // ML-KEM-768
+		#expect(AbstractTwoMLS.PQClient.supportedSuites.contains(suite))
+	}
+
+	@Test func supportedSuitesAreTheCombinerPair() {
+		//0x0003 = X25519+ChaCha20Poly1305 (classical), 0xFDEA = ML-KEM-768 (pq)
+		#expect(AbstractTwoMLS.PQClient.supportedSuites == [0x0003, 0xFDEA])
+	}
+
+	@Test func unparseableKeyPackageYieldsZeroSentinel() {
+		#expect(
+			AbstractTwoMLS.PQClient.parseKeyPackageSuite(
+				encoded: Data([0xDE, 0xAD, 0xBE, 0xEF])) == 0
+		)
+		#expect(!AbstractTwoMLS.PQClient.supportedSuites.contains(0))
+	}
+}
+
+//`createTwoMLSGroup` binds the published key package to the identity the app is
+//addressing, refusing before it seals the AppWelcome to a stranger. (The receive-side
+//counterpart is covered by PQInvitationTests.receiveRejectsMismatchedIdentity.)
+struct InitiatorIdentityBindingDemo {
+	@Test func createGroupRejectsMismatchedRemoteIdentity() throws {
+		let acceptor = try ClientWrapper<AbstractTwoMLS.PQClient>()
+		let initiator = try AbstractTwoMLS.PQClient(clientId: .mock())
+		let (sendGroup, _, _) = try initiator.reply(
+			keyPackageMessage: acceptor.currentInvitation.encodedKeyPackage
+		)
+		do {
+			_ = try initiator.createTwoMLSGroup(
+				remoteAgentId: .mock(),  // not the acceptor's authenticated id
+				mySendGroup: sendGroup,
+				theirKeyPackageMessage: acceptor.currentInvitation.encodedKeyPackage,
+				appWelcome: Data("welcome".utf8)
+			)
+			Issue.record("expected remoteIdentityMismatch")
+		} catch TwoMLSPQConformanceError.remoteIdentityMismatch {
+			// expected
+		}
+	}
+}
+
+//The defining last-resort capability: one invitation onboards more than one distinct
+//initiator, each pairing establishing and exchanging independently. (`lastResort: true`
+//is hardcoded in PQClient.makeInvitation / PQInvitation.init.)
+struct LastResortReuseDemo {
+	@Test func oneInvitationEstablishesWithTwoDistinctRemotes() throws {
+		let acceptor = try ClientWrapper<AbstractTwoMLS.PQClient>()
+
+		for _ in 0..<2 {
+			let initiator = try ClientWrapper<AbstractTwoMLS.PQClient>()
+			let (initiatorSession, encryptedCombinedWelcome) = try initiator.client.reply(
+				remoteClientId: acceptor.clientId,
+				encodedRemoteKpkg: acceptor.currentInvitation.encodedKeyPackage
+			)
+			let (acceptorSession, _) = try acceptor.currentInvitation.receiveReply(
+				ciphertext: encryptedCombinedWelcome,
+				expecting: try initiator.clientId
+			)
+			//complete establishment and confirm a routine round-trip, per pairing
+			try acceptorSession.send(to: initiatorSession)
+			try initiatorSession.exchange(with: acceptorSession)
+		}
 	}
 }
 
