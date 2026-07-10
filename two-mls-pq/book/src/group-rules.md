@@ -22,9 +22,9 @@ reusable layer: an `MlsRules` filter every client is built with
    pins it to the peer.
 3. **External PSKs only.** PSK proposals carry the APQ and cross-party TwoMLS
    bindings; resumption PSKs are never used (this protocol never resumes groups).
-4. **Basic credentials only.** Each leaf's credential is the member's opaque
-   ClientId. (Credential *succession* rules — the TwoMLS Authentication Service —
-   land as the next layer on top of this chapter's structural rules.)
+4. **Basic credentials only, evolving along the app-defined sequence.** Each leaf's
+   credential is the member's opaque ClientId, and it may change only per the TwoMLS
+   Authentication Service (below).
 5. **Commit epoch must equal the receiver's current epoch.** Ahead is `EpochDesync`
    (reconnect territory); behind is an idempotent skip (the staple re-rides every
    frame).
@@ -68,8 +68,44 @@ Two properties worth naming:
 
 ## The Authentication Service
 
-Credential-succession rules (each leaf's credential as an app-defined sequence,
-candidates riding the classical ratchet's Upd proposals, the peer's commit defining
-the canonical next credential, with the PQ halves lagging) build on these structural
-rules — see the plan in this repository's tracking issue; the chapter section lands
-with that change.
+Each party's leaf credential evolves along an **app-defined sequence**, and the
+sequence is driven by the classical ratchet itself:
+
+1. **Candidates ride the Upd proposals.** `stage_rotation(new_id)` mints a successor
+   principal and authorizes it; `prepare_to_encrypt(Some(id))` selects which staged
+   candidate this frame's Upd(self) carries (its new leaf bears the candidate's
+   credential). Different frames may propose different candidates. The frame's
+   proposal section is self-describing — the receiver surfaces the candidate as
+   `QueuedRemoteProposal.proposing` *before* the proposal touches any group, and
+   `queue_proposal` verifies the declared identity against the Update's actual leaf.
+2. **The app's approval is the authorization.** `queue_proposal` is the running tally:
+   approving a proposal authorizes its credential as the peer's next; a later approval
+   replaces the tally.
+3. **The commit defines the canonical next credential.** When the receiver's commit
+   folds the chosen Upd, that credential becomes the sender's canonical identity
+   (`committed_remote_client_id`, `their_principal_state`). The staple back
+   canonicalizes the sender's own session onto the winning candidate
+   (`remote_commit.new_recipient`, `my_principal_state` → `Sync`); losing candidates'
+   authorizations expire.
+4. **Everything else lags and catches up.** The sender's own send-group leaf moves at
+   its next approved commit (the peer observes `new_sender`); the PQ leaves catch up
+   at the next A.4/A.5 handoff; the acceptor's recv-group leaf converges from the
+   invitation identity to the #48 dedicated principal via its first committed Upd.
+   The AS validates every catch-up against the sequence *history*
+   (`CREDENTIAL_HISTORY_WINDOW = 8` canonical steps) — a lagging leaf may only
+   fast-forward to an already-canonical credential; candidates are proposed and
+   canonicalized exclusively in the classical ratchet.
+
+Enforcement is the mls-rs `IdentityProvider` (`apq/src/authentication.rs`):
+`valid_successor` implements same-id / authorized-step / catch-up; `validate_member`
+whitelists known-or-authorized identities (with a one-shot adoption window strictly
+around a welcome join whose creator cannot be known in advance — the dedicated
+establishment principal, authenticated by the cross-party PSK); external senders are
+always rejected. Every client a session drives — invitation-derived, dedicated,
+staged candidates, restored — resolves to one session-canonical state through a
+rebindable view, and the sequences ride the session archive.
+
+A refusal surfaces as `CredentialRejected` and is **retryable** where it arises from
+a staple: the staple re-rides every frame, so approve-and-reprocess recovers the
+round. `new_sender` / `new_recipient` are event hints; `their_principal_state()` /
+`my_principal_state()` are the truth.

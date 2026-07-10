@@ -111,8 +111,14 @@ State: `is_established`, `is_fully_established`, `has_receive_group`,
 `pending_outbound` (the standalone copy of the own welcome — no longer consumed by
 `encrypt`; the welcome also rides every pre-commit frame as the staple), `epochs`.
 
-Messaging: `prepare_to_encrypt`, `encrypt`, `process_incoming`, `proposal_context`,
-`queue_proposal`, `stage_rotation`.
+Messaging: `prepare_to_encrypt(proposing)` — `Some(id)` selects which staged rotation
+candidate this round's Upd proposes (`None` re-proposes the current identity; the
+commit path is unchanged); `encrypt`; `process_incoming`; `proposal_context`;
+`queue_proposal` — approving the peer's Upd also authorizes the credential it carries
+(`QueuedRemoteProposal.proposing`, the candidate identity, surfaced before the
+proposal touches any group); `stage_rotation` — mints a successor candidate
+(re-staging adds candidates; the peer's commit picks the winner). See
+[Group Rules](./group-rules.md) for the Authentication Service semantics.
 
 Header encryption: `open_incoming(blob) -> Option<OpenedFrame { kind, frame }>` removes
 the outer seal from a rendezvous-channel blob and returns the plaintext `frame` plus a
@@ -156,7 +162,8 @@ All failures map to the flat `TwoMlsPqError` enum (`Mls`, `InvalidKeyPackage`,
 `MissingWelcome`, `PskBinding`, `PqNotAvailable`, `SessionNotEstablished`,
 `SessionNotReady`, `ProposalRejected`, `DecryptionFailed`, `DuplicateWelcome`,
 `InvitationSpent`, `ArchiveInvalid`, `UnsupportedCipherSuite`, `CipherSuiteMismatch`,
-`EpochDesync`, `UnexpectedWelcome`, `InvalidClientId`, `RemoteIdentityMismatch`).
+`EpochDesync`, `UnexpectedWelcome`, `InvalidClientId`, `RemoteIdentityMismatch`,
+`CredentialRejected`).
 mls-rs error types never cross the FFI boundary. `InvalidClientId` rejects an empty
 principal id supplied to `receive(new_client_id:)` or `stage_rotation` — empty is
 reserved (it is the ratchet-commit authenticated-data discriminator, so an empty id
@@ -164,7 +171,9 @@ could never be announced to the peer). `RemoteIdentityMismatch` is an establishm
 identity-binding failure: an `expected_remote` the key package does not name, a
 welcome whose creator leaf differs from the supplied key package, or an A.4
 bootstrap key package naming a principal that is not the established peer (see
-[Group Rules](./group-rules.md)).
+[Group Rules](./group-rules.md)). `CredentialRejected` is the Authentication
+Service's refusal (an unauthorized credential succession) — retryable where it arises
+from a staple: authorize (`queue_proposal` on a fresh delivery) and reprocess.
 `EpochDesync` means a stapled commit is more than one epoch ahead of the receive group
 (the bridging commit no longer rides any frame) — a reconnect condition, distinct from the
 transient `DecryptionFailed`. `UnexpectedWelcome` means a welcome differing from the one a

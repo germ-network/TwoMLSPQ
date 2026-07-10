@@ -89,6 +89,20 @@ pub fn version() -> String {
 // one peer-leaf Update + external PSKs; everything else rejected as `Mls`), and a stapled
 // or A.5 proposal that is not the peer's own-leaf Update is rejected at ingest
 // (`ProposalRejected`).
+// Also in v9 (2026-07-10, the TwoMLS AS): credential rotation is PROPOSAL-DRIVEN.
+// `stage_rotation` mints a candidate (several may be staged; my_principal_state is
+// Pending while any are); `prepare_to_encrypt(Some(id))` selects which candidate this
+// round's Upd proposes (it no longer commits a rotation — the unilateral AD-announced
+// rotation commit is gone, and rotation may ride the very first frame);
+// `QueuedRemoteProposal.proposing` now carries the CANDIDATE credential the Upd's
+// leaf bears; `queue_proposal` approval authorizes it; the approver's commit
+// canonicalizes it (`committed_remote_client_id`, `their_principal_state`), and the
+// staple back swaps the proposer onto the winner (`remote_commit.new_recipient`,
+// Sync). Leaf credentials genuinely move in leaves now; `new_sender` derives from the
+// observed leaf change (commit AD is no longer read). TwoMlsPqError gained
+// `CredentialRejected` (AS refusal, retryable from a staple). The session archive
+// carries the AS sequences and staged candidates (SESSION_ARCHIVE_VERSION -> 5; v4
+// blobs fail ArchiveInvalid per prerelease policy).
 const BINDING_CONTRACT_VERSION: u64 = 9;
 
 /// See `BINDING_CONTRACT_VERSION`. Exported so the Swift layer can verify the
@@ -390,6 +404,13 @@ pub enum TwoMlsPqError {
     /// bootstrap key package names a principal that is not the established peer.
     #[error("remote identity does not match the expected principal")]
     RemoteIdentityMismatch,
+    /// A credential failed the Authentication Service: an Update proposing an
+    /// unauthorized successor, a commit moving a leaf outside the app-defined
+    /// sequence, or a canonicalized credential naming no staged candidate. Retryable
+    /// where it arises from a staple — the staple re-rides every frame, so
+    /// authorize-and-reprocess recovers the round.
+    #[error("credential succession rejected by the authentication service")]
+    CredentialRejected,
 }
 
 /// SHA-256 over `bytes` — the single hashing primitive behind every digest this

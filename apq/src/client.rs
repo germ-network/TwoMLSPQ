@@ -11,14 +11,12 @@ use mls_rs::{
         self, BaseConfig, WithCryptoProvider, WithGroupStateStorage, WithIdentityProvider,
         WithKeyPackageRepo, WithMlsRules,
     },
-    identity::{
-        basic::{BasicCredential, BasicIdentityProvider},
-        SigningIdentity,
-    },
+    identity::{basic::BasicCredential, SigningIdentity},
     CipherSuite, CipherSuiteProvider, CryptoProvider, ExtensionList, KeyPackageStorage,
 };
 use zeroize::Zeroizing;
 
+use crate::authentication::{AuthView, TwoMlsIdentityProvider};
 use crate::rules::TwoMlsRules;
 use crate::storage::PersistableGroupStorage;
 use crate::{CombinerError, Result};
@@ -192,7 +190,7 @@ pub type OurConfig<S, C> = WithMlsRules<
         PersistableGroupStorage,
         WithKeyPackageRepo<
             S,
-            WithIdentityProvider<BasicIdentityProvider, WithCryptoProvider<C, BaseConfig>>,
+            WithIdentityProvider<TwoMlsIdentityProvider, WithCryptoProvider<C, BaseConfig>>,
         >,
     >,
 >;
@@ -220,6 +218,9 @@ where
     /// property a session is locked to. The APQ mode is derived from it.
     suite: ApqCipherSuite,
     classical_signing_key: Zeroizing<Vec<u8>>,
+    /// The classical signing key's public half, kept from construction so the rotation
+    /// credential handoff never re-derives it (mirror of `pq_signing_public`).
+    classical_signing_public: mls_rs::crypto::SignaturePublicKey,
     classical: MlsClient<S, C>,
     classical_kp_store: S,
     /// The injected classical group-state storage; shares its map with the clone
@@ -232,6 +233,9 @@ where
     pq: PqMlsClient<S, P>,
     pq_kp_store: S,
     pq_group_storage: PersistableGroupStorage,
+    /// This client's rebindable view of the session-canonical AS state; both halves'
+    /// identity providers resolve through it (see `authentication.rs`).
+    auth_view: AuthView,
 }
 
 impl<S, C, P> CombinerClient<S, C, P>
@@ -265,10 +269,12 @@ where
             .cipher_suite_provider(suite.pq)
             .ok_or(CombinerError::UnsupportedCipherSuite)?;
 
+        let auth_view = AuthView::seeded(&client_id);
         let (classical_sk, classical_pk) = classical_cs
             .signature_key_generate()
             .map_err(|_| CombinerError::Mls)?;
         let classical_signing_key = Zeroizing::new(classical_sk.as_bytes().to_vec());
+        let classical_signing_public = classical_pk.clone();
         let classical_kp_store = S::default();
         let classical_group_storage = PersistableGroupStorage::new();
         let classical = build_client(
@@ -279,6 +285,7 @@ where
             suite.classical,
             classical_kp_store.clone(),
             classical_group_storage.clone(),
+            auth_view.clone(),
         );
 
         // The PQ half's signing key comes from the PQ suite's own provider: under
@@ -300,12 +307,14 @@ where
             suite.pq,
             pq_kp_store.clone(),
             pq_group_storage.clone(),
+            auth_view.clone(),
         );
 
         Ok(Self {
             client_id,
             suite,
             classical_signing_key,
+            classical_signing_public,
             classical,
             classical_kp_store,
             classical_group_storage,
@@ -314,6 +323,7 @@ where
             pq,
             pq_kp_store,
             pq_group_storage,
+            auth_view,
         })
     }
 
@@ -342,10 +352,12 @@ where
             .cipher_suite_provider(suite.pq)
             .ok_or(CombinerError::UnsupportedCipherSuite)?;
 
+        let auth_view = AuthView::seeded(&client_id);
         let classical_sk = mls_rs::crypto::SignatureSecretKey::new(classical_signing_key.to_vec());
         let classical_pk = classical_cs
             .signature_key_derive_public(&classical_sk)
             .map_err(|_| CombinerError::Mls)?;
+        let classical_signing_public = classical_pk.clone();
         let classical_group_storage = PersistableGroupStorage::new();
         let classical = build_client(
             crypto.classical,
@@ -355,6 +367,7 @@ where
             suite.classical,
             classical_kp_store.clone(),
             classical_group_storage.clone(),
+            auth_view.clone(),
         );
 
         let pq_sk = mls_rs::crypto::SignatureSecretKey::new(pq_signing_key.to_vec());
@@ -371,12 +384,14 @@ where
             suite.pq,
             pq_kp_store.clone(),
             pq_group_storage.clone(),
+            auth_view.clone(),
         );
 
         Ok(Self {
             client_id,
             suite,
             classical_signing_key,
+            classical_signing_public,
             classical,
             classical_kp_store,
             classical_group_storage,
@@ -385,6 +400,7 @@ where
             pq,
             pq_kp_store,
             pq_group_storage,
+            auth_view,
         })
     }
 
@@ -426,6 +442,25 @@ where
             mls_rs::crypto::SignatureSecretKey::new(self.pq_signing_key.to_vec()),
             self.pq_signing_public.clone(),
         )
+    }
+
+    /// The classical half's signing keypair — the rotation credential handoff signs the
+    /// updated leaf with it (mirror of `pq_signature_keypair`).
+    pub fn classical_signature_keypair(
+        &self,
+    ) -> (
+        mls_rs::crypto::SignatureSecretKey,
+        mls_rs::crypto::SignaturePublicKey,
+    ) {
+        (
+            mls_rs::crypto::SignatureSecretKey::new(self.classical_signing_key.to_vec()),
+            self.classical_signing_public.clone(),
+        )
+    }
+
+    /// This client's rebindable view of the session-canonical AS state.
+    pub fn auth_view(&self) -> &AuthView {
+        &self.auth_view
     }
 
     pub fn classical(&self) -> &MlsClient<S, C> {
@@ -480,6 +515,9 @@ where
     }
 }
 
+// The parameter list mirrors the construction inputs one-to-one (the same shape both
+// constructors destructure); a params struct would restate it with extra ceremony.
+#[allow(clippy::too_many_arguments)]
 fn build_client<S: KeyPackageStorage + Clone, C: CryptoProvider + Clone>(
     provider: C,
     client_id: Vec<u8>,
@@ -488,12 +526,15 @@ fn build_client<S: KeyPackageStorage + Clone, C: CryptoProvider + Clone>(
     suite: CipherSuite,
     key_package_store: S,
     group_storage: PersistableGroupStorage,
+    auth_view: AuthView,
 ) -> MlsClient<S, C> {
     let credential = BasicCredential::new(client_id);
     let signing_identity = SigningIdentity::new(credential.into_credential(), public_key);
     client_builder::ClientBuilder::new()
         .crypto_provider(provider)
-        .identity_provider(BasicIdentityProvider::new())
+        // The TwoMLS Authentication Service (see `authentication.rs`): credential
+        // succession is validated against the session-canonical sequences.
+        .identity_provider(TwoMlsIdentityProvider::new(auth_view))
         .key_package_repo(key_package_store)
         .group_state_storage(group_storage)
         // The TwoMLS operation whitelist (see `rules.rs`): vetoes any commit — built

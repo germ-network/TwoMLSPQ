@@ -10,6 +10,21 @@ mod tests {
         test_utils::{establish_sessions, make_client},
     };
 
+    /// Mutually admit two principals' ids into each other's AS views — the
+    /// authorization the session layer performs; these tests drive raw mls-rs groups.
+    fn admit_pair(
+        a: &std::sync::Arc<crate::key_packages::TwoMlsPqPrincipal>,
+        b: &std::sync::Arc<crate::key_packages::TwoMlsPqPrincipal>,
+    ) {
+        let (a_id, b_id) = (a.client_id().bytes, b.client_id().bytes);
+        a.combiner()
+            .auth_view()
+            .with(|core| core.theirs.commit(b_id.clone()));
+        b.combiner()
+            .auth_view()
+            .with(|core| core.theirs.commit(a_id.clone()));
+    }
+
     #[test]
     #[ignore = "zeroize-on-drop is not externally observable via the public API"]
     fn test_export_psk_bytes_are_zeroized_on_drop() {}
@@ -19,6 +34,7 @@ mod tests {
         // If the required PSK is not in the receiver's store, join_group must fail.
         let alice = make_client();
         let bob = make_client();
+        admit_pair(&alice, &bob);
 
         let psk_id = ExternalPskId::new(b"required-psk".to_vec());
         let psk = PreSharedKey::new(vec![0xAB; 32]);
@@ -61,6 +77,7 @@ mod tests {
         // must fail to decrypt on Bob's group.
         let alice = make_client();
         let bob = make_client();
+        admit_pair(&alice, &bob);
 
         let psk_id = ExternalPskId::new(b"shared-psk".to_vec());
         let correct_psk = PreSharedKey::new(vec![0xAA; 32]);

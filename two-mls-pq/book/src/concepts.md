@@ -92,14 +92,19 @@ break *both* halves to break the session — so the classical half keeps protect
 traffic even if ML-KEM were to fail, and vice-versa. This is the hybrid property,
 achieved at the group level. See [PSK Binding](./psk-binding.md).
 
-## Basic credentials, no AS
+## Basic credentials and the TwoMLS AS
 
-The MLS leaf identity is the principal's public signing key, wrapped in a Basic
-Credential. There is no Authentication Service. Because basic credentials carry no
-external trust, **CommProtocol cooperates on every encrypt and decrypt** — it decides
-which remote proposals to accept and binds a per-round proposal hash into the
-plaintext. TwoMLSPQ stages proposals and reports state changes; it does not make
-trust decisions.
+The MLS leaf identity is the principal's opaque ClientId, wrapped in a Basic
+Credential. Basic credentials carry no external trust, so **CommProtocol still makes
+every trust decision** — it validates identities out of band, decides which remote
+proposals to accept, and binds a per-round proposal hash into the plaintext. What the
+library now adds is an Authentication Service that **enforces** those decisions
+inside MLS: each leaf's credential may evolve only along the app-defined sequence
+(candidates ride the ratchet's Upd proposals; approving one via `queue_proposal` IS
+the authorization; the commit canonicalizes it — see
+[The Rules of a TwoMLS Group](./group-rules.md)). TwoMLSPQ still stages and reports;
+the app still decides; the AS makes a bypassed decision cryptographically
+unrepresentable.
 
 ## The CommProtocol boundary
 

@@ -9,7 +9,8 @@
    so the app-layer welcome that identifies Alice is hidden on the invitation channel
    (see [Header Encryption](./header-encryption.md)).
 2. **`TwoMlsPqInvitation::open_initial(envelope) -> { app_payload, welcome }`** then
-   **`receive(welcome, their_kp, spawn_token, new_client_id)`** — Bob opens the envelope
+   **`receive(welcome, their_kp, spawn_token, new_client_id, expected_remote)`** — Bob
+   opens the envelope
    (the invitation holds the KP′ material), validates the app-layer welcome, and joins
    Group_A as his receive group (PQ half first, re-deriving the APQ-PSK, then the
    classical half), and builds his own send group (Group_B) **classical half only**,
@@ -18,9 +19,7 @@
    `new_client_id` selects an optional **dedicated per-session principal** at
    establishment: Group_B (and later its A.4 PQ half) is created under a freshly-minted
    principal with that id, so Alice sees the dedicated principal as the creator leaf of
-   the very welcome she joins from — no first-frame rotation commit is needed (which
-   the rotation gate below would refuse anyway: the acceptor's first frame must carry
-   the welcome staple, and a unilateral commit would displace it). Alice adopts the id
+   the very welcome she joins from — no first-frame rotation is needed. Alice adopts the id
    on the joining frame, surfacing it as `remote_commit.new_sender`; authenticity rides
    the cross-party PSK — only the invitation holder can create a Group_B that Alice's
    join accepts. `APQWelcome_B`
@@ -83,7 +82,8 @@ Sending is two-phase so CommProtocol can bind a per-round proposal hash:
   - `proposing: None` → routine round. Our own send group commits only when a
     queued, app-approved remote proposal is pending — then `did_commit: true` and
     the cross-party PSK refreshes.
-  - `proposing: Some(new_client_id)` → principal rotation (after `stage_rotation`).
+  - `proposing: Some(new_client_id)` → this round's Upd proposes the named staged
+    rotation candidate (after `stage_rotation`; see Principal key rotation below).
 - **`encrypt(app_message)`** — binds the pending `proposal_hash` into the message's
   authenticated data and returns `EncryptResult { cipher_text, sender, recipient,
   epochs }`, where `epochs` is the send group's APQ pair — `pq_epoch` (0 while that
@@ -125,36 +125,32 @@ epoch and refreshing the PSK binding.
 
 ## Principal key rotation
 
-Rotation serves **mid-session** handoffs. For the common "dedicated agent per
-session" pattern, don't rotate at all: pass the agent's id to
-`receive(…, new_client_id:)` and the session is born under it (Establishment,
-above) — the gate below exists precisely because a first-frame rotation commit
-would displace the welcome staple the peer still needs.
+Rotation is **proposal-driven** (see [Group Rules](./group-rules.md) — the
+Authentication Service): `stage_rotation(new_client_id)` mints the successor (the app
+supplies only the opaque ClientId; signing keys are session-owned) and marks the
+session `Pending`; `prepare_to_encrypt(Some(new_id))` makes this round's stapled
+Upd(self) carry the candidate's credential. Different rounds may propose different
+candidates — the app orders them. The peer surfaces each candidate as
+`QueuedRemoteProposal.proposing`, approves one with `queue_proposal` (the running
+tally), and its next commit **canonicalizes** it: `committed_remote_client_id` and
+`their_principal_state` report the new identity on the committing side, and the
+commit staple's return canonicalizes the proposer (`remote_commit.new_recipient`,
+`my_principal_state` → `Sync { new }`, the session swaps to the winning principal).
+Because rotation rides the proposal slot, it can be offered on the very first frame —
+it can never displace the welcome staple.
 
-`stage_rotation(new_client_id)` then `prepare_to_encrypt(Some(new_id))` commits the
-handoff to the staged principal, announcing the new `ClientId` in the commit's
-authenticated data (the classical leaf credential itself is unchanged; ratchet
-commits have empty AD, which is the whole wire discriminator). A rotation round is
-otherwise an ordinary round: it stages the routine `Upd(self)` proposal, and it
-folds a queued, app-approved peer proposal into the same commit (with the
-cross-party PSK refresh, reported via `committed_remote_client_id`). Rotation is
-gated on having processed at least one peer message frame (`SessionNotReady`
-otherwise) — a unilateral commit must never displace a welcome staple the peer may
-still need. The app supplies
-only the opaque `ClientId`; the successor's MLS signing keys are minted internally, as
-session-owned state — staging the same id twice is a no-op, a different id replaces the
-staged one. The local state becomes `AgentState::Pending { old, new }` until the peer
-replies, then resolves to `Sync { new }`. The peer observes the change as
-`CommitResult.new_sender`.
+The winner's other leaves **lag and catch up**: the proposer's own send-group leaf
+moves at its next approved commit (the peer observes `new_sender` on that staple, and
+message attribution follows); the PQ leaves catch up at the next A.4/A.5 handoff
+(`pq_rekey_begin(rotating:)` must name the session's *current* — already canonical —
+principal, and the handoff's new leaf carries that credential); the acceptor's
+recv-group leaf converges from the invitation identity to the dedicated
+establishment principal via its first committed Upd. Every catch-up is validated
+against the AS history window.
 
-The **PQ leaves catch up on the next re-key**: `pq_rekey_begin(rotating: new_id)` —
-which must name the session's *current* principal, i.e. the classical rotation above has
-already happened — moves the initiator's leaf in both PQ groups to the new principal's
-signing key (the `Upd'`, then the final `Commit'`'s updatePath). The `ClientId`
-travels in the proposal's authenticated data, and the responder returns it from
-`pq_rekey_respond`; leaf credential *bytes* stay fixed, as on the classical side.
-`pq_bootstrap_begin(rotating:)` accepts the same id — its key package is generated by
-the current principal, so the check alone suffices.
+For the common "dedicated agent per session" pattern, don't rotate at establishment
+at all: pass the agent's id to `receive(…, new_client_id:)` and the session is born
+under it (Establishment, above).
 
 ## Invitations & replayed initial frames
 

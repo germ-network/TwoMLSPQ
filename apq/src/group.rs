@@ -357,6 +357,21 @@ pub fn create_group_with_member<Cfg: MlsConfig>(
     Ok((group, welcome_bytes))
 }
 
+/// The ClientId (basic-credential identifier) a key package names. Used to admit the
+/// peer into the AS state before a group is built around its key package.
+pub fn key_package_client_id(kp_bytes: &[u8]) -> Result<Vec<u8>> {
+    let msg = MlsMessage::from_bytes(kp_bytes).map_err(|_| CombinerError::InvalidKeyPackage)?;
+    let kp = msg
+        .into_key_package()
+        .ok_or(CombinerError::InvalidKeyPackage)?;
+    let basic = kp
+        .signing_identity()
+        .credential
+        .as_basic()
+        .ok_or(CombinerError::InvalidKeyPackage)?;
+    Ok(basic.identifier.clone())
+}
+
 /// Every group in this protocol is a 1:1 pair — exactly two leaves, the creator and the
 /// added member. Enforce that shape wherever a group's roster is set or changed by peer
 /// input (joins, and applied peer commits): a crafted welcome or commit carrying extra
@@ -401,6 +416,10 @@ where
     C: CryptoProvider + Clone,
     P: CryptoProvider + Clone,
 {
+    // The caller passing the peer's key package IS the app's authorization: admit its
+    // identity into the AS state so the added leaves validate.
+    let peer_id = key_package_client_id(pq_kp)?;
+    client.auth_view().with(|core| core.theirs.commit(peer_id));
     // PQ side group first, unbound.
     let (pq_group, pq_welcome) = create_group_with_member(client.pq(), pq_kp, &[])?;
     // APQ-PSK: export from the PQ group, inject into the classical message group.
@@ -442,11 +461,24 @@ where
     C: CryptoProvider + Clone,
     P: CryptoProvider + Clone,
 {
-    let pq = join_group_from_welcome(client.pq(), pq_welcome)?;
-    // Re-derive the same APQ-PSK the creator used to bind the classical group.
-    export_and_register_psk(&pq, client)?;
-    let classical = join_group_from_welcome(client.classical(), classical_welcome)?;
-    Ok(CombinerGroup::from_client(client, classical, Some(pq)))
+    // The joins validate every leaf in the received trees, including a creator this
+    // client may not know yet (e.g. a dedicated per-session principal): open the
+    // adoption window for the joins, then record the creator as the peer's canonical
+    // identity. Authenticity rides the PSKs bound into the welcome.
+    client.auth_view().with(|core| core.adopting = true);
+    let joined = (|| {
+        let pq = join_group_from_welcome(client.pq(), pq_welcome)?;
+        // Re-derive the same APQ-PSK the creator used to bind the classical group.
+        export_and_register_psk(&pq, client)?;
+        let classical = join_group_from_welcome(client.classical(), classical_welcome)?;
+        Ok(CombinerGroup::from_client(client, classical, Some(pq)))
+    })();
+    client.auth_view().with(|core| core.adopting = false);
+    let group: CombinerGroup<S, C, P> = joined?;
+    let mine = group.classical.current_member_index();
+    let creator = sender_client_id(&group.classical, if mine == 0 { 1 } else { 0 })?;
+    client.auth_view().with(|core| core.theirs.commit(creator));
+    Ok(group)
 }
 
 /// Create the acceptor's bound send group (Group_B) with the PQ half deferred (A.4):
@@ -462,6 +494,8 @@ where
     C: CryptoProvider + Clone,
     P: CryptoProvider + Clone,
 {
+    let peer_id = key_package_client_id(classical_kp)?;
+    client.auth_view().with(|core| core.theirs.commit(peer_id));
     let psk_cross = export_and_register_psk(recv_classical, client)?;
     let (classical_group, classical_welcome) =
         create_group_with_member(client.classical(), classical_kp, &[psk_cross])?;
@@ -486,6 +520,8 @@ where
     C: CryptoProvider + Clone,
     P: CryptoProvider + Clone,
 {
+    let peer_id = key_package_client_id(classical_kp)?;
+    client.auth_view().with(|core| core.theirs.commit(peer_id));
     // Cross-party TwoMLS-PSK from the recv group (Group_A classical).
     let psk_cross = export_and_register_psk(recv_classical, client)?;
     // PQ side group first, unbound.
@@ -544,6 +580,14 @@ mod tests {
 
     fn client() -> TestClient {
         CombinerClient::new(client_id(), crypto()).unwrap()
+    }
+
+    /// Admit `peer` into `me`'s AS view — the authorization the combiner-level
+    /// builders perform internally; tests driving `create_group_with_member` /
+    /// `join_group_from_welcome` directly do it explicitly.
+    fn admit(me: &TestClient, peer: &[u8]) {
+        let peer = peer.to_vec();
+        me.auth_view().with(|core| core.theirs.commit(peer));
     }
 
     /// A rules-free mls-rs client (default `MlsRules`, plain basic identity provider,
@@ -632,7 +676,10 @@ mod tests {
         let bob = client();
         let carol = client();
 
-        // Honest pair.
+        // Honest pair (mutual admissions — the step the combiner-level builders and
+        // the session layer perform).
+        admit(&alice, bob.client_id());
+        admit(&bob, alice.client_id());
         let (mut alice_send, welcome) = create_group_with_member(
             alice.classical(),
             &bob.generate_classical_key_package().unwrap(),
@@ -653,8 +700,10 @@ mod tests {
 
         // A rogue creator CAN build it — the victim must veto it on receive, before
         // application (the roster still reads 2 afterwards).
-        let rogue = rogue_client(client_id());
+        let rogue_id = client_id();
+        let rogue = rogue_client(rogue_id.clone());
         let victim = client();
+        admit(&victim, &rogue_id);
         let mut rogue_group = rogue
             .create_group(ExtensionList::new(), ExtensionList::new(), None)
             .unwrap();
@@ -840,6 +889,7 @@ mod tests {
     fn test_export_and_register_psk_is_deterministic_and_le_epoch_group_id() {
         let alice = client();
         let bob = client();
+        admit(&alice, bob.client_id());
         let (group, _) = create_group_with_member(
             alice.classical(),
             &bob.generate_classical_key_package().unwrap(),
@@ -861,6 +911,7 @@ mod tests {
     fn test_sender_client_id_returns_group_creator() {
         let alice = client();
         let bob = client();
+        admit(&alice, bob.client_id());
         let (group, _) = create_group_with_member(
             alice.classical(),
             &bob.generate_classical_key_package().unwrap(),
