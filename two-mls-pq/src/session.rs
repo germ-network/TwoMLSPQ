@@ -4686,10 +4686,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "reconnect (Phase 11) not yet implemented"]
-    fn test_process_incoming_returns_none_on_rejoin_needed() {}
-
-    #[test]
     fn test_session_id_differs_for_different_pairs() {
         let alice = make_client();
         let bob = make_client();
@@ -4727,10 +4723,6 @@ mod tests {
             alice_session.my_principal_state().client_id()
         );
     }
-
-    #[test]
-    #[ignore = "concurrent-session dedup not yet implemented"]
-    fn test_concurrent_sessions_same_did_pair_both_valid() {}
 
     #[test]
     fn test_principal_rotation_migrates_session_to_new_principal() {
