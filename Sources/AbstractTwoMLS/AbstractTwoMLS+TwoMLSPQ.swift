@@ -20,7 +20,7 @@
 //     handoff, `begin(.rekey/.finishBootstrap, rotating:)` moves the PQ leaves (the
 //     peer reads `PQInbound.rotatedCredential`); forward routing — a replayed initial
 //     frame decodes as `.forward` via the invitation's spawn-token table
-//     (`combinedWelcomeDigest` doubles as the opaque token), acknowledged by the
+//     (the `WelcomeToken` opaque token), acknowledged by the
 //     spawned session via `forwarded(headerDecrypted:)`.
 //   - Session archive/restore is total: `PQSession.archive` / `init(archive:)` ride
 //     0.0.10's self-contained `fromArchive(archive:)` (no owning client).
@@ -477,7 +477,7 @@ extension AbstractTwoMLS {
 			}
 			// The PQ initiator cannot staple a private message pre-establishment.
 			return .appWelcome(
-				appWelcomeDigest: digest,
+				welcomeToken: WelcomeToken(digest),
 				appWelcome: decrypted,
 				stapledPrivateMessage: nil
 			)
@@ -487,7 +487,7 @@ extension AbstractTwoMLS {
 			sendGroupWelcome: Data,
 			remoteKeyPackage: Data,
 			remoteClientId: AbstractTwoMLS.ClientID,
-			combinedWelcomeDigest: TypedDigest,
+			welcomeToken: WelcomeToken,
 			stapledMessage: Data?,
 			newClientId: AbstractTwoMLS.ClientID
 		) throws -> (PQSession, plaintext: Data?) {
@@ -502,18 +502,18 @@ extension AbstractTwoMLS {
 
 			// Joins both halves from the APQ welcome and stands up the bound return
 			// send group; the invitation dedups repeat welcomes per remote. The
-			// combined-welcome digest keys the forward table as the FFI's opaque spawn
+			// welcome token keys the forward table as the FFI's opaque spawn
 			// token, so a transport re-delivery of the same initial frame decodes as
 			// `.forward` to this session.
-			// CONTRACT: callers must pass `decodeHeader`'s `appWelcomeDigest` back
-			// verbatim as `combinedWelcomeDigest` — a digest over anything other than
-			// the exact header-decrypted frame bytes (e.g. a re-serialized welcome)
-			// silently breaks replay forwarding.
+			// The `WelcomeToken` type enforces the round-trip: `receive` accepts only the
+			// token `decodeHeader` returned, so a caller cannot substitute a digest
+			// recomputed over the wrong bytes (e.g. a re-serialized welcome) and
+			// silently break replay forwarding.
 			let session = PQSession(
 				try base.receive(
 					welcome: sendGroupWelcome,
 					theirKeyPackage: pair,
-					spawnToken: combinedWelcomeDigest.wireFormat
+					spawnToken: welcomeToken.wireFormat
 				))
 
 			// Deliberately fail open on the staple: an untrusted, optional early-delivery

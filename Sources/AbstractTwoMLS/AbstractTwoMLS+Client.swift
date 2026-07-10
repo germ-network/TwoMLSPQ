@@ -79,7 +79,7 @@ public enum AbstractTwoMLS {
 			sendGroupWelcome: Data,
 			remoteKeyPackage: Data,
 			remoteClientId: ClientID,
-			combinedWelcomeDigest: TypedDigest,
+			welcomeToken: WelcomeToken,
 			stapledMessage: Data?,
 			newClientId: AbstractTwoMLS.ClientID,
 		) throws -> (Session, plaintext: Data?)
@@ -88,8 +88,8 @@ public enum AbstractTwoMLS {
 	public enum HeaderDecryptResult {
 		case forward(groupId: DataIdentifier, mlsMessageData: Data)
 		case appWelcome(
-			//digest of the MLSApplication message within the header encryption
-			appWelcomeDigest: TypedDigest,
+			//opaque token for this welcome; pass it back verbatim to `receive`
+			welcomeToken: WelcomeToken,
 			appWelcome: Data,
 			stapledPrivateMessage: Data?
 		)

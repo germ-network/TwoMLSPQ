@@ -42,7 +42,7 @@ struct PQInvitationReceiveTests {
 			sendGroupWelcome: welcome,
 			remoteKeyPackage: encodeCombinerKeyPackage(keyPackage: initiatorKp),
 			remoteClientId: initiator.clientId().bytes,
-			combinedWelcomeDigest: TypedDigest(prefix: .sha256, over: welcome),
+			welcomeToken: AbstractTwoMLS.WelcomeToken(TypedDigest(prefix: .sha256, over: welcome)),
 			stapledMessage: nil,
 			newClientId: .mock()
 		)
@@ -82,13 +82,13 @@ struct PQInvitationReceiveTests {
 		let initiatorKp = encodeCombinerKeyPackage(
 			keyPackage: try initiator.generateCombinerKeyPackage()
 		)
-		let digest = TypedDigest(prefix: .sha256, over: welcome)
+		let token = AbstractTwoMLS.WelcomeToken(TypedDigest(prefix: .sha256, over: welcome))
 
 		_ = try invitation.receive(
 			sendGroupWelcome: welcome,
 			remoteKeyPackage: initiatorKp,
 			remoteClientId: initiator.clientId().bytes,
-			combinedWelcomeDigest: digest,
+			welcomeToken: token,
 			stapledMessage: nil,
 			newClientId: .mock()
 		)
@@ -99,7 +99,7 @@ struct PQInvitationReceiveTests {
 				sendGroupWelcome: welcome,
 				remoteKeyPackage: initiatorKp,
 				remoteClientId: initiator.clientId().bytes,
-				combinedWelcomeDigest: digest,
+				welcomeToken: token,
 				stapledMessage: nil,
 				newClientId: .mock()
 			)
@@ -128,7 +128,7 @@ struct PQInvitationReceiveTests {
 				sendGroupWelcome: welcome,
 				remoteKeyPackage: initiatorKp,
 				remoteClientId: .mock(),  // not the initiator's identity
-				combinedWelcomeDigest: TypedDigest(prefix: .sha256, over: welcome),
+				welcomeToken: AbstractTwoMLS.WelcomeToken(TypedDigest(prefix: .sha256, over: welcome)),
 				stapledMessage: nil,
 				newClientId: .mock()
 			)

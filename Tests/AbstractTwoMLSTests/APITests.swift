@@ -572,7 +572,7 @@ extension AbstractTwoMLS.Invitation {
 
 		guard
 			case .appWelcome(
-				appWelcomeDigest: let appWelcomeDigest,
+				welcomeToken: let welcomeToken,
 				appWelcome: let appWelcome,
 				stapledPrivateMessage: let stapledPrivateMessage
 			) = headerDecrypted
@@ -591,7 +591,7 @@ extension AbstractTwoMLS.Invitation {
 			sendGroupWelcome: decoded.mySendGroupWelcome,
 			remoteKeyPackage: decoded.myKeyPackage,
 			remoteClientId: remoteClientId,
-			combinedWelcomeDigest: appWelcomeDigest,
+			welcomeToken: welcomeToken,
 			stapledMessage: stapledPrivateMessage,
 			newClientId: newClientId
 		)
