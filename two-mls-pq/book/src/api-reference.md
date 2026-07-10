@@ -135,7 +135,7 @@ key belongs in the platform keystore). An archive is **single-use** — any furt
 the live session (or a second restore) rewinds the sender ratchet into AEAD nonce reuse.
 Serializing a mid-A.3 round costs at most one round of PCS against an archive thief who
 already holds the epoch secrets; discarding the round state instead would permanently
-desync the side-band, so it is not an option. Reconnect remains unimplemented — see
+desync the side-band, so it is not an option. Reconnect is not planned — see
 [Planned Features](./planned-features.md).
 
 ## Errors

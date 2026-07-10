@@ -94,7 +94,8 @@ Sending is two-phase so CommProtocol can bind a per-round proposal hash:
   (e.g. peer rotated → `new_sender`); repeats of an already-applied staple are
   silent skips.
 - `None` — a re-delivered welcome (standalone `0x01` already joined from), or a
-  message for an unknown epoch (reconnect path; see Planned Features).
+  message for an unknown epoch (a reconnect condition — not recovered
+  in-library; see Planned Features).
 
 A stapled commit *ahead* of the receive group's next epoch fails with `EpochDesync`
 before the app ciphertext is touched: the peer advanced more than one commit past us
