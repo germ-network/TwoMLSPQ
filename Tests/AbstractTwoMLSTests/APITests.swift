@@ -389,6 +389,48 @@ struct ForwardRoutingDemo {
 	}
 }
 
+//Session archive/restore round-trips. TwoMLSPQ 0.0.10 made `fromArchive(archive:)`
+//total and self-contained (no owning client), so an archived session restores into a
+//working session that keeps talking to the peer.
+struct SessionArchiveDemo {
+	let local: ClientWrapper<AbstractTwoMLS.PQClient>
+	let remote: ClientWrapper<AbstractTwoMLS.PQClient>
+
+	init() throws {
+		local = try .init()
+		remote = try .init()
+	}
+
+	@Test func restoredSessionContinuesTheConversation() throws {
+		let (localSession, encryptedCombinedWelcome) = try local.client.reply(
+			remoteClientId: remote.clientId,
+			encodedRemoteKpkg: remote.currentInvitation.encodedKeyPackage
+		)
+		let (remoteSession, _) = try remote.currentInvitation.receiveReply(
+			ciphertext: encryptedCombinedWelcome,
+			expecting: try local.clientId
+		)
+		// Complete establishment, then confirm a routine round-trip works.
+		try remoteSession.send(to: localSession)
+		try localSession.exchange(with: remoteSession)
+
+		// Archive the acceptor and restore it into a fresh session object.
+		let snapshot = remoteSession.epochs
+		let archived = try remoteSession.archive
+		let restored = try AbstractTwoMLS.PQSession(archive: archived)
+
+		// The restored session picks up exactly where the archived one left off...
+		#expect(restored.epochs.pqEpoch == snapshot.pqEpoch)
+		#expect(restored.epochs.classicalEpoch == snapshot.classicalEpoch)
+		#expect(restored.isFullyEstablished == remoteSession.isFullyEstablished)
+
+		// ...and keeps talking to the peer. Latest-only discipline: drive `restored`,
+		// not the now-archived `remoteSession`.
+		try localSession.send(to: restored)
+		try restored.send(to: localSession)
+	}
+}
+
 //Digest-surface cleanup: the binding values the backends expose through the
 //TypedDigest slots are honest sha256 digests with cross-side coherence — the
 //classical backend's semantics, now matched by the PQ backend (previously an

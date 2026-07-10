@@ -13,7 +13,7 @@
 //  `AbstractTwoMLS` namespace rather than by extending the generated classes
 //  directly. The generated module stays pristine.
 //
-//  Status (as of the TwoMLSPQ 0.0.9 binding, increment C):
+//  Status (as of the TwoMLSPQ 0.0.10 binding):
 //   - `PQSession`, the six result adapters, `PQClient`, and `PQInvitation` are wired,
 //     including routing (`shouldListenOn`/`sendRendezvous`), the true APQ epoch pair
 //     on encrypt results, A.5 rekey (`begin(.rekey)`), agent rotation —
@@ -23,8 +23,8 @@
 //     routing: a replayed initial frame decodes as `.forward` via the invitation's
 //     spawn-token table (`combinedWelcomeDigest` doubles as the opaque token) and the
 //     spawned session acknowledges it through `forwarded(headerDecrypted:)`.
-//   - Remaining gap: `PQSession.init(archive:)` needs the owning client and session
-//     archive/restore is unimplemented upstream.
+//   - Session archive/restore is total: `PQSession.archive` / `init(archive:)` ride
+//     TwoMLSPQ 0.0.10's self-contained `fromArchive(archive:)` (no owning client).
 //
 
 import CommProtocol
@@ -34,10 +34,6 @@ import TwoMLSPQ
 // MARK: - Errors
 
 public enum TwoMLSPQConformanceError: Error {
-	/// TwoMLSPQ restores a session via `fromArchive(archive:client:)`, which
-	/// needs the owning client; the parameterless `Archivable.init(archive:)`
-	/// cannot supply it.
-	case clientRequiredForRestore
 	/// The remote key package's credential does not match the authenticated
 	/// remote identity extracted from the validated welcome.
 	case remoteIdentityMismatch
@@ -207,9 +203,13 @@ extension AbstractTwoMLS {
 		}
 
 		public init(archive: Data) throws {
-			// GAP: TwoMlsPqSession.fromArchive(archive:client:) also needs the
-			// owning client, which this initializer cannot supply.
-			throw TwoMLSPQConformanceError.clientRequiredForRestore
+			// TwoMLSPQ 0.0.10 made session restore total and self-contained:
+			// `fromArchive(archive:)` reconstructs the session from the blob alone,
+			// with no owning client. (Seal-before-persisting + latest-only discipline
+			// is the caller's, mirroring invitation archives.)
+			self.init(
+				try TwoMlsPqSession.fromArchive(
+					archive: TwoMLSPQ.Archive(bytes: archive)))
 		}
 
 		// MARK: State
