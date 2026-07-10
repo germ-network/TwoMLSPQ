@@ -9,12 +9,21 @@
    so the app-layer welcome that identifies Alice is hidden on the invitation channel
    (see [Header Encryption](./header-encryption.md)).
 2. **`TwoMlsPqInvitation::open_initial(envelope) -> { app_payload, welcome }`** then
-   **`receive(welcome, their_kp, spawn_token)`** — Bob opens the envelope (the invitation
-   holds the KP′ material), validates the app-layer welcome, and joins Group_A as his
-   receive group (PQ half first, re-deriving the APQ-PSK, then the classical half),
-   and builds his own send group (Group_B) **classical half only**, bound by a
-   cross-party PSK exported from Group_A's classical half — Group_B's PQ half is
-   deferred to the bootstrap (below), so Bob can send immediately. `APQWelcome_B`
+   **`receive(welcome, their_kp, spawn_token, new_client_id)`** — Bob opens the envelope
+   (the invitation holds the KP′ material), validates the app-layer welcome, and joins
+   Group_A as his receive group (PQ half first, re-deriving the APQ-PSK, then the
+   classical half), and builds his own send group (Group_B) **classical half only**,
+   bound by a cross-party PSK exported from Group_A's classical half — Group_B's PQ
+   half is deferred to the bootstrap (below), so Bob can send immediately.
+   `new_client_id` selects an optional **dedicated per-session principal** at
+   establishment: Group_B (and later its A.4 PQ half) is created under a freshly-minted
+   principal with that id, so Alice sees the dedicated principal as the creator leaf of
+   the very welcome she joins from — no first-frame rotation commit is needed (which
+   the rotation gate below would refuse anyway: the acceptor's first frame must carry
+   the welcome staple, and a unilateral commit would displace it). Alice adopts the id
+   on the joining frame, surfacing it as `remote_commit.new_sender`; authenticity rides
+   the cross-party PSK — only the invitation holder can create a Group_B that Alice's
+   join accepts. `APQWelcome_B`
    (with an empty PQ slot) rides as the **staple** on every frame Bob sends until his
    first commit (see [Wire Format](./wire-format.md)); a standalone copy is also in
    `pending_outbound()` for hosts that deliver it separately.
@@ -90,11 +99,16 @@ Sending is two-phase so CommProtocol can bind a per-round proposal hash:
 - `application_message` — a decrypted app message.
 - `proposal` — the peer's stapled `Upd(sender)` proposal, offered for app approval
   (then `queue_proposal(digest)`).
-- `remote_commit` — a `CommitResult`, surfaced on the frame whose staple was applied
-  (e.g. peer rotated → `new_sender`); repeats of an already-applied staple are
-  silent skips.
-- `None` — a re-delivered welcome (standalone `0x01` already joined from), or a
-  message for an unknown epoch (reconnect path; see Planned Features).
+- `remote_commit` — a `CommitResult`, surfaced on the delivery that applied the staple
+  or performed the welcome join (peer rotated, or established under a dedicated
+  principal → `new_sender`); repeats of an already-applied staple are silent skips. A
+  *standalone* welcome that adopts a dedicated peer principal returns a `DecryptResult`
+  with only `remote_commit` set — the handoff is observable whichever copy of the
+  welcome arrives first. `new_sender` is an event hint; `their_principal_state()` is
+  the truth (the signal is lost if the same frame's app message fails).
+- `None` — a welcome that changed nothing to announce (a re-delivery already joined
+  from, or a first join under the peer's expected identity), or a message for an
+  unknown epoch (reconnect path; see Planned Features).
 
 A stapled commit *ahead* of the receive group's next epoch fails with `EpochDesync`
 before the app ciphertext is touched: the peer advanced more than one commit past us
@@ -110,6 +124,12 @@ sequence number and, if accepted, calls `queue_proposal(digest)`. The next
 epoch and refreshing the PSK binding.
 
 ## Principal key rotation
+
+Rotation serves **mid-session** handoffs. For the common "dedicated agent per
+session" pattern, don't rotate at all: pass the agent's id to
+`receive(…, new_client_id:)` and the session is born under it (Establishment,
+above) — the gate below exists precisely because a first-frame rotation commit
+would displace the welcome staple the peer still needs.
 
 `stage_rotation(new_client_id)` then `prepare_to_encrypt(Some(new_id))` commits the
 handoff to the staged principal, announcing the new `ClientId` in the commit's

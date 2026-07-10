@@ -32,10 +32,10 @@ pub use client::{
 pub use group::{
     create_bound_classical_send_group, create_bound_combiner_send_group,
     create_combiner_send_group, create_group_with_member, decode_apq_welcome, encode_apq_welcome,
-    export_and_register_psk, export_psk, forget_psk, forget_psk_stores, join_combiner_group,
-    join_combiner_group_from_halves, join_group_from_welcome, load_combiner_group, register_psk,
-    register_psk_stores, sender_client_id, CombinerGroup, CombinerGroupState, MlsGroup, PqMlsGroup,
-    APQ_TAG,
+    ensure_two_party, export_and_register_psk, export_psk, forget_psk, forget_psk_stores,
+    join_combiner_group, join_combiner_group_from_halves, join_group_from_welcome,
+    load_combiner_group, register_psk, register_psk_stores, sender_client_id, CombinerGroup,
+    CombinerGroupState, MlsGroup, PqMlsGroup, APQ_TAG,
 };
 
 /// Failure categories for the combiner layer. The two-mls layer maps these onto its
