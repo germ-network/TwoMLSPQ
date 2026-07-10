@@ -47,16 +47,20 @@ hub for group operations (see [Concepts](./concepts.md)).
 The receiving side of a published key package — no live client required.
 
 - `new(archive)` / `archive()` — restore/persist; the archive carries the signing
-  identity, the key package's private material, the consumed-remote set, and the
-  spawned-group forward table.
+  identity, the key package's private material, the consumed-remote set, the
+  spawned-group forward table, and the processed-welcome ledger.
 - `client_id()`, `combiner_key_package()` — what to publish.
 - `receive(welcome, their_key_package, spawn_token) -> TwoMlsPqSession` — establish
-  from a remote initiator's welcome; rejects a repeat remote (`DuplicateWelcome`) and,
-  for a single-use invitation whose key package has already been consumed, any further
-  welcome (`InvitationSpent`). `spawn_token` is an opaque, replay-stable identifier for
-  the initial frame, keying the forward table.
+  from a remote initiator's welcome; rejects a re-delivered welcome (byte-identical,
+  via the processed-welcome ledger) and a repeat remote (both `DuplicateWelcome`),
+  and, for a single-use invitation whose key package has already been consumed, any
+  further welcome (`InvitationSpent`). `spawn_token` is an opaque, replay-stable
+  identifier for the initial frame, keying the forward table.
 - `forward_group_id(spawn_token) -> Option<MlsGroupId>` — resolve a replayed
   initial frame to the spawned session's receive group (its classical message-half id).
+- `processed_welcome_group_id(welcome) -> Option<MlsGroupId>` — the content-keyed
+  counterpart: resolve a re-delivered welcome by the digest of its exact bytes, no
+  host token convention needed.
 - `hpke_open(kem_output, ciphertext, info, aad)` — decrypt data sealed to the
   invitation's key package (the initial routing-header pattern); the counterpart
   free function is `hpke_seal_to_key_package`.
@@ -81,7 +85,8 @@ groups still sign with the keys embedded in their snapshots.
 
 State: `is_established`, `is_fully_established`, `has_receive_group`,
 `active_session_id`, `receive_group_id`, `my_principal_state`, `their_principal_state`,
-`pending_outbound`, `epochs`.
+`pending_outbound` (the standalone copy of the own welcome — no longer consumed by
+`encrypt`; the welcome also rides every pre-commit frame as the staple), `epochs`.
 
 Messaging: `prepare_to_encrypt`, `encrypt`, `process_incoming`, `proposal_context`,
 `queue_proposal`, `stage_rotation`.

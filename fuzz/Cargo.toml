@@ -34,3 +34,10 @@ doc = false
 name = "session_archive_decode"
 path = "fuzz_targets/session_archive_decode.rs"
 test = false
+
+[[bin]]
+bench = false
+doc = false
+name = "message_frame_decode"
+path = "fuzz_targets/message_frame_decode.rs"
+test = false

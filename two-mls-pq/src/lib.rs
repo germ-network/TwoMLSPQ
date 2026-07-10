@@ -44,7 +44,13 @@ pub fn version() -> String {
 // v5 (2026-07-09): TwoMlsPqError gained `InvitationSpent` (a single-use invitation's key
 // package has already been consumed; `generate_invitation` also gained a `last_resort` flag,
 // but that function-signature change is caught by uniffi's own load-time checksum).
-const BINDING_CONTRACT_VERSION: u64 = 5;
+// v6 (2026-07-10): wire format v2 — one message frame (0x03) with a mandatory
+// commit-or-welcome staple replaces BUNDLED/PARTIAL/STAPLED_WELCOME; PQ side-band tags
+// renumbered to 0x05–0x11 (classify via `pq_frame_kind`, never raw bytes). TwoMlsPqError
+// gained `EpochDesync` and `UnexpectedWelcome`. Semantics: `remote_commit` is surfaced
+// only on the frame whose staple first applied; `prepare_to_encrypt(Some(_))` returns
+// `SessionNotReady` until a peer frame has been processed.
+const BINDING_CONTRACT_VERSION: u64 = 6;
 
 /// See `BINDING_CONTRACT_VERSION`. Exported so the Swift layer can verify the
 /// binding it was generated with matches the binary it loaded.
@@ -318,6 +324,19 @@ pub enum TwoMlsPqError {
     /// provider gap): here the peer's suites are the wrong ones.
     #[error("cipher suite mismatch")]
     CipherSuiteMismatch,
+    /// A stapled commit is for a *future* epoch of the receive group: the peer has advanced
+    /// more than one commit past us, and the bridging commit no longer rides any frame (only
+    /// the sender's latest commit staples). Not transient — the direction needs the
+    /// reconnect path. Distinct from `DecryptionFailed`, which covers malformed or (possibly
+    /// reordered, hence retriable) unprocessable frames.
+    #[error("stapled commit is ahead of the receive group; reconnect required")]
+    EpochDesync,
+    /// A welcome arrived that differs from the one this session's receive group was joined
+    /// from. Re-deliveries of the *same* welcome are normal and skipped silently (the peer
+    /// re-staples it until its first commit); a different welcome on a live session is a
+    /// mis-route or an unexpected re-invite.
+    #[error("a different welcome arrived for an already-joined receive group")]
+    UnexpectedWelcome,
 }
 
 /// SHA-256 over `bytes` — the single hashing primitive behind every digest this

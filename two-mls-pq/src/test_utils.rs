@@ -41,3 +41,19 @@ pub(crate) fn establish_sessions() -> (Arc<TwoMlsPqSession>, Arc<TwoMlsPqSession
     assert_ok!(alice_session.process_incoming(welcome_b));
     (alice_session, bob_session)
 }
+
+/// `establish_sessions` plus one message-frame round-trip in each direction, so both
+/// sides have processed a peer frame. That is the `peer_confirmed` precondition for a
+/// unilateral rotation commit under the always-staple wire format (a rotation commit
+/// must never displace a welcome staple the peer may still need). Neither side queues
+/// the offered proposals, so no epochs advance here.
+pub(crate) fn establish_confirmed_sessions() -> (Arc<TwoMlsPqSession>, Arc<TwoMlsPqSession>) {
+    let (alice_session, bob_session) = establish_sessions();
+    assert_ok!(alice_session.prepare_to_encrypt(None));
+    let enc = assert_ok!(alice_session.encrypt(b"confirm-a".to_vec()));
+    assert_some!(assert_ok!(bob_session.process_incoming(enc.cipher_text)));
+    assert_ok!(bob_session.prepare_to_encrypt(None));
+    let enc = assert_ok!(bob_session.encrypt(b"confirm-b".to_vec()));
+    assert_some!(assert_ok!(alice_session.process_incoming(enc.cipher_text)));
+    (alice_session, bob_session)
+}
