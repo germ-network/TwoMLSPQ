@@ -23,8 +23,8 @@ exactly the state its job needs:
   *last-resort* invitation retains its key package to accept many welcomes, while a
   *single-use* one consumes it (dropping the private material from the archive) after
   the first accepted session.
-- **`TwoMlsPqSession`** — one established pairwise channel: the two Combiner
-  send/receive group pairs and the per-round state.
+- **`TwoMlsPqSession`** — one established pairwise channel: the two send groups
+  (each an APQ group — see below) and the per-round state.
 
 ### Naming
 
@@ -82,15 +82,17 @@ each party a group they alone send on:
 This makes the two directions independent and lets each side advance its own key
 material without coordinating a shared committer.
 
-## The Combiner / APQ construction
+## The APQ group
 
-Each "group" above is really a **Combiner group**: a classical half (`0x0003`) and an
+Each send group above is really an **APQ group**: a classical half (`0x0003`) and an
 ML-KEM-768 half (`0xFDEA`). The two halves are bound by injecting a PSK derived from
 the PQ half into the classical half at creation; a second, cross-party PSK ties each
 party's send group to the group it receives on. An attacker must
 break *both* halves to break the session — so the classical half keeps protecting
 traffic even if ML-KEM were to fail, and vice-versa. This is the hybrid property,
-achieved at the group level. See [PSK Binding](./psk-binding.md).
+achieved at the group level (the construction follows `draft-ietf-mls-combiner-02`;
+in code an APQ group is the `apq` crate's `CombinerGroup`). See
+[PSK Binding](./psk-binding.md).
 
 ## Basic credentials and the TwoMLS AS
 

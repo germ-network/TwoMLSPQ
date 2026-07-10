@@ -8,7 +8,7 @@ use common::{established, suite_label};
 fn bench_messaging(c: &mut Criterion) {
     let mut group = c.benchmark_group("messaging");
 
-    // Steady-state send (partial-commit path). Commits mutate state, so each iteration
+    // Steady-state send (no-commit-round path). Commits mutate state, so each iteration
     // gets a freshly established session via `iter_batched_ref`.
     group.bench_function(format!("send_partial/{}", suite_label()), |b| {
         b.iter_batched_ref(

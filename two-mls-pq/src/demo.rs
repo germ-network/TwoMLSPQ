@@ -105,7 +105,7 @@ fn demo_e2e_full_session() {
         enc.epochs.classical_epoch
     );
 
-    // Step 6 — full commit (send-group commit rides the 0x05 ratchet frame): Bob proposes,
+    // Step 6 — folding commit (send-group commit rides the 0x03 message frame): Bob proposes,
     // Alice queues + commits with PSK refresh.
     assert_ok!(bob_session.prepare_to_encrypt(None));
     let proposal = assert_ok!(bob_session.encrypt(b"bob update".to_vec()));
@@ -116,7 +116,7 @@ fn demo_e2e_full_session() {
     let prep = assert_ok!(alice_session.prepare_to_encrypt(None));
     assert!(
         prep.did_commit,
-        "queued remote proposal forces a full commit"
+        "queued remote proposal forces a folding commit"
     );
     let enc = assert_ok!(alice_session.encrypt(b"committed".to_vec()));
     let got = assert_some!(assert_ok!(bob_session.process_incoming(enc.cipher_text)));
@@ -125,7 +125,7 @@ fn demo_e2e_full_session() {
         b"committed"
     );
     println!(
-        "[6] full commit: epoch advanced to {} + PSK refreshed",
+        "[6] folding commit: epoch advanced to {} + PSK refreshed",
         enc.epochs.classical_epoch
     );
 

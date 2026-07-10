@@ -32,12 +32,12 @@ fn main() {
     let welcome_b = bob_s.pending_outbound().unwrap();
     alice_s.process_incoming(welcome_b.clone()).unwrap();
 
-    // Partial commit (steady state, no queued proposal) — tag 0x05.
+    // No-commit round (steady state, no queued proposal) — message frame 0x03.
     alice_s.prepare_to_encrypt(None).unwrap();
-    let partial = alice_s.encrypt(payload.to_vec()).unwrap().cipher_text;
-    bob_s.process_incoming(partial.clone()).unwrap();
+    let no_commit = alice_s.encrypt(payload.to_vec()).unwrap().cipher_text;
+    bob_s.process_incoming(no_commit.clone()).unwrap();
 
-    // Full commit (epoch advance + PSK refresh) — still an A.2 ratchet frame, tag 0x05.
+    // Folding commit (epoch advance + PSK refresh) — still an A.2 message frame, 0x03.
     bob_s.prepare_to_encrypt(None).unwrap();
     let prop = bob_s.encrypt(b"proposal".to_vec()).unwrap();
     let res = alice_s.process_incoming(prop.cipher_text).unwrap().unwrap();
@@ -45,10 +45,10 @@ fn main() {
         .queue_proposal(res.proposal.unwrap().digest)
         .unwrap();
     alice_s.prepare_to_encrypt(None).unwrap();
-    let full = alice_s.encrypt(payload.to_vec()).unwrap().cipher_text;
-    bob_s.process_incoming(full.clone()).unwrap();
+    let folding = alice_s.encrypt(payload.to_vec()).unwrap().cipher_text;
+    bob_s.process_incoming(folding.clone()).unwrap();
 
-    // Agent rotation — tag 0x03.
+    // Principal rotation — message frame 0x03.
     let new_id = client().client_id();
     alice_s.stage_rotation(new_id.bytes.clone()).unwrap();
     alice_s.prepare_to_encrypt(Some(new_id)).unwrap();
@@ -95,13 +95,13 @@ fn main() {
     println!("payload (plaintext)          : {:>6} B", payload.len());
     println!("initial envelope A (§A.1)    : {:>6} B", envelope_a.len());
     println!("APQ welcome B (0x01, sealed) : {:>6} B", welcome_b.len());
-    println!("partial commit + app (0x03)  : {:>6} B", partial.len());
-    println!("full commit + app (0x03)     : {:>6} B", full.len());
+    println!("no-commit frame + app (0x03) : {:>6} B", no_commit.len());
+    println!("folding commit + app (0x03)  : {:>6} B", folding.len());
     println!("rotation commit + app (0x03) : {:>6} B", rotation.len());
     println!(
-        "overhead: partial={} B, full={} B, rotation={} B (over payload)\n",
-        partial.len() - payload.len(),
-        full.len() - payload.len(),
+        "overhead: no-commit={} B, folding={} B, rotation={} B (over payload)\n",
+        no_commit.len() - payload.len(),
+        folding.len() - payload.len(),
         rotation.len() - payload.len(),
     );
 

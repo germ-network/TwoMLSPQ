@@ -41,18 +41,18 @@ the peer (`my_pq_turn()`), and only one operation may be in flight at a time.
 
 - **Bootstrap** (`0x0B`/`0x0D`) — stands up Group_B's deferred PQ half off the
   critical path: Alice sends her PQ key package; Bob creates Group_B.pq around it and
-  returns its Welcome. Both send groups are then full APQ pairs
+  returns its Welcome. Both send groups are then complete APQ groups
   (`is_fully_established()`).
 - **PQ ratchet** (`0x05`/`0x07`/`0x09`) — injects fresh ML-KEM
   entropy into a send group's PQ half via a pathless PSK commit and re-binds the
   exported APQ-PSK into the classical half in the same round.
-- **PQ re-key** (`0x0F`/`0x11`) — updatePath commits run on the
-  two PQ groups **alone**, so the classical ratchet is never blocked behind a large
-  ML-KEM updatePath: the initiator proposes `Upd'(self)` into the peer's send-PQ
-  (`pq_rekey_begin`), the responder commits it and counter-proposes
-  (`pq_rekey_respond`), and each `Commit'` cross-injects a PSK exported from the
-  *opposite* PQ send group (`pq_rekey_apply`). The bumped `pq_epoch` reconciles into
-  the classical half at the next PQ ratchet bind.
+- **PQ re-key** (`0x0F`/`0x11`) — updatePath commits run on the two send groups'
+  PQ halves **alone**, so the classical ratchet is never blocked behind a large
+  ML-KEM updatePath: the initiator proposes `Upd'(self)` into the PQ half of the
+  peer's send group (`pq_rekey_begin`), the responder commits it and counter-proposes
+  (`pq_rekey_respond`), and each `Commit'` cross-injects a PSK exported from the PQ
+  half of the *opposite* send group (`pq_rekey_apply`). The bumped `pq_epoch`
+  reconciles into the classical half at the next PQ ratchet bind.
 
 ## Routing
 
@@ -86,7 +86,7 @@ Sending is two-phase so CommProtocol can bind a per-round proposal hash:
     rotation candidate (after `stage_rotation`; see Principal key rotation below).
 - **`encrypt(app_message)`** — binds the pending `proposal_hash` into the message's
   authenticated data and returns `EncryptResult { cipher_text, sender, recipient,
-  epochs }`, where `epochs` is the send group's APQ pair — `pq_epoch` (0 while that
+  epochs }`, where `epochs` is the send group's epoch pair — `pq_epoch` (0 while that
   half is deferred) and `classical_epoch` (the message epoch). The frame is always
   the `[staple][proposal][app]` triple: the staple (our latest send-group commit, or
   our APQWelcome until the first commit) rides every frame, so a peer that missed a
@@ -108,7 +108,8 @@ Sending is two-phase so CommProtocol can bind a per-round proposal hash:
   the truth (the signal is lost if the same frame's app message fails).
 - `None` — a welcome that changed nothing to announce (a re-delivery already joined
   from, or a first join under the peer's expected identity), or a message for an
-  unknown epoch (reconnect path; see Planned Features).
+  unknown epoch (a reconnect condition — not recovered in-library; see
+  Planned Features).
 
 A stapled commit *ahead* of the receive group's next epoch fails with `EpochDesync`
 before the app ciphertext is touched: the peer advanced more than one commit past us
@@ -116,7 +117,7 @@ and the bridging commit no longer rides any frame — reconnect territory,
 distinguishable from a transient `DecryptionFailed` (e.g. a message frame that
 overtook its A.3 BIND, which succeeds on retry once the BIND lands).
 
-## Remote proposals & full commit
+## Remote proposals & the folding commit
 
 When `process_incoming` surfaces a `proposal`, CommProtocol orders it against its own
 sequence number and, if accepted, calls `queue_proposal(digest)`. The next

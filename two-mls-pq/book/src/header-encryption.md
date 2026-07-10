@@ -175,7 +175,7 @@ halves and rotates with `pq_epoch`, so each header key tracks the clock of the f
 it protects. This matters because the classical and PQ ratchets run on **independent,
 asynchronous cadences** — the classical ratchet is continuous (every message), the PQ
 side-band is a slower turn-based exchange, and the two synchronize only at the A.3 bind
-(partial PQ commit + full classical commit importing the exported PSK). A side-band
+(partial PQ commit + the classical commit importing the exported PSK). A side-band
 frame keyed by the classical epoch would have its outer-seal availability governed by
 classical message volume: a frame in flight could be overtaken by classical epoch
 advances unrelated to it and, past the classical retention window, become unopenable.
@@ -328,8 +328,8 @@ reason the window must be ≥ 2 even in the happy path).
 ### Establishment walkthrough
 
 Alice initiates; Bob accepts (send groups per the [Session
-Lifecycle](./session-lifecycle.md); this inverts the §A.1 diagram's roles, matching
-the crate's constructor names).
+Lifecycle](./session-lifecycle.md); this matches the architecture-diagrams §A.1
+orientation and the crate's constructor names — Alice builds `Group_A` ≡ ASG).
 
 1. **Alice `initiate(client, their_kp, app_payload)`** — builds Group_A; captures
    `HeaderKey(Group_A, e₀)` into her receive window (piggybacked on the existing
@@ -468,8 +468,8 @@ never has.
    *content*, leaving only its metadata. A reverse (classical→PQ) PSK injection at the
    A.3/A.5 PQ commits would give the PQ groups' key schedules — and hence
    `HeaderKeyPQ` — classical cover, closing the one non-hybrid derivation. It is
-   protocol-level (changes commit contents on both sides), so it belongs to a Combiner
-   revision, not the header layer.
+   protocol-level (changes commit contents on both sides), so it belongs to a revision
+   of the APQ binding, not the header layer.
 3. **Receive-side AD checking** (from the stapling assessment): should the
    message-frame handler verify the app message's AD against the stapled proposal's
    digest (and, on a rotation commit, against the commit), restoring the classical stack's

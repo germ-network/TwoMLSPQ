@@ -1,11 +1,10 @@
 # Planned Features
 
-These methods exist in the API surface but currently return `Err` — they are
-scheduled work.
-
-| Area | Methods | Status |
-|------|---------|--------|
-| Reconnect | epoch-history window; `process_incoming` → `None` on unknown epoch; recovery from `EpochDesync` (a stapled commit ahead of the receive group) | not yet implemented |
+**Reconnect (`EpochDesync` recovery) is not planned.** When a stapled commit
+arrives ahead of the receive group, `process_incoming` surfaces `EpochDesync`
+and the session is not recovered in-library — how to proceed (typically
+re-establishing a fresh session) is the host's decision. The epoch-history
+window previously sketched here for in-library recovery has been dropped.
 
 Session archive/restore, transport routing (`should_listen_on`, `send_rendezvous`,
 `forwarded`), the always-staple wire format, and **header encryption** (the symmetric

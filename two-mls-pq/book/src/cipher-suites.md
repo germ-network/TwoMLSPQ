@@ -10,12 +10,12 @@
 `MlsCipherSuite::is_combiner_pq()` returns true **only** for `0xFDEA` — it is the
 routing signal: true means "handle in TwoMLSPQ as the PQ half", false means "hand to the
 classical library". `is_combiner_classical()` returns true **only** for `0x0003`; use it to
-recognise the classical half of a Combiner pair so it is paired with the ML-KEM-768
+recognise the classical half of an APQ group so it is paired with the ML-KEM-768
 half rather than routed to the classical library on its own.
 
 TwoMLSPQ uses **pure ML-KEM-768** for the PQ half — there is no hybrid (XWing-style)
-cipher suite. The hybrid property comes from the Combiner construction (the classical
-group bound to the ML-KEM-768 group via PSK).
+cipher suite. The hybrid property comes from the APQ group's two-half binding (the
+classical group bound to the ML-KEM-768 group via PSK).
 
 ## Suites and the APQ mode
 

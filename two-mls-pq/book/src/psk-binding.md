@@ -1,14 +1,14 @@
 # PSK Binding
 
 Two distinct PSK chains tie the construction together. The **APQ-PSK** binds the two
-halves of one Combiner group — this is what makes the construction hybrid: an attacker
+halves of one APQ group — this is what makes a send group hybrid: an attacker
 must break the classical half *and* the ML-KEM-768 half to break a session. The
 **cross-party TwoMLS-PSK** ties one party's send group to the group it receives on, so
 the two directions of a session share fate.
 
 ## The APQ-PSK (hybrid binding, PQ → classical)
 
-Each Combiner group is created PQ half first; the classical half then absorbs the PQ
+Each APQ group is created PQ half first; the classical half then absorbs the PQ
 half's secrecy at birth:
 
 ```
@@ -42,7 +42,7 @@ See the [Concepts](./concepts.md) object-model notes.
 
 ## Refresh
 
-On a full commit — one that consumes the peer's approved Upd proposal — the committer
+On a folding commit — one that consumes the peer's approved Upd proposal — the committer
 re-exports the cross-party PSK from its **receive** group's classical half at the
 current epoch and injects it into its own send-group commit, re-binding the two
 directions and providing break-in recovery.
@@ -52,7 +52,8 @@ entropy is injected into the send group's PQ half as a per-round PSK, and the
 re-exported APQ-PSK is bound into the classical half's commit in the same round.
 
 The PQ re-key adds a third, PQ-to-PQ chain: each of its two
-`Commit'`s cross-injects a PSK exported from the **opposite** PQ send group (same
+`Commit'`s cross-injects a PSK exported from the PQ half of the **opposite** send
+group (same
 exporter invariants, same exported-ID encoding), tying the two directions' PQ halves
 to each other while their updatePaths rotate the leaves.
 

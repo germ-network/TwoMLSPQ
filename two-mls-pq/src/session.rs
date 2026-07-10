@@ -2822,7 +2822,7 @@ impl TwoMlsPqSession {
     /// Prepare a pending proposal nonce and stage it for binding into the next outbound message.
     /// Returns `Err(SessionNotReady)` until both groups are established.
     ///
-    /// - `proposing: None` with a queued remote proposal → full commit (epoch advance + PSK refresh), `did_commit: true`
+    /// - `proposing: None` with a queued remote proposal → folding commit — folds the approved Upd (epoch advance + PSK refresh), `did_commit: true`
     /// - `proposing: Some(new_id)` → rotation commit with new leaf credential, `did_commit: true`
     /// - Otherwise → recv self-Update only, `did_commit: false`
     pub fn prepare_to_encrypt(&self, proposing: Option<ClientId>) -> Result<PrepareEncryptResult> {
@@ -4497,14 +4497,14 @@ mod tests {
         let offered = assert_some!(got.proposal);
         assert_ok!(bob.queue_proposal(offered.digest));
         assert!(assert_ok!(bob.prepare_to_encrypt(None)).did_commit);
-        let b2a = assert_ok!(bob.encrypt(b"full-commit".to_vec()));
+        let b2a = assert_ok!(bob.encrypt(b"folding-commit".to_vec()));
         assert_eq!(
             assert_some!(
                 assert_some!(assert_ok!(alice.process_incoming(b2a.cipher_text)))
                     .application_message
             )
             .app_message_data,
-            b"full-commit"
+            b"folding-commit"
         );
     }
 
@@ -5090,7 +5090,7 @@ mod tests {
     #[test]
     fn test_archive_preserves_listen_map() {
         let (alice_session, bob_session) = establish_sessions();
-        // Advance the send epoch (full commit round) so the map holds several epochs.
+        // Advance the send epoch (folding-commit round) so the map holds several epochs.
         message_round(&alice_session, &bob_session, b"staple");
         message_round(&bob_session, &alice_session, b"staple-back");
         let offered = {
@@ -5147,7 +5147,7 @@ mod tests {
     }
 
     /// The restored PSK ledger — not the (empty) stores of the rebuilt client — must
-    /// resolve the cross-party PSK a peer commit references: Bob's full commit binds the
+    /// resolve the cross-party PSK a peer commit references: Bob's folding commit binds the
     /// PSK of Alice's send group at the epoch he last observed, and the restored Alice
     /// runs on a rebuilt identity whose mls-rs secret stores hold nothing.
     #[test]
@@ -5540,19 +5540,13 @@ mod tests {
         let prep = assert_ok!(bob_session.prepare_to_encrypt(None));
         assert!(!prep.did_commit, "no commit before queue_proposal");
 
-        let partial = assert_ok!(bob_session.encrypt(b"no-commit".to_vec()));
-        assert_some!(assert_ok!(
-            alice_session.process_incoming(partial.cipher_text)
-        ));
+        let frame = assert_ok!(bob_session.encrypt(b"no-commit".to_vec()));
+        assert_some!(assert_ok!(alice_session.process_incoming(frame.cipher_text)));
 
         assert_ok!(bob_session.queue_proposal(proposal.digest));
         let prep2 = assert_ok!(bob_session.prepare_to_encrypt(None));
         assert!(prep2.did_commit, "must commit after queue_proposal");
     }
-
-    #[test]
-    #[ignore = "reconnect (Phase 11) not yet implemented"]
-    fn test_process_incoming_returns_none_on_rejoin_needed() {}
 
     #[test]
     fn test_session_id_differs_for_different_pairs() {
@@ -5592,10 +5586,6 @@ mod tests {
             alice_session.my_principal_state().client_id()
         );
     }
-
-    #[test]
-    #[ignore = "concurrent-session dedup not yet implemented"]
-    fn test_concurrent_sessions_same_did_pair_both_valid() {}
 
     #[test]
     fn test_principal_rotation_migrates_session_to_new_principal() {
@@ -5686,7 +5676,7 @@ mod tests {
 
     /// A frame that crossed one of our commits references our send group's *previous*
     /// epoch. The session's PSK ledger must still resolve it — live derivation cannot,
-    /// because mls-rs only exports the current epoch. Choreography: alice's full-commit
+    /// because mls-rs only exports the current epoch. Choreography: alice's folding-commit
     /// frame binds the PSK of bob's send group at epoch E; bob rotates (E → E+1) before
     /// processing alice's frame.
     #[test]
@@ -5699,7 +5689,7 @@ mod tests {
         let result = assert_some!(assert_ok!(alice_session.process_incoming(enc.cipher_text)));
         assert_ok!(alice_session.queue_proposal(assert_some!(result.proposal).digest));
 
-        // Alice's full commit binds the PSK of bob's send group at its current epoch.
+        // Alice's folding commit binds the PSK of bob's send group at its current epoch.
         assert_ok!(alice_session.prepare_to_encrypt(None));
         let crossing = assert_ok!(alice_session.encrypt(b"crossed".to_vec()));
 
@@ -5719,7 +5709,7 @@ mod tests {
         );
     }
 
-    /// One-shot PSKs (the recv-group export a full commit binds) are removed from the
+    /// One-shot PSKs (the recv-group export a folding commit binds) are removed from the
     /// mls-rs secret stores once the commit is applied — the stores hold nothing the
     /// session doesn't currently vouch for.
     #[test]
@@ -5779,7 +5769,10 @@ mod tests {
         let result = assert_some!(assert_ok!(bob_session.process_incoming(enc.cipher_text)));
         let app = assert_some!(result.application_message);
         assert_eq!(app.app_message_data, b"after commit");
-        assert!(app.epoch > 1, "send epoch must advance after full commit");
+        assert!(
+            app.epoch > 1,
+            "send epoch must advance after the folding commit"
+        );
     }
 
     #[test]
@@ -5812,21 +5805,21 @@ mod tests {
     }
 
     #[test]
-    fn test_partial_commit_recv_advances_send_group_on_peer() {
+    fn test_no_commit_round_delivers_app_message() {
         let (alice_session, bob_session) = establish_sessions();
 
         assert_ok!(alice_session.prepare_to_encrypt(None));
-        let enc = assert_ok!(alice_session.encrypt(b"partial".to_vec()));
+        let enc = assert_ok!(alice_session.encrypt(b"no-commit".to_vec()));
 
         let result = assert_some!(assert_ok!(bob_session.process_incoming(enc.cipher_text)));
         assert_eq!(
             assert_some!(result.application_message).app_message_data,
-            b"partial"
+            b"no-commit"
         );
     }
 
     #[test]
-    fn test_partial_commit_followed_by_bob_send_still_decrypts() {
+    fn test_no_commit_round_followed_by_bob_send_still_decrypts() {
         let (alice_session, bob_session) = establish_sessions();
 
         assert_ok!(alice_session.prepare_to_encrypt(None));
@@ -6356,7 +6349,7 @@ mod tests {
     }
 
     /// The dedicated-principal session drives the full lifecycle: cross-party PSK
-    /// refreshes (full commits in both directions — the acceptor's recv group lives on
+    /// refreshes (folding commits in both directions — the acceptor's recv group lives on
     /// the invitation-derived client's stores while its send group lives on the
     /// dedicated client's, so this proves `register_psk` reaches both), the A.4
     /// bootstrap (the PQ half is created under the dedicated principal too — no
@@ -6907,7 +6900,7 @@ mod tests {
     }
 
     #[test]
-    fn test_partial_commit_surfaces_proposal_nonce() {
+    fn test_no_commit_round_surfaces_proposal() {
         let (alice_session, bob_session) = establish_sessions();
 
         assert_ok!(alice_session.prepare_to_encrypt(None));
@@ -6923,7 +6916,7 @@ mod tests {
     }
 
     #[test]
-    fn test_multiple_sequential_partial_commits_stay_in_sync() {
+    fn test_multiple_sequential_no_commit_rounds_stay_in_sync() {
         let (alice_session, bob_session) = establish_sessions();
 
         for i in 0..3u8 {
@@ -7117,12 +7110,12 @@ mod tests {
     }
 
     #[test]
-    fn test_full_commit_after_multiple_partial_commits() {
+    fn test_folding_commit_after_multiple_no_commit_rounds() {
         let (alice_session, bob_session) = establish_sessions();
 
         for _ in 0..2 {
             assert_ok!(alice_session.prepare_to_encrypt(None));
-            let enc = assert_ok!(alice_session.encrypt(b"partial".to_vec()));
+            let enc = assert_ok!(alice_session.encrypt(b"no-commit".to_vec()));
             assert_some!(assert_ok!(bob_session.process_incoming(enc.cipher_text)));
         }
 
