@@ -206,47 +206,100 @@ pub fn decode_apq_welcome(bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
 }
 
 /// Trailing domain byte that distinguishes a PQ-ratchet *injected-secret* PSK id from an
-/// *exported* (apq / cross-party) PSK id. Injected ids carry this byte and are therefore always
-/// exactly one byte longer than an exported id, so the two families can never collide even at the
-/// same epoch. See `pq_ratchet` for the injection path.
+/// *exported* (apq / cross-party) PSK id. Injected ids carry this byte and are 8+group_id+1
+/// bytes, whereas an exported id is a fixed 32-byte derived value (see [`export_psk`]); with
+/// this crate's 32-byte group ids the two families are disjoint by length. See `pq_ratchet`
+/// for the injection path.
 pub(crate) const PSK_DOMAIN_INJECTED: u8 = 0x52;
 
-/// Raw PSK-id bytes: 8-byte little-endian epoch || group_id. The single source of truth for the
-/// id layout; all PSK ids in this crate are derived from this.
-fn psk_id_bytes(epoch: u64, group_id: &[u8]) -> Vec<u8> {
+/// PSK identifier for a PQ-ratchet *injected* secret: LE epoch || group_id || `PSK_DOMAIN_INJECTED`.
+/// The injected secret S is externally-sourced ML-KEM entropy, not an exporter-derived value,
+/// so it keeps this structural id (and stays an *external* PSK) in both recipe phases — it is
+/// Germ's extension, not draft-02's `apq_psk`.
+pub(crate) fn injected_secret_psk_id(epoch: u64, group_id: &[u8]) -> ExternalPskId {
     let mut id = epoch.to_le_bytes().to_vec();
     id.extend_from_slice(group_id);
-    id
-}
-
-/// PSK identifier for an *exported* secret (apq-PSK or cross-party TwoMLS-PSK): LE epoch || group_id.
-fn make_psk_id(epoch: u64, group_id: &[u8]) -> ExternalPskId {
-    ExternalPskId::new(psk_id_bytes(epoch, group_id))
-}
-
-/// PSK identifier for a PQ-ratchet *injected* secret: LE epoch || group_id || `PSK_DOMAIN_INJECTED`.
-pub(crate) fn injected_secret_psk_id(epoch: u64, group_id: &[u8]) -> ExternalPskId {
-    let mut id = psk_id_bytes(epoch, group_id);
     id.push(PSK_DOMAIN_INJECTED);
     ExternalPskId::new(id)
 }
 
-/// Derive the exportable PSK for `group`'s current epoch: 32 bytes via exportSecret, with
-/// id = LE epoch || group_id. Pure derivation — no store side-effect. Both parties derive
-/// the same value from the same epoch. Durable PSK material belongs to the caller (session
-/// orchestration), which registers the pair into every PSK store its groups resolve from
-/// just-in-time before the commit that references it — an mls-rs group reads the store of
+/// Which exported-PSK family a derivation belongs to. Both parties on a given binding MUST
+/// pass the same domain: the domain selects the component id and the exporter labels, so a
+/// mismatch would derive different id/value pairs and the PSK would never resolve.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PskDomain {
+    /// draft-02's `apq_psk`: exported from a PQ group, imported into its paired classical
+    /// group (intra-party PQ→classical binding).
+    Apq,
+    /// Germ's cross-party TwoMLS-PSK: exported from one party's send group and imported into
+    /// the other party's send group (classical↔classical at establishment / the routine
+    /// ratchet, PQ↔PQ at an A.5 re-key).
+    CrossParty,
+}
+
+impl PskDomain {
+    /// The mls-extensions component id this domain binds its exporter derivations to.
+    fn component_id(self) -> u32 {
+        match self {
+            PskDomain::Apq => crate::component::APQ_COMPONENT_ID,
+            PskDomain::CrossParty => crate::component::TWOMLS_COMPONENT_ID,
+        }
+    }
+
+    /// The exporter label for the PSK id.
+    fn id_label(self) -> &'static [u8] {
+        match self {
+            PskDomain::Apq => b"apq_psk_id",
+            PskDomain::CrossParty => b"twomls_psk_id",
+        }
+    }
+
+    /// The exporter label for the PSK value.
+    fn psk_label(self) -> &'static [u8] {
+        match self {
+            PskDomain::Apq => b"apq_psk",
+            PskDomain::CrossParty => b"twomls_psk",
+        }
+    }
+}
+
+/// Derive the exportable PSK for `group`'s current epoch in the given [`PskDomain`]
+/// (draft-02 phase-A recipe): two independently-labeled 32-byte exports off the group's
+/// exporter secret, each domain-separated by the component id via a `ComponentOperationLabel`
+/// context — the id, and the value. The exporter secret is derived from the epoch's start
+/// secret, so forward secrecy holds; nothing intermediate is materialized, so nothing needs
+/// deleting. Both parties derive the same pair from the same epoch and domain.
+///
+/// Pure derivation — no store side-effect. Durable PSK material belongs to the caller
+/// (session orchestration), which registers the pair into every PSK store its groups resolve
+/// from just-in-time before the commit that references it — an mls-rs group reads the store of
 /// the client that created it, which a session's current client may no longer be after an
 /// agent rotation. See [`register_psk`] / [`register_psk_stores`].
 ///
 /// Generic over the group's config, so it serves both the classical and the PQ half.
-pub fn export_psk<Cfg: MlsConfig>(group: &Group<Cfg>) -> Result<(ExternalPskId, PreSharedKey)> {
-    let secret = group
-        .export_secret(b"exportSecret", b"derive", 32)
+///
+/// Phase B (fork) replaces the two `export_secret` calls with a true `SafeExportSecret`
+/// exporter-tree leaf + `DeriveSecret("psk_id"/"psk")` and moves the import to
+/// `psk_type = application`; the domain-to-component mapping here is the migration seam.
+pub fn export_psk<Cfg: MlsConfig>(
+    group: &Group<Cfg>,
+    domain: PskDomain,
+) -> Result<(ExternalPskId, PreSharedKey)> {
+    let context = mls_rs::group::component_operation::ComponentOperationLabel::new(
+        domain.component_id(),
+        b"",
+    )
+    .get_bytes()
+    .map_err(|_| CombinerError::Mls)?;
+    let id = group
+        .export_secret(domain.id_label(), &context, 32)
+        .map_err(|_| CombinerError::Mls)?;
+    let psk = group
+        .export_secret(domain.psk_label(), &context, 32)
         .map_err(|_| CombinerError::Mls)?;
     Ok((
-        make_psk_id(group.current_epoch(), group.group_id()),
-        PreSharedKey::new(secret.as_bytes().to_vec()),
+        ExternalPskId::new(id.as_bytes().to_vec()),
+        PreSharedKey::new(psk.as_bytes().to_vec()),
     ))
 }
 
@@ -312,6 +365,7 @@ where
 pub fn export_and_register_psk<Cfg, S, C, P>(
     group: &Group<Cfg>,
     client: &CombinerClient<S, C, P>,
+    domain: PskDomain,
 ) -> Result<ExternalPskId>
 where
     Cfg: MlsConfig,
@@ -319,7 +373,7 @@ where
     C: CryptoProvider + Clone,
     P: CryptoProvider + Clone,
 {
-    let (psk_id, psk) = export_psk(group)?;
+    let (psk_id, psk) = export_psk(group, domain)?;
     register_psk(client, &psk_id, &psk);
     Ok(psk_id)
 }
@@ -489,7 +543,7 @@ where
         GroupCreation::new(pq_gid, &info, Some(attestation))?,
     )?;
     // APQ-PSK: export from the PQ group, inject into the classical message group.
-    let apq_psk = export_and_register_psk(&pq_group, client)?;
+    let apq_psk = export_and_register_psk(&pq_group, client, PskDomain::Apq)?;
     let (classical_group, classical_welcome) = create_group_with_member(
         client.classical(),
         classical_kp,
@@ -539,7 +593,7 @@ where
     let joined = (|| {
         let pq = join_group_from_welcome(client.pq(), pq_welcome)?;
         // Re-derive the same APQ-PSK the creator used to bind the classical group.
-        export_and_register_psk(&pq, client)?;
+        export_and_register_psk(&pq, client, PskDomain::Apq)?;
         let classical = join_group_from_welcome(client.classical(), classical_welcome)?;
         Ok(CombinerGroup::from_client(client, classical, Some(pq)))
     })();
@@ -573,7 +627,7 @@ where
 {
     let peer_id = key_package_client_id(classical_kp)?;
     client.auth_view().with(|core| core.theirs.commit(peer_id));
-    let psk_cross = export_and_register_psk(recv_classical, client)?;
+    let psk_cross = export_and_register_psk(recv_classical, client, PskDomain::CrossParty)?;
     // Pre-allocate the deferred PQ half's group id now: it is pinned inside the
     // classical half's APQInfo (durable in GroupContext, riding the Welcome), and the
     // A.4 bootstrap must later create the PQ group under exactly this id. The PQ epoch
@@ -613,7 +667,7 @@ where
     let peer_id = key_package_client_id(classical_kp)?;
     client.auth_view().with(|core| core.theirs.commit(peer_id));
     // Cross-party TwoMLS-PSK from the recv group (Group_A classical).
-    let psk_cross = export_and_register_psk(recv_classical, client)?;
+    let psk_cross = export_and_register_psk(recv_classical, client, PskDomain::CrossParty)?;
     // Pre-generated ids + APQInfo in both halves; both creation commits carry the
     // {1, 1} attestation (the pair is created together — structurally FULL).
     let suite = client.cipher_suite();
@@ -632,7 +686,7 @@ where
         GroupCreation::new(pq_gid, &info, Some(attestation))?,
     )?;
     // Intra-party APQ-PSK from Group_B's PQ group.
-    let psk_apq = export_and_register_psk(&pq_group, client)?;
+    let psk_apq = export_and_register_psk(&pq_group, client, PskDomain::Apq)?;
     let (classical_group, classical_welcome) = create_group_with_member(
         client.classical(),
         classical_kp,
@@ -996,7 +1050,7 @@ mod tests {
     }
 
     #[test]
-    fn test_export_and_register_psk_is_deterministic_and_le_epoch_group_id() {
+    fn test_export_psk_is_deterministic_and_domain_separated() {
         let alice = client();
         let bob = client();
         admit(&alice, bob.client_id());
@@ -1008,14 +1062,18 @@ mod tests {
         )
         .unwrap();
 
-        let id1 = export_and_register_psk(&group, &alice).unwrap();
-        let id2 = export_and_register_psk(&group, &alice).unwrap();
+        let id1 = export_and_register_psk(&group, &alice, PskDomain::CrossParty).unwrap();
+        let id2 = export_and_register_psk(&group, &alice, PskDomain::CrossParty).unwrap();
+        // Deterministic: the same group epoch + domain derives the same opaque id.
         assert_eq!(id1, id2);
 
-        let mut expected = group.current_epoch().to_le_bytes().to_vec();
-        expected.extend_from_slice(group.group_id());
+        // Phase-A ids are 32-byte derived values, not the old LE(epoch)||group_id layout.
         let id_bytes: &[u8] = &id1;
-        assert_eq!(id_bytes, expected.as_slice());
+        assert_eq!(id_bytes.len(), 32);
+
+        // Distinct domains derive distinct ids from the same group.
+        let (apq_id, _) = export_psk(&group, PskDomain::Apq).unwrap();
+        assert_ne!(&apq_id as &[u8], id_bytes);
     }
 
     #[test]

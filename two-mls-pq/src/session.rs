@@ -19,7 +19,7 @@ use apq::{
     create_bound_classical_send_group, create_combiner_send_group, create_group_with_member,
     decode_apq_welcome, encode_apq_welcome, export_psk, forget_psk,
     join_combiner_group_from_halves, join_group_from_welcome, register_psk, sender_client_id,
-    GroupCreation, APQ_TAG,
+    GroupCreation, PskDomain, APQ_TAG,
 };
 
 use crate::key_package_store::CombinerGroup;
@@ -1104,7 +1104,7 @@ impl TwoMlsPqSession {
                 .as_ref()
                 .and_then(|g| g.pq.as_ref())
                 .ok_or(TwoMlsPqError::SessionNotReady)?;
-            let (psk_id, psk) = export_psk(recv_pq)?;
+            let (psk_id, psk) = export_psk(recv_pq, PskDomain::CrossParty)?;
             inner.register_psk(&psk_id, &psk);
             psk_id
         };
@@ -1203,7 +1203,7 @@ impl TwoMlsPqSession {
                 .as_ref()
                 .and_then(|g| g.pq.as_ref())
                 .ok_or(TwoMlsPqError::SessionNotReady)?;
-            let (psk_id, psk) = export_psk(send_pq)?;
+            let (psk_id, psk) = export_psk(send_pq, PskDomain::CrossParty)?;
             inner.register_psk(&psk_id, &psk);
         }
         match inner.pq_inflight.take() {
@@ -1237,7 +1237,7 @@ impl TwoMlsPqSession {
                     }
                     // A peer commit must never change the two-party shape.
                     apq::ensure_two_party(&*recv_pq)?;
-                    export_psk(&*recv_pq)?
+                    export_psk(&*recv_pq, PskDomain::CrossParty)?
                 };
                 inner.register_psk(&psk_id, &psk);
                 // Commit the counter-Upd' on our own send-PQ. If this rekey carries a
@@ -1642,7 +1642,7 @@ impl SessionInner {
             .send_group
             .as_ref()
             .ok_or(TwoMlsPqError::SessionNotReady)?;
-        let (psk_id, psk) = export_psk(&send.classical)?;
+        let (psk_id, psk) = export_psk(&send.classical, PskDomain::CrossParty)?;
         if !self
             .send_psk_ledger
             .iter()
@@ -1749,7 +1749,7 @@ impl SessionInner {
             } else {
                 // Join the PQ group first, then re-derive the intra-party APQ-PSK from it.
                 let pq = join_group_from_welcome(client.pq(), &pq_welcome)?;
-                let (psk_id, psk) = export_psk(&pq)?;
+                let (psk_id, psk) = export_psk(&pq, PskDomain::Apq)?;
                 self.register_psk(&psk_id, &psk);
                 // Join the classical group (bound with the cross-party + APQ PSKs).
                 let classical = join_group_from_welcome(client.classical(), &classical_welcome)?;
@@ -1868,7 +1868,7 @@ impl SessionInner {
                     .recv_group
                     .as_ref()
                     .ok_or(TwoMlsPqError::SessionNotReady)?;
-                let (psk_id, psk) = export_psk(&recv.classical)?;
+                let (psk_id, psk) = export_psk(&recv.classical, PskDomain::CrossParty)?;
                 let send = self
                     .send_group
                     .as_ref()
@@ -6824,7 +6824,7 @@ mod tests {
     }
 
     #[test]
-    fn test_psk_export_uses_correct_label_and_context() {
+    fn test_psk_export_is_deterministic_and_domain_separated() {
         let alice = make_client();
         let bob = make_client();
         let bob_kp = make_combiner_kp(&bob);
@@ -6841,30 +6841,27 @@ mod tests {
             apq::GroupCreation::bare(assert_ok!(alice.combiner().random_group_id())),
         ));
 
-        let s1 = assert_ok!(group.export_secret(b"exportSecret", b"derive", 32));
-        let s2 = assert_ok!(group.export_secret(b"exportSecret", b"derive", 32));
-        assert_eq!(s1.as_bytes(), s2.as_bytes());
-        assert_eq!(s1.as_bytes().len(), 32);
+        // Phase-A recipe: deterministic per (group epoch, domain), 32-byte opaque ids, and
+        // the two domains derive distinct ids from the same group.
+        let (apq_id, apq_psk) = assert_ok!(apq::export_psk(&group, apq::PskDomain::Apq));
+        let (apq_id2, apq_psk2) = assert_ok!(apq::export_psk(&group, apq::PskDomain::Apq));
+        assert_eq!(apq_id, apq_id2);
+        assert_eq!(apq_psk.raw_value(), apq_psk2.raw_value());
+        assert_eq!((&apq_id as &[u8]).len(), 32);
 
-        let other = assert_ok!(group.export_secret(b"otherLabel", b"derive", 32));
-        assert_ne!(s1.as_bytes(), other.as_bytes());
-
-        let psk_id = assert_ok!(apq::export_and_register_psk(&group, alice.combiner()));
-        let expected_id = {
-            let mut v = group.current_epoch().to_le_bytes().to_vec();
-            v.extend_from_slice(group.group_id());
-            mls_rs::psk::ExternalPskId::new(v)
-        };
-        assert_eq!(psk_id, expected_id);
+        let (cross_id, cross_psk) = assert_ok!(apq::export_psk(&group, apq::PskDomain::CrossParty));
+        assert_ne!(&apq_id as &[u8], &cross_id as &[u8]);
+        assert_ne!(apq_psk.raw_value(), cross_psk.raw_value());
     }
 
     #[test]
     fn test_apq_psk_is_exported_from_pq_group_not_classical() {
         // draft-ietf-mls-combiner §4/§6.2: the APQ-PSK is exported from the PQ session and
         // imported into the traditional session (pq -> classical). Regression guard against the
-        // old (wrong) classical -> pq direction: a PSK keyed by the PQ group's (epoch, group_id)
-        // must be registered (it is the export source); under the reverted direction the PQ
-        // group is the importer and its id is never a PSK source, so this would fail.
+        // old (wrong) classical -> pq direction: the Apq-domain PSK derived from the send
+        // group's PQ half must be registered in the classical half's store (it is the export
+        // source → importer); under the reverted direction the PQ group is the importer and its
+        // export is never registered classically, so this would fail.
         let (alice_session, _bob_session) = establish_sessions();
         let inner = alice_session
             .inner
@@ -6872,12 +6869,10 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let send = assert_some!(inner.send_group.as_ref());
 
-        let apq_id_from_pq = {
-            let send_pq = send.pq.as_ref().expect("send pq");
-            let mut v = send_pq.current_epoch().to_le_bytes().to_vec();
-            v.extend_from_slice(send_pq.group_id());
-            mls_rs::psk::ExternalPskId::new(v)
-        };
+        let (apq_id_from_pq, _) = assert_ok!(apq::export_psk(
+            send.pq.as_ref().expect("send pq"),
+            apq::PskDomain::Apq,
+        ));
         assert!(
             inner
                 .client

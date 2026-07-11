@@ -20,7 +20,7 @@ use mls_rs_crypto_traits::KemType;
 use zeroize::Zeroizing;
 
 use crate::component::{commit_attestation, ApqInfoUpdate};
-use crate::group::{export_psk, injected_secret_psk_id};
+use crate::group::{export_psk, injected_secret_psk_id, PskDomain};
 use crate::{CombinerError, Result};
 
 /// Initiator-side ephemeral for one PQ ratchet round. Holds the decapsulation key; the
@@ -137,7 +137,7 @@ pub fn inject_and_commit<Cfg: MlsConfig>(
     crate::group::ensure_two_party(pq_group)?;
     // S is now folded into the new epoch; wipe it from the stores before re-exporting.
     drop(secret);
-    let (apq_psk_id, apq_psk) = export_psk(pq_group)?;
+    let (apq_psk_id, apq_psk) = export_psk(pq_group, PskDomain::Apq)?;
     crate::group::register_psk_stores(stores, &apq_psk_id, &apq_psk);
     let bytes = out
         .commit_message
@@ -174,7 +174,7 @@ pub fn apply_injected_commit<Cfg: MlsConfig>(
     crate::group::ensure_two_party(pq_group)?;
     // S is now folded into the new epoch; wipe it before re-exporting.
     drop(secret);
-    let (apq_psk_id, apq_psk) = export_psk(pq_group)?;
+    let (apq_psk_id, apq_psk) = export_psk(pq_group, PskDomain::Apq)?;
     crate::group::register_psk_stores(stores, &apq_psk_id, &apq_psk);
     Ok((apq_psk_id, attestation))
 }
