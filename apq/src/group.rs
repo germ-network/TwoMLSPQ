@@ -651,20 +651,15 @@ where
 }
 
 /// Create the acceptor's bound send group (Group_B) with the PQ half deferred (A.4):
-/// classical only, bound to the cross-party TwoMLS-PSK from the recv group. The heavy PQ
-/// half is stood up later by the bootstrap flow, off the handshake critical path.
-///
-/// Returns `(send_group, welcome, cross_party_psk)`: the cross-party PSK is handed back so
-/// the caller can seed its export memo — the recv group's cross-party leaf at this epoch is
-/// now consumed, and the first routine full commit would otherwise try to re-derive it.
-// The 3-tuple mirrors the sibling builders' `(group, welcome)` return plus the memo seed; a
-// named struct would not read more clearly at the two call sites.
-#[allow(clippy::type_complexity)]
+/// classical only, bound to the cross-party TwoMLS-PSK from the recv group — the sole path
+/// by which this classical-only send group inherits post-quantum protection before A.4 (the
+/// recv group's classical half is PQ-seeded via its own `apq_psk`). The heavy PQ half is
+/// stood up later by the bootstrap flow, off the handshake critical path.
 pub fn create_bound_classical_send_group<S, C, P>(
     classical_kp: &[u8],
     client: &CombinerClient<S, C, P>,
     recv_classical: &mut MlsGroup<S, C>,
-) -> Result<(CombinerGroup<S, C, P>, Vec<u8>, ExportedPsk)>
+) -> Result<(CombinerGroup<S, C, P>, Vec<u8>)>
 where
     S: KeyPackageStorage + Clone,
     C: CryptoProvider + Clone,
@@ -691,7 +686,6 @@ where
     Ok((
         CombinerGroup::from_client(client, classical_group, None),
         classical_welcome,
-        psk_cross,
     ))
 }
 

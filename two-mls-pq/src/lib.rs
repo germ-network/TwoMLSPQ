@@ -133,7 +133,12 @@ pub fn version() -> String {
 // A.3 injected secret S stays an external PSK. Ledger/archive reshaped (SESSION_ARCHIVE_VERSION
 // -> 7). The exporter tree consumes each component's leaf once per epoch, so the session
 // exports at most once per (send group, epoch) and memoizes via the ledger.
-const BINDING_CONTRACT_VERSION: u64 = 11;
+// v12 (2026-07-11, event-driven cross-party injection): the cross-party TwoMLS-PSK is
+// re-injected only when the peer's group has ADVANCED since we last bound it (a full commit /
+// A.3 bind on the classical side, a PQ commit on the A.5 side), not procedurally on every
+// commit — so a commit with no new peer entropy to entangle with carries no cross-party PSK.
+// The transient PSK memo is replaced by epoch watermarks (SESSION_ARCHIVE_VERSION -> 8).
+const BINDING_CONTRACT_VERSION: u64 = 12;
 
 /// See `BINDING_CONTRACT_VERSION`. Exported so the Swift layer can verify the
 /// binding it was generated with matches the binary it loaded.
