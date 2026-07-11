@@ -5,6 +5,9 @@ import PackageDescription
 
 let package = Package(
 	name: "AbstractTwoMLS",
+	// Import/link floors. The PQ backend's ML-KEM paths additionally require
+	// OS 26 (CryptoKit ML-KEM-768) at RUNTIME — that floor applies only to
+	// calling the PQ API, not to importing or linking this package.
 	platforms: [.iOS(.v17), .macOS(.v15)],
 	products: [
 		// Vend the abstraction plus each concrete UniFFI wrapper. The wrappers must be

@@ -1,5 +1,5 @@
 {
-	"name": "@{owner}/{packageName}",
+	"name": "@germ-network/abstract-two-mls",
 	"private": true,
 	"version": "0.0.0",
 	"engines": {
