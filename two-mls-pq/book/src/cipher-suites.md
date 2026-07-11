@@ -49,6 +49,13 @@ package or welcome whose suites don't match fails early with `CipherSuiteMismatc
 decrypt error, and a restored archive whose suite pair differs from the build's pinned
 suite is rejected as `ArchiveInvalid`.
 
+The same `(mode, classical_suite, pq_suite)` triple is recorded in each half's `APQInfo`
+GroupContext extension (type `0xF0A1`) and carried in the Welcome, so a joiner
+re-verifies the pair — and rejects an invalid or duplicate suite pairing, as
+`draft-ietf-mls-combiner-02` requires — against that record, not only against its own
+pinned suite. See [group rules](./group-rules.md) (rule 7) and
+[wire format](./wire-format.md).
+
 ## Feature flags
 
 | Flag | Meaning |
