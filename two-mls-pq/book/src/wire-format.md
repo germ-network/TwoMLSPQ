@@ -74,6 +74,30 @@ is also what makes the message frame's staple slot self-discriminating (welcome
 space stays unused and in reserve; extending the protocol is "take the next unused
 odd value."
 
+## Draft-02 conformance inside the frames
+
+The Germ tags above are the *transport* envelope; inside them the MLS payloads carry
+the `draft-ietf-mls-combiner-02` structures directly. The apq crate conforms to the
+draft, and the Germ frames **enclose** the draft-02 wire shapes rather than replacing
+them.
+
+- **APQInfo** — a GroupContext extension (type `0xF0A1`) present in both halves of each
+  APQ group and carried automatically in every Welcome's GroupInfo. It names both group
+  ids, the mode, both cipher suites, and the creation-time epochs; it is written once at
+  creation and never rewritten, and joiners verify it against the groups they actually
+  joined (see [group rules](./group-rules.md), rule 7).
+- **AppDataUpdate** — a custom proposal (type `0x0008`) that rides both commits of every
+  FULL commit, attesting the new epochs of both halves. Receivers verify the two copies
+  agree and match the actual post-commit epochs before any app data is decrypted.
+- **Combiner key package (v2)** — the `CombinerKeyPackage` payload adopts the draft's §7
+  `APQKeyPackage { t_key_package, pq_key_package }` TLS encoding inside Germ's version
+  framing. A v1 (pre-conformance) key package is rejected outright.
+
+The conformance cutover is a hard version bump — `COMBINER_KEY_PACKAGE_VERSION = 2`,
+`SESSION_ARCHIVE_VERSION = 8`, `BINDING_CONTRACT_VERSION = 12` — because every occupied
+leaf must now advertise the new extension (`0xF0A1`) and proposal (`0x0008`) types, and
+a leaf that cannot support them is rejected rather than silently degraded.
+
 ## Invariants
 
 The tag values are part of the on-wire protocol; pre-release, a renumber is allowed

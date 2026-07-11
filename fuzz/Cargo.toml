@@ -19,7 +19,7 @@ libfuzzer-sys = "0.4"
 two-mls-pq = { path = "../two-mls-pq", default-features = false, features = ["awslc"] }
 
 [patch.crates-io]
-mls-rs = { git = "https://github.com/germ-network/mls-rs", rev = "3743c75d32257ab48bde2875f5e8d624410147e9" }
+mls-rs = { git = "https://github.com/germ-network/mls-rs", rev = "7c8c63a7c940e15af9845ed001d5d95b61f496cf" }
 
 [[bin]]
 bench = false

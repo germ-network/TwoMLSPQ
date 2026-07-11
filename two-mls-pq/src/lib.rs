@@ -111,7 +111,34 @@ pub fn version() -> String {
 // rejected call is a no-op and replacing the running tally is a clean overwrite; the
 // tally is dropped when the send epoch advances via an A.3 bind. New exported getter
 // `queued_remote_successor() -> Option<ClientId>` surfaces the current tally.
-const BINDING_CONTRACT_VERSION: u64 = 9;
+//
+// v10 (2026-07-10, draft-02 conformance, phase A): every group carries an `APQInfo`
+// GroupContext extension written at creation (both group ids — the acceptor's PQ id
+// pre-allocated for A.4 — mode, suites, creation epochs with EPOCH_UNBOUND sentinels
+// for a deferred half); joins verify it (a welcome without one fails
+// `ApqInfoMismatch` — new error variant — as a downgrade attempt) plus -02 §4.2.1
+// membership consistency. Every FULL commit (the A.3 bind's two halves, and full-pair
+// creation commits) carries an `AppDataUpdate` (0x0008) proposal attesting the absolute
+// post-commit epochs of both groups; receivers verify both copies agree and match the
+// actual epochs before decrypting the stapled app message. A.5 re-key commits must NOT
+// carry one (pq_epoch reconciles at the next A.3 bind — the documented Germ extension).
+// Leaves now advertise the APQInfo extension type (0xF0A1) and AppDataUpdate proposal
+// type, so v1 combiner key packages and v5 archives are rejected
+// (COMBINER_KEY_PACKAGE_VERSION -> 2: the payload is now the -02 §7 APQKeyPackage TLS
+// shape inside the version byte; SESSION_ARCHIVE_VERSION -> 6, pure compatibility cut).
+// v11 (2026-07-10, draft-02 conformance, phase B): the apq_psk / cross-party PSKs are now the
+// conformant application PSKs — SafeExportSecret(component_id) off the mls-rs exporter tree +
+// DeriveSecret("psk_id"/"psk"), imported with psk_type=application(3) via add_application_psk
+// (the fork's safe_extensions feature; pin bumped to the germ-shadow-safe-exporter rev). The
+// A.3 injected secret S stays an external PSK. Ledger/archive reshaped (SESSION_ARCHIVE_VERSION
+// -> 7). The exporter tree consumes each component's leaf once per epoch, so the session
+// exports at most once per (send group, epoch) and memoizes via the ledger.
+// v12 (2026-07-11, event-driven cross-party injection): the cross-party TwoMLS-PSK is
+// re-injected only when the peer's group has ADVANCED since we last bound it (a full commit /
+// A.3 bind on the classical side, a PQ commit on the A.5 side), not procedurally on every
+// commit — so a commit with no new peer entropy to entangle with carries no cross-party PSK.
+// The transient PSK memo is replaced by epoch watermarks (SESSION_ARCHIVE_VERSION -> 8).
+const BINDING_CONTRACT_VERSION: u64 = 12;
 
 /// See `BINDING_CONTRACT_VERSION`. Exported so the Swift layer can verify the
 /// binding it was generated with matches the binary it loaded.
@@ -419,6 +446,13 @@ pub enum TwoMlsPqError {
     /// authorize-and-reprocess recovers the round.
     #[error("credential succession rejected by the authentication service")]
     CredentialRejected,
+    /// The draft -02 bookkeeping failed verification: an `APQInfo` GroupContext extension
+    /// is missing or inconsistent across a pair's halves (a welcome without one is a
+    /// downgrade attempt), an A.4 group id does not match the id pre-allocated at
+    /// establishment, or an `AppDataUpdate` epoch attestation does not match the actual
+    /// post-commit epochs of both groups.
+    #[error("APQInfo missing or inconsistent")]
+    ApqInfoMismatch,
 }
 
 /// SHA-256 over `bytes` — the single hashing primitive behind every digest this
@@ -465,6 +499,7 @@ impl From<apq::CombinerError> for TwoMlsPqError {
             apq::CombinerError::ArchiveInvalid => TwoMlsPqError::ArchiveInvalid,
             apq::CombinerError::UnsupportedCipherSuite => TwoMlsPqError::UnsupportedCipherSuite,
             apq::CombinerError::CipherSuiteMismatch => TwoMlsPqError::CipherSuiteMismatch,
+            apq::CombinerError::ApqInfoMismatch => TwoMlsPqError::ApqInfoMismatch,
         }
     }
 }

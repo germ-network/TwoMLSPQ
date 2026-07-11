@@ -13,15 +13,19 @@ reusable layer: an `MlsRules` filter every client is built with
    permitted Add: the creator, alone in the group, adds the single peer and nothing
    else. That is how every half is born — the classical halves at establishment, the
    acceptor's PQ half at the A.4 bootstrap (`create_group_with_member`). Once the
-   roster is two: no Add, Remove, ReInit, ExternalInit, GroupContextExtensions, or
-   custom proposals, ever; no external commits; no external senders.
+   roster is two: no Add, Remove, ReInit, ExternalInit, or GroupContextExtensions,
+   ever; no external commits; no external senders. The **only** custom proposal ever
+   admitted is the draft-02 `AppDataUpdate` (type `0x0008`) that attests new epochs in a
+   FULL commit (rule 7); every other custom proposal is rejected.
 2. **At most one Update per commit, never the committer's own.** The only Update a
    commit legitimately folds is the *other* party's leaf update (the stapled
    `Upd(sender)` of the classical ratchet, or the A.5 `Upd'`). An MLS Update always
    covers its sender's leaf, so requiring a member sender other than the committer
    pins it to the peer.
-3. **External PSKs only.** PSK proposals carry the APQ and cross-party TwoMLS
-   bindings; resumption PSKs are never used (this protocol never resumes groups).
+3. **Application and external PSKs only, never resumption.** The APQ-PSK and
+   cross-party TwoMLS-PSK are imported as `application(3)` PSKs (draft-02 §6.2); the
+   A.3 injected secret rides an `external(1)` PSK. Resumption PSKs are never used (this
+   protocol never resumes groups). See [PSK Binding](./psk-binding.md).
 4. **Basic credentials only, evolving along the app-defined sequence.** Each leaf's
    credential is the member's opaque ClientId, and it may change only per the TwoMLS
    Authentication Service (below).
@@ -37,6 +41,17 @@ reusable layer: an `MlsRules` filter every client is built with
    *initiator's* welcome join takes the creator leaf as the peer's principal — the
    acceptor may establish under a dedicated per-session principal, authenticated by
    the cross-party PSK.)
+7. **APQInfo is written once; epochs are attested per FULL.** Each half carries an
+   `APQInfo` GroupContext extension (type `0xF0A1`) naming both group ids, the mode,
+   both cipher suites, and the creation-time epochs — written at creation, riding the
+   Welcome, and **never rewritten** (rewriting it would need a GroupContextExtensions
+   proposal, which rule 1 forbids — and which would force an updatePath onto the
+   otherwise-pathless A.3 bind). Epoch freshness rides the `AppDataUpdate` in each FULL
+   commit instead: both halves carry it, the two copies must agree, and each must attest
+   its group's *actual* new epoch. A.5 re-keys are PQ-only and carry no `AppDataUpdate`
+   (an attestation smuggled into one is rejected); their `pq_epoch` reconciles at the
+   next A.3 bind. The deferred A.4 PQ group id is pre-allocated in the classical half's
+   `APQInfo` with its epoch set to `EPOCH_UNBOUND` until the bootstrap lands.
 
 ## Enforcement map
 
@@ -47,9 +62,10 @@ checks each cover ingress the others cannot see.
 |---|---|---|
 | Two members | roster gate on every commit, both directions | `ensure_two_party` at every welcome join (no commit runs there) and re-asserted after every applied commit |
 | Creation-commit shape | roster == 1 ⇒ exactly one Add | groups only ever built via `create_group_with_member` |
-| No Add/Remove/ReInit/GCE/… post-creation | rejected on build **and** on receive (a peer commit carrying one is vetoed before it applies) | post-commit `ensure_two_party` backstop |
+| No Add/Remove/ReInit/GCE post-creation | rejected on build **and** on receive (a peer commit carrying one is vetoed before it applies) | post-commit `ensure_two_party` backstop |
+| Custom proposals: only `AppDataUpdate` (`0x0008`) | ≤ 1 custom proposal, correct type, committer-sent, strict-decoded, same-half epoch == `context.epoch + 1`; any other custom type rejected | presence/cross-half agreement and actual-epoch match verified in the session (`pq_ratchet_apply`), before app decrypt |
 | ≤ 1 Update, peer's own leaf only | sender ≠ committer on every folded Update | `require_peer_update` at ingest: the stapled proposal (`queue_proposal`), the A.5 opener (`pq_rekey_respond`), and the A.5 counter slot (`pq_rekey_apply`) reject anything that isn't the peer's own-leaf Update *before* it enters a cache |
-| External PSKs only | resumption PSKs rejected | PSK ids are minted internally (`export_psk`) |
+| Application/external PSKs, never resumption | resumption rejected; external **or** application accepted | PSK ids are minted internally (`export_psk`); application PSKs carry the APQ/cross-party bindings, the A.3 injected secret stays external |
 | No external commits/senders | `CommitSource::NewMember` rejected | external senders never configured |
 | Epoch discipline | — | staple-epoch compare in `process_incoming` (`EpochDesync` / skip) |
 | Identity binding at establishment | — | `expected_remote` pre-claim check; creator-leaf ≡ key-package check at join; A.4 bootstrap KP identity check (`RemoteIdentityMismatch`) |
