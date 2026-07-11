@@ -239,9 +239,17 @@ mod cryptokit_interop {
 
         // Alice (awslc) binds: pathless PQ commit + classical apq-PSK commit.
         let a_stores = [alice.pq().secret_store(), alice.classical().secret_store()];
-        let (pq_commit, apq_psk_id) =
-            pq_ratchet::inject_and_commit(a_send.pq.as_mut().unwrap(), &s_alice, &a_stores)
-                .unwrap();
+        let attestation = apq::component::ApqInfoUpdate {
+            t_epoch: a_send.classical.current_epoch() + 1,
+            pq_epoch: a_send.pq.as_ref().unwrap().current_epoch() + 1,
+        };
+        let (pq_commit, apq_psk_id) = pq_ratchet::inject_and_commit(
+            a_send.pq.as_mut().unwrap(),
+            &s_alice,
+            &a_stores,
+            attestation,
+        )
+        .unwrap();
         let cl_out = a_send
             .classical
             .commit_builder()
@@ -251,15 +259,17 @@ mod cryptokit_interop {
             .unwrap();
         a_send.classical.apply_pending_commit().unwrap();
 
-        // Bob (CryptoKit) applies both commits.
+        // Bob (CryptoKit) applies both commits; the applied PQ commit surfaces the
+        // initiator's epoch attestation intact.
         let b_stores = [bob.pq().secret_store(), bob.classical().secret_store()];
-        pq_ratchet::apply_injected_commit(
+        let (_, b_attestation) = pq_ratchet::apply_injected_commit(
             b_recv.pq.as_mut().unwrap(),
             &s_bob,
             &pq_commit,
             &b_stores,
         )
         .unwrap();
+        assert_eq!(b_attestation, attestation);
         let cl = MlsMessage::from_bytes(&cl_out.commit_message.to_bytes().unwrap()).unwrap();
         b_recv.classical.process_incoming_message(cl).unwrap();
 

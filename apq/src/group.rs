@@ -549,7 +549,7 @@ where
     // naming exactly these groups, and both rosters hold the same two identities.
     {
         let pq = group.pq.as_ref().ok_or(CombinerError::Mls)?;
-        verify_apqinfo_pair(&group.classical, Some(pq), client.cipher_suite())?;
+        verify_apqinfo_pair(&group.classical, pq, client.cipher_suite())?;
         ensure_membership_consistent(&group.classical, pq)?;
     }
     let mine = group.classical.current_member_index();

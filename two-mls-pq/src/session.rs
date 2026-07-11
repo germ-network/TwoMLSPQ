@@ -11,7 +11,10 @@ use mls_rs::{
 };
 
 use apq::authentication::{AuthCoreHandle, PartySequence};
-use apq::component::{read_apqinfo, verify_deferred_pq_info, ApqInfo, EPOCH_UNBOUND};
+use apq::component::{
+    commit_attestation, read_apqinfo, verify_apqinfo_deferred, verify_apqinfo_pair,
+    verify_deferred_pq_info, ApqInfo, ApqInfoUpdate, EPOCH_UNBOUND,
+};
 use apq::{
     create_bound_classical_send_group, create_combiner_send_group, create_group_with_member,
     decode_apq_welcome, encode_apq_welcome, export_psk, forget_psk,
@@ -370,7 +373,11 @@ enum PqInflight {
 // send-group epoch.
 // v4 (PQ-family side-band keys): added the PQ header window (`recv_header_keys_pq`), so a
 // restored session opens PQ side-band frames sealed under a recent pq_epoch too.
-const SESSION_ARCHIVE_VERSION: u8 = 5;
+// v6 (draft-02 conformance, phase A): no layout change — a pure compatibility cut. v5-era
+// groups carry no APQInfo GroupContext extension and their leaves lack the AppDataUpdate /
+// APQInfo capabilities, so a restored v5 session could never verify or carry the -02
+// machinery; reject the blob instead of resurrecting a permanently non-conformant session.
+const SESSION_ARCHIVE_VERSION: u8 = 6;
 
 // In its own module because the derive-generated impls reference the std `Result`, which
 // the crate-local `Result` alias would shadow (same pattern as `invitation::wire`).
@@ -882,12 +889,20 @@ impl TwoMlsPqSession {
             .as_mut()
             .ok_or(TwoMlsPqError::SessionNotReady)?;
         let send_pq = send.pq.as_mut().ok_or(TwoMlsPqError::SessionNotReady)?;
-        let (pq_commit, apq_psk_id) = apq::pq_ratchet::inject_and_commit(send_pq, &s, &stores)?;
+        // The bind is a -02 FULL commit: both halves carry the AppDataUpdate attesting
+        // the absolute post-commit epochs of both groups, computed before either commit.
+        let attestation = ApqInfoUpdate {
+            t_epoch: send.classical.current_epoch() + 1,
+            pq_epoch: send_pq.current_epoch() + 1,
+        };
+        let (pq_commit, apq_psk_id) =
+            apq::pq_ratchet::inject_and_commit(send_pq, &s, &stores, attestation)?;
         let cl_out = send
             .classical
             .commit_builder()
             .add_external_psk(apq_psk_id.clone())
             .map_err(|_| TwoMlsPqError::Mls)?
+            .custom_proposal(attestation.to_custom_proposal()?)
             .build()
             .map_err(|_| TwoMlsPqError::Mls)?;
         send.classical
@@ -950,11 +965,28 @@ impl TwoMlsPqSession {
             .as_mut()
             .ok_or(TwoMlsPqError::SessionNotReady)?;
         let recv_pq = recv.pq.as_mut().ok_or(TwoMlsPqError::SessionNotReady)?;
-        let apq_psk_id = apq::pq_ratchet::apply_injected_commit(recv_pq, &s, &pq_commit, &stores)?;
+        let (apq_psk_id, pq_attestation) =
+            apq::pq_ratchet::apply_injected_commit(recv_pq, &s, &pq_commit, &stores)?;
         let cl = MlsMessage::from_bytes(&cl_commit).map_err(|_| TwoMlsPqError::Mls)?;
-        recv.classical
+        let cl_attestation = match recv
+            .classical
             .process_incoming_message(cl)
-            .map_err(|_| TwoMlsPqError::Mls)?;
+            .map_err(|_| TwoMlsPqError::Mls)?
+        {
+            ReceivedMessage::Commit(desc) => {
+                commit_attestation(&desc)?.ok_or(TwoMlsPqError::ApqInfoMismatch)?
+            }
+            _ => return Err(TwoMlsPqError::ApqInfoMismatch),
+        };
+        // -02 FULL verification: both halves carried the AppDataUpdate, the two copies
+        // agree, and they attest the actual post-apply epochs of both groups — checked
+        // before the stapled app message is decrypted.
+        if cl_attestation != pq_attestation
+            || pq_attestation.pq_epoch != recv_pq.current_epoch()
+            || cl_attestation.t_epoch != recv.classical.current_epoch()
+        {
+            return Err(TwoMlsPqError::ApqInfoMismatch);
+        }
         // Peer commits (the PQ partial above is checked inside `apply_injected_commit`)
         // must never change the two-party shape.
         apq::ensure_two_party(&recv.classical)?;
@@ -1193,7 +1225,14 @@ impl TwoMlsPqSession {
                         .process_incoming_message(commit_msg)
                         .map_err(|_| TwoMlsPqError::Mls)?
                     {
-                        ReceivedMessage::Commit(_) => {}
+                        // A.5 commits are PQ-group-only and carry no AppDataUpdate —
+                        // the bumped pq_epoch reconciles at the next A.3 bind. An
+                        // attestation smuggled in here is rejected.
+                        ReceivedMessage::Commit(desc) => {
+                            if commit_attestation(&desc)?.is_some() {
+                                return Err(TwoMlsPqError::ApqInfoMismatch);
+                            }
+                        }
                         _ => return Err(TwoMlsPqError::Mls),
                     }
                     // A peer commit must never change the two-party shape.
@@ -1280,7 +1319,12 @@ impl TwoMlsPqSession {
                     .process_incoming_message(commit_msg)
                     .map_err(|_| TwoMlsPqError::Mls)?
                 {
-                    ReceivedMessage::Commit(_) => {}
+                    // Like the responder's Commit' above: A.5 carries no AppDataUpdate.
+                    ReceivedMessage::Commit(desc) => {
+                        if commit_attestation(&desc)?.is_some() {
+                            return Err(TwoMlsPqError::ApqInfoMismatch);
+                        }
+                    }
                     _ => return Err(TwoMlsPqError::Mls),
                 }
                 // A peer commit must never change the two-party shape.
@@ -1688,9 +1732,15 @@ impl SessionInner {
             .with(|core| core.adopting = true);
         // An empty PQ slot is the acceptor's deferred (A.4) return welcome: join the
         // classical group only; the PQ half arrives with the bootstrap flow.
+        let suite = self.suite;
         let joined: Result<CombinerGroup> = (|| {
             if pq_welcome.is_empty() {
                 let classical = join_group_from_welcome(client.classical(), &classical_welcome)?;
+                // -02 joiner verification, deferred shape: the classical half's APQInfo
+                // must record the PQ side as pending (EPOCH_UNBOUND) with a non-empty
+                // pre-allocated group id — the id the A.4 bootstrap must later use. A
+                // welcome without an APQInfo at all is a downgrade attempt.
+                verify_apqinfo_deferred(&classical, suite)?;
                 Ok(CombinerGroup::from_client(
                     client.combiner(),
                     classical,
@@ -1703,6 +1753,11 @@ impl SessionInner {
                 self.register_psk(&psk_id, &psk);
                 // Join the classical group (bound with the cross-party + APQ PSKs).
                 let classical = join_group_from_welcome(client.classical(), &classical_welcome)?;
+                // -02 joiner verification, full-pair shape: both halves carry a
+                // coherent, mutually consistent APQInfo naming exactly these groups,
+                // and both rosters hold the same two identities.
+                verify_apqinfo_pair(&classical, &pq, suite)?;
+                apq::component::ensure_membership_consistent(&classical, &pq)?;
                 Ok(CombinerGroup::from_client(
                     client.combiner(),
                     classical,
@@ -3072,19 +3127,37 @@ impl TwoMlsPqSession {
                         let peer_index = if mine == 0 { 1 } else { 0 };
                         let prior_peer = sender_client_id(&recv.classical, peer_index)?;
                         let prior_own = sender_client_id(&recv.classical, mine)?;
-                        match recv.classical.process_incoming_message(commit_msg) {
-                            Ok(ReceivedMessage::Commit(_)) => {}
-                            Ok(_) => return Err(TwoMlsPqError::DecryptionFailed),
-                            Err(e) => {
-                                return Err(match map_credential_err(e) {
-                                    TwoMlsPqError::CredentialRejected => {
-                                        TwoMlsPqError::CredentialRejected
-                                    }
-                                    // Preserve the transient, retriable semantics of a
-                                    // staple that cannot process YET (e.g. a message
-                                    // frame overtaking its A.3 BIND).
-                                    _ => TwoMlsPqError::DecryptionFailed,
-                                });
+                        let staple_attestation =
+                            match recv.classical.process_incoming_message(commit_msg) {
+                                Ok(ReceivedMessage::Commit(desc)) => commit_attestation(&desc)?,
+                                Ok(_) => return Err(TwoMlsPqError::DecryptionFailed),
+                                Err(e) => {
+                                    return Err(match map_credential_err(e) {
+                                        TwoMlsPqError::CredentialRejected => {
+                                            TwoMlsPqError::CredentialRejected
+                                        }
+                                        // Preserve the transient, retriable semantics of a
+                                        // staple that cannot process YET (e.g. a message
+                                        // frame overtaking its A.3 BIND).
+                                        _ => TwoMlsPqError::DecryptionFailed,
+                                    });
+                                }
+                            };
+                        // A staple commit is normally a PARTIAL (no AppDataUpdate); one
+                        // that DOES attest (a bare attestation commit, or an A.3 bind
+                        // classical half applied out of band) must attest truthfully:
+                        // the actual post-apply classical epoch and the recv-PQ's actual
+                        // current epoch.
+                        if let Some(attestation) = staple_attestation {
+                            let pq_epoch = recv
+                                .pq
+                                .as_ref()
+                                .map(|pq| pq.current_epoch())
+                                .ok_or(TwoMlsPqError::ApqInfoMismatch)?;
+                            if attestation.t_epoch != recv.classical.current_epoch()
+                                || attestation.pq_epoch != pq_epoch
+                            {
+                                return Err(TwoMlsPqError::ApqInfoMismatch);
                             }
                         }
                         // A peer commit must never change the two-party shape (an Add
@@ -7320,6 +7393,156 @@ mod tests {
         assert_err!(
             TwoMlsPqSession::from_archive(crate::Archive { bytes }),
             TwoMlsPqError::ArchiveInvalid
+        );
+    }
+
+    // --- draft-ietf-mls-combiner-02 conformance ---------------------------------------
+
+    /// Establishment carries the APQInfo GroupContext extension end to end: Alice's full
+    /// send group records both epochs live, and Bob's deferred (classical-only) send
+    /// group records the PQ side as pending (EPOCH_UNBOUND) with a pre-allocated group
+    /// id. Both are verified inside the join paths; here we assert the recorded shape.
+    #[test]
+    fn test_establishment_carries_apqinfo_with_deferred_sentinel() {
+        use apq::component::{read_apqinfo, EPOCH_UNBOUND};
+        let (alice, bob) = establish_sessions();
+
+        // Alice's send group (full APQ pair): both halves live at epoch 1.
+        {
+            let inner = alice.lock();
+            let send = inner.send_group.as_ref().unwrap();
+            let info = read_apqinfo(&send.classical).unwrap();
+            assert_eq!(info.t_epoch, 1);
+            assert_eq!(info.pq_epoch, 1);
+            assert_eq!(info.t_session_group_id, send.classical.group_id());
+            assert_eq!(
+                info.pq_session_group_id,
+                send.pq.as_ref().unwrap().group_id()
+            );
+        }
+
+        // Bob's send group (deferred): classical live, PQ pending with a non-empty
+        // pre-allocated id.
+        {
+            let inner = bob.lock();
+            let send = inner.send_group.as_ref().unwrap();
+            assert!(send.pq.is_none());
+            let info = read_apqinfo(&send.classical).unwrap();
+            assert_eq!(info.t_epoch, 1);
+            assert_eq!(info.pq_epoch, EPOCH_UNBOUND);
+            assert!(!info.pq_session_group_id.is_empty());
+        }
+    }
+
+    /// A.4 stands the deferred PQ half up under exactly the group id the classical
+    /// half's APQInfo pre-allocated at establishment.
+    #[test]
+    fn test_a4_uses_preallocated_pq_group_id() {
+        use apq::component::read_apqinfo;
+        let (alice, bob) = establish_confirmed_sessions();
+
+        let preallocated = {
+            let inner = bob.lock();
+            read_apqinfo(&inner.send_group.as_ref().unwrap().classical)
+                .unwrap()
+                .pq_session_group_id
+        };
+
+        let kp = assert_ok!(alice.pq_bootstrap_begin(None));
+        assert_ok!(bob.pq_bootstrap_respond(kp));
+        let bind = assert_some!(bob.pq_take_pending_outbound());
+        assert_ok!(alice.pq_bootstrap_apply(bind));
+
+        {
+            let inner = bob.lock();
+            let pq = inner.send_group.as_ref().unwrap().pq.as_ref().unwrap();
+            assert_eq!(pq.group_id(), preallocated.as_slice());
+        }
+    }
+
+    /// The deferred-branch joiner verifier and the full-pair verifier are not
+    /// interchangeable: feeding a full session's classical half (which records
+    /// `pq_epoch == 1`, not the deferred sentinel) to the deferred verifier fails. This
+    /// is what stops a full-pair welcome masquerading as a deferred one (or vice versa),
+    /// and a welcome carrying no APQInfo at all fails the same `read_apqinfo` guard.
+    #[test]
+    fn test_apqinfo_deferred_verifier_rejects_bound_pq_epoch() {
+        use apq::component::{verify_apqinfo_deferred, EPOCH_UNBOUND};
+        let (alice, _bob) = establish_sessions();
+        let inner = alice.lock();
+        let send = inner.send_group.as_ref().unwrap();
+        let info = apq::component::read_apqinfo(&send.classical).unwrap();
+        assert_ne!(info.pq_epoch, EPOCH_UNBOUND);
+        assert!(verify_apqinfo_deferred(&send.classical, inner.suite).is_err());
+    }
+
+    /// The A.3 bind is a -02 FULL: each round carries the AppDataUpdate in both halves,
+    /// and `pq_ratchet_apply` verifies the two copies agree AND match the actual
+    /// post-apply epochs of both groups before decrypting the stapled app message — so a
+    /// clean delivery is proof the attestation verified end to end. Both directions
+    /// (turn-flipped) exercise it. (The epoch-arithmetic rejection itself is unit-tested
+    /// at the apq layer, where a mismatched attestation can be crafted directly.)
+    #[test]
+    fn test_a3_bind_full_round_verifies_attestation_both_directions() {
+        let (alice, bob) = establish_full();
+
+        let ek = assert_ok!(alice.pq_ratchet_begin());
+        assert_ok!(bob.pq_ratchet_respond(ek));
+        let ct = assert_some!(bob.pq_take_pending_outbound());
+        assert_ok!(alice.pq_ratchet_bind(ct, b"a-to-b".to_vec()));
+        let bind = assert_some!(alice.pq_take_pending_outbound());
+        assert_eq!(assert_ok!(bob.pq_ratchet_apply(bind)), b"a-to-b");
+
+        // Turn flipped to Bob; his bind's attestation verifies on Alice's apply too.
+        let ek2 = assert_ok!(bob.pq_ratchet_begin());
+        assert_ok!(alice.pq_ratchet_respond(ek2));
+        let ct2 = assert_some!(alice.pq_take_pending_outbound());
+        assert_ok!(bob.pq_ratchet_bind(ct2, b"b-to-a".to_vec()));
+        let bind2 = assert_some!(bob.pq_take_pending_outbound());
+        assert_eq!(assert_ok!(alice.pq_ratchet_apply(bind2)), b"b-to-a");
+    }
+
+    /// A.5 re-key commits must not carry an AppDataUpdate — that is the wire-visible
+    /// difference from an A.3 bind, and it is what lets the pq_epoch reconcile lazily at
+    /// the next bind. A full A.5 round (which carries none) completes cleanly under the
+    /// new receiver checks; a smuggled attestation is rejected in `pq_rekey_apply`. After
+    /// `establish_full` the turn is Bob's, so Bob initiates.
+    #[test]
+    fn test_a5_rekey_round_completes_without_attestation() {
+        let (alice, bob) = establish_full();
+        assert!(bob.my_pq_turn());
+        let upd = assert_ok!(bob.pq_rekey_begin(None));
+        assert_ok!(alice.pq_rekey_respond(upd));
+        let commit = assert_some!(alice.pq_take_pending_outbound());
+        assert!(assert_ok!(bob.pq_rekey_apply(commit)));
+        let commit2 = assert_some!(bob.pq_take_pending_outbound());
+        assert!(!assert_ok!(alice.pq_rekey_apply(commit2)));
+        // A.5 advanced only the PQ epochs; the classical stream is untouched.
+        assert_eq!(alice.epochs().pq_epoch, 2);
+        assert_eq!(bob.epochs().pq_epoch, 2);
+    }
+
+    /// A combiner key package round-trips through the -02 §7 APQKeyPackage encoding
+    /// (v2), and a v1-framed blob is rejected outright (the capability hard-cut).
+    #[test]
+    fn test_combiner_kp_v2_round_trips_and_rejects_v1() {
+        let client = make_client();
+        let kp = make_combiner_kp(&client);
+        let encoded = crate::key_packages::encode_combiner_key_package(kp.clone());
+        assert_eq!(encoded[0], 2, "version byte is 2");
+        let decoded = assert_ok!(crate::key_packages::decode_combiner_key_package(encoded));
+        assert_eq!(decoded.classical, kp.classical);
+        assert_eq!(decoded.pq, kp.pq);
+
+        // A v1 blob (old bespoke framing) is rejected.
+        let mut v1 = vec![1u8];
+        v1.extend_from_slice(&(kp.classical.len() as u32).to_le_bytes());
+        v1.extend_from_slice(&kp.classical);
+        v1.extend_from_slice(&(kp.pq.len() as u32).to_le_bytes());
+        v1.extend_from_slice(&kp.pq);
+        assert_err!(
+            crate::key_packages::decode_combiner_key_package(v1),
+            TwoMlsPqError::InvalidKeyPackage
         );
     }
 }

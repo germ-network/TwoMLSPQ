@@ -214,44 +214,74 @@ pub fn parse_combiner_key_package(kp: CombinerKeyPackage) -> Result<ParsedCombin
 }
 
 /// Version tag for the opaque combiner key-package encoding.
-const COMBINER_KEY_PACKAGE_VERSION: u8 = 1;
+///
+/// v1: bespoke u32-LE framing, classical then pq.
+/// v2 (-02 conformance): the payload is the draft-02 §7 `APQKeyPackage`
+/// TLS shape — `t_key_package` then `pq_key_package` as variable-length vectors
+/// (MLS codec), each carrying the standard MLSMessage-encoded KeyPackage — enclosed in
+/// Germ's version byte. v2 also marks the capability cut: leaves generated at v2
+/// advertise the APQInfo extension and AppDataUpdate proposal types, which v1-era
+/// leaves lack, so v1 blobs are rejected outright (prerelease hard-cut policy).
+const COMBINER_KEY_PACKAGE_VERSION: u8 = 2;
 
-/// Encode a combiner key package pair into one opaque blob for publication. The
-/// abstraction layer above carries the pair as a single `Data`; only TwoMLSPQ reads the
-/// halves back out (see [`decode_combiner_key_package`]).
+// In its own module because the derive-generated impls reference the std `Result`,
+// which the crate-local `Result` alias would shadow (same pattern as `archive_wire`).
+mod kp_wire {
+    use mls_rs::mls_rs_codec::{self, MlsDecode, MlsEncode, MlsSize};
+
+    /// draft-ietf-mls-combiner-02 §7 `APQKeyPackage`: the traditional half first, then
+    /// the PQ half, as TLS variable-length vectors.
+    #[derive(MlsSize, MlsEncode, MlsDecode)]
+    pub(super) struct ApqKeyPackageWire {
+        #[mls_codec(with = "mls_rs_codec::byte_vec")]
+        pub(super) t_key_package: Vec<u8>,
+        #[mls_codec(with = "mls_rs_codec::byte_vec")]
+        pub(super) pq_key_package: Vec<u8>,
+    }
+}
+
+/// Encode a combiner key package pair into one opaque blob for publication: the -02 §7
+/// `APQKeyPackage` TLS encoding inside Germ's version byte. The abstraction layer above
+/// carries the pair as a single `Data`; only TwoMLSPQ reads the halves back out (see
+/// [`decode_combiner_key_package`]).
 #[uniffi::export]
 pub fn encode_combiner_key_package(key_package: CombinerKeyPackage) -> Vec<u8> {
-    // Same framing style as the APQ welcome envelope: version byte, then u32-LE
-    // length-prefixed halves. Key packages are a few KB, far below u32::MAX.
-    let mut out =
-        Vec::with_capacity(1 + 4 + key_package.classical.len() + 4 + key_package.pq.len());
-    out.push(COMBINER_KEY_PACKAGE_VERSION);
-    out.extend_from_slice(&(key_package.classical.len() as u32).to_le_bytes());
-    out.extend_from_slice(&key_package.classical);
-    out.extend_from_slice(&(key_package.pq.len() as u32).to_le_bytes());
-    out.extend_from_slice(&key_package.pq);
+    use mls_rs::mls_rs_codec::MlsEncode;
+    let wire = kp_wire::ApqKeyPackageWire {
+        t_key_package: key_package.classical,
+        pq_key_package: key_package.pq,
+    };
+    let mut out = vec![COMBINER_KEY_PACKAGE_VERSION];
+    // Encoding two in-memory byte vectors is infallible in practice; an allocation
+    // failure would abort long before this.
+    out.extend_from_slice(&wire.mls_encode_to_vec().unwrap_or_default());
     out
 }
 
 /// Decode an [`encode_combiner_key_package`] blob back into the key package pair.
 #[uniffi::export]
 pub fn decode_combiner_key_package(bytes: Vec<u8>) -> Result<CombinerKeyPackage> {
+    use mls_rs::mls_rs_codec::MlsDecode;
     let (&version, mut rest) = bytes
         .split_first()
         .ok_or(TwoMlsPqError::InvalidKeyPackage)?;
     if version != COMBINER_KEY_PACKAGE_VERSION {
         return Err(TwoMlsPqError::InvalidKeyPackage);
     }
-    let classical = take_bytes(&mut rest).ok_or(TwoMlsPqError::InvalidKeyPackage)?;
-    let pq = take_bytes(&mut rest).ok_or(TwoMlsPqError::InvalidKeyPackage)?;
+    let wire = kp_wire::ApqKeyPackageWire::mls_decode(&mut rest)
+        .map_err(|_| TwoMlsPqError::InvalidKeyPackage)?;
     if !rest.is_empty() {
         return Err(TwoMlsPqError::InvalidKeyPackage);
     }
-    Ok(CombinerKeyPackage { classical, pq })
+    Ok(CombinerKeyPackage {
+        classical: wire.t_key_package,
+        pq: wire.pq_key_package,
+    })
 }
 
-/// Reader for the u32-LE framing above. This blob is published wire data, so it keeps its
-/// byte-stable bespoke framing rather than the MLS codec used by the archive formats.
+/// Reader for the u32-LE framing used by the HPKE envelope below. Published wire data,
+/// so it keeps its byte-stable bespoke framing rather than the MLS codec used by the
+/// archive formats.
 fn take_bytes(rest: &mut &[u8]) -> Option<Vec<u8>> {
     let len = u32::from_le_bytes(rest.get(..4)?.try_into().ok()?) as usize;
     *rest = &rest[4..];

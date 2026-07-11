@@ -17,6 +17,7 @@
 use mls_rs::client_builder::MlsConfig;
 use mls_rs::extension::ExtensionType;
 use mls_rs::group::proposal::{CustomProposal, Proposal, ProposalType};
+use mls_rs::group::{CommitEffect, CommitMessageDescription};
 use mls_rs::mls_rules::ProposalInfo;
 use mls_rs::{ExtensionList, Group};
 
@@ -219,6 +220,16 @@ pub fn find_apqinfo_update(applied: &[ProposalInfo<Proposal>]) -> Result<Option<
     Ok(found)
 }
 
+/// The attestation carried by a processed or applied commit's description, if any.
+/// `Removed` / `ReInit` effects are never legitimate in this protocol (the rules forbid
+/// the proposals that produce them) and are refused outright.
+pub fn commit_attestation(desc: &CommitMessageDescription) -> Result<Option<ApqInfoUpdate>> {
+    match &desc.effect {
+        CommitEffect::NewEpoch(new_epoch) => find_apqinfo_update(new_epoch.applied_proposals()),
+        _ => Err(CombinerError::ApqInfoMismatch),
+    }
+}
+
 /// An `ExtensionList` carrying exactly the given `APQInfo` — the GroupContext extension
 /// list every combiner group is created with.
 pub fn apq_info_extensions(info: &ApqInfo) -> Result<ExtensionList> {
@@ -239,21 +250,12 @@ pub fn read_apqinfo<Cfg: MlsConfig>(group: &Group<Cfg>) -> Result<ApqInfo> {
         .ok_or(CombinerError::ApqInfoMismatch)
 }
 
-/// Joiner-side `APQInfo` verification, run at the join point (both groups at epoch 1).
-///
-/// Checks on the classical half's extension: present; suites equal the pinned pair and
-/// re-validate as a coherent APQ combination; mode matches; `t_session_group_id` is the
-/// joined classical group's id; `t_epoch` equals the observed epoch. Then either
-/// - `pq` present (full pair): the PQ half's extension has identical identity fields,
-///   names the joined PQ group, and its `pq_epoch` matches the observed epoch; the
-///   classical half's `pq_epoch` must match too (it was written with the pair live), or
-/// - `pq` deferred: the classical half records `pq_epoch == EPOCH_UNBOUND` with a
-///   non-empty pre-allocated PQ group id (the id A.4 must later use).
-///
-/// Returns the classical half's `ApqInfo` (the authoritative copy for later A.4 checks).
-pub fn verify_apqinfo_pair<Cfg1: MlsConfig, Cfg2: MlsConfig>(
-    classical: &Group<Cfg1>,
-    pq: Option<&Group<Cfg2>>,
+/// The classical-half checks shared by the full-pair and deferred joiner verifications:
+/// extension present; suites equal the pinned pair and re-validate as a coherent APQ
+/// combination; mode matches; `t_session_group_id` is the joined classical group's id;
+/// `t_epoch` equals the observed epoch.
+fn verify_classical_half<Cfg: MlsConfig>(
+    classical: &Group<Cfg>,
     expected: ApqCipherSuite,
 ) -> Result<ApqInfo> {
     let info = read_apqinfo(classical)?;
@@ -264,27 +266,50 @@ pub fn verify_apqinfo_pair<Cfg1: MlsConfig, Cfg2: MlsConfig>(
     if info.t_epoch == EPOCH_UNBOUND || info.t_epoch != classical.current_epoch() {
         return Err(CombinerError::ApqInfoMismatch);
     }
-    match pq {
-        Some(pq_group) => {
-            let pq_info = read_apqinfo(pq_group)?;
-            if !info.identity_fields_match(&pq_info) {
-                return Err(CombinerError::ApqInfoMismatch);
-            }
-            if info.pq_session_group_id != pq_group.group_id() {
-                return Err(CombinerError::ApqInfoMismatch);
-            }
-            if pq_info.pq_epoch == EPOCH_UNBOUND
-                || pq_info.pq_epoch != pq_group.current_epoch()
-                || info.pq_epoch != pq_group.current_epoch()
-            {
-                return Err(CombinerError::ApqInfoMismatch);
-            }
-        }
-        None => {
-            if info.pq_epoch != EPOCH_UNBOUND || info.pq_session_group_id.is_empty() {
-                return Err(CombinerError::ApqInfoMismatch);
-            }
-        }
+    Ok(info)
+}
+
+/// Joiner-side `APQInfo` verification for a full pair, run at the join point (both
+/// groups at epoch 1): the classical-half checks, plus — the PQ half's extension has
+/// identical identity fields, names the joined PQ group, and its `pq_epoch` matches the
+/// observed epoch; the classical half's `pq_epoch` must match too (it was written with
+/// the pair live).
+///
+/// Returns the classical half's `ApqInfo` (the authoritative copy for later A.4 checks).
+pub fn verify_apqinfo_pair<Cfg1: MlsConfig, Cfg2: MlsConfig>(
+    classical: &Group<Cfg1>,
+    pq: &Group<Cfg2>,
+    expected: ApqCipherSuite,
+) -> Result<ApqInfo> {
+    let info = verify_classical_half(classical, expected)?;
+    let pq_info = read_apqinfo(pq)?;
+    if !info.identity_fields_match(&pq_info) {
+        return Err(CombinerError::ApqInfoMismatch);
+    }
+    if info.pq_session_group_id != pq.group_id() {
+        return Err(CombinerError::ApqInfoMismatch);
+    }
+    if pq_info.pq_epoch == EPOCH_UNBOUND
+        || pq_info.pq_epoch != pq.current_epoch()
+        || info.pq_epoch != pq.current_epoch()
+    {
+        return Err(CombinerError::ApqInfoMismatch);
+    }
+    Ok(info)
+}
+
+/// Joiner-side `APQInfo` verification for the deferred (A.4-pending) shape: the
+/// classical-half checks, plus the extension records the PQ side as pending
+/// (`pq_epoch == EPOCH_UNBOUND`) with a non-empty pre-allocated group id — the id the
+/// A.4 bootstrap must later use. A welcome without an `APQInfo` at all is a downgrade
+/// attempt and fails the same way.
+pub fn verify_apqinfo_deferred<Cfg: MlsConfig>(
+    classical: &Group<Cfg>,
+    expected: ApqCipherSuite,
+) -> Result<ApqInfo> {
+    let info = verify_classical_half(classical, expected)?;
+    if info.pq_epoch != EPOCH_UNBOUND || info.pq_session_group_id.is_empty() {
+        return Err(CombinerError::ApqInfoMismatch);
     }
     Ok(info)
 }

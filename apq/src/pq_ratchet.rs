@@ -19,6 +19,7 @@ use mls_rs::{Group, MlsMessage};
 use mls_rs_crypto_traits::KemType;
 use zeroize::Zeroizing;
 
+use crate::component::{commit_attestation, ApqInfoUpdate};
 use crate::group::{export_psk, injected_secret_psk_id};
 use crate::{CombinerError, Result};
 
@@ -112,19 +113,22 @@ impl Drop for InjectedSecret<'_> {
     }
 }
 
-/// Initiator (committer) — inject S into `pq_group` via a pathless PSK commit, apply it, and
-/// re-export the `apq_psk` from the new PQ epoch (registered for the classical bind).
+/// Initiator (committer) — inject S into `pq_group` via a pathless PSK commit carrying the
+/// -02 `AppDataUpdate` epoch attestation, apply it, and re-export the `apq_psk` from the
+/// new PQ epoch (registered for the classical bind).
 /// Returns `(pq_commit_bytes, apq_psk_id)`.
 pub fn inject_and_commit<Cfg: MlsConfig>(
     pq_group: &mut Group<Cfg>,
     s: &[u8],
     stores: &[InMemoryPreSharedKeyStorage],
+    attestation: ApqInfoUpdate,
 ) -> Result<(Vec<u8>, ExternalPskId)> {
     let secret = InjectedSecret::register(pq_group, s, stores);
     let out = pq_group
         .commit_builder()
         .add_external_psk(secret.id.clone())
         .map_err(|_| CombinerError::Mls)?
+        .custom_proposal(attestation.to_custom_proposal()?)
         .build()
         .map_err(|_| CombinerError::Mls)?;
     pq_group
@@ -144,23 +148,35 @@ pub fn inject_and_commit<Cfg: MlsConfig>(
 
 /// Responder (applier) — register S (held since `encapsulate`), apply the initiator's pathless PQ
 /// commit, and re-export the same `apq_psk` from the new PQ epoch.
+///
+/// Returns the id together with the commit's -02 `AppDataUpdate` attestation, which is
+/// mandatory on this half of a FULL: its absence (or a non-commit in the slot) fails with
+/// [`CombinerError::ApqInfoMismatch`] before any secret is re-exported. The caller
+/// verifies the attested epochs against both halves once the classical commit has
+/// applied too.
 pub fn apply_injected_commit<Cfg: MlsConfig>(
     pq_group: &mut Group<Cfg>,
     s: &[u8],
     pq_commit: &[u8],
     stores: &[InMemoryPreSharedKeyStorage],
-) -> Result<ExternalPskId> {
+) -> Result<(ExternalPskId, ApqInfoUpdate)> {
     let secret = InjectedSecret::register(pq_group, s, stores);
     let msg = MlsMessage::from_bytes(pq_commit).map_err(|_| CombinerError::Mls)?;
-    pq_group
+    let received = pq_group
         .process_incoming_message(msg)
         .map_err(|_| CombinerError::Mls)?;
+    let attestation = match &received {
+        mls_rs::group::ReceivedMessage::Commit(desc) => {
+            commit_attestation(desc)?.ok_or(CombinerError::ApqInfoMismatch)?
+        }
+        _ => return Err(CombinerError::ApqInfoMismatch),
+    };
     crate::group::ensure_two_party(pq_group)?;
     // S is now folded into the new epoch; wipe it before re-exporting.
     drop(secret);
     let (apq_psk_id, apq_psk) = export_psk(pq_group)?;
     crate::group::register_psk_stores(stores, &apq_psk_id, &apq_psk);
-    Ok(apq_psk_id)
+    Ok((apq_psk_id, attestation))
 }
 
 /// Benchmark fixture (never enabled in production): the "old" APQ-faithful per-round PQ cost — a
@@ -277,10 +293,15 @@ mod tests {
         assert_eq!(s_alice, s_bob);
 
         // Alice binds: pathless PQ commit injecting S, then a classical commit importing apq_psk.
+        let attestation = ApqInfoUpdate {
+            t_epoch: cl_epoch_before + 1,
+            pq_epoch: pq_epoch_before + 1,
+        };
         let (pq_commit, apq_psk_id) = inject_and_commit(
             asg.pq.as_mut().unwrap(),
             &s_alice,
             &[alice.pq().secret_store(), alice.classical().secret_store()],
+            attestation,
         )
         .unwrap();
         let cl_out = asg
@@ -294,7 +315,7 @@ mod tests {
         let cl_commit = cl_out.commit_message.to_bytes().unwrap();
 
         // Bob applies the stapled commits.
-        let apq_psk_id_bob = apply_injected_commit(
+        let (apq_psk_id_bob, bob_attestation) = apply_injected_commit(
             bob_recv.pq.as_mut().unwrap(),
             &s_bob,
             &pq_commit,
@@ -322,6 +343,8 @@ mod tests {
         let alice_apq: &[u8] = &apq_psk_id;
         let bob_apq: &[u8] = &apq_psk_id_bob;
         assert_eq!(alice_apq, bob_apq);
+        // The applied PQ commit surfaced the initiator's epoch attestation intact.
+        assert_eq!(bob_attestation, attestation);
 
         // The classical group still works after the PQ-seeded epoch: Alice → Bob app message.
         let msg = asg
@@ -355,15 +378,78 @@ mod tests {
         let eph = generate_ephemeral(&kem()).unwrap();
         let (_s_bob, ct) = encapsulate(&kem(), &eph.encapsulation_key()).unwrap();
         let s = decapsulate(&kem(), &eph, &ct).unwrap();
+        let attestation = ApqInfoUpdate {
+            t_epoch: asg.classical.current_epoch() + 1,
+            pq_epoch: asg.pq.as_ref().unwrap().current_epoch() + 1,
+        };
         inject_and_commit(
             asg.pq.as_mut().unwrap(),
             &s,
             &[alice.pq().secret_store(), alice.classical().secret_store()],
+            attestation,
         )
         .unwrap();
 
         // Forward secrecy: the per-round ML-KEM secret is gone from the store after the bind.
         assert!(alice.pq().secret_store().get(&s_id).is_none());
+    }
+
+    /// Adversarial: the initiator commits a bind whose AppDataUpdate attests a WRONG
+    /// pq_epoch (a value that is not the PQ half's next epoch). The responder's
+    /// `TwoMlsRules::filter_proposals` runs on receive with the recv-PQ's pre-commit
+    /// context and vetoes the commit — the epoch check is `attested == context.epoch + 1`
+    /// — before any secret is folded. Proven by `apply_injected_commit` erroring.
+    #[test]
+    fn test_bind_with_wrong_epoch_attestation_is_vetoed_on_receive() {
+        let alice = client();
+        let bob = client();
+        let (mut asg, welcome) = create_combiner_send_group(
+            &bob.generate_classical_key_package().unwrap(),
+            &bob.generate_pq_key_package().unwrap(),
+            &alice,
+        )
+        .unwrap();
+        let mut bob_recv = join_combiner_group(&welcome, &bob).unwrap();
+
+        let eph = generate_ephemeral(&kem()).unwrap();
+        let (s_bob, ct) = encapsulate(&kem(), &eph.encapsulation_key()).unwrap();
+        let s_alice = decapsulate(&kem(), &eph, &ct).unwrap();
+
+        // A lie: pq_epoch attests +2 instead of the true +1. Alice's OWN rules would
+        // veto this on build too, so craft with a rogue-free path is unnecessary — the
+        // point is the receiver's independent veto. (Alice's build also rejects it, so
+        // this asserts inject_and_commit itself refuses to produce the poisoned commit.)
+        let a_stores = [alice.pq().secret_store(), alice.classical().secret_store()];
+        let bad = ApqInfoUpdate {
+            t_epoch: asg.classical.current_epoch() + 1,
+            pq_epoch: asg.pq.as_ref().unwrap().current_epoch() + 2,
+        };
+        assert!(
+            inject_and_commit(asg.pq.as_mut().unwrap(), &s_alice, &a_stores, bad).is_err(),
+            "the committer's own rules must veto a false epoch attestation at build"
+        );
+
+        // And a well-formed bind from a fresh round still applies on the responder — the
+        // veto above did not corrupt either side's PQ group.
+        let eph2 = generate_ephemeral(&kem()).unwrap();
+        let (s_bob2, ct2) = encapsulate(&kem(), &eph2.encapsulation_key()).unwrap();
+        let s_alice2 = decapsulate(&kem(), &eph2, &ct2).unwrap();
+        let good = ApqInfoUpdate {
+            t_epoch: asg.classical.current_epoch() + 1,
+            pq_epoch: asg.pq.as_ref().unwrap().current_epoch() + 1,
+        };
+        let (pq_commit, _) =
+            inject_and_commit(asg.pq.as_mut().unwrap(), &s_alice2, &a_stores, good).unwrap();
+        let _ = (s_bob, s_bob2);
+        let b_stores = [bob.pq().secret_store(), bob.classical().secret_store()];
+        let (_, attestation) = apply_injected_commit(
+            bob_recv.pq.as_mut().unwrap(),
+            &s_alice2,
+            &pq_commit,
+            &b_stores,
+        )
+        .unwrap();
+        assert_eq!(attestation, good);
     }
 
     #[test]
