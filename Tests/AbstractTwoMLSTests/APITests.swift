@@ -160,8 +160,10 @@ struct APIDemo {
 
 //Increment B: agent rotation. Phase 8 (classical) rides the session surface —
 //receive(newClientId:) stages the dedicated agent, prepareToEncrypt(proposing:)
-//commits the handoff — and the PQ side-band catches the PQ leaves up via
-//begin(.rekey, rotating:), which the peer observes as PQInbound.rotatedCredential.
+//puts the candidate on the wire, and the PEER's approval + commit canonicalizes
+//it (contract v9 candidate lifecycle; see `rotate(to:peer:)`) — then the PQ
+//side-band catches the PQ leaves up via begin(.rekey, rotating:), which the peer
+//observes as PQInbound.rotatedCredential.
 struct RotationDemo {
 	let local: ClientWrapper<AbstractTwoMLS.PQClient>
 	let remote: ClientWrapper<AbstractTwoMLS.PQClient>
@@ -186,15 +188,11 @@ struct RotationDemo {
 			newClientId: dedicatedAgentId
 		)
 
-		//Phase 8: the acceptor's first reply bundles the rotation commit (and
-		//staples the return welcome); the initiator observes the new identity
-		let prep = try remoteSession.prepareToEncrypt(proposing: dedicatedAgentId)
-		guard prep?.didCommit == true else { throw TestErrors.unexpected }
-		let frame = try remoteSession.encrypt(appMessage: Data("rotate".utf8))
-		let decrypted = try #require(
-			try localSession.processIncoming(ciphertext: frame.cipherText))
-		#expect(decrypted.remoteCommit?.newSender == dedicatedAgentId)
-		#expect(decrypted.applicationMessage?.appMessageData == Data("rotate".utf8))
+		//Phase 8, contract v9+ candidate lifecycle: the acceptor's first reply
+		//CARRIES the candidate proposal (and staples the return welcome); the
+		//initiator's approval + commit canonicalizes it, and the staple back
+		//completes the handoff — see `rotate(to:peer:)`.
+		try remoteSession.rotate(to: dedicatedAgentId, peer: localSession)
 
 		//messaging still flows both ways under the rotated agent
 		try localSession.exchange(with: remoteSession)
@@ -212,16 +210,10 @@ struct RotationDemo {
 			newClientId: dedicatedAgentId
 		)
 
-		//Phase 8 first: the classical rotation announces the dedicated agent and
-		//swaps the session client (the first reply also staples the return welcome)
-		_ = try remoteSession.prepareToEncrypt(proposing: dedicatedAgentId)
-		let frame = try remoteSession.encrypt(appMessage: Data("rotate".utf8))
-		guard
-			try localSession.processIncoming(ciphertext: frame.cipherText)?
-				.remoteCommit?.newSender == dedicatedAgentId
-		else { throw TestErrors.unexpected }
-		//a reply confirms the rotation on the acceptor's side
-		try localSession.send(to: remoteSession)
+		//Phase 8 first, contract v9+ dance: the classical rotation canonicalizes
+		//the dedicated agent and swaps the session client — the dance's closing
+		//staple doubles as the confirming reply (see `rotate(to:peer:)`)
+		try remoteSession.rotate(to: dedicatedAgentId, peer: localSession)
 
 		//PQSession always conforms; take the abstract PQ view directly
 		let localPQ = localSession as any AbstractTwoMLS.PQRatchetingSession
@@ -602,6 +594,35 @@ extension AbstractTwoMLS.Invitation {
 }
 
 extension AbstractTwoMLS.Session {
+	/// Phase 8 classical rotation — the contract v9+ candidate lifecycle, mirroring
+	/// the crate's `rotate_round` test helper. The rotating party's frame CARRIES the
+	/// staged candidate as its Upd proposal (the proposer never commits its own
+	/// rotation); the peer's approval (`queueProposal`) plus commit defines the
+	/// canonical next credential; the staple back canonicalizes this side onto it
+	/// (including the session-client swap).
+	func rotate(
+		to newClientId: AbstractTwoMLS.ClientID,
+		peer: some AbstractTwoMLS.Session
+	) throws {
+		// Propose: no commit rides this frame.
+		_ = try prepareToEncrypt(proposing: newClientId)
+		let frame = try encrypt(appMessage: Data("rotate".utf8))
+		let got = try peer.processIncoming(ciphertext: frame.cipherText).tryUnwrap
+		let offered = try got.proposal.tryUnwrap
+		guard offered.proposing == newClientId else { throw TestErrors.unexpected }
+		// Approve + commit: the peer's commit folds the Upd and defines the
+		// canonical next credential.
+		try peer.queueProposal(digest: offered.digest)
+		let prepared = try peer.prepareToEncrypt(proposing: nil).tryUnwrap
+		guard prepared.didCommit, prepared.commitedRemoteClientId == newClientId
+		else { throw TestErrors.unexpected }
+		let back = try peer.encrypt(appMessage: Data("canonicalize".utf8))
+		// The staple back canonicalizes the rotating side onto the new principal.
+		let confirmed = try processIncoming(ciphertext: back.cipherText).tryUnwrap
+		guard confirmed.remoteCommit?.newRecipient == newClientId
+		else { throw TestErrors.unexpected }
+	}
+
 	func exchange(with remote: some AbstractTwoMLS.Session) throws {
 		try send(to: remote)
 		try remote.send(to: self)

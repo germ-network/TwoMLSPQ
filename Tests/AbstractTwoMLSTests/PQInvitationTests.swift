@@ -29,7 +29,8 @@ struct PQInvitationReceiveTests {
 		let acceptorPair = try decodeCombinerKeyPackage(bytes: invitation.encodedKeyPackage)
 		let initiatorSession = try TwoMlsPqSession.initiate(
 			client: initiator,
-			theirKeyPackage: acceptorPair
+			theirKeyPackage: acceptorPair,
+			appPayload: nil
 		)
 		let welcome = try #require(initiatorSession.pendingOutbound())
 
@@ -76,7 +77,8 @@ struct PQInvitationReceiveTests {
 		let acceptorPair = try decodeCombinerKeyPackage(bytes: invitation.encodedKeyPackage)
 		let initiatorSession = try TwoMlsPqSession.initiate(
 			client: initiator,
-			theirKeyPackage: acceptorPair
+			theirKeyPackage: acceptorPair,
+			appPayload: nil
 		)
 		let welcome = try #require(initiatorSession.pendingOutbound())
 		let initiatorKp = encodeCombinerKeyPackage(
@@ -115,7 +117,8 @@ struct PQInvitationReceiveTests {
 		let acceptorPair = try decodeCombinerKeyPackage(bytes: invitation.encodedKeyPackage)
 		let initiatorSession = try TwoMlsPqSession.initiate(
 			client: initiator,
-			theirKeyPackage: acceptorPair
+			theirKeyPackage: acceptorPair,
+			appPayload: nil
 		)
 		let welcome = try #require(initiatorSession.pendingOutbound())
 		let initiatorKp = encodeCombinerKeyPackage(

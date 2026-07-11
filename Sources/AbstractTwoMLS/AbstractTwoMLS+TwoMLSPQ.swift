@@ -62,7 +62,26 @@ public enum TwoMLSPQConformanceError: Error {
 // v4: TwoMlsPqError gained CipherSuiteMismatch; MlsCipherSuite.isSupported -> isCombinerPq;
 //     AgentState -> PrincipalState.
 // v5: TwoMlsPqError gained InvitationSpent; generateInvitation gained a lastResort flag.
-private let expectedBindingContract: UInt64 = 5
+// v6: wire format v2 — one message frame (0x03) with a mandatory commit-or-welcome staple;
+//     PQ side-band tags renumbered to 0x05–0x11 (classify via PqFrameKind, never raw bytes);
+//     TwoMlsPqError gained EpochDesync and UnexpectedWelcome.
+// v7: header encryption — every rendezvous-channel frame leaves the library sealed; the host
+//     removes the seal with openIncoming(blob:) -> OpenedFrame { kind, frame } and routes
+//     `frame` by `kind` (OpenedFrameKind: message | pqSideBand(kind: PqFrameKind)).
+// v8: initiate-side envelope — initiate gained appPayload: Data?; its initial frame comes back
+//     from pendingOutbound already HPKE-enveloped; TwoMlsPqInvitation.openInitial(blob:) ->
+//     InitialFrame { appPayload, welcome } opens it (decrypt-only, non-consuming).
+// v9–v10: receive gained newClientId: Data? (establish under a dedicated per-session
+//     principal) and expectedRemote: Data? (crate-side identity pin, checked before any
+//     invitation state is claimed); queuedRemoteSuccessor() -> ClientId? exposes the
+//     approval tally; TwoMlsPqError gained CredentialRejected, InvalidClientId, and
+//     RemoteIdentityMismatch.
+// v11–v12: draft-ietf-mls-combiner-02 conformance — APQInfo GroupContext extension,
+//     AppDataUpdate epoch attestation on FULL commits, SafeExportSecret application-PSK
+//     recipe, event-driven cross-party injection; combiner key package framing v2 and
+//     session archive v8 (old key packages and archives are rejected — regenerate);
+//     TwoMlsPqError gained ApqInfoMismatch. No call-shape changes.
+private let expectedBindingContract: UInt64 = 12
 
 enum TwoMLSPQBindingContract {
 	static let verified: Void = {
@@ -337,10 +356,21 @@ extension AbstractTwoMLS {
 		}
 
 		public func ingest(_ message: Data) throws -> PQInbound {
-			// PQ side-band frame tags (session.rs): EK 0x0B, CT 0x0D, bind 0x0F,
-			// bootstrap KP 0x11, bootstrap bind 0x13, rekey Upd' 0x15, rekey Commit' 0x17.
-			switch message.first {
-			case 0x15:
+			// Frames leave the peer sealed (header encryption, contract v7): the leading
+			// tag is no longer in the clear, so classify by removing the outer seal and
+			// reading the routing `kind` rather than switching on `message.first`. The
+			// pq_* receivers open the seal transparently, so hand them the sealed blob.
+			guard let opened = try base.openIncoming(blob: message) else {
+				// No header key opened it — a stranger's frame or a reconnect-gap frame
+				// for an epoch we no longer hold a key for.
+				throw TwoMLSPQConformanceError.malformedHeaderFrame
+			}
+			guard case let .pqSideBand(kind) = opened.kind else {
+				// A message-path frame (welcome/0x03) reached the side-band entry point.
+				throw TwoMLSPQConformanceError.malformedHeaderFrame
+			}
+			switch kind {
+			case .rekeyUpdate:
 				// A.5 responder: commit the initiator's Upd' on our send-PQ; the
 				// [Commit'][counter-Upd'] reply parks for `advance` to hand out.
 				// A credential handoff announces the initiator's (already Phase
@@ -350,7 +380,7 @@ extension AbstractTwoMLS {
 				return PQInbound(
 					kind: .rekey, advancedGroup: .ours,
 					newEpochs: epochs, rotatedCredential: rotated?.bytes)
-			case 0x17:
+			case .rekeyCommit:
 				// Mid-operation (initiator: counter-Upd' present) our own send-PQ also
 				// committed and the final Commit' parks for `advance`; final (responder:
 				// empty counter) only our recv mirror advanced and the turn is ours.
@@ -358,34 +388,32 @@ extension AbstractTwoMLS {
 				return PQInbound(
 					kind: .rekey, advancedGroup: continued ? .ours : .theirs,
 					newEpochs: epochs, rotatedCredential: nil)
-			case 0x11:
+			case .bootstrapKeyPackage:
 				try base.pqBootstrapRespond(kpMsg: message)
 				return PQInbound(
 					kind: .finishBootstrap, advancedGroup: .ours,
 					newEpochs: epochs, rotatedCredential: nil)
-			case 0x13:
+			case .bootstrapBind:
 				try base.pqBootstrapApply(bindMsg: message)
 				return PQInbound(
 					kind: .finishBootstrap, advancedGroup: .theirs,
 					newEpochs: epochs, rotatedCredential: nil)
-			case 0x0B:
+			case .ratchetEphemeralKey:
 				try base.pqRatchetRespond(ekMsg: message)
 				return PQInbound(
 					kind: .ratchet, advancedGroup: .theirs,
 					newEpochs: nil, rotatedCredential: nil)
-			case 0x0D:
+			case .ratchetCiphertext:
 				try base.pqRatchetBind(ctMsg: message, app: Data())
 				return PQInbound(
 					kind: .ratchet, advancedGroup: .ours,
 					newEpochs: epochs, rotatedCredential: nil)
-			case 0x0F:
+			case .ratchetBind:
 				let plaintext = try base.pqRatchetApply(bindMsg: message)
 				return PQInbound(
 					kind: .ratchet, advancedGroup: .theirs,
 					newEpochs: epochs, rotatedCredential: nil,
 					plaintext: plaintext.isEmpty ? nil : plaintext)
-			default:
-				throw TwoMLSPQConformanceError.malformedHeaderFrame
 			}
 		}
 	}
@@ -512,11 +540,24 @@ extension AbstractTwoMLS {
 			// token `decodeHeader` returned, so a caller cannot substitute a digest
 			// recomputed over the wrong bytes (e.g. a re-serialized welcome) and
 			// silently break replay forwarding.
+			// `sendGroupWelcome` is the crate's §A.1 envelope (contract v8), not a bare
+			// APQ welcome: unwrap it with `openInitial` (decrypt-only, does not consume
+			// the invitation) to recover the MLS welcome `receive` joins from. The
+			// app-layer payload rides this backend's own outer frame, so it is empty here.
+			let opened = try base.openInitial(blob: sendGroupWelcome)
+			// v12 `receive` grew `newClientId:` (establish directly under the dedicated
+			// principal) and `expectedRemote:` (crate-side identity pin, checked before
+			// any invitation state is claimed). Adopted mechanically as nil/nil for now:
+			// this wrapper still pins the remote via the key-package guard above and
+			// stages the dedicated principal for the Phase 8 rotation below — switching
+			// those to the crate-side path is a deliberate follow-up, not a re-pin.
 			let session = PQSession(
 				try base.receive(
-					welcome: sendGroupWelcome,
+					welcome: opened.welcome,
 					theirKeyPackage: pair,
-					spawnToken: welcomeToken.wireFormat
+					spawnToken: welcomeToken.wireFormat,
+					newClientId: nil,
+					expectedRemote: nil
 				))
 
 			// Deliberately fail open on the staple: an untrusted, optional early-delivery
@@ -592,11 +633,15 @@ extension AbstractTwoMLS {
 			myKeyPackage: Data
 		) {
 			let pair = try decodeCombinerKeyPackage(bytes: keyPackageMessage)
+			// `appPayload: nil` — this backend carries the app-layer AppWelcome in its own
+			// outer HPKE frame (createTwoMLSGroup/decodeHeader), so the crate's envelope
+			// wraps only the APQ welcome. `pendingOutbound` returns that opaque §A.1
+			// envelope (contract v8); `PQInvitation.receive` unwraps it with `openInitial`.
 			let session = try TwoMlsPqSession.initiate(
-				client: base, theirKeyPackage: pair)
+				client: base, theirKeyPackage: pair, appPayload: nil)
 			guard let welcome = session.pendingOutbound() else {
 				throw TwoMLSPQConformanceError.notImplemented(
-					"PQClient.reply — initiate produced no welcome"
+					"PQClient.reply — initiate produced no envelope"
 				)
 			}
 			// The return-group key package uses the retaining generate path: this live

@@ -66,9 +66,12 @@ let package = Package(
 			// binary + binding MUST come from the same build (see above). Keep that
 			// swap uncommitted.
 			// path: "../TwoMLSPQ/buildIos/TwoMLSPQ.xcframework"
+			//
+			// NOTE: tags are v-prefixed from v0.0.13 on (changesets); each release also
+			// publishes this checksum as the TwoMLSPQ.xcframework.zip.checksum asset.
 			url:
-				"https://github.com/germ-network/TwoMLSPQ/releases/download/0.0.10/TwoMLSPQ.xcframework.zip",
-			checksum: "f83f43d1d35afadcfc9adbadae290b6c83209c9c53e6680fcaa4d243108a3acf"
+				"https://github.com/germ-network/TwoMLSPQ/releases/download/v0.0.13/TwoMLSPQ.xcframework.zip",
+			checksum: "da9be144531843ec9f20f4d3c5a56aa79c0d72ac05815f4284913034034397bf"
 		),
 		.testTarget(
 			name: "AbstractTwoMLSTests",
