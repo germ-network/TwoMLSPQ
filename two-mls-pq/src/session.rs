@@ -1016,8 +1016,22 @@ impl TwoMlsPqSession {
             _ => return Err(TwoMlsPqError::ApqInfoMismatch),
         };
         // -02 FULL verification: both halves carried the AppDataUpdate, the two copies
-        // agree, and they attest the actual post-apply epochs of both groups — checked
-        // before the stapled app message is decrypted.
+        // agree, and they attest the actual post-apply epochs of both groups.
+        //
+        // Verify/apply boundary: per-half AppDataUpdate validity (correct proposal type,
+        // committer-sent, and new-epoch == pre-commit context.epoch + 1) is enforced
+        // PRE-apply by the MlsRules filter (see `apq::rules`), so a structurally bad
+        // attestation is rejected before either group state moves. What remains here — the
+        // CROSS-half agreement and the match against the actual post-apply epochs — is
+        // necessarily post-apply, because comparing the two halves' epochs requires both
+        // commits to have been applied (mls-rs `process_incoming_message` validates and
+        // applies atomically; there is no inspect-without-apply short of a fork change).
+        // That residual check still gates every observable effect: it runs BEFORE the
+        // stapled app message is decrypted (line below), BEFORE the one-shot apq PSK is
+        // forgotten, and BEFORE the turn passes — so on a bad attestation from our sole
+        // counterparty no plaintext is released and no turn/PSK state is confirmed. The
+        // only thing an attestation forgery can force is a self-inflicted epoch advance
+        // that then errors out, which is within the two-party DoS threat model.
         if cl_attestation != pq_attestation
             || pq_attestation.pq_epoch != recv_pq.current_epoch()
             || cl_attestation.t_epoch != recv.classical.current_epoch()
@@ -1207,6 +1221,11 @@ impl TwoMlsPqSession {
                 .to_bytes()
                 .map_err(|_| TwoMlsPqError::Mls)?
         };
+        // Our send-PQ commit above consumed the one-shot cross-party PSK (when one rode
+        // it); drop it from the ephemeral store now the commit is applied.
+        if let Some(psk) = &cross_psk {
+            inner.forget_psk(psk.storage_id());
+        }
         // Counter-Upd'(self) for the initiator's send-PQ (our recv mirror).
         let counter = {
             let recv_pq = inner
@@ -1251,7 +1270,7 @@ impl TwoMlsPqSession {
         // it at most once per send-PQ epoch (`last_send_pq_exported`): the value stays in the
         // store, and re-exporting a consumed leaf across two re-keys without our send-PQ
         // advancing would fail. (The send-PQ analogue of the classical `send_psk_ledger`.)
-        {
+        let pre_registered_send_pq: Option<ExternalPskId> = {
             let inner: &mut SessionInner = &mut inner;
             let send_pq_epoch = inner
                 .send_group
@@ -1268,8 +1287,15 @@ impl TwoMlsPqSession {
                 let exported = export_psk(send_pq, PskDomain::CrossParty)?;
                 inner.register_psk(exported.storage_id(), exported.psk());
                 inner.last_send_pq_exported = Some(send_pq_epoch);
+                // Held so we can drop it once the peer's commit (below) has resolved it —
+                // it is consumed within this same call. When the export is skipped
+                // (watermark already at this epoch) the peer's commit skips referencing it
+                // too, so there is nothing new to forget.
+                Some(exported.storage_id().clone())
+            } else {
+                None
             }
-        }
+        };
         match inner.pq_inflight.take() {
             Some(PqInflight::RekeyInitiated { rotating }) => {
                 if counter_bytes.is_empty() {
@@ -1316,6 +1342,11 @@ impl TwoMlsPqSession {
                 };
                 if let Some(psk) = &exported {
                     inner.register_psk(psk.storage_id(), psk.psk());
+                }
+                // The responder's Commit' we just applied to our recv-PQ mirror consumed the
+                // send-PQ cross-PSK we pre-registered above; drop it from the store.
+                if let Some(id) = &pre_registered_send_pq {
+                    inner.forget_psk(id);
                 }
                 // Commit the counter-Upd' on our own send-PQ. If this rekey carries a
                 // credential handoff, the commit's updatePath also moves OUR committer
@@ -1376,6 +1407,11 @@ impl TwoMlsPqSession {
                         .to_bytes()
                         .map_err(|_| TwoMlsPqError::Mls)?
                 };
+                // Our counter commit above consumed the recv-PQ cross-PSK we exported and
+                // registered for it; drop it now the commit is applied.
+                if let Some(psk) = &exported {
+                    inner.forget_psk(psk.storage_id());
+                }
                 // Our operation completes once the peer applies; the turn passes.
                 inner.pq_turn_mine = false;
                 inner.pending_pq_outbound = Some(encode_pq_rekey_commit(commit2, Vec::new()));
@@ -1406,6 +1442,11 @@ impl TwoMlsPqSession {
                 }
                 // A peer commit must never change the two-party shape.
                 apq::ensure_two_party(recv_pq)?;
+                // The initiator's final Commit' we just applied consumed the send-PQ
+                // cross-PSK we pre-registered above; drop it from the store.
+                if let Some(id) = &pre_registered_send_pq {
+                    inner.forget_psk(id);
+                }
                 // We finished receiving this operation; the next one is ours to start.
                 inner.pq_turn_mine = true;
                 Ok(false)
@@ -1537,6 +1578,15 @@ impl SessionInner {
     /// Register an exported PSK into every store this session's groups resolve from.
     fn register_psk(&self, psk_id: &ExternalPskId, psk: &PreSharedKey) {
         apq::register_psk_stores(&self.psk_stores, psk_id, psk);
+    }
+
+    /// Drop a one-shot exported PSK from every store this session's groups resolve from —
+    /// the counterpart of [`SessionInner::register_psk`]. Used to bound the ephemeral PQ
+    /// store: an A.5 cross-party PSK is consumed within the same call that registers it, so
+    /// it is forgotten once the consuming commit/apply completes (the leaf can never be
+    /// referenced again — the send-PQ / recv-PQ watermarks keep both parties in lockstep).
+    fn forget_psk(&self, psk_id: &ExternalPskId) {
+        apq::forget_psk_stores(&self.psk_stores, psk_id);
     }
 
     /// Track `client`'s PSK stores so future `register_psk` calls reach any group half
@@ -1972,6 +2022,17 @@ impl SessionInner {
                     .as_ref()
                     .ok_or(TwoMlsPqError::SessionNotReady)?;
                 send.register_psk(exported.storage_id(), exported.psk());
+                // Advance the watermark now — deliberately BEFORE the build/apply below,
+                // not after. `export_psk` has already consumed the recv exporter leaf, and
+                // that consumption is irreversible (once per epoch, for FS). So this is not
+                // a "commit succeeded" flag; it records "this leaf is spent." If build/apply
+                // then fails, no commit reaches the peer (no divergence), and a retry at this
+                // same `recv_epoch` MUST take the skip branch above — a second export of the
+                // spent leaf would error. The prior binding's entanglement still holds and the
+                // next peer advance re-triggers a fresh injection. The only observable cost of
+                // a mid-commit failure is that this one recv-epoch's re-binding is skipped and
+                // the folded peer proposal is dropped (the peer re-proposes on its next
+                // advance) — both self-healing, neither a security property.
                 self.last_cross_injected = Some(recv_epoch);
                 Some(exported)
             };
@@ -4563,6 +4624,52 @@ mod tests {
         rekey_round(&alice, &bob);
         assert_eq!(alice.epochs().pq_epoch, 3);
         assert_eq!(bob.epochs().pq_epoch, 3);
+    }
+
+    /// Regression: two consecutive A.5 rekeys with an archive/restore of BOTH parties
+    /// *between* the rounds. This exercises the send-PQ export watermark
+    /// (`last_send_pq_exported`) against an ephemeral PQ secret store emptied by the jump —
+    /// the store that holds the A.5 cross-party PSKs is not archived, so the second round
+    /// must stand up entirely on restored watermark + epoch state. The lockstep invariant
+    /// (a party pre-registers its send-PQ leaf iff the peer will reference it) is what keeps
+    /// the empty store safe. Complements `test_pq_rekey_full_round` (two rekeys, no restore)
+    /// and `test_archive_mid_rekey_round_completes_after_restore` (restore mid-round).
+    #[test]
+    fn test_two_rekeys_with_archive_between_rounds() {
+        let (alice, bob) = establish_full();
+        // Round 1: Bob holds the turn after the bootstrap, so he initiates.
+        assert!(bob.my_pq_turn());
+        rekey_round(&bob, &alice);
+        assert_eq!(alice.epochs().pq_epoch, 2);
+        assert_eq!(bob.epochs().pq_epoch, 2);
+        // The turn flipped to Alice.
+        assert!(alice.my_pq_turn());
+        assert!(!bob.my_pq_turn());
+
+        // Archive + restore both parties between the rounds. The A.5 cross-party PSKs live
+        // only in the ephemeral store, which does not ride the archive.
+        let alice = round_trip(&alice);
+        let bob = round_trip(&bob);
+        assert!(alice.my_pq_turn());
+        assert!(!bob.my_pq_turn());
+
+        // Round 2: Alice initiates on the restored sessions. If the second round tried to
+        // re-export a send-PQ leaf the first round consumed, or the peer referenced a PSK
+        // the empty store could not resolve, this would fail here.
+        rekey_round(&alice, &bob);
+        assert_eq!(alice.epochs().pq_epoch, 3);
+        assert_eq!(bob.epochs().pq_epoch, 3);
+        assert!(bob.my_pq_turn());
+
+        // Messaging still flows on the twice-rekeyed, once-restored groups.
+        assert_ok!(alice.prepare_to_encrypt(None));
+        let a2b = assert_ok!(alice.encrypt(b"after-two-rekeys".to_vec()));
+        assert_eq!(a2b.epochs.pq_epoch, 3);
+        let got = assert_ok!(bob.process_incoming(a2b.cipher_text));
+        assert_eq!(
+            assert_some!(assert_some!(got).application_message).app_message_data,
+            b"after-two-rekeys".to_vec()
+        );
     }
 
     #[test]

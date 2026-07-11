@@ -206,10 +206,12 @@ pub fn decode_apq_welcome(bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
 }
 
 /// Trailing domain byte that distinguishes a PQ-ratchet *injected-secret* PSK id from an
-/// *exported* (apq / cross-party) PSK id. Injected ids carry this byte and are 8+group_id+1
-/// bytes, whereas an exported id is a fixed 32-byte derived value (see [`export_psk`]); with
-/// this crate's 32-byte group ids the two families are disjoint by length. See `pq_ratchet`
-/// for the injection path.
+/// *exported* (apq / cross-party) application-PSK id. An injected id is an *external* PSK id
+/// of `8 + group_id + 1` bytes (41 with this crate's 32-byte group ids) ending in this byte,
+/// whereas an exported id is a 38-byte *application* storage id
+/// `0x03 ‖ component_id ‖ len ‖ psk_id` (see [`export_psk`] / `ExportedPsk::storage_id`). The
+/// two families are disjoint both by length (41 ≠ 38) and by the leading application
+/// discriminant. See `pq_ratchet` for the injection path.
 pub(crate) const PSK_DOMAIN_INJECTED: u8 = 0x52;
 
 /// PSK identifier for a PQ-ratchet *injected* secret: LE epoch || group_id || `PSK_DOMAIN_INJECTED`.

@@ -34,14 +34,14 @@ strip = "symbols"
 
 [workspace.dependencies]
 mls-rs = { version = "0.55", features = ["psk", "private_message", "serde", "safe_extensions"] }
-mls-rs-core = { version = "0.27", git = "https://github.com/germ-network/mls-rs", rev = "5ee2b3d6b789e01ec75db7a1e5420ec095ab772b" }
-mls-rs-crypto-awslc = { version = "0.25", git = "https://github.com/germ-network/mls-rs", rev = "5ee2b3d6b789e01ec75db7a1e5420ec095ab772b", features = [
+mls-rs-core = { version = "0.27", git = "https://github.com/germ-network/mls-rs", rev = "7c8c63a7c940e15af9845ed001d5d95b61f496cf" }
+mls-rs-crypto-awslc = { version = "0.25", git = "https://github.com/germ-network/mls-rs", rev = "7c8c63a7c940e15af9845ed001d5d95b61f496cf", features = [
   "post-quantum",
 ] }
-mls-rs-crypto-cryptokit = { version = "0.11", git = "https://github.com/germ-network/mls-rs", rev = "5ee2b3d6b789e01ec75db7a1e5420ec095ab772b", features = [
+mls-rs-crypto-cryptokit = { version = "0.11", git = "https://github.com/germ-network/mls-rs", rev = "7c8c63a7c940e15af9845ed001d5d95b61f496cf", features = [
   "post-quantum",
 ] }
-mls-rs-crypto-traits = { version = "0.22", git = "https://github.com/germ-network/mls-rs", rev = "5ee2b3d6b789e01ec75db7a1e5420ec095ab772b" }
+mls-rs-crypto-traits = { version = "0.22", git = "https://github.com/germ-network/mls-rs", rev = "7c8c63a7c940e15af9845ed001d5d95b61f496cf" }
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
 thiserror = "1"
@@ -49,4 +49,4 @@ uniffi = "0.31"
 zeroize = { version = "1", features = ["derive"] }
 
 [patch.crates-io]
-mls-rs = { git = "https://github.com/germ-network/mls-rs", rev = "5ee2b3d6b789e01ec75db7a1e5420ec095ab772b" }
+mls-rs = { git = "https://github.com/germ-network/mls-rs", rev = "7c8c63a7c940e15af9845ed001d5d95b61f496cf" }
