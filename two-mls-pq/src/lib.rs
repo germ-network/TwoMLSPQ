@@ -126,7 +126,14 @@ pub fn version() -> String {
 // type, so v1 combiner key packages and v5 archives are rejected
 // (COMBINER_KEY_PACKAGE_VERSION -> 2: the payload is now the -02 §7 APQKeyPackage TLS
 // shape inside the version byte; SESSION_ARCHIVE_VERSION -> 6, pure compatibility cut).
-const BINDING_CONTRACT_VERSION: u64 = 10;
+// v11 (2026-07-10, draft-02 conformance, phase B): the apq_psk / cross-party PSKs are now the
+// conformant application PSKs — SafeExportSecret(component_id) off the mls-rs exporter tree +
+// DeriveSecret("psk_id"/"psk"), imported with psk_type=application(3) via add_application_psk
+// (the fork's safe_extensions feature; pin bumped to the germ-shadow-safe-exporter rev). The
+// A.3 injected secret S stays an external PSK. Ledger/archive reshaped (SESSION_ARCHIVE_VERSION
+// -> 7). The exporter tree consumes each component's leaf once per epoch, so the session
+// exports at most once per (send group, epoch) and memoizes via the ledger.
+const BINDING_CONTRACT_VERSION: u64 = 11;
 
 /// See `BINDING_CONTRACT_VERSION`. Exported so the Swift layer can verify the
 /// binding it was generated with matches the binary it loaded.

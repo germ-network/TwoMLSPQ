@@ -38,7 +38,7 @@ pub use group::{
     ensure_two_party, export_and_register_psk, export_psk, forget_psk, forget_psk_stores,
     join_combiner_group, join_combiner_group_from_halves, join_group_from_welcome,
     load_combiner_group, register_psk, register_psk_stores, sender_client_id, CombinerGroup,
-    CombinerGroupState, GroupCreation, MlsGroup, PqMlsGroup, PskDomain, APQ_TAG,
+    CombinerGroupState, ExportedPsk, GroupCreation, MlsGroup, PqMlsGroup, PskDomain, APQ_TAG,
 };
 
 /// Failure categories for the combiner layer. The two-mls layer maps these onto its

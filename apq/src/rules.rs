@@ -127,13 +127,12 @@ impl MlsRules for TwoMlsRules {
             }
         }
 
-        // Every PSK is an external PSK (the APQ / cross-party bindings); this
-        // protocol never resumes groups.
-        if proposals
-            .psk_proposals()
-            .iter()
-            .any(|p| p.proposal.external_psk_id().is_none())
-        {
+        // Every PSK is external (the A.3 injected secret S) or application (the
+        // draft-02 apq_psk / Germ cross-party bindings); this protocol never resumes
+        // groups. A proposal for which both accessors are `None` is a resumption PSK.
+        if proposals.psk_proposals().iter().any(|p| {
+            p.proposal.external_psk_id().is_none() && p.proposal.application_psk().is_none()
+        }) {
             return Err(RuleError::ResumptionPsk);
         }
 

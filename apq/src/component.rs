@@ -26,13 +26,18 @@ use crate::{CombinerError, Result};
 
 pub use wire::{ApqInfo, ApqInfoUpdate};
 
-/// The combiner component id. The draft's id awaits IANA assignment; this is a
-/// private-use value (mls-extensions reserves `0x80000000..` for private use).
-pub const APQ_COMPONENT_ID: u32 = 0x8000_0001;
+/// The combiner component id. The draft's id awaits IANA assignment; this is a high,
+/// uncommon value. It MUST fit the 16-bit Exporter Tree that `SafeExportSecret` walks:
+/// draft-ietf-mls-extensions-08 types `ComponentID` as `uint32` but gives the tree only
+/// `2^16` leaves (draft -09 resolves this by narrowing `ComponentID` to `uint16`), and the
+/// fork rejects out-of-range ids rather than truncating — so combiner component ids live in
+/// `[0, 0x10000)`.
+pub const APQ_COMPONENT_ID: u32 = 0xFF01;
 
 /// Germ's cross-party TwoMLS-PSK domain, kept disjoint from the combiner component so the
-/// two exported-PSK families can never collide once both derive component-bound labels.
-pub const TWOMLS_COMPONENT_ID: u32 = 0x8000_0002;
+/// two exported-PSK families can never collide (distinct Exporter Tree leaves). Also 16-bit
+/// (see [`APQ_COMPONENT_ID`]).
+pub const TWOMLS_COMPONENT_ID: u32 = 0xFF02;
 
 /// The `APQInfo` GroupContext extension type (RFC 9420 private-use extension range).
 pub const APQINFO_EXTENSION_TYPE: ExtensionType = ExtensionType::new(0xF0A1);

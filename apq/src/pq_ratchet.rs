@@ -20,7 +20,7 @@ use mls_rs_crypto_traits::KemType;
 use zeroize::Zeroizing;
 
 use crate::component::{commit_attestation, ApqInfoUpdate};
-use crate::group::{export_psk, injected_secret_psk_id, PskDomain};
+use crate::group::{export_psk, injected_secret_psk_id, ExportedPsk, PskDomain};
 use crate::{CombinerError, Result};
 
 /// Initiator-side ephemeral for one PQ ratchet round. Holds the decapsulation key; the
@@ -115,14 +115,16 @@ impl Drop for InjectedSecret<'_> {
 
 /// Initiator (committer) — inject S into `pq_group` via a pathless PSK commit carrying the
 /// -02 `AppDataUpdate` epoch attestation, apply it, and re-export the `apq_psk` from the
-/// new PQ epoch (registered for the classical bind).
-/// Returns `(pq_commit_bytes, apq_psk_id)`.
+/// new PQ epoch (registered for the classical bind). The injected secret S stays an
+/// *external* PSK (it is externally-sourced KEM entropy, not an exporter-derived value);
+/// the re-exported `apq_psk` is an application PSK.
+/// Returns `(pq_commit_bytes, apq_psk)`.
 pub fn inject_and_commit<Cfg: MlsConfig>(
     pq_group: &mut Group<Cfg>,
     s: &[u8],
     stores: &[InMemoryPreSharedKeyStorage],
     attestation: ApqInfoUpdate,
-) -> Result<(Vec<u8>, ExternalPskId)> {
+) -> Result<(Vec<u8>, ExportedPsk)> {
     let secret = InjectedSecret::register(pq_group, s, stores);
     let out = pq_group
         .commit_builder()
@@ -137,13 +139,13 @@ pub fn inject_and_commit<Cfg: MlsConfig>(
     crate::group::ensure_two_party(pq_group)?;
     // S is now folded into the new epoch; wipe it from the stores before re-exporting.
     drop(secret);
-    let (apq_psk_id, apq_psk) = export_psk(pq_group, PskDomain::Apq)?;
-    crate::group::register_psk_stores(stores, &apq_psk_id, &apq_psk);
+    let apq_psk = export_psk(pq_group, PskDomain::Apq)?;
+    crate::group::register_psk_stores(stores, apq_psk.storage_id(), apq_psk.psk());
     let bytes = out
         .commit_message
         .to_bytes()
         .map_err(|_| CombinerError::Mls)?;
-    Ok((bytes, apq_psk_id))
+    Ok((bytes, apq_psk))
 }
 
 /// Responder (applier) — register S (held since `encapsulate`), apply the initiator's pathless PQ
@@ -159,7 +161,7 @@ pub fn apply_injected_commit<Cfg: MlsConfig>(
     s: &[u8],
     pq_commit: &[u8],
     stores: &[InMemoryPreSharedKeyStorage],
-) -> Result<(ExternalPskId, ApqInfoUpdate)> {
+) -> Result<(ExportedPsk, ApqInfoUpdate)> {
     let secret = InjectedSecret::register(pq_group, s, stores);
     let msg = MlsMessage::from_bytes(pq_commit).map_err(|_| CombinerError::Mls)?;
     let received = pq_group
@@ -174,9 +176,9 @@ pub fn apply_injected_commit<Cfg: MlsConfig>(
     crate::group::ensure_two_party(pq_group)?;
     // S is now folded into the new epoch; wipe it before re-exporting.
     drop(secret);
-    let (apq_psk_id, apq_psk) = export_psk(pq_group, PskDomain::Apq)?;
-    crate::group::register_psk_stores(stores, &apq_psk_id, &apq_psk);
-    Ok((apq_psk_id, attestation))
+    let apq_psk = export_psk(pq_group, PskDomain::Apq)?;
+    crate::group::register_psk_stores(stores, apq_psk.storage_id(), apq_psk.psk());
+    Ok((apq_psk, attestation))
 }
 
 /// Benchmark fixture (never enabled in production): the "old" APQ-faithful per-round PQ cost — a
@@ -297,17 +299,15 @@ mod tests {
             t_epoch: cl_epoch_before + 1,
             pq_epoch: pq_epoch_before + 1,
         };
-        let (pq_commit, apq_psk_id) = inject_and_commit(
+        let (pq_commit, apq_psk) = inject_and_commit(
             asg.pq.as_mut().unwrap(),
             &s_alice,
             &[alice.pq().secret_store(), alice.classical().secret_store()],
             attestation,
         )
         .unwrap();
-        let cl_out = asg
-            .classical
-            .commit_builder()
-            .add_external_psk(apq_psk_id.clone())
+        let cl_out = apq_psk
+            .add_to_commit(asg.classical.commit_builder())
             .unwrap()
             .build()
             .unwrap();
@@ -315,7 +315,7 @@ mod tests {
         let cl_commit = cl_out.commit_message.to_bytes().unwrap();
 
         // Bob applies the stapled commits.
-        let (apq_psk_id_bob, bob_attestation) = apply_injected_commit(
+        let (apq_psk_bob, bob_attestation) = apply_injected_commit(
             bob_recv.pq.as_mut().unwrap(),
             &s_bob,
             &pq_commit,
@@ -339,10 +339,10 @@ mod tests {
         // Both classical groups advanced (the apq_psk bind) and agree.
         assert_eq!(asg.classical.current_epoch(), cl_epoch_before + 1);
         assert_eq!(bob_recv.classical.current_epoch(), cl_epoch_before + 1);
-        // Both sides independently derived the same apq_psk id from the new PQ epoch.
-        let alice_apq: &[u8] = &apq_psk_id;
-        let bob_apq: &[u8] = &apq_psk_id_bob;
-        assert_eq!(alice_apq, bob_apq);
+        // Both sides independently derived the same apq_psk (store key + value) from the
+        // new PQ epoch.
+        assert_eq!(apq_psk.storage_id(), apq_psk_bob.storage_id());
+        assert_eq!(apq_psk.psk().raw_value(), apq_psk_bob.psk().raw_value());
         // The applied PQ commit surfaced the initiator's epoch attestation intact.
         assert_eq!(bob_attestation, attestation);
 

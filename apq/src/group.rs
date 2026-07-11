@@ -238,69 +238,108 @@ pub enum PskDomain {
 }
 
 impl PskDomain {
-    /// The mls-extensions component id this domain binds its exporter derivations to.
+    /// The mls-extensions component id this domain exports its `SafeExportSecret` leaf from.
+    /// Domain separation is the component id (distinct exporter-tree leaves); the
+    /// `DeriveSecret` labels (`"psk_id"` / `"psk"`) are fixed across domains.
     fn component_id(self) -> u32 {
         match self {
             PskDomain::Apq => crate::component::APQ_COMPONENT_ID,
             PskDomain::CrossParty => crate::component::TWOMLS_COMPONENT_ID,
         }
     }
+}
 
-    /// The exporter label for the PSK id.
-    fn id_label(self) -> &'static [u8] {
-        match self {
-            PskDomain::Apq => b"apq_psk_id",
-            PskDomain::CrossParty => b"twomls_psk_id",
-        }
+/// A draft-02 `application` PSK derived from a group's exporter tree: the component id and
+/// `psk_id` that name it in a commit (via [`CommitBuilder::add_application_psk`]), the
+/// `storage_id` its value is looked up under in the group's PSK store, and the value itself.
+/// Produced by [`export_psk`]; consumed by the commit builders (which reference it) and by
+/// [`register_psk`] / [`register_psk_stores`] (which install the value under `storage_id`).
+#[derive(Clone)]
+pub struct ExportedPsk {
+    component_id: u32,
+    psk_id: Vec<u8>,
+    storage_id: ExternalPskId,
+    psk: PreSharedKey,
+}
+
+impl ExportedPsk {
+    /// The component id naming this application PSK in a commit.
+    pub fn component_id(&self) -> u32 {
+        self.component_id
+    }
+    /// The opaque `psk_id` naming this application PSK in a commit.
+    pub fn psk_id(&self) -> &[u8] {
+        &self.psk_id
+    }
+    /// The store key the PSK value is installed under (`0x03 ‖ component_id ‖ psk_id`).
+    pub fn storage_id(&self) -> &ExternalPskId {
+        &self.storage_id
+    }
+    /// The PSK value.
+    pub fn psk(&self) -> &PreSharedKey {
+        &self.psk
     }
 
-    /// The exporter label for the PSK value.
-    fn psk_label(self) -> &'static [u8] {
-        match self {
-            PskDomain::Apq => b"apq_psk",
-            PskDomain::CrossParty => b"twomls_psk",
-        }
+    /// Reconstruct an `ExportedPsk` from its archived parts, recomputing the store key.
+    /// The value is not re-derived from any group (the exporter leaf is long consumed);
+    /// this is how a restored session recovers a ledgered cross-party PSK.
+    pub fn from_parts(component_id: u32, psk_id: Vec<u8>, psk: PreSharedKey) -> Result<Self> {
+        let storage_id = mls_rs::psk::ApplicationPsk::new(component_id, psk_id.clone())
+            .storage_id()
+            .map_err(|_| CombinerError::Mls)?;
+        Ok(Self {
+            component_id,
+            psk_id,
+            storage_id,
+            psk,
+        })
+    }
+
+    /// Add this application PSK to a commit under construction.
+    pub fn add_to_commit<'a, Cfg: MlsConfig>(
+        &self,
+        builder: mls_rs::group::CommitBuilder<'a, Cfg>,
+    ) -> Result<mls_rs::group::CommitBuilder<'a, Cfg>> {
+        builder
+            .add_application_psk(self.component_id, self.psk_id.clone())
+            .map_err(|_| CombinerError::Mls)
     }
 }
 
-/// Derive the exportable PSK for `group`'s current epoch in the given [`PskDomain`]
-/// (draft-02 phase-A recipe): two independently-labeled 32-byte exports off the group's
-/// exporter secret, each domain-separated by the component id via a `ComponentOperationLabel`
-/// context — the id, and the value. The exporter secret is derived from the epoch's start
-/// secret, so forward secrecy holds; nothing intermediate is materialized, so nothing needs
-/// deleting. Both parties derive the same pair from the same epoch and domain.
-///
-/// Pure derivation — no store side-effect. Durable PSK material belongs to the caller
-/// (session orchestration), which registers the pair into every PSK store its groups resolve
-/// from just-in-time before the commit that references it — an mls-rs group reads the store of
-/// the client that created it, which a session's current client may no longer be after an
-/// agent rotation. See [`register_psk`] / [`register_psk_stores`].
+/// Derive the draft-02 `apq_psk` (or Germ cross-party PSK) for `group`'s current epoch in the
+/// given [`PskDomain`] — the conformant recipe (mls-extensions-08 §4.4): a single
+/// `SafeExportSecret(component_id)` off the epoch's exporter tree, then
+/// `DeriveSecret(apq_exporter, "psk_id")` and `DeriveSecret(apq_exporter, "psk")`. The
+/// exporter leaf is rooted in the epoch's start secret (forward secrecy) and is **consumed**:
+/// `safe_export_secret` deletes the leaf, so a given (group, epoch, component) can be exported
+/// **at most once** — hence `&mut group`, and callers that may need the value again must
+/// memoize it (see the session's PSK ledger). Both parties derive the same [`ExportedPsk`]
+/// from the same epoch and domain.
 ///
 /// Generic over the group's config, so it serves both the classical and the PQ half.
-///
-/// Phase B (fork) replaces the two `export_secret` calls with a true `SafeExportSecret`
-/// exporter-tree leaf + `DeriveSecret("psk_id"/"psk")` and moves the import to
-/// `psk_type = application`; the domain-to-component mapping here is the migration seam.
 pub fn export_psk<Cfg: MlsConfig>(
-    group: &Group<Cfg>,
+    group: &mut Group<Cfg>,
     domain: PskDomain,
-) -> Result<(ExternalPskId, PreSharedKey)> {
-    let context = mls_rs::group::component_operation::ComponentOperationLabel::new(
-        domain.component_id(),
-        b"",
-    )
-    .get_bytes()
-    .map_err(|_| CombinerError::Mls)?;
-    let id = group
-        .export_secret(domain.id_label(), &context, 32)
+) -> Result<ExportedPsk> {
+    let exporter = group
+        .safe_export_secret(domain.component_id())
         .map_err(|_| CombinerError::Mls)?;
+    let psk_id = group
+        .derive_secret(exporter.as_bytes(), b"psk_id")
+        .map_err(|_| CombinerError::Mls)?
+        .as_bytes()
+        .to_vec();
     let psk = group
-        .export_secret(domain.psk_label(), &context, 32)
+        .derive_secret(exporter.as_bytes(), b"psk")
         .map_err(|_| CombinerError::Mls)?;
-    Ok((
-        ExternalPskId::new(id.as_bytes().to_vec()),
-        PreSharedKey::new(psk.as_bytes().to_vec()),
-    ))
+    let application = mls_rs::psk::ApplicationPsk::new(domain.component_id(), psk_id.clone());
+    let storage_id = application.storage_id().map_err(|_| CombinerError::Mls)?;
+    Ok(ExportedPsk {
+        component_id: domain.component_id(),
+        psk_id,
+        storage_id,
+        psk: PreSharedKey::new(psk.as_bytes().to_vec()),
+    })
 }
 
 /// Register an exported PSK into every store in `stores` — the caller's registry of
@@ -360,22 +399,23 @@ where
 }
 
 /// [`export_psk`] + [`register_psk`] for derive-and-use-immediately sites (establishment,
-/// where the PSK is consumed by a join/commit in the same call). Generic over the group's
-/// config, so it serves both the classical and the PQ half.
+/// where the PSK is consumed by a join/commit in the same call): derives the application PSK,
+/// installs its value under the store key, and returns the descriptor so the caller can also
+/// reference it in a commit. Generic over the group's config, so it serves both halves.
 pub fn export_and_register_psk<Cfg, S, C, P>(
-    group: &Group<Cfg>,
+    group: &mut Group<Cfg>,
     client: &CombinerClient<S, C, P>,
     domain: PskDomain,
-) -> Result<ExternalPskId>
+) -> Result<ExportedPsk>
 where
     Cfg: MlsConfig,
     S: KeyPackageStorage + Clone,
     C: CryptoProvider + Clone,
     P: CryptoProvider + Clone,
 {
-    let (psk_id, psk) = export_psk(group, domain)?;
-    register_psk(client, &psk_id, &psk);
-    Ok(psk_id)
+    let exported = export_psk(group, domain)?;
+    register_psk(client, exported.storage_id(), exported.psk());
+    Ok(exported)
 }
 
 /// Creation-time parameters for one half of a combiner group: the pre-generated group id
@@ -422,7 +462,7 @@ impl GroupCreation {
 pub fn create_group_with_member<Cfg: MlsConfig>(
     mls_client: &Client<Cfg>,
     their_kp_bytes: &[u8],
-    psk_ids: &[ExternalPskId],
+    psks: &[ExportedPsk],
     creation: GroupCreation,
 ) -> Result<(Group<Cfg>, Vec<u8>)> {
     let mut group = mls_client
@@ -439,10 +479,8 @@ pub fn create_group_with_member<Cfg: MlsConfig>(
         .commit_builder()
         .add_member(their_kp)
         .map_err(|_| CombinerError::Mls)?;
-    for psk in psk_ids {
-        builder = builder
-            .add_external_psk(psk.clone())
-            .map_err(|_| CombinerError::Mls)?;
+    for psk in psks {
+        builder = psk.add_to_commit(builder)?;
     }
     if let Some(update) = creation.app_data_update {
         builder = builder.custom_proposal(update.to_custom_proposal()?);
@@ -536,14 +574,14 @@ where
         pq_epoch: 1,
     };
     // PQ side group first, unbound.
-    let (pq_group, pq_welcome) = create_group_with_member(
+    let (mut pq_group, pq_welcome) = create_group_with_member(
         client.pq(),
         pq_kp,
         &[],
         GroupCreation::new(pq_gid, &info, Some(attestation))?,
     )?;
     // APQ-PSK: export from the PQ group, inject into the classical message group.
-    let apq_psk = export_and_register_psk(&pq_group, client, PskDomain::Apq)?;
+    let apq_psk = export_and_register_psk(&mut pq_group, client, PskDomain::Apq)?;
     let (classical_group, classical_welcome) = create_group_with_member(
         client.classical(),
         classical_kp,
@@ -591,9 +629,9 @@ where
     // identity. Authenticity rides the PSKs bound into the welcome.
     client.auth_view().with(|core| core.adopting = true);
     let joined = (|| {
-        let pq = join_group_from_welcome(client.pq(), pq_welcome)?;
+        let mut pq = join_group_from_welcome(client.pq(), pq_welcome)?;
         // Re-derive the same APQ-PSK the creator used to bind the classical group.
-        export_and_register_psk(&pq, client, PskDomain::Apq)?;
+        export_and_register_psk(&mut pq, client, PskDomain::Apq)?;
         let classical = join_group_from_welcome(client.classical(), classical_welcome)?;
         Ok(CombinerGroup::from_client(client, classical, Some(pq)))
     })();
@@ -615,11 +653,18 @@ where
 /// Create the acceptor's bound send group (Group_B) with the PQ half deferred (A.4):
 /// classical only, bound to the cross-party TwoMLS-PSK from the recv group. The heavy PQ
 /// half is stood up later by the bootstrap flow, off the handshake critical path.
+///
+/// Returns `(send_group, welcome, cross_party_psk)`: the cross-party PSK is handed back so
+/// the caller can seed its export memo — the recv group's cross-party leaf at this epoch is
+/// now consumed, and the first routine full commit would otherwise try to re-derive it.
+// The 3-tuple mirrors the sibling builders' `(group, welcome)` return plus the memo seed; a
+// named struct would not read more clearly at the two call sites.
+#[allow(clippy::type_complexity)]
 pub fn create_bound_classical_send_group<S, C, P>(
     classical_kp: &[u8],
     client: &CombinerClient<S, C, P>,
-    recv_classical: &MlsGroup<S, C>,
-) -> Result<(CombinerGroup<S, C, P>, Vec<u8>)>
+    recv_classical: &mut MlsGroup<S, C>,
+) -> Result<(CombinerGroup<S, C, P>, Vec<u8>, ExportedPsk)>
 where
     S: KeyPackageStorage + Clone,
     C: CryptoProvider + Clone,
@@ -640,12 +685,13 @@ where
     let (classical_group, classical_welcome) = create_group_with_member(
         client.classical(),
         classical_kp,
-        &[psk_cross],
+        std::slice::from_ref(&psk_cross),
         GroupCreation::new(t_gid, &info, None)?,
     )?;
     Ok((
         CombinerGroup::from_client(client, classical_group, None),
         classical_welcome,
+        psk_cross,
     ))
 }
 
@@ -657,7 +703,7 @@ pub fn create_bound_combiner_send_group<S, C, P>(
     classical_kp: &[u8],
     pq_kp: &[u8],
     client: &CombinerClient<S, C, P>,
-    recv_classical: &MlsGroup<S, C>,
+    recv_classical: &mut MlsGroup<S, C>,
 ) -> Result<(CombinerGroup<S, C, P>, Vec<u8>)>
 where
     S: KeyPackageStorage + Clone,
@@ -679,14 +725,14 @@ where
         pq_epoch: 1,
     };
     // PQ side group first, unbound.
-    let (pq_group, pq_welcome) = create_group_with_member(
+    let (mut pq_group, pq_welcome) = create_group_with_member(
         client.pq(),
         pq_kp,
         &[],
         GroupCreation::new(pq_gid, &info, Some(attestation))?,
     )?;
     // Intra-party APQ-PSK from Group_B's PQ group.
-    let psk_apq = export_and_register_psk(&pq_group, client, PskDomain::Apq)?;
+    let psk_apq = export_and_register_psk(&mut pq_group, client, PskDomain::Apq)?;
     let (classical_group, classical_welcome) = create_group_with_member(
         client.classical(),
         classical_kp,
@@ -1035,13 +1081,13 @@ mod tests {
             &alice,
         )
         .unwrap();
-        let bob_recv = join_combiner_group(&welcome_a, &bob).unwrap();
+        let mut bob_recv = join_combiner_group(&welcome_a, &bob).unwrap();
 
         let (bob_send, _welcome_b) = create_bound_combiner_send_group(
             &alice.generate_classical_key_package().unwrap(),
             &alice.generate_pq_key_package().unwrap(),
             &bob,
-            &bob_recv.classical,
+            &mut bob_recv.classical,
         )
         .unwrap();
 
@@ -1049,31 +1095,38 @@ mod tests {
         assert_eq!(bob_send.pq.as_ref().unwrap().current_epoch(), 1);
     }
 
+    /// Deterministic across parties, domain-separated, and consumed once per epoch. Two
+    /// independent group instances at the same epoch (the two parties' copies) each export
+    /// once and agree; the two domains are distinct exporter-tree leaves; and a second
+    /// export of the same (group, epoch, component) is rejected (`SafeExportSecret` consumes
+    /// the leaf — the FS property the session's ledger memoization is built around).
     #[test]
-    fn test_export_psk_is_deterministic_and_domain_separated() {
+    fn test_export_psk_agrees_across_parties_and_consumes_once() {
         let alice = client();
         let bob = client();
-        admit(&alice, bob.client_id());
-        let (group, _) = create_group_with_member(
-            alice.classical(),
+
+        let (mut send, welcome) = create_combiner_send_group(
             &bob.generate_classical_key_package().unwrap(),
-            &[],
-            GroupCreation::bare(alice.random_group_id().unwrap()),
+            &bob.generate_pq_key_package().unwrap(),
+            &alice,
         )
         .unwrap();
+        let mut recv = join_combiner_group(&welcome, &bob).unwrap();
 
-        let id1 = export_and_register_psk(&group, &alice, PskDomain::CrossParty).unwrap();
-        let id2 = export_and_register_psk(&group, &alice, PskDomain::CrossParty).unwrap();
-        // Deterministic: the same group epoch + domain derives the same opaque id.
-        assert_eq!(id1, id2);
+        // Cross-party from each party's copy of the classical group: same store key +
+        // value (the CrossParty leaf is untouched by establishment, which consumes only
+        // the Apq leaves to bind the pair).
+        let a = export_psk(&mut send.classical, PskDomain::CrossParty).unwrap();
+        let b = export_psk(&mut recv.classical, PskDomain::CrossParty).unwrap();
+        assert_eq!(a.storage_id(), b.storage_id());
+        assert_eq!(a.psk().raw_value(), b.psk().raw_value());
 
-        // Phase-A ids are 32-byte derived values, not the old LE(epoch)||group_id layout.
-        let id_bytes: &[u8] = &id1;
-        assert_eq!(id_bytes.len(), 32);
+        // Re-exporting the same (group, epoch, component) is rejected: the leaf is consumed.
+        assert!(export_psk(&mut send.classical, PskDomain::CrossParty).is_err());
 
-        // Distinct domains derive distinct ids from the same group.
-        let (apq_id, _) = export_psk(&group, PskDomain::Apq).unwrap();
-        assert_ne!(&apq_id as &[u8], id_bytes);
+        // Establishment already consumed the Apq leaf of both PQ halves (pq -> classical
+        // bind), so re-exporting it at the same epoch is likewise rejected.
+        assert!(export_psk(send.pq.as_mut().unwrap(), PskDomain::Apq).is_err());
     }
 
     #[test]
