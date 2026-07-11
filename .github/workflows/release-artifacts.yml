@@ -1,0 +1,71 @@
+name: Release artifacts
+
+# Builds the dynamic XCFramework + Swift bindings for a tagged release and
+# uploads them as release assets. Invoked automatically from release.yml when
+# changesets publishes a release; dispatchable by hand to (re)build artifacts
+# for an existing tag.
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: "Release tag to build and upload artifacts for"
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build and upload artifacts for (e.g. v0.0.12)"
+        required: true
+        type: string
+
+jobs:
+  build-upload:
+    name: XCFramework + Swift bindings
+    # CryptoKit's ML-KEM-768 primitives require the macOS 26 SDK — same pinned
+    # runner as ci.yml's macos-cryptokit job.
+    runs-on: macos-26
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios,aarch64-apple-darwin
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml') }}
+
+      # The shipped configuration: CryptoKit backing both halves, dynamic
+      # framework bundles (see the script header for why dynamic + framework).
+      - name: Build XCFramework (cryptokit)
+        run: ./scripts/buildIosDynamic.sh
+
+      # Downstream Package.swift binaryTarget needs this checksum; publish it
+      # alongside the zip so cutting a consumer release never requires a local
+      # rebuild.
+      - name: Compute SwiftPM checksum
+        run: |
+          swift package compute-checksum buildIos/TwoMLSPQ.xcframework.zip \
+            | tee TwoMLSPQ.xcframework.zip.checksum
+
+      - name: Upload artifacts to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ inputs.tag }}" \
+            buildIos/TwoMLSPQ.xcframework.zip \
+            bindings/two_mls_pq.swift \
+            bindings/two_mls_pqFFI.h \
+            TwoMLSPQ.xcframework.zip.checksum \
+            --clobber
