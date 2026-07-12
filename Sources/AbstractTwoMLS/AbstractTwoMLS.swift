@@ -30,6 +30,20 @@ extension AbstractTwoMLS {
 		//this is an exported secret with width 32 bytes
 		var sendRendezvous: RendezvousID? { get throws }
 
+		/// This side's credential state — the TRUTH surface (see `PrincipalState`).
+		var myPrincipalState: PrincipalState { get }
+		/// The peer's credential state — the TRUTH surface. Reconcile identity
+		/// here after any `processIncoming` failure of the retriable class: the
+		/// frame's staple may have applied (moving the peer's principal) before
+		/// the app message failed, and the one-shot `remoteCommit` event will not
+		/// fire again on the retry.
+		var theirPrincipalState: PrincipalState { get }
+		/// The remote credential the app has approved (`queueProposal`) for the
+		/// next commit — the running tally. Latest-wins; cleared when the send
+		/// epoch advances. `nil` when nothing is tallied, and always `nil` for
+		/// backends without an approval tally.
+		var queuedRemoteSuccessor: ClientID? { get }
+
 		associatedtype PrepareEncryptResult: PrepareEncryptResultProtocol
 		func prepareToEncrypt(
 			proposing: ClientID?
@@ -88,8 +102,33 @@ extension AbstractTwoMLS {
 		var context: TypedDigest { get }
 	}
 
+	/// Rotation outcomes surfaced by a commit — HINTS, not truth. These fire
+	/// once, on the frame where the transition applied; if that frame's app
+	/// message fails after the staple applied, the event is lost (the retry's
+	/// staple is an idempotent skip). `myPrincipalState` / `theirPrincipalState`
+	/// are the truth — reconcile there, never from missed events.
 	public protocol CommitResultProtocol: Sendable {
 		var newSender: ClientID? { get }
 		var newRecipient: ClientID { get }
 	}
+
+	/// Credential state for one send direction. `.pending` means a candidate is
+	/// staged/proposed but the peer's approval + commit has not yet
+	/// canonicalized it.
+	///
+	/// STATE IS TRUTH, EVENTS ARE HINTS: `remoteCommit.newSender` /
+	/// `.newRecipient` fire once, on the frame where the transition applied —
+	/// and are LOST if that frame's app message fails after its staple applied.
+	/// After a retriable `processIncoming` failure, reconcile identity from
+	/// `theirPrincipalState`, not from missed events.
+	public enum PrincipalState: Sendable, Equatable, Hashable {
+		case sync(ClientID)
+		case pending(old: ClientID, new: ClientID)
+	}
+}
+
+extension AbstractTwoMLS.Session {
+	/// Default for backends without an approval tally (e.g. the deprecated
+	/// classical backend): honestly tally-less. Backends with a tally override.
+	public var queuedRemoteSuccessor: AbstractTwoMLS.ClientID? { nil }
 }

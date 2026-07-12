@@ -108,6 +108,17 @@ private func liftDigest(_ raw: Data) throws -> TypedDigest {
 	try TypedDigest(prefix: .sha256, checkedData: raw)
 }
 
+extension AbstractTwoMLS.PrincipalState {
+	init(_ base: TwoMLSPQ.PrincipalState) {
+		switch base {
+		case .sync(let clientId):
+			self = .sync(clientId.bytes)
+		case .pending(let old, let new):
+			self = .pending(old: old.bytes, new: new.bytes)
+		}
+	}
+}
+
 extension TwoMLSPQ.ClientId {
 	var clientID: AbstractTwoMLS.ClientID { bytes }
 }
@@ -242,6 +253,20 @@ extension AbstractTwoMLS {
 			// 32-byte values, so a conversion failure is treated as "no context".
 			guard let digest = base.proposalContext() else { return nil }
 			return try? liftDigest(digest)
+		}
+
+		// MARK: Principal state (truth surface)
+
+		public var myPrincipalState: AbstractTwoMLS.PrincipalState {
+			.init(base.myPrincipalState())
+		}
+
+		public var theirPrincipalState: AbstractTwoMLS.PrincipalState {
+			.init(base.theirPrincipalState())
+		}
+
+		public var queuedRemoteSuccessor: AbstractTwoMLS.ClientID? {
+			base.queuedRemoteSuccessor()?.bytes
 		}
 
 		public var sendRendezvous: AbstractTwoMLS.RendezvousID? {

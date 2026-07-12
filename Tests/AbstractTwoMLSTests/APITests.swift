@@ -611,16 +611,27 @@ extension AbstractTwoMLS.Session {
 		let offered = try got.proposal.tryUnwrap
 		guard offered.proposing == newClientId else { throw TestErrors.unexpected }
 		// Approve + commit: the peer's commit folds the Upd and defines the
-		// canonical next credential.
+		// canonical next credential. Approval populates the tally (M6 truth
+		// surface); the commit consumes it.
 		try peer.queueProposal(digest: offered.digest)
+		guard peer.queuedRemoteSuccessor == newClientId else {
+			throw TestErrors.unexpected
+		}
 		let prepared = try peer.prepareToEncrypt(proposing: nil).tryUnwrap
 		guard prepared.didCommit, prepared.commitedRemoteClientId == newClientId
 		else { throw TestErrors.unexpected }
+		guard peer.theirPrincipalState == .sync(newClientId) else {
+			throw TestErrors.unexpected
+		}
 		let back = try peer.encrypt(appMessage: Data("canonicalize".utf8))
-		// The staple back canonicalizes the rotating side onto the new principal.
+		// The staple back canonicalizes the rotating side onto the new principal —
+		// remoteCommit is the one-shot hint; the principal state is the truth.
 		let confirmed = try processIncoming(ciphertext: back.cipherText).tryUnwrap
 		guard confirmed.remoteCommit?.newRecipient == newClientId
 		else { throw TestErrors.unexpected }
+		guard myPrincipalState == .sync(newClientId) else {
+			throw TestErrors.unexpected
+		}
 	}
 
 	func exchange(with remote: some AbstractTwoMLS.Session) throws {

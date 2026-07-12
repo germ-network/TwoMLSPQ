@@ -77,12 +77,13 @@ struct LifecycleTests {
 		// acceptor's staged candidate: `receive(newClientId:)` leaves the acceptor
 		// .pending, and a candidate stays PRIVATE to its proposer until a frame
 		// carries it (contract v9 candidate lifecycle), so the initiator still
-		// sees the canonical invitation identity.
-		#expect(localBase.myPrincipalState() == remoteBase.theirPrincipalState())
-		guard case .pending(let old, _) = remoteBase.myPrincipalState() else {
+		// sees the canonical invitation identity. Asserted through the abstract
+		// truth surface (M6), not the raw binding.
+		#expect(localSession.myPrincipalState == remoteSession.theirPrincipalState)
+		guard case .pending(let old, _) = remoteSession.myPrincipalState else {
 			throw TestErrors.unexpected
 		}
-		#expect(localBase.theirPrincipalState() == .sync(clientId: old))
+		#expect(localSession.theirPrincipalState == .sync(old))
 
 		// Routing: remote can post immediately — its post address is the recv
 		// group's current exporter, which is the same MLS group as the initiator's

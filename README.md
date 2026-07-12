@@ -37,6 +37,18 @@ link transitively but cannot be imported by consumers. This is deliberate:
 Value/result types (`PQInbound`, decrypt results, epochs, tokens, archives)
 are `Sendable` snapshots and move freely.
 
+## State is truth, events are hints
+
+Rotation outcomes surface twice: as one-shot **events**
+(`remoteCommit.newSender`/`newRecipient`, on the frame where the transition
+applied) and as queryable **state** (`myPrincipalState` /
+`theirPrincipalState` / `queuedRemoteSuccessor`). Events can be lost — a
+frame's staple (commit) applies before its app message decrypts, so a
+transient decrypt failure swallows the event and the retry's staple is an
+idempotent skip. After any retriable `processIncoming` failure, reconcile
+identity from `theirPrincipalState`; never depend on an event you might have
+missed.
+
 ## Platforms
 
 `.iOS(.v17)` / `.macOS(.v15)` are **import/link floors** — the package builds
