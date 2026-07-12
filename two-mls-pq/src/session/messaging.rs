@@ -592,12 +592,13 @@ impl SessionInner {
         // backend's convention. `encrypt` carries it as the app message's authenticated
         // data, so the staple is verifiable against the frame it rides in.
         let proposal_hash = crate::sha256(&proposal_bytes);
-        self.pending_proposal_message = Some((proposing, proposal_bytes));
+        self.pending_proposal_message = Some((proposing, proposal_bytes.clone()));
 
         let their_id = self.their_state.client_id();
         self.pending_proposal_hash = Some(proposal_hash.clone());
 
         Ok(crate::PrepareEncryptResult {
+            proposal_message: proposal_bytes,
             proposal_hash,
             committed_remote_client_id: if did_commit { Some(their_id) } else { None },
             did_commit,

@@ -2178,6 +2178,79 @@ fn test_proposal_hash_is_digest_of_the_staple_both_sides_agree_on() {
     );
 }
 
+/// `PrepareEncryptResult.proposal_message` is the RAW staged Upd(self): `sha256(bytes)`
+/// equals the same result's `proposal_hash` AND the receiver's independently derived
+/// digest for the same rotation Upd — the coherence a signed anchor handoff relies on,
+/// with bytes and digest from one critical section so no later prepare can interpose.
+/// Mirrors `test_proposal_hash_is_digest_of_the_staple_both_sides_agree_on` for raw bytes.
+#[test]
+fn test_prepare_result_proposal_message_digests_to_the_value_both_sides_agree_on() {
+    let (alice_session, bob_session) = establish_confirmed_sessions();
+
+    let new_alice = make_client();
+    let new_alice_id = new_alice.client_id();
+
+    assert_ok!(alice_session.stage_rotation(new_alice_id.bytes.clone()));
+    let prep = assert_ok!(alice_session.prepare_to_encrypt(Some(new_alice_id.clone())));
+
+    // Sender coherence: the caller's own digest of the returned bytes is the round's
+    // binding value.
+    assert_eq!(crate::sha256(&prep.proposal_message), prep.proposal_hash);
+
+    // Cross-side coherence: the receiver digests the bytes it pulls off the frame, and
+    // the Upd carries the rotation candidate's credential.
+    let enc = assert_ok!(alice_session.encrypt(b"rotation".to_vec()));
+    let got = assert_some!(assert_ok!(bob_session.process_incoming(enc.cipher_text)));
+    let proposal = assert_some!(got.proposal);
+    assert_eq!(crate::sha256(&prep.proposal_message), proposal.digest);
+    assert_eq!(proposal.proposing, new_alice_id);
+}
+
+/// The anchor-onboarding moment: an acceptor fresh out of `receive(new_client_id:)` —
+/// no peer frame processed yet — stages the dedicated id and prepares; the prepare's
+/// `proposal_message` binds the handoff signature before its first `encrypt`. The
+/// digest must already be cross-side coherent on that very first frame.
+#[test]
+fn test_prepare_result_proposal_message_at_establishment_binds_the_dedicated_candidate() {
+    use crate::key_packages::TwoMlsPqInvitation;
+
+    let alice = make_client();
+    let bob = make_client();
+    let alice_kp = make_combiner_kp(&alice);
+    let bob_inv = assert_ok!(TwoMlsPqInvitation::restore(assert_ok!(
+        bob.generate_invitation(true)
+    )));
+    let alice_session = assert_ok!(TwoMlsPqSession::initiate(
+        Arc::clone(&alice),
+        bob_inv.combiner_key_package(),
+        None
+    ));
+    let opened = assert_ok!(bob_inv.open_initial(assert_some!(alice_session.pending_outbound())));
+
+    let dedicated_id = make_client().client_id();
+    let bob_session = assert_ok!(bob_inv.receive(
+        opened.welcome,
+        alice_kp,
+        b"anchor".to_vec(),
+        Some(dedicated_id.bytes.clone()),
+        None
+    ));
+
+    // Stage → prepare, all before any peer frame: the result carries the bytes, already
+    // digesting to the round's binding value.
+    assert_ok!(bob_session.stage_rotation(dedicated_id.bytes.clone()));
+    let prep = assert_ok!(bob_session.prepare_to_encrypt(Some(dedicated_id.clone())));
+    assert_eq!(crate::sha256(&prep.proposal_message), prep.proposal_hash);
+
+    // The first frame delivers that exact Upd: the initiator derives the same digest
+    // and sees the dedicated candidate's credential.
+    let enc = assert_ok!(bob_session.encrypt(b"first frame".to_vec()));
+    let got = assert_some!(assert_ok!(alice_session.process_incoming(enc.cipher_text)));
+    let proposal = assert_some!(got.proposal);
+    assert_eq!(crate::sha256(&prep.proposal_message), proposal.digest);
+    assert_eq!(proposal.proposing, dedicated_id);
+}
+
 #[test]
 fn test_prepare_to_encrypt_did_commit_true_when_remote_proposal_staged() {
     let (alice_session, bob_session) = establish_sessions();
