@@ -1489,6 +1489,87 @@ fn round_trip(session: &Arc<TwoMlsPqSession>) -> Arc<TwoMlsPqSession> {
     assert_ok!(TwoMlsPqSession::from_archive(archive))
 }
 
+/// A push-persistence sink that records every blob (the test analogue of a persistence
+/// layer). `latest` returns the newest blob of a kind — exactly the newest-per-slot the
+/// `ArchiveSink` contract asks a real sink to keep.
+#[derive(Default)]
+struct RecordingSink {
+    pushes: std::sync::Mutex<Vec<(u64, crate::BlobKind, Vec<u8>)>>,
+}
+
+impl RecordingSink {
+    fn kinds(&self) -> Vec<crate::BlobKind> {
+        self.pushes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(_, k, _)| *k)
+            .collect()
+    }
+
+    fn latest(&self, kind: crate::BlobKind) -> Option<crate::Archive> {
+        self.pushes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|(_, k, _)| *k == kind)
+            .max_by_key(|(seq, _, _)| *seq)
+            .map(|(_, _, bytes)| crate::Archive {
+                bytes: bytes.clone(),
+            })
+    }
+}
+
+impl crate::ArchiveSink for RecordingSink {
+    fn persist(&self, seq: u64, kind: crate::BlobKind, archive: Vec<u8>) {
+        self.pushes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((seq, kind, archive));
+    }
+}
+
+/// End-to-end smoke test of the push path: install a sink, drive classical + PQ ops, and
+/// confirm the blob kinds, then restore from the pushed blobs and keep messaging.
+#[test]
+fn test_push_persistence_smoke() {
+    let (alice, bob) = establish_full();
+
+    let sink = Arc::new(RecordingSink::default());
+    // `install_sink` pushes exactly one baseline checkpoint.
+    assert_ok!(alice.install_sink(sink.clone()));
+    assert_eq!(sink.kinds(), vec![crate::BlobKind::Checkpoint]);
+
+    // Classical message rounds push ONLY Core — never re-encode the ML-KEM trees.
+    message_round(&alice, &bob, b"one");
+    message_round(&bob, &alice, b"two");
+    assert!(
+        sink.kinds()
+            .iter()
+            .skip(1)
+            .all(|k| *k == crate::BlobKind::Core),
+        "classical ops must push only Core, got {:?}",
+        sink.kinds()
+    );
+
+    // A PQ side-band round (A.5 rekey) pushes Checkpoint(s).
+    rekey_round(&bob, &alice);
+    assert!(
+        sink.kinds()
+            .iter()
+            .any(|k| *k == crate::BlobKind::Checkpoint && sink.kinds().len() > 1),
+        "a PQ op must push a Checkpoint"
+    );
+
+    // Restore from the newest pushed blobs and keep going.
+    let restored = assert_ok!(TwoMlsPqSession::from_persisted(
+        sink.latest(crate::BlobKind::Core),
+        sink.latest(crate::BlobKind::Checkpoint),
+    ));
+    message_round(&bob, &restored, b"after-restore");
+    message_round(&restored, &bob, b"restore->bob");
+}
+
 #[test]
 fn test_archive_round_trips_session_state() {
     let (alice_session, bob_session) = establish_sessions();

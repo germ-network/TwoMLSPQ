@@ -279,6 +279,40 @@ pub struct Archive {
     pub bytes: Vec<u8>,
 }
 
+/// Which persistence slot a pushed blob targets — see [`ArchiveSink`]. `Core` holds
+/// everything except the two ML-KEM ratchet trees and is rewritten on every classical
+/// mutation; `Checkpoint` is the complete state (incl. the PQ trees) and is written on every
+/// PQ-touching mutation and at birth. Each slot is upserted atomically and independently, and
+/// a `Core` is only ever consistent with the latest `Checkpoint` (the PQ trees never change
+/// between checkpoints), so restore needs no cross-slot transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum BlobKind {
+    Core,
+    Checkpoint,
+}
+
+/// Foreign-implemented persistence hook: the object PUSHES its new state after every
+/// state-advancing mutation, inverting the old pull-`archive()` model (which was a move, not a
+/// copy — misusing it re-armed AEAD nonce reuse). Pass one per object at construction (or
+/// `None` to opt out, e.g. in tests).
+///
+/// Contract on the implementer:
+/// - `persist` is called OUTSIDE the object lock, on the calling Rust thread. It MUST be
+///   enqueue-only and non-blocking, and MUST NOT synchronously re-enter this library.
+/// - Exactly one blob per call. Atomically upsert the slot named by `kind` (write-temp-rename,
+///   or a DB row) — a single-object write, never a multi-object one.
+/// - Persists can arrive out of order; keep the newest `seq` per `kind`.
+/// - `archive` is PLAINTEXT SECRET MATERIAL (signing keys, epoch secrets, KEM material) — seal
+///   it before writing (the key belongs in the platform keystore).
+///
+/// Transmission stays the app's concern: outbound frames carry `depends_on_seq`, and the app
+/// waits until it has durably persisted that `seq` before transmitting frames that publish
+/// stored-private-key material.
+#[uniffi::export(with_foreign)]
+pub trait ArchiveSink: Send + Sync {
+    fn persist(&self, seq: u64, kind: BlobKind, archive: Vec<u8>);
+}
+
 #[derive(Debug, uniffi::Record)]
 pub struct EpochRendezvous {
     pub epoch: u64,

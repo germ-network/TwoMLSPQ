@@ -595,7 +595,16 @@ impl TwoMlsPqInvitation {
 
         match TwoMlsPqPrincipal::from_combiner_invitation(&snapshot)
             .and_then(|client| {
-                TwoMlsPqSession::accept_with(client, session_client, welcome, their_key_package)
+                // R1: the spawn token is set inside `accept_with` before the birth checkpoint,
+                // so it rides the persisted birth state (the old post-construction setter
+                // would miss it).
+                TwoMlsPqSession::accept_with(
+                    client,
+                    session_client,
+                    welcome,
+                    their_key_package,
+                    Some(spawn_token.clone()),
+                )
             })
             .and_then(|session| {
                 // Enter the spawn in the forward table and the welcome in the
@@ -611,7 +620,6 @@ impl TwoMlsPqInvitation {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .insert(welcome_digest.clone(), gid.classical.bytes);
-                session.set_spawn_token(spawn_token);
                 Ok(session)
             }) {
             Ok(session) => Ok(session),

@@ -611,12 +611,13 @@ impl TwoMlsPqSession {
     /// - `proposing: Some(new_id)` → rotation commit with new leaf credential, `did_commit: true`
     /// - Otherwise → recv self-Update only, `did_commit: false`
     pub fn prepare_to_encrypt(&self, proposing: Option<ClientId>) -> Result<PrepareEncryptResult> {
-        let mut inner = self.lock();
-        let result = inner.prepare_ratchet_commit(proposing)?;
-        // A committing round advanced the send group's classical epoch — capture
-        // the new epoch's listen address.
-        inner.record_listen_rendezvous()?;
-        Ok(result)
+        self.mutate_and_persist(crate::BlobKind::Core, |inner| {
+            let result = inner.prepare_ratchet_commit(proposing)?;
+            // A committing round advanced the send group's classical epoch — capture
+            // the new epoch's listen address.
+            inner.record_listen_rendezvous()?;
+            Ok(result)
+        })
     }
 
     /// Encrypt `app_message` using the PQ send group.
@@ -628,56 +629,56 @@ impl TwoMlsPqSession {
     /// is NOT consumed here — the staple carries the welcome; the standalone copy stays
     /// available for hosts that also deliver it separately (processing is idempotent).
     pub fn encrypt(&self, app_message: Vec<u8>) -> Result<EncryptResult> {
-        let mut inner = self.lock();
-
-        let proposal_hash = inner
-            .pending_proposal_hash
-            .take()
-            .ok_or(TwoMlsPqError::SessionNotReady)?;
-
-        let (app_bytes, epochs) = {
-            let send = inner
-                .send_group
-                .as_mut()
+        self.mutate_and_persist(crate::BlobKind::Core, |inner| {
+            let proposal_hash = inner
+                .pending_proposal_hash
+                .take()
                 .ok_or(TwoMlsPqError::SessionNotReady)?;
 
-            let cipher_msg = send
-                .message_group_mut()
-                .encrypt_application_message(&app_message, proposal_hash)
-                .map_err(|_| TwoMlsPqError::Mls)?;
+            let (app_bytes, epochs) = {
+                let send = inner
+                    .send_group
+                    .as_mut()
+                    .ok_or(TwoMlsPqError::SessionNotReady)?;
 
-            let epochs = apq_epochs(send);
-            let bytes = cipher_msg.to_bytes().map_err(|_| TwoMlsPqError::Mls)?;
-            (bytes, epochs)
-        };
+                let cipher_msg = send
+                    .message_group_mut()
+                    .encrypt_application_message(&app_message, proposal_hash)
+                    .map_err(|_| TwoMlsPqError::Mls)?;
 
-        // Every prepare path stages a proposal, and the staple is set at construction —
-        // an empty slot here means encrypt was reached outside the prepare contract.
-        let (proposing, proposal) = inner
-            .pending_proposal_message
-            .take()
-            .ok_or(TwoMlsPqError::SessionNotReady)?;
-        if inner.current_staple.is_empty() {
-            return Err(TwoMlsPqError::SessionNotReady);
-        }
-        let frame = encode_message_frame(
-            &inner.current_staple,
-            encode_proposal_section(&proposing, &proposal),
-            app_bytes,
-        );
-        // Header encryption: seal the whole frame into one opaque blob before it leaves
-        // the library. `encrypt` only runs post-establishment (prepare needs the recv
-        // group), so the seal key is always available.
-        let cipher_text = inner.seal(&frame)?;
+                let epochs = apq_epochs(send);
+                let bytes = cipher_msg.to_bytes().map_err(|_| TwoMlsPqError::Mls)?;
+                (bytes, epochs)
+            };
 
-        let sender = inner.my_state.client_id();
-        let recipient = inner.their_state.client_id();
+            // Every prepare path stages a proposal, and the staple is set at construction —
+            // an empty slot here means encrypt was reached outside the prepare contract.
+            let (proposing, proposal) = inner
+                .pending_proposal_message
+                .take()
+                .ok_or(TwoMlsPqError::SessionNotReady)?;
+            if inner.current_staple.is_empty() {
+                return Err(TwoMlsPqError::SessionNotReady);
+            }
+            let frame = encode_message_frame(
+                &inner.current_staple,
+                encode_proposal_section(&proposing, &proposal),
+                app_bytes,
+            );
+            // Header encryption: seal the whole frame into one opaque blob before it leaves
+            // the library. `encrypt` only runs post-establishment (prepare needs the recv
+            // group), so the seal key is always available.
+            let cipher_text = inner.seal(&frame)?;
 
-        Ok(EncryptResult {
-            cipher_text,
-            sender,
-            recipient,
-            epochs,
+            let sender = inner.my_state.client_id();
+            let recipient = inner.their_state.client_id();
+
+            Ok(EncryptResult {
+                cipher_text,
+                sender,
+                recipient,
+                epochs,
+            })
         })
     }
 
@@ -732,6 +733,19 @@ impl TwoMlsPqSession {
     /// else — including bare MLS ciphertext, which no longer occurs on the send path — is
     /// rejected as `DecryptionFailed`.
     pub fn process_incoming(&self, ciphertext: Vec<u8>) -> Result<Option<DecryptResult>> {
+        let r = self.process_incoming_inner(ciphertext);
+        // Push on success only. A rejected (garbage / mis-routed) frame mutated nothing, and
+        // pushing per garbage frame would be a DoS amplifier — a full core encode each; skipping
+        // it there is the pure-guard rule. A processed frame (a real message or an idempotent
+        // re-delivery) advanced or reaffirmed state, so persist it. mls-rs applies commits
+        // transactionally, so an `Err` leaves no partial mutation to capture.
+        if r.is_ok() {
+            self.persist_after(crate::BlobKind::Core);
+        }
+        r
+    }
+
+    fn process_incoming_inner(&self, ciphertext: Vec<u8>) -> Result<Option<DecryptResult>> {
         // Header encryption: accept either the sealed blob off the wire or the frame a
         // host already took from `open_incoming` (see `open_or_raw`). The initiator's
         // initial welcome (invitation channel, unsealed) passes through untouched.
@@ -1043,33 +1057,34 @@ impl TwoMlsPqSession {
     /// re-applies and commits it (with a cross-party PSK refresh). Single-occupancy,
     /// latest-wins; a rejected call is a no-op.
     pub fn queue_proposal(&self, digest: Vec<u8>) -> Result<()> {
-        let mut inner = self.lock();
-        let (offered, proposal_bytes, proposing) = inner
-            .offered_proposal
-            .take()
-            .ok_or(TwoMlsPqError::ProposalRejected)?;
-        // The offer's digest must match the value the app approved.
-        if offered != digest {
-            inner.offered_proposal = Some((offered, proposal_bytes, proposing));
-            return Err(TwoMlsPqError::ProposalRejected);
-        }
-        // Validate without leaving the send group's cache touched (see
-        // `validate_offered_update`). On success, record the authorization and the queued
-        // proposal; on ANY rejection, restore the offer so the call is a pure no-op.
-        match inner.validate_offered_update(&proposal_bytes, &proposing) {
-            Ok(()) => {
-                // Approving the proposal IS the app's authorization of the credential it
-                // carries (the running tally — a later queue replaces both the
-                // authorization and the queued proposal while no commit has happened).
-                inner.with_auth(|core| core.theirs.authorize(proposing.clone()));
-                inner.queued_proposal = Some((digest, proposing, proposal_bytes));
-                Ok(())
-            }
-            Err(e) => {
+        self.mutate_and_persist(crate::BlobKind::Core, |inner| {
+            let (offered, proposal_bytes, proposing) = inner
+                .offered_proposal
+                .take()
+                .ok_or(TwoMlsPqError::ProposalRejected)?;
+            // The offer's digest must match the value the app approved.
+            if offered != digest {
                 inner.offered_proposal = Some((offered, proposal_bytes, proposing));
-                Err(e)
+                return Err(TwoMlsPqError::ProposalRejected);
             }
-        }
+            // Validate without leaving the send group's cache touched (see
+            // `validate_offered_update`). On success, record the authorization and the queued
+            // proposal; on ANY rejection, restore the offer so the call is a pure no-op.
+            match inner.validate_offered_update(&proposal_bytes, &proposing) {
+                Ok(()) => {
+                    // Approving the proposal IS the app's authorization of the credential it
+                    // carries (the running tally — a later queue replaces both the
+                    // authorization and the queued proposal while no commit has happened).
+                    inner.with_auth(|core| core.theirs.authorize(proposing.clone()));
+                    inner.queued_proposal = Some((digest, proposing, proposal_bytes));
+                    Ok(())
+                }
+                Err(e) => {
+                    inner.offered_proposal = Some((offered, proposal_bytes, proposing));
+                    Err(e)
+                }
+            }
+        })
     }
 
     /// The remote credential currently queued for the next commit (the app's running
@@ -1101,40 +1116,41 @@ impl TwoMlsPqSession {
         if new_client_id.is_empty() {
             return Err(TwoMlsPqError::InvalidClientId);
         }
-        let mut inner = self.lock();
-        // Already in flight, or already the parked next request → no-op.
-        if inner
-            .staged_candidates
-            .iter()
-            .any(|staged| staged.client_id().bytes == new_client_id)
-            || inner.deferred_candidate.as_deref() == Some(new_client_id.as_slice())
-        {
-            return Ok(());
-        }
-        if inner.staged_candidates.len() < CANDIDATE_WINDOW {
-            // Admit into the in-flight pool: mint, rebind the candidate's clients to the
-            // session-canonical AS core, and authorize the id for OUR sequence (the peer's
-            // provider learns it from the proposal we send; ours needs it for the local
-            // commit apply). It is proposable this round via `prepare_to_encrypt(Some(id))`.
-            let candidate = TwoMlsPqPrincipal::new(new_client_id.clone())?;
-            candidate.combiner().auth_view().rebind(&inner.auth_core);
-            inner.with_auth(|core| core.mine.authorize(new_client_id.clone()));
-            inner.staged_candidates.push(candidate);
-        } else {
-            // Pool full — never evict a sent candidate. Park this request in the single
-            // deferred slot; it is promoted and proposed on the next routine round once a
-            // canonicalization frees a slot. Not authorized yet (it is not on the wire),
-            // keeping `mine.authorized_next` aligned with the retained principals.
-            inner.deferred_candidate = Some(new_client_id.clone());
-        }
-        let old = inner.my_state.client_id();
-        inner.my_state = PrincipalState::Pending {
-            old,
-            new: ClientId {
-                bytes: new_client_id,
-            },
-        };
-        Ok(())
+        self.mutate_and_persist(crate::BlobKind::Core, |inner| {
+            // Already in flight, or already the parked next request → no-op.
+            if inner
+                .staged_candidates
+                .iter()
+                .any(|staged| staged.client_id().bytes == new_client_id)
+                || inner.deferred_candidate.as_deref() == Some(new_client_id.as_slice())
+            {
+                return Ok(());
+            }
+            if inner.staged_candidates.len() < CANDIDATE_WINDOW {
+                // Admit into the in-flight pool: mint, rebind the candidate's clients to the
+                // session-canonical AS core, and authorize the id for OUR sequence (the peer's
+                // provider learns it from the proposal we send; ours needs it for the local
+                // commit apply). It is proposable this round via `prepare_to_encrypt(Some(id))`.
+                let candidate = TwoMlsPqPrincipal::new(new_client_id.clone())?;
+                candidate.combiner().auth_view().rebind(&inner.auth_core);
+                inner.with_auth(|core| core.mine.authorize(new_client_id.clone()));
+                inner.staged_candidates.push(candidate);
+            } else {
+                // Pool full — never evict a sent candidate. Park this request in the single
+                // deferred slot; it is promoted and proposed on the next routine round once a
+                // canonicalization frees a slot. Not authorized yet (it is not on the wire),
+                // keeping `mine.authorized_next` aligned with the retained principals.
+                inner.deferred_candidate = Some(new_client_id.clone());
+            }
+            let old = inner.my_state.client_id();
+            inner.my_state = PrincipalState::Pending {
+                old,
+                new: ClientId {
+                    bytes: new_client_id,
+                },
+            };
+            Ok(())
+        })
     }
 
     /// Acknowledge a replayed initial frame routed here by the invitation's forward
