@@ -395,6 +395,18 @@ extension AbstractTwoMLS {
 			}
 		}
 
+		/// The receive group's classical (message-half) id, or nil before this side
+		/// has joined one (the initiator, before processing the peer's stapled
+		/// return welcome). Same currency as `shouldListenOn()`'s GroupID: the
+		/// stable classical half — the acceptor's PQ half is empty until the A.4
+		/// bootstrap. The card role's post-join envelope check compares this
+		/// against the signed `AppWelcome.Content.groupId` (classical parity:
+		/// MultiMLS checks `receiveGroup.groupId == welcome.groupId` inside
+		/// `receiveWelcome`).
+		public var receiveGroupId: AbstractTwoMLS.GroupID? {
+			base.receiveGroupId()?.classical.bytes
+		}
+
 		public func shouldListenOn() throws(AbstractTwoMLS.SessionError) -> (
 			AbstractTwoMLS.GroupID, [UInt64: AbstractTwoMLS.RendezvousID]
 		) {

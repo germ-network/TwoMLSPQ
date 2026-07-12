@@ -531,6 +531,38 @@ struct ProposalBindingDemo {
 	}
 }
 
+//Group-id surface coherence: the acceptor's receive group IS the group the
+//initiator created (classical half), so an adopter can bind the id it reads off
+//its fresh session (shouldListenOn) into a signed welcome envelope and the peer
+//can verify it post-join via receiveGroupId — the card role's envelope check.
+struct GroupIdSurfaceDemo {
+	let local: ClientWrapper<AbstractTwoMLS.PQClient>
+	let remote: ClientWrapper<AbstractTwoMLS.PQClient>
+
+	init() throws {
+		local = try .init()
+		remote = try .init()
+	}
+
+	@Test func receiveGroupIdMatchesPeerSendGroup() throws {
+		let (localSession, sealed) = try local.client.reply(
+			remoteClientId: remote.clientId,
+			encodedRemoteKpkg: remote.currentInvitation.encodedKeyPackage
+		)
+		let (remoteSession, _) = try remote.currentInvitation.receiveReply(
+			ciphertext: sealed,
+			expecting: try local.clientId
+		)
+		//the acceptor joined the initiator's send group as its receive group
+		#expect(try remoteSession.receiveGroupId == localSession.shouldListenOn().0)
+		//the initiator has no receive group until the stapled return welcome lands
+		#expect(localSession.receiveGroupId == nil)
+
+		try remoteSession.send(to: localSession)  //first frame staples; local joins
+		#expect(try localSession.receiveGroupId == remoteSession.shouldListenOn().0)
+	}
+}
+
 struct MockAppWelcome: Codable, Sendable {
 	let mySendGroupWelcome: Data
 	let myKeyPackage: Data
