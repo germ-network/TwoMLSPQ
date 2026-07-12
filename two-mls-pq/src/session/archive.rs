@@ -27,7 +27,11 @@ use super::*;
 // v8 (event-driven cross-party injection): the transient PSK memo is gone, replaced by three
 // small epoch watermarks (`last_cross_injected`, `last_cross_injected_pq`,
 // `last_send_pq_exported`) that gate the cross-party injections, so the archive layout changed.
-const SESSION_ARCHIVE_VERSION: u8 = 8;
+// v9 (push-based persistence): the wire gained `state_seq` (the per-session mutation counter
+// that stamps each pushed blob) and the PQ-epoch manifest (`send_pq_epoch`/`recv_pq_epoch`)
+// that lets a `core` blob (PQ trees omitted) be reconciled against a `checkpoint` blob at
+// restore. A whole-blob archive still round-trips through this same layout.
+const SESSION_ARCHIVE_VERSION: u8 = 9;
 
 // In its own module because the derive-generated impls reference the std `Result`, which
 // the crate-local `Result` alias would shadow (same pattern as `invitation::wire`).
@@ -212,6 +216,17 @@ pub(crate) mod archive_wire {
     /// whose turn already flipped would desync the side-band permanently).
     #[derive(MlsSize, MlsEncode, MlsDecode)]
     pub(in crate::session) struct SessionArchive {
+        /// Per-session monotonic mutation counter (see `SessionInner::state_seq`). Stamps
+        /// this blob; `from_persisted` compares a `core` blob's `state_seq` against the
+        /// `checkpoint`'s to pick the newer non-PQ state.
+        pub(in crate::session) state_seq: u64,
+        /// PQ-epoch manifest: the current epoch of each PQ half at the time this blob was
+        /// written (`None` when that half is absent). In a `checkpoint` these describe the
+        /// PQ trees carried inline; in a `core` (PQ trees omitted) they are the epochs the
+        /// core expects the reconciling checkpoint's PQ halves to be at — a mismatch means a
+        /// PQ op advanced without emitting a checkpoint (forbidden), so restore fails closed.
+        pub(in crate::session) send_pq_epoch: Option<u64>,
+        pub(in crate::session) recv_pq_epoch: Option<u64>,
         #[mls_codec(with = "mls_rs_codec::byte_vec")]
         pub(in crate::session) session_id: Vec<u8>,
         /// The session's current client signing identity, rebuilt byte-exact on restore
@@ -545,6 +560,7 @@ impl TwoMlsPqSession {
                 session_id: SessionId {
                     bytes: wire.session_id,
                 },
+                state_seq: wire.state_seq,
                 my_state,
                 their_state,
                 pq_turn_mine: wire.pq_turn_mine,
@@ -654,8 +670,24 @@ impl TwoMlsPqSession {
             None => None,
         };
 
+        // The PQ-epoch manifest: the current epoch of each PQ half (None when absent). Export
+        // does not advance an epoch, so reading them after export is equivalent to before.
+        let send_pq_epoch = inner
+            .send_group
+            .as_ref()
+            .and_then(|g| g.pq.as_ref())
+            .map(|p| p.current_epoch());
+        let recv_pq_epoch = inner
+            .recv_group
+            .as_ref()
+            .and_then(|g| g.pq.as_ref())
+            .map(|p| p.current_epoch());
+
         let archive =
             archive_wire::SessionArchive {
+                state_seq: inner.state_seq,
+                send_pq_epoch,
+                recv_pq_epoch,
                 session_id: inner.session_id.bytes.clone(),
                 client,
                 my_state: wire_principal_state(&inner.my_state),

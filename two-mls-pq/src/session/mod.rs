@@ -94,6 +94,13 @@ struct SessionInner {
     auth_core: AuthCoreHandle,
     pq_inflight: Option<PqInflight>,
     session_id: SessionId,
+    /// Monotonic per-session mutation counter, bumped once per state-advancing FFI call
+    /// (see `mutate_and_persist`). Serialized in the archive so it continues across a
+    /// restore; stamps each pushed blob and feeds `depends_on_seq` on outbound frames. `u64`
+    /// so it cannot overflow (2^64 mutations is unreachable — ~585k years at 1M/s); the bump
+    /// is a `checked_add` that hard-errors rather than wrapping, since a wrap would corrupt
+    /// the app's `durable >= depends_on` transmit gate.
+    state_seq: u64,
     my_state: PrincipalState,
     their_state: PrincipalState,
     /// Responder-side side-band frame awaiting pickup by `pq_take_pending_outbound`.
@@ -421,6 +428,7 @@ fn build_session(
             auth_core,
             pq_inflight: None,
             session_id,
+            state_seq: 0,
             my_state: PrincipalState::Sync { client_id: my_id },
             their_state: PrincipalState::Sync {
                 client_id: their_id,
