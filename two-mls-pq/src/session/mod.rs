@@ -393,6 +393,21 @@ impl SessionInner {
         let mut core = self.auth_core.lock().unwrap_or_else(|e| e.into_inner());
         f(&mut core)
     }
+
+    /// The current epoch of each PQ half (`None` when the half is absent), as
+    /// `(send_pq_epoch, recv_pq_epoch)`. This is the PQ-epoch manifest that
+    /// `build_archive_wire` records and that `reconcile_persisted` validates; it is also
+    /// the signal `process_incoming` uses to decide Core vs. Checkpoint — a frame that
+    /// leaves both epochs untouched is classical-only (Core), any change means a PQ half
+    /// was created or advanced and must be captured by a Checkpoint.
+    fn pq_epochs(&self) -> (Option<u64>, Option<u64>) {
+        let epoch = |g: &Option<CombinerGroup>| {
+            g.as_ref()
+                .and_then(|g| g.pq.as_ref())
+                .map(|p| p.current_epoch())
+        };
+        (epoch(&self.send_group), epoch(&self.recv_group))
+    }
 }
 
 // Two constructors' shared assembly — the parameter list mirrors their divergent

@@ -1594,6 +1594,54 @@ fn test_install_sink_rejects_second_call() {
     assert_eq!(first.kinds(), vec![crate::BlobKind::Checkpoint]);
 }
 
+/// Guard-first discipline: a call that fails a precondition (or is an idempotent no-op) mutates
+/// nothing, so it must neither advance `state_seq` nor push a blob. Pushing per rejected call —
+/// especially a peer-replayable side-band frame that would force a full ML-KEM Checkpoint — is a
+/// DoS amplifier the choke point must avoid. This pins the checks OUTSIDE `mutate_and_persist`.
+#[test]
+fn test_guard_first_rejection_neither_pushes_nor_bumps() {
+    let (alice, _bob) = establish_full();
+    let sink = Arc::new(RecordingSink::default());
+    assert_ok!(alice.install_sink(sink.clone()));
+
+    // (1) Core path — a real mutation followed by its idempotent Ok no-op: staging a fresh id
+    // pushes a Core; re-staging the SAME id changes nothing and must neither bump nor push.
+    assert_ok!(alice.stage_rotation(b"successor-1".to_vec()));
+    let seq = alice.state_seq();
+    let pushes = sink.kinds().len();
+    assert_ok!(alice.stage_rotation(b"successor-1".to_vec()));
+    assert_eq!(
+        alice.state_seq(),
+        seq,
+        "an idempotent stage_rotation must not advance state_seq"
+    );
+    assert_eq!(
+        sink.kinds().len(),
+        pushes,
+        "an idempotent stage_rotation must not push a blob"
+    );
+
+    // (2) Checkpoint path — a state-guard rejection of a PQ op. The first `pq_ratchet_begin` is a
+    // real mutation (pushes a Checkpoint); the second sees the in-flight ephemeral and rejects.
+    // That rejection is the peer-replayable amplifier class, and it must NOT push a full ML-KEM
+    // Checkpoint for a no-op. (`begin` has no turn guard, so this holds regardless of whose turn
+    // it is.)
+    assert_ok!(alice.pq_ratchet_begin());
+    let seq = alice.state_seq();
+    let pushes = sink.kinds().len();
+    assert_err!(alice.pq_ratchet_begin(), TwoMlsPqError::SessionNotReady);
+    assert_eq!(
+        alice.state_seq(),
+        seq,
+        "a rejected pq_ratchet_begin must not advance state_seq"
+    );
+    assert_eq!(
+        sink.kinds().len(),
+        pushes,
+        "a rejected pq_ratchet_begin must not push a Checkpoint"
+    );
+}
+
 /// Fail-closed restore: a `core` whose PQ-epoch manifest does not match the reconciling
 /// `checkpoint` (a PQ op advanced without emitting a checkpoint — impossible normally, but
 /// the manifest guards a lost/torn checkpoint) is rejected rather than restored spliced.

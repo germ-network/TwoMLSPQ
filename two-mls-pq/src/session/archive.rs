@@ -699,17 +699,10 @@ fn build_archive_wire(
     };
 
     // The PQ-epoch manifest: the current epoch of each PQ half (None when absent). Export
-    // does not advance an epoch, so reading them after export is equivalent to before.
-    let send_pq_epoch = inner
-        .send_group
-        .as_ref()
-        .and_then(|g| g.pq.as_ref())
-        .map(|p| p.current_epoch());
-    let recv_pq_epoch = inner
-        .recv_group
-        .as_ref()
-        .and_then(|g| g.pq.as_ref())
-        .map(|p| p.current_epoch());
+    // does not advance an epoch, so reading them after export is equivalent to before. The
+    // same `pq_epochs` accessor gates `process_incoming`'s Core/Checkpoint choice, so the
+    // manifest and that decision can never diverge on what counts as a PQ change.
+    let (send_pq_epoch, recv_pq_epoch) = inner.pq_epochs();
 
     let archive =
         archive_wire::SessionArchive {

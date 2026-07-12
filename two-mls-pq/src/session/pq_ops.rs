@@ -45,7 +45,15 @@ impl TwoMlsPqSession {
     /// Initiator step 1 — generate an ML-KEM ephemeral and return the encapsulation-key message
     /// (tag 0x05). The decapsulation key is held until the ciphertext arrives.
     pub fn pq_ratchet_begin(&self) -> Result<Vec<u8>> {
-        self.mutate_and_persist(crate::BlobKind::Checkpoint, |inner| {
+        // Guard-first (pre-lock, OUTSIDE `mutate_and_persist`): a call that fails a precondition
+        // mutates nothing. Rejecting it here — rather than inside the closure — keeps the persist
+        // choke point from bumping the seq and pushing a full blob for a no-op. That is the same
+        // pure-guard rule `process_incoming` follows (a peer can replay a well-formed but
+        // ill-timed side-band frame, so an in-closure guard would be a Checkpoint-per-frame
+        // amplifier). Only genuine mutate-then-fail paths stay inside and push their advanced
+        // state. The body keeps its own downstream borrow guards as defense.
+        {
+            let inner = self.lock();
             // A.3 is post-A.4 (both PQ halves live), so the recv group always exists here —
             // guard explicitly, both because the ratchet is meaningless pre-establishment and
             // because the header seal below needs the recv group's key.
@@ -55,6 +63,8 @@ impl TwoMlsPqSession {
             if inner.pq_inflight.is_some() {
                 return Err(TwoMlsPqError::SessionNotReady);
             }
+        }
+        self.mutate_and_persist(crate::BlobKind::Checkpoint, |inner| {
             let eph = apq::pq_ratchet::generate_ephemeral(&providers::pq_kem()?)?;
             let mut msg = vec![PQ_EK_TAG];
             msg.extend_from_slice(&eph.encapsulation_key());
@@ -67,16 +77,24 @@ impl TwoMlsPqSession {
     /// Responder — encapsulate a fresh secret to the initiator's EK, hold it, and return the
     /// ciphertext message (tag 0x07).
     pub fn pq_ratchet_respond(&self, ek_msg: Vec<u8>) -> Result<()> {
-        let ek_msg = self.lock().open_or_raw(ek_msg);
-        let (&tag, ek) = ek_msg.split_first().ok_or(TwoMlsPqError::Mls)?;
-        if tag != PQ_EK_TAG {
-            return Err(TwoMlsPqError::Mls);
-        }
-        self.mutate_and_persist(crate::BlobKind::Checkpoint, |inner| {
+        // Guard-first (see `pq_ratchet_begin`): validate the frame and check the turn/slot
+        // state before the persist choke point, so a replayed or ill-timed EK frame can't force
+        // a full-Checkpoint push for a no-op. Frame validation comes first to preserve the
+        // precedence a stranger's blob is rejected as `Mls` before the state is consulted.
+        let ek = {
+            let inner = self.lock();
+            let ek_msg = inner.open_or_raw(ek_msg);
+            let (&tag, ek) = ek_msg.split_first().ok_or(TwoMlsPqError::Mls)?;
+            if tag != PQ_EK_TAG {
+                return Err(TwoMlsPqError::Mls);
+            }
             if inner.pq_inflight.is_some() || inner.pending_pq_outbound.is_some() {
                 return Err(TwoMlsPqError::SessionNotReady);
             }
-            let (s, ct) = apq::pq_ratchet::encapsulate(&providers::pq_kem()?, ek)?;
+            ek.to_vec()
+        };
+        self.mutate_and_persist(crate::BlobKind::Checkpoint, |inner| {
+            let (s, ct) = apq::pq_ratchet::encapsulate(&providers::pq_kem()?, &ek)?;
             inner.pq_inflight = Some(PqInflight::Responding(Zeroizing::new(s)));
             let mut msg = vec![PQ_CT_TAG];
             msg.extend_from_slice(&ct);
@@ -89,12 +107,19 @@ impl TwoMlsPqSession {
     /// commit, bind the exported apq_psk into the classical half, and staple an app message.
     /// Returns the bind frame (tag 0x09).
     pub fn pq_ratchet_bind(&self, ct_msg: Vec<u8>, app: Vec<u8>) -> Result<()> {
-        let ct_msg = self.lock().open_or_raw(ct_msg);
-        let (&tag, ct) = ct_msg.split_first().ok_or(TwoMlsPqError::Mls)?;
-        if tag != PQ_CT_TAG {
-            return Err(TwoMlsPqError::Mls);
-        }
-        self.mutate_and_persist(crate::BlobKind::Checkpoint, |inner| {
+        // Guard-first (see `pq_ratchet_begin`): validate the frame and every turn/slot/staple
+        // precondition before the persist choke point. The `pq_inflight` state is checked here
+        // as a pure read; the closure below still `take`s it (guaranteed `Initiating`). A
+        // displaced or ill-timed CT frame is then a no-op that neither bumps the seq nor pushes
+        // a Checkpoint — and, crucially, never reaches the `take` that would consume a held
+        // ephemeral or the `remember_send_psk` that mutates.
+        let ct = {
+            let inner = self.lock();
+            let ct_msg = inner.open_or_raw(ct_msg);
+            let (&tag, ct) = ct_msg.split_first().ok_or(TwoMlsPqError::Mls)?;
+            if tag != PQ_CT_TAG {
+                return Err(TwoMlsPqError::Mls);
+            }
             if inner.pending_pq_outbound.is_some() {
                 return Err(TwoMlsPqError::SessionNotReady);
             }
@@ -105,6 +130,13 @@ impl TwoMlsPqSession {
             if inner.pending_proposal_hash.is_some() {
                 return Err(TwoMlsPqError::SessionNotReady);
             }
+            // Only an initiator holding the A.3 ephemeral can bind the ciphertext.
+            if !matches!(inner.pq_inflight, Some(PqInflight::Initiating(_))) {
+                return Err(TwoMlsPqError::SessionNotReady);
+            }
+            ct.to_vec()
+        };
+        self.mutate_and_persist(crate::BlobKind::Checkpoint, |inner| {
             // Capture the departing epoch's PSK before the classical bind commit below.
             inner.remember_send_psk()?;
             let eph = match inner.pq_inflight.take() {
@@ -114,7 +146,7 @@ impl TwoMlsPqSession {
             let s = Zeroizing::new(apq::pq_ratchet::decapsulate(
                 &providers::pq_kem()?,
                 &eph,
-                ct,
+                &ct,
             )?);
             let stores = inner.psk_stores.clone();
             let send = inner
@@ -189,8 +221,21 @@ impl TwoMlsPqSession {
     /// Responder — apply the stapled bind: register the held secret, apply the PQ partial commit
     /// and classical commit on the recv group, and return the decrypted app message.
     pub fn pq_ratchet_apply(&self, bind_msg: Vec<u8>) -> Result<Vec<u8>> {
-        let bind_msg = self.lock().open_or_raw(bind_msg);
-        let (pq_commit, cl_commit, app_ct) = decode_pq_bind(&bind_msg)?;
+        // Guard-first (see `pq_ratchet_begin`): decode the frame and confirm we hold the
+        // responder secret before the persist choke point, so a stray or ill-timed bind is a
+        // no-op that neither `take`s the held secret nor pushes a Checkpoint. Frame validation
+        // comes first, so a stranger's unparseable blob is rejected at the frame layer (`Mls`)
+        // before any KEM/turn state is consulted; the closure still `take`s the (now guaranteed
+        // `Responding`) inflight state.
+        let (pq_commit, cl_commit, app_ct) = {
+            let inner = self.lock();
+            let bind_msg = inner.open_or_raw(bind_msg);
+            let decoded = decode_pq_bind(&bind_msg)?;
+            if !matches!(inner.pq_inflight, Some(PqInflight::Responding(_))) {
+                return Err(TwoMlsPqError::SessionNotReady);
+            }
+            decoded
+        };
         self.mutate_and_persist(crate::BlobKind::Checkpoint, |inner| {
             let s = match inner.pq_inflight.take() {
                 Some(PqInflight::Responding(s)) => s,
@@ -273,7 +318,12 @@ impl TwoMlsPqSession {
     /// `BasicIdentityProvider` requires a stable identity across leaf updates, so principal
     /// identity travels at the announcement level, not in the Basic Credential.
     pub fn pq_rekey_begin(&self, rotating: Option<ClientId>) -> Result<Vec<u8>> {
-        self.mutate_and_persist(crate::BlobKind::Checkpoint, |inner| {
+        // Guard-first (see `pq_ratchet_begin`): the turn/slot/inflight and send-PQ-present
+        // preconditions are pure reads — check them before the persist choke point so an
+        // ill-timed call is a no-op. (The `rotating` credential check stays in the closure: it
+        // guards a handoff that only matters once we mutate, and it needs the moved id.)
+        {
+            let inner = self.lock();
             if !inner.pq_turn_mine
                 || inner.pending_pq_outbound.is_some()
                 || inner.pq_inflight.is_some()
@@ -288,6 +338,8 @@ impl TwoMlsPqSession {
             {
                 return Err(TwoMlsPqError::SessionNotReady);
             }
+        }
+        self.mutate_and_persist(crate::BlobKind::Checkpoint, |inner| {
             let handoff = match &rotating {
                 Some(new_id) => {
                     if inner.client.client_id() != *new_id {
@@ -340,17 +392,23 @@ impl TwoMlsPqSession {
     /// authoritative identity-rotation channel — this reports the PQ half catching up
     /// and does not touch the session's principal state.
     pub fn pq_rekey_respond(&self, upd_msg: Vec<u8>) -> Result<Option<ClientId>> {
-        let upd_msg = self.lock().open_or_raw(upd_msg);
-        let (&tag, proposal_bytes) = upd_msg.split_first().ok_or(TwoMlsPqError::Mls)?;
-        if tag != PQ_REKEY_UPD_TAG {
-            return Err(TwoMlsPqError::Mls);
-        }
-        let proposal_msg =
-            MlsMessage::from_bytes(proposal_bytes).map_err(|_| TwoMlsPqError::Mls)?;
-        self.mutate_and_persist(crate::BlobKind::Checkpoint, |inner| {
+        // Guard-first (see `pq_ratchet_begin`): check the slot/inflight state and validate the
+        // frame before the persist choke point, so a replayed or ill-timed Upd' is a no-op.
+        let proposal_msg = {
+            let inner = self.lock();
+            let upd_msg = inner.open_or_raw(upd_msg);
+            let (&tag, proposal_bytes) = upd_msg.split_first().ok_or(TwoMlsPqError::Mls)?;
+            if tag != PQ_REKEY_UPD_TAG {
+                return Err(TwoMlsPqError::Mls);
+            }
+            let proposal_msg =
+                MlsMessage::from_bytes(proposal_bytes).map_err(|_| TwoMlsPqError::Mls)?;
             if inner.pending_pq_outbound.is_some() || inner.pq_inflight.is_some() {
                 return Err(TwoMlsPqError::SessionNotReady);
             }
+            proposal_msg
+        };
+        self.mutate_and_persist(crate::BlobKind::Checkpoint, |inner| {
             // Cross-PSK from our recv-PQ mirror (§A.5: "Export PSK from [ASG-PQ]"), but only
             // when the peer's send-PQ has advanced since we last cross-injected it — the same
             // event-driven rule as the classical ratchet (see `last_cross_injected_pq`). Across
@@ -458,16 +516,22 @@ impl TwoMlsPqSession {
     /// responder (empty counter slot), apply the final commit, take the turn, and return
     /// `false` — the operation is complete.
     pub fn pq_rekey_apply(&self, msg: Vec<u8>) -> Result<bool> {
-        let msg = self.lock().open_or_raw(msg);
-        let (commit_bytes, counter_bytes) = decode_pq_rekey_commit(&msg)?;
-        self.mutate_and_persist(crate::BlobKind::Checkpoint, |inner| {
-            // Reject unsolicited commits before parsing or registering anything.
+        // Guard-first (see `pq_ratchet_begin`): reject an unsolicited commit before the persist
+        // choke point (a pure read of the inflight state) and decode the frame here. The closure
+        // still `take`s the (now guaranteed rekey) inflight state below.
+        let (commit_bytes, counter_bytes) = {
+            let inner = self.lock();
+            let msg = inner.open_or_raw(msg);
+            let decoded = decode_pq_rekey_commit(&msg)?;
             if !matches!(
                 inner.pq_inflight,
                 Some(PqInflight::RekeyInitiated { .. }) | Some(PqInflight::RekeyResponded)
             ) {
                 return Err(TwoMlsPqError::SessionNotReady);
             }
+            decoded
+        };
+        self.mutate_and_persist(crate::BlobKind::Checkpoint, |inner| {
             let commit_msg =
                 MlsMessage::from_bytes(&commit_bytes).map_err(|_| TwoMlsPqError::Mls)?;
             let client = inner.client.clone();
@@ -713,7 +777,11 @@ impl TwoMlsPqSession {
     /// below is generated by that client, so the new leaf carries its credential without
     /// further work — the check is all a bootstrap-time handoff needs.
     pub fn pq_bootstrap_begin(&self, rotating: Option<ClientId>) -> Result<Vec<u8>> {
-        self.mutate_and_persist(crate::BlobKind::Checkpoint, |inner| {
+        // Guard-first (see `pq_ratchet_begin`): turn, the optional credential handoff, and the
+        // "send exists, recv-PQ absent" readiness are all pure reads — check them before the
+        // persist choke point so an ill-timed call is a no-op.
+        {
+            let inner = self.lock();
             if !inner.pq_turn_mine {
                 return Err(TwoMlsPqError::SessionNotReady);
             }
@@ -731,6 +799,8 @@ impl TwoMlsPqSession {
             if !ready {
                 return Err(TwoMlsPqError::SessionNotReady);
             }
+        }
+        self.mutate_and_persist(crate::BlobKind::Checkpoint, |inner| {
             let kp = inner.client.combiner().generate_pq_key_package()?;
             let mut msg = vec![PQ_BOOTSTRAP_KP_TAG];
             msg.extend_from_slice(&kp);
@@ -747,17 +817,23 @@ impl TwoMlsPqSession {
     /// the classical group at the next A.3 bind. Taking this turn makes the next
     /// operation ours.
     pub fn pq_bootstrap_respond(&self, kp_msg: Vec<u8>) -> Result<()> {
-        let kp_msg = self.lock().open_or_raw(kp_msg);
-        let (&tag, kp) = kp_msg.split_first().ok_or(TwoMlsPqError::Mls)?;
-        if tag != PQ_BOOTSTRAP_KP_TAG {
-            return Err(TwoMlsPqError::Mls);
-        }
-        self.mutate_and_persist(crate::BlobKind::Checkpoint, |inner| {
+        // Guard-first (see `pq_ratchet_begin`): the slot check, the KP suite/identity
+        // validation, and "our send-PQ half is not already up" are all pure reads of `inner`
+        // and the frame — run them before the persist choke point so a replayed or malformed
+        // bootstrap KP is a no-op rather than a full-Checkpoint push. The closure below assumes
+        // these hold (sequential driving) and proceeds straight to standing up the group.
+        let kp = {
+            let inner = self.lock();
+            let kp_msg = inner.open_or_raw(kp_msg);
+            let (&tag, kp) = kp_msg.split_first().ok_or(TwoMlsPqError::Mls)?;
+            if tag != PQ_BOOTSTRAP_KP_TAG {
+                return Err(TwoMlsPqError::Mls);
+            }
             if inner.pending_pq_outbound.is_some() {
                 return Err(TwoMlsPqError::SessionNotReady);
             }
-            // Validate the peer's PQ key package suite before building a group around it — an early,
-            // clear CipherSuiteMismatch rather than a late opaque mls-rs error.
+            // Validate the peer's PQ key package suite before building a group around it — an
+            // early, clear CipherSuiteMismatch rather than a late opaque mls-rs error.
             check_key_package_suite(kp, inner.suite.pq)?;
             // The bootstrap KP must name the established peer: the new PQ half's added leaf
             // becomes a sender identity this library reports, so an unexpected principal is
@@ -765,6 +841,19 @@ impl TwoMlsPqSession {
             if parse_mls_key_package(kp.to_vec())?.client_id != inner.their_state.client_id() {
                 return Err(TwoMlsPqError::RemoteIdentityMismatch);
             }
+            // Our send-PQ half must not already be up (checked last, matching the original body
+            // order); the guard-first position prevents a full-Checkpoint push on a replay.
+            if inner
+                .send_group
+                .as_ref()
+                .map(|g| g.pq.is_some())
+                .unwrap_or(false)
+            {
+                return Err(TwoMlsPqError::SessionNotReady);
+            }
+            kp.to_vec()
+        };
+        self.mutate_and_persist(crate::BlobKind::Checkpoint, |inner| {
             let client = inner.client.clone();
             let suite = inner.suite;
             // The new PQ half resolves PSKs from the CURRENT client's stores (A.4 runs on
@@ -775,6 +864,8 @@ impl TwoMlsPqSession {
                     .send_group
                     .as_mut()
                     .ok_or(TwoMlsPqError::SessionNotReady)?;
+                // Defense-in-depth: send-PQ-absent was already checked guard-first above, so
+                // under sequential driving this never fires; kept as a structural invariant.
                 if send.pq.is_some() {
                     return Err(TwoMlsPqError::SessionNotReady);
                 }
@@ -794,7 +885,7 @@ impl TwoMlsPqSession {
                 );
                 let (pq_group, pq_welcome) = create_group_with_member(
                     client.pq(),
-                    kp,
+                    &kp,
                     &[],
                     GroupCreation::new(pq_gid, &info, None)?,
                 )?;
@@ -818,13 +909,30 @@ impl TwoMlsPqSession {
     /// PQ-groups-only, like the responder side: no classical commit is applied here.
     /// The turn passes to the peer.
     pub fn pq_bootstrap_apply(&self, bind_msg: Vec<u8>) -> Result<()> {
-        let bind_msg = self.lock().open_or_raw(bind_msg);
-        let pq_welcome = decode_bootstrap_bind(&bind_msg)?;
-        self.mutate_and_persist(crate::BlobKind::Checkpoint, |inner| {
+        // Guard-first (see `pq_ratchet_begin`): confirm our recv-PQ half is not already up and
+        // validate the welcome suite before the persist choke point, so a replayed or malformed
+        // bootstrap bind is a no-op rather than a full-Checkpoint push.
+        let pq_welcome = {
+            let inner = self.lock();
+            let bind_msg = inner.open_or_raw(bind_msg);
+            let pq_welcome = decode_bootstrap_bind(&bind_msg)?;
             // Validate the peer's PQ welcome suite before joining — an early, clear
-            // CipherSuiteMismatch rather than a late opaque mls-rs error (matches the establishment
-            // welcome path).
+            // CipherSuiteMismatch rather than a late opaque mls-rs error (matches the
+            // establishment welcome path).
             check_welcome_suite(&pq_welcome, inner.suite.pq)?;
+            // Our recv-PQ half must not already be up (checked last, matching the original body
+            // order); the guard-first position prevents a full-Checkpoint push on a replay.
+            if inner
+                .recv_group
+                .as_ref()
+                .map(|g| g.pq.is_some())
+                .unwrap_or(false)
+            {
+                return Err(TwoMlsPqError::SessionNotReady);
+            }
+            pq_welcome
+        };
+        self.mutate_and_persist(crate::BlobKind::Checkpoint, |inner| {
             let client = inner.client.clone();
             let suite = inner.suite;
             // The joined PQ half resolves PSKs from the CURRENT client's stores — track them.
@@ -834,6 +942,7 @@ impl TwoMlsPqSession {
                     .recv_group
                     .as_mut()
                     .ok_or(TwoMlsPqError::SessionNotReady)?;
+                // Defense-in-depth: recv-PQ-absent was checked guard-first above.
                 if recv.pq.is_some() {
                     return Err(TwoMlsPqError::SessionNotReady);
                 }

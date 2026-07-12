@@ -737,14 +737,27 @@ impl TwoMlsPqSession {
     /// else — including bare MLS ciphertext, which no longer occurs on the send path — is
     /// rejected as `DecryptionFailed`.
     pub fn process_incoming(&self, ciphertext: Vec<u8>) -> Result<Option<DecryptResult>> {
+        // Snapshot the PQ-half epochs so the persist below can tell a classical-only frame
+        // (Core) from one that created or advanced a PQ half. Only `process_welcome`'s
+        // full-pair join does the latter today (a peer delivering a non-deferred welcome to
+        // a recv-less session); a Core there would omit the new ML-KEM tree, and the next
+        // restore would fail the epoch manifest closed. Deriving the kind from what actually
+        // changed keeps the blob kind from ever disagreeing with the mutation.
+        let pq_before = self.lock().pq_epochs();
         let r = self.process_incoming_inner(ciphertext);
         // Push on success only. A rejected (garbage / mis-routed) frame mutated nothing, and
         // pushing per garbage frame would be a DoS amplifier — a full core encode each; skipping
         // it there is the pure-guard rule. A processed frame (a real message or an idempotent
-        // re-delivery) advanced or reaffirmed state, so persist it. mls-rs applies commits
-        // transactionally, so an `Err` leaves no partial mutation to capture.
+        // re-delivery) advanced or reaffirmed state, so persist it — as a Checkpoint if it
+        // touched a PQ half, else a Core. mls-rs applies commits transactionally, so an `Err`
+        // leaves no partial mutation to capture.
         if r.is_ok() {
-            self.persist_after(crate::BlobKind::Core);
+            let kind = if self.lock().pq_epochs() == pq_before {
+                crate::BlobKind::Core
+            } else {
+                crate::BlobKind::Checkpoint
+            };
+            self.persist_after(kind);
         }
         r
     }
@@ -1061,6 +1074,13 @@ impl TwoMlsPqSession {
     /// re-applies and commits it (with a cross-party PSK refresh). Single-occupancy,
     /// latest-wins; a rejected call is a no-op.
     pub fn queue_proposal(&self, digest: Vec<u8>) -> Result<()> {
+        // Guard-first: approving with nothing offered mutates nothing, so reject it before the
+        // persist choke point rather than bump the seq and push a Core for a no-op. (The
+        // digest-mismatch and validation-failure paths below take-then-restore, so they stay in
+        // the closure; both require a real pending offer to reach.)
+        if self.lock().offered_proposal.is_none() {
+            return Err(TwoMlsPqError::ProposalRejected);
+        }
         self.mutate_and_persist(crate::BlobKind::Core, |inner| {
             let (offered, proposal_bytes, proposing) = inner
                 .offered_proposal
@@ -1120,8 +1140,11 @@ impl TwoMlsPqSession {
         if new_client_id.is_empty() {
             return Err(TwoMlsPqError::InvalidClientId);
         }
-        self.mutate_and_persist(crate::BlobKind::Core, |inner| {
-            // Already in flight, or already the parked next request → no-op.
+        // Guard-first: staging an id already in flight (or already parked as the next request)
+        // is an idempotent no-op — return before the persist choke point so it neither bumps the
+        // seq nor pushes a Core for a state that did not change.
+        {
+            let inner = self.lock();
             if inner
                 .staged_candidates
                 .iter()
@@ -1130,6 +1153,8 @@ impl TwoMlsPqSession {
             {
                 return Ok(());
             }
+        }
+        self.mutate_and_persist(crate::BlobKind::Core, |inner| {
             if inner.staged_candidates.len() < CANDIDATE_WINDOW {
                 // Admit into the in-flight pool: mint, rebind the candidate's clients to the
                 // session-canonical AS core, and authorize the id for OUR sequence (the peer's
