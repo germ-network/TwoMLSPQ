@@ -1,5 +1,15 @@
 # @germ-network/two-mls-pq
 
+## 0.2.0
+
+### Minor Changes
+
+- [#60](https://github.com/germ-network/TwoMLSPQ/pull/60) [`3478ceb`](https://github.com/germ-network/TwoMLSPQ/commit/3478ceb0dec6dec2fa16d08b28709009c489c5d7) Thanks [@germ-mark](https://github.com/germ-mark)! - `PrepareEncryptResult` gains `proposal_message: Vec<u8>` (Swift: `proposalMessage: Data`) — the raw staged Upd(self) proposal, the exact message the paired `encrypt` staples and the peer independently digests.
+
+  **⚠️ Binding contract 13 → 14 — binding and binary MUST pair.** Take `two_mls_pq.swift` from this release (a Record shape change; a stale pairing mis-reads FFI buffers). No wire, archive, or semantic change — persisted state carries over.
+
+  Unblocks the anchor "agent handoff" flow: the app signs over its own `sha256(proposal_message)`, which equals the same result's `proposal_hash` and the receiver's independently derived `QueuedRemoteProposal.digest` (cross-side coherence, covered by new tests — including at the establishment moment, before any peer frame). Bytes and digest come from the same critical section, so there is deliberately NO staged-slot getter: a decoupled read could return whatever Upd a later `prepare_to_encrypt` staged (routine self-refreshes included), and a signature input must not be exposed to that race.
+
 ## 0.1.0
 
 ### Minor Changes
