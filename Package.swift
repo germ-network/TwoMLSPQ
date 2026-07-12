@@ -10,13 +10,19 @@ let package = Package(
 	// calling the PQ API, not to importing or linking this package.
 	platforms: [.iOS(.v17), .macOS(.v15)],
 	products: [
-		// Vend the abstraction plus each concrete UniFFI wrapper. The wrappers must be
-		// separate modules: each imports its own `*FFI` C module, and both FFI modules
-		// declare a C `RustBuffer` / `ForeignBytes` / `RustCallStatus` — ambiguous if
-		// imported into one Swift module.
+		// Vend ONLY the abstraction. The concrete UniFFI wrapper modules stay
+		// internal targets (they still link transitively): uniffi stamps its
+		// interface classes `@unchecked Sendable` (Rust Send+Sync, lock-serialized
+		// — memory-safe but with no ordering guarantees), so exposing them would
+		// hand consumers a freely-shareable session handle and defeat the
+		// deliberately non-Sendable wrapper types, which are the only supported
+		// session handles. The wrappers also must remain separate MODULES from
+		// each other: each imports its own `*FFI` C module, and both FFI modules
+		// declare a C `RustBuffer` / `ForeignBytes` / `RustCallStatus` —
+		// ambiguous if imported into one Swift module.
 		.library(
 			name: "AbstractTwoMLS",
-			targets: ["AbstractTwoMLS", "TwoMLSPQ"]
+			targets: ["AbstractTwoMLS"]
 		)
 	],
 	dependencies: [
@@ -78,7 +84,11 @@ let package = Package(
 		),
 		.testTarget(
 			name: "AbstractTwoMLSTests",
-			dependencies: ["AbstractTwoMLS", "MLSrsClassic"]
+			// TwoMLSPQ is named explicitly: the tests exercise the concrete
+			// backend directly (in-package target imports are unaffected by the
+			// product narrowing above — external consumers can import only
+			// AbstractTwoMLS).
+			dependencies: ["AbstractTwoMLS", "TwoMLSPQ", "MLSrsClassic"]
 		),
 	],
 	swiftLanguageModes: [.v6]
