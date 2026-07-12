@@ -20,7 +20,7 @@ fn main() {
     let bob = client();
     let alice_kp = combiner_kp(&alice);
 
-    let bob_inv = TwoMlsPqInvitation::new(bob.generate_invitation(true).unwrap()).unwrap();
+    let bob_inv = TwoMlsPqInvitation::restore(bob.generate_invitation(true).unwrap()).unwrap();
     let bob_kp = bob_inv.combiner_key_package();
 
     let alice_s = TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None).unwrap();
@@ -59,7 +59,7 @@ fn main() {
         let a = client();
         let b = client();
         let a_kp = combiner_kp(&a);
-        let b_inv = TwoMlsPqInvitation::new(b.generate_invitation(true).unwrap()).unwrap();
+        let b_inv = TwoMlsPqInvitation::restore(b.generate_invitation(true).unwrap()).unwrap();
         let b_kp = b_inv.combiner_key_package();
         let a_s = TwoMlsPqSession::initiate(Arc::clone(&a), b_kp, None).unwrap();
         let envelope = a_s.pending_outbound().unwrap();

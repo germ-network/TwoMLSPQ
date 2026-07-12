@@ -32,7 +32,7 @@ pub(crate) fn establish_sessions() -> (Arc<TwoMlsPqSession>, Arc<TwoMlsPqSession
     // The production establishment path: Bob publishes an invitation (whose KP Alice
     // initiates to and which opens the §A.1 envelope). Alice's first frame is the sealed
     // envelope; Bob opens it and joins.
-    let bob_inv = assert_ok!(TwoMlsPqInvitation::new(assert_ok!(
+    let bob_inv = assert_ok!(TwoMlsPqInvitation::restore(assert_ok!(
         bob.generate_invitation(true)
     )));
     let bob_kp = bob_inv.combiner_key_package();

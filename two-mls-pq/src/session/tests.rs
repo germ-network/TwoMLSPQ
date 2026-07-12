@@ -1484,13 +1484,13 @@ fn message_round(sender: &Arc<TwoMlsPqSession>, receiver: &Arc<TwoMlsPqSession>,
 
 /// Restore `session` through the PUSH path: attach a recording sink (whose `install_sink`
 /// pushes a baseline checkpoint of the current state), then rebuild from the pushed blobs.
-/// The whole archive/restore corpus therefore flows through `ArchiveSink` + `from_persisted`,
+/// The whole archive/restore corpus therefore flows through `ArchiveSink` + `restore`,
 /// not just the legacy whole-blob `archive()`. (Equivalent outcome — the baseline checkpoint
 /// is the full state — while exercising install_sink/encode_checkpoint/reconcile.)
 fn round_trip(session: &Arc<TwoMlsPqSession>) -> Arc<TwoMlsPqSession> {
     let sink = Arc::new(RecordingSink::default());
     assert_ok!(session.install_sink(sink.clone()));
-    assert_ok!(TwoMlsPqSession::from_persisted(
+    assert_ok!(TwoMlsPqSession::restore(
         sink.latest(crate::BlobKind::Core),
         sink.latest(crate::BlobKind::Checkpoint),
     ))
@@ -1569,7 +1569,7 @@ fn test_push_persistence_smoke() {
     );
 
     // Restore from the newest pushed blobs and keep going.
-    let restored = assert_ok!(TwoMlsPqSession::from_persisted(
+    let restored = assert_ok!(TwoMlsPqSession::restore(
         sink.latest(crate::BlobKind::Core),
         sink.latest(crate::BlobKind::Checkpoint),
     ));
@@ -1646,7 +1646,7 @@ fn test_guard_first_rejection_neither_pushes_nor_bumps() {
 /// `checkpoint` (a PQ op advanced without emitting a checkpoint — impossible normally, but
 /// the manifest guards a lost/torn checkpoint) is rejected rather than restored spliced.
 #[test]
-fn test_from_persisted_fails_closed_on_stale_checkpoint() {
+fn test_restore_fails_closed_on_stale_checkpoint() {
     let (alice, bob) = establish_full();
     let sink = Arc::new(RecordingSink::default());
     assert_ok!(alice.install_sink(sink.clone()));
@@ -1664,7 +1664,7 @@ fn test_from_persisted_fails_closed_on_stale_checkpoint() {
     // Splicing that newer Core onto the pre-rekey checkpoint would pair classical state with a
     // stale PQ tree — the manifest catches it.
     assert_err!(
-        TwoMlsPqSession::from_persisted(core, stale_checkpoint),
+        TwoMlsPqSession::restore(core, stale_checkpoint),
         TwoMlsPqError::ArchiveInvalid
     );
 }
@@ -1802,9 +1802,9 @@ fn test_archive_preserves_spawn_token() {
     let alice = make_client();
     let bob = make_client();
     let alice_kp = make_combiner_kp(&alice);
-    let bob_inv = assert_ok!(crate::key_packages::TwoMlsPqInvitation::new(assert_ok!(
-        bob.generate_invitation(true)
-    )));
+    let bob_inv = assert_ok!(crate::key_packages::TwoMlsPqInvitation::restore(
+        assert_ok!(bob.generate_invitation(true))
+    ));
     let bob_kp = bob_inv.combiner_key_package();
     let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
     let welcome_a = alice_session.test_initial_welcome();
@@ -2814,7 +2814,7 @@ fn test_initial_envelope_roundtrip_return_welcome_sealed() {
     let alice = make_client();
     let bob = make_client();
     let alice_kp = make_combiner_kp(&alice);
-    let bob_inv = assert_ok!(TwoMlsPqInvitation::new(assert_ok!(
+    let bob_inv = assert_ok!(TwoMlsPqInvitation::restore(assert_ok!(
         bob.generate_invitation(true)
     )));
     let bob_kp = bob_inv.combiner_key_package();
@@ -2864,7 +2864,7 @@ fn test_initial_envelope_no_app_payload() {
     let alice = make_client();
     let bob = make_client();
     let alice_kp = make_combiner_kp(&alice);
-    let bob_inv = assert_ok!(TwoMlsPqInvitation::new(assert_ok!(
+    let bob_inv = assert_ok!(TwoMlsPqInvitation::restore(assert_ok!(
         bob.generate_invitation(true)
     )));
     let bob_kp = bob_inv.combiner_key_package();
@@ -2886,7 +2886,7 @@ fn test_receive_under_dedicated_principal() {
     let alice = make_client();
     let bob = make_client();
     let alice_kp = make_combiner_kp(&alice);
-    let bob_inv = assert_ok!(TwoMlsPqInvitation::new(assert_ok!(
+    let bob_inv = assert_ok!(TwoMlsPqInvitation::restore(assert_ok!(
         bob.generate_invitation(true)
     )));
     let bob_kp = bob_inv.combiner_key_package();
@@ -2957,7 +2957,7 @@ fn test_empty_principal_id_rejected() {
     let alice = make_client();
     let bob = make_client();
     let alice_kp = make_combiner_kp(&alice);
-    let bob_inv = assert_ok!(TwoMlsPqInvitation::new(assert_ok!(
+    let bob_inv = assert_ok!(TwoMlsPqInvitation::restore(assert_ok!(
         bob.generate_invitation(true)
     )));
     let bob_kp = bob_inv.combiner_key_package();
@@ -2993,7 +2993,7 @@ fn test_standalone_welcome_surfaces_dedicated_principal() {
     let alice = make_client();
     let bob = make_client();
     let alice_kp = make_combiner_kp(&alice);
-    let bob_inv = assert_ok!(TwoMlsPqInvitation::new(assert_ok!(
+    let bob_inv = assert_ok!(TwoMlsPqInvitation::restore(assert_ok!(
         bob.generate_invitation(true)
     )));
     let bob_kp = bob_inv.combiner_key_package();
@@ -3032,7 +3032,7 @@ fn test_dedicated_principal_full_lifecycle() {
     let alice = make_client();
     let bob = make_client();
     let alice_kp = make_combiner_kp(&alice);
-    let bob_inv = assert_ok!(TwoMlsPqInvitation::new(assert_ok!(
+    let bob_inv = assert_ok!(TwoMlsPqInvitation::restore(assert_ok!(
         bob.generate_invitation(true)
     )));
     let bob_kp = bob_inv.combiner_key_package();
@@ -3141,7 +3141,7 @@ fn test_initial_envelope_resend_same_plaintext() {
     use crate::key_packages::TwoMlsPqInvitation;
     let alice = make_client();
     let bob = make_client();
-    let bob_inv = assert_ok!(TwoMlsPqInvitation::new(assert_ok!(
+    let bob_inv = assert_ok!(TwoMlsPqInvitation::restore(assert_ok!(
         bob.generate_invitation(true)
     )));
     let bob_kp = bob_inv.combiner_key_package();
@@ -3183,7 +3183,7 @@ fn test_spent_invitation_cannot_open_initial() {
     let carol = make_client();
     let bob = make_client();
     let alice_kp = make_combiner_kp(&alice);
-    let bob_inv = assert_ok!(TwoMlsPqInvitation::new(assert_ok!(
+    let bob_inv = assert_ok!(TwoMlsPqInvitation::restore(assert_ok!(
         bob.generate_invitation(false)
     )));
     let bob_kp = bob_inv.combiner_key_package();

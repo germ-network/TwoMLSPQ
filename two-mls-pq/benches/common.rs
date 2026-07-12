@@ -39,7 +39,7 @@ pub fn established() -> (Arc<TwoMlsPqSession>, Arc<TwoMlsPqSession>) {
 
     // Production establishment path (mirrors `src/test_utils.rs`): Bob publishes an
     // invitation; Alice's first frame is the §A.1 envelope, which Bob opens and joins.
-    let bob_inv = TwoMlsPqInvitation::new(bob.generate_invitation(true).unwrap()).unwrap();
+    let bob_inv = TwoMlsPqInvitation::restore(bob.generate_invitation(true).unwrap()).unwrap();
     let bob_kp = bob_inv.combiner_key_package();
 
     let alice_session = TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None).unwrap();
