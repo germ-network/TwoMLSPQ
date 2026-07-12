@@ -542,6 +542,9 @@ fn session_from_wire(wire: archive_wire::SessionArchive) -> Result<Arc<TwoMlsPqS
             recv_group,
             pending_outbound: wire.pending_outbound,
             pending_proposal_hash: wire.pending_proposal_hash,
+            // Not serialized; the staple was persisted no later than the archived seq, so
+            // using it is a safe (never-under) `depends_on_seq` for post-restore frames.
+            current_staple_seq: wire.state_seq,
             current_staple: wire.current_staple,
             pending_proposal_message: wire
                 .pending_proposal_message

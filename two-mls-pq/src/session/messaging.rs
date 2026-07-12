@@ -498,6 +498,9 @@ impl SessionInner {
                 .commit_message
                 .to_bytes()
                 .map_err(|_| TwoMlsPqError::Mls)?;
+            // This commit publishes new leaf keys; the push about to persist it lands at the
+            // (already-bumped) current `state_seq`, so tag the staple with it for `depends_on_seq`.
+            self.current_staple_seq = self.state_seq;
             // This fold advanced our send epoch, so any still-unapproved offer is now
             // bound to the prior epoch — drop it (the queued one was consumed by the
             // `take` above). Mirrors the A.3 bind's clear; the peer re-proposes at the
@@ -678,6 +681,7 @@ impl TwoMlsPqSession {
                 sender,
                 recipient,
                 epochs,
+                depends_on_seq: inner.current_staple_seq,
             })
         })
     }

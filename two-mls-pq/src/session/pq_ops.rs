@@ -171,6 +171,9 @@ impl TwoMlsPqSession {
             // (A message frame can overtake the BIND; the peer then lacks the APQ-PSK and the
             // staple fails retriably until the BIND lands — same as today's ordering.)
             inner.current_staple = cl_commit.clone();
+            // The A.3 bind commit publishes new keys; tag the staple with the (already-bumped)
+            // push seq for `depends_on_seq`.
+            inner.current_staple_seq = inner.state_seq;
             // Our operation is complete once the peer applies; the turn passes.
             inner.pq_turn_mine = false;
             inner.pending_pq_outbound = Some(encode_pq_bind(pq_commit, cl_commit, app_ct));

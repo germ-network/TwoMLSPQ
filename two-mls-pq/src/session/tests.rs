@@ -1482,11 +1482,18 @@ fn message_round(sender: &Arc<TwoMlsPqSession>, receiver: &Arc<TwoMlsPqSession>,
     );
 }
 
-/// Archive `session` and restore it (self-contained — the archive rebuilds its own
-/// client, so no identity is passed).
+/// Restore `session` through the PUSH path: attach a recording sink (whose `install_sink`
+/// pushes a baseline checkpoint of the current state), then rebuild from the pushed blobs.
+/// The whole archive/restore corpus therefore flows through `ArchiveSink` + `from_persisted`,
+/// not just the legacy whole-blob `archive()`. (Equivalent outcome — the baseline checkpoint
+/// is the full state — while exercising install_sink/encode_checkpoint/reconcile.)
 fn round_trip(session: &Arc<TwoMlsPqSession>) -> Arc<TwoMlsPqSession> {
-    let archive = assert_ok!(session.archive());
-    assert_ok!(TwoMlsPqSession::from_archive(archive))
+    let sink = Arc::new(RecordingSink::default());
+    assert_ok!(session.install_sink(sink.clone()));
+    assert_ok!(TwoMlsPqSession::from_persisted(
+        sink.latest(crate::BlobKind::Core),
+        sink.latest(crate::BlobKind::Checkpoint),
+    ))
 }
 
 /// A push-persistence sink that records every blob (the test analogue of a persistence
@@ -1568,6 +1575,50 @@ fn test_push_persistence_smoke() {
     ));
     message_round(&bob, &restored, b"after-restore");
     message_round(&restored, &bob, b"restore->bob");
+}
+
+/// Fail-closed restore: a `core` whose PQ-epoch manifest does not match the reconciling
+/// `checkpoint` (a PQ op advanced without emitting a checkpoint — impossible normally, but
+/// the manifest guards a lost/torn checkpoint) is rejected rather than restored spliced.
+#[test]
+fn test_from_persisted_fails_closed_on_stale_checkpoint() {
+    let (alice, bob) = establish_full();
+    let sink = Arc::new(RecordingSink::default());
+    assert_ok!(alice.install_sink(sink.clone()));
+    // The baseline checkpoint carries the pre-rekey PQ epochs.
+    let stale_checkpoint = sink.latest(crate::BlobKind::Checkpoint);
+    assert!(stale_checkpoint.is_some());
+
+    // A PQ rekey advances alice's PQ halves (and pushes a fresh checkpoint we deliberately
+    // ignore); a classical message then pushes a Core whose manifest names the NEW PQ epochs.
+    rekey_round(&bob, &alice);
+    message_round(&alice, &bob, b"post-rekey");
+    let core = sink.latest(crate::BlobKind::Core);
+    assert!(core.is_some());
+
+    // Splicing that newer Core onto the pre-rekey checkpoint would pair classical state with a
+    // stale PQ tree — the manifest catches it.
+    assert_err!(
+        TwoMlsPqSession::from_persisted(core, stale_checkpoint),
+        TwoMlsPqError::ArchiveInvalid
+    );
+}
+
+/// `depends_on_seq`: a routine app message re-staples an already-committed staple, so its
+/// `depends_on_seq` does not advance and never exceeds the live `state_seq`.
+#[test]
+fn test_depends_on_seq_stable_across_routine_messages() {
+    let (alice, bob) = establish_full();
+    assert_ok!(alice.prepare_to_encrypt(None));
+    let first = assert_ok!(alice.encrypt(b"one".to_vec()));
+    let _ = bob.process_incoming(first.cipher_text);
+    assert_ok!(alice.prepare_to_encrypt(None));
+    let second = assert_ok!(alice.encrypt(b"two".to_vec()));
+
+    // Neither routine round committed, so the stapled commit — hence depends_on_seq — is
+    // unchanged, and it can never point past the current state.
+    assert_eq!(first.depends_on_seq, second.depends_on_seq);
+    assert!(second.depends_on_seq <= alice.state_seq());
 }
 
 #[test]

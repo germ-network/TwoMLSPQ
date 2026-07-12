@@ -215,6 +215,13 @@ pub struct EncryptResult {
     pub sender: ClientId,
     pub recipient: ClientId,
     pub epochs: ApqEpochs,
+    /// The persistence `state_seq` this frame depends on: the seq at which the commit it
+    /// staples was persisted. If the frame publishes new stored-private-key material (it
+    /// staples a fresh commit), the app should wait until it has durably persisted this seq
+    /// before transmitting — otherwise a crash-restore could rewind past keys the peer will
+    /// rely on. A routine app message re-staples an already-persisted commit, so its
+    /// `depends_on_seq` is already durable and imposes no wait. See `ArchiveSink`.
+    pub depends_on_seq: u64,
 }
 
 /// Returned by `process_incoming`. Fields are `None` when not applicable to

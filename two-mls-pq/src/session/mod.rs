@@ -52,6 +52,13 @@ struct SessionInner {
     /// send group's own APQWelcome. Never empty once the send group exists; re-sent on
     /// every frame so any single received frame heals the peer up to our current epoch.
     current_staple: Vec<u8>,
+    /// The `state_seq` at which `current_staple` was last set (the commit — or the birth
+    /// welcome — that produced it). An outbound frame stapling this commit publishes
+    /// stored-private-key material that was persisted at this seq, so it is the frame's
+    /// `depends_on_seq`: the app waits for this seq to be durable before transmitting. A
+    /// routine frame re-stapling an already-persisted commit therefore imposes no wait. Live
+    /// state (re-derivable from the archived `state_seq` on restore — not itself serialized).
+    current_staple_seq: u64,
     /// Upd(self) proposal for the peer's send group, stapled onto the next outbound
     /// frame, with the identity it proposes (the credential its new leaf carries):
     /// `(proposing, proposal bytes)`.
@@ -425,6 +432,7 @@ fn build_session(
             pending_proposal_hash: None,
             current_staple,
             pending_proposal_message: None,
+            current_staple_seq: 0,
             joined_welcome_digest,
             offered_proposal: None,
             queued_proposal: None,
@@ -534,15 +542,17 @@ impl TwoMlsPqSession {
         f: impl FnOnce(&mut SessionInner) -> Result<T>,
     ) -> Result<T> {
         let mut inner = self.lock();
-        let result = f(&mut inner);
-        // `checked_add` never wraps (2^64 mutations is unreachable — ~585k years at 1M/s); if
-        // it somehow saturated we stop persisting rather than corrupt the seq ordering that
-        // gates transmission. No panic (the crate denies it).
+        // Bump BEFORE running the mutation so a staple-setting mutation can record the seq this
+        // push will land at (that seq feeds `depends_on_seq` on the frame it produces).
+        // `checked_add` never wraps (2^64 mutations is unreachable — ~585k years at 1M/s); if it
+        // somehow saturated we run the mutation without persisting rather than corrupt the seq
+        // ordering that gates transmission. No panic (the crate denies it).
         match inner.state_seq.checked_add(1) {
             Some(s) => inner.state_seq = s,
-            None => return result,
+            None => return f(&mut inner),
         }
         let seq = inner.state_seq;
+        let result = f(&mut inner);
         let Some(sink) = inner.sink.clone() else {
             return result;
         };
@@ -845,6 +855,17 @@ impl TwoMlsPqSession {
         drop(inner);
         sink.persist(seq, crate::BlobKind::Checkpoint, bytes);
         Ok(())
+    }
+
+    /// The session's current persistence `state_seq` (the monotonic mutation counter). Lets
+    /// the app correlate a frame's `depends_on_seq` against its own durable high-water mark,
+    /// and gate transmission of the key-material-bearing frames whose return type does not
+    /// carry the seq — the establishment envelope from `pending_outbound` and the PQ side-band
+    /// frames from `pq_take_pending_outbound` (both publish stored-private-key material, so the
+    /// app should read `state_seq()` right after taking them and wait for it to be durable
+    /// before transmitting).
+    pub fn state_seq(&self) -> u64 {
+        self.lock().state_seq
     }
 
     /// Welcome bytes to deliver to the remote party to complete group establishment.
