@@ -497,7 +497,7 @@ impl TwoMlsPqInvitation {
     /// Materialise a live invitation from its serialised bytes — the output of
     /// `TwoMlsPqPrincipal.generateInvitation` on first use, or a pushed checkpoint blob on
     /// restore. Named `restore`, not `new`: the state lives in the bytes and this mints none of
-    /// it (mirrors the session's `from_persisted`).
+    /// it (mirrors the session's `restore`).
     #[uniffi::constructor]
     pub fn restore(archive: Vec<u8>) -> Result<Arc<Self>> {
         let (invitation, consumed, spawned, processed, state_seq) = decode_archive(&archive)?;

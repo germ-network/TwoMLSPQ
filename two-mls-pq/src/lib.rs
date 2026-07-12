@@ -142,7 +142,7 @@ pub fn version() -> String {
 // both TwoMlsPqSession and TwoMlsPqInvitation (its move-not-copy contract re-armed AEAD nonce
 // reuse — security review H1). The live object now PUSHES its state to a foreign `ArchiveSink`
 // (new `with_foreign` trait + `BlobKind{Core,Checkpoint}`) after every mutation; attach it with
-// the new `install_sink`. Session restore is the new `from_persisted(core, checkpoint)` (the
+// the new `install_sink`. Session restore is the new `restore(core, checkpoint)` (the
 // two-blob model — classical mutations rewrite a `core` blob omitting the ML-KEM trees, PQ ops
 // write a full `checkpoint`); invitation restore stays `new(archive)`. New read-only `state_seq()`
 // on both. EncryptResult gained `depends_on_seq` (persist-before-transmit correlation), and

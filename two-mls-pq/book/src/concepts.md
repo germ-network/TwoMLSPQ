@@ -54,7 +54,7 @@ The app attaches one `ArchiveSink` per object with `install_sink`, and the objec
 `persist(seq, kind, bytes)` from inside the mutation. There is no mls-rs-style "restore
 the client and find your groups again" path — you restore an invitation
 (`TwoMlsPqInvitation.restore(archive)`) or a session
-(`TwoMlsPqSession.from_persisted(core, checkpoint)`).
+(`TwoMlsPqSession.restore(core, checkpoint)`).
 
 Push, not pull, closes a soundness gap. The old pull `archive()` was a *move, not a
 copy* — using the live object after snapshotting it, then restoring, rewound the sender

@@ -1484,13 +1484,13 @@ fn message_round(sender: &Arc<TwoMlsPqSession>, receiver: &Arc<TwoMlsPqSession>,
 
 /// Restore `session` through the PUSH path: attach a recording sink (whose `install_sink`
 /// pushes a baseline checkpoint of the current state), then rebuild from the pushed blobs.
-/// The whole archive/restore corpus therefore flows through `ArchiveSink` + `from_persisted`,
+/// The whole archive/restore corpus therefore flows through `ArchiveSink` + `restore`,
 /// not just the legacy whole-blob `archive()`. (Equivalent outcome — the baseline checkpoint
 /// is the full state — while exercising install_sink/encode_checkpoint/reconcile.)
 fn round_trip(session: &Arc<TwoMlsPqSession>) -> Arc<TwoMlsPqSession> {
     let sink = Arc::new(RecordingSink::default());
     assert_ok!(session.install_sink(sink.clone()));
-    assert_ok!(TwoMlsPqSession::from_persisted(
+    assert_ok!(TwoMlsPqSession::restore(
         sink.latest(crate::BlobKind::Core),
         sink.latest(crate::BlobKind::Checkpoint),
     ))
@@ -1569,7 +1569,7 @@ fn test_push_persistence_smoke() {
     );
 
     // Restore from the newest pushed blobs and keep going.
-    let restored = assert_ok!(TwoMlsPqSession::from_persisted(
+    let restored = assert_ok!(TwoMlsPqSession::restore(
         sink.latest(crate::BlobKind::Core),
         sink.latest(crate::BlobKind::Checkpoint),
     ));
@@ -1646,7 +1646,7 @@ fn test_guard_first_rejection_neither_pushes_nor_bumps() {
 /// `checkpoint` (a PQ op advanced without emitting a checkpoint — impossible normally, but
 /// the manifest guards a lost/torn checkpoint) is rejected rather than restored spliced.
 #[test]
-fn test_from_persisted_fails_closed_on_stale_checkpoint() {
+fn test_restore_fails_closed_on_stale_checkpoint() {
     let (alice, bob) = establish_full();
     let sink = Arc::new(RecordingSink::default());
     assert_ok!(alice.install_sink(sink.clone()));
@@ -1664,7 +1664,7 @@ fn test_from_persisted_fails_closed_on_stale_checkpoint() {
     // Splicing that newer Core onto the pre-rekey checkpoint would pair classical state with a
     // stale PQ tree — the manifest catches it.
     assert_err!(
-        TwoMlsPqSession::from_persisted(core, stale_checkpoint),
+        TwoMlsPqSession::restore(core, stale_checkpoint),
         TwoMlsPqError::ArchiveInvalid
     );
 }

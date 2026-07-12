@@ -6,7 +6,7 @@ and the session is not recovered in-library — how to proceed (typically
 re-establishing a fresh session) is the host's decision. The epoch-history
 window previously sketched here for in-library recovery has been dropped.
 
-Session persistence (push-based — `ArchiveSink` / `install_sink` / `from_persisted`),
+Session persistence (push-based — `ArchiveSink` / `install_sink` / `restore`),
 transport routing (`should_listen_on`, `send_rendezvous`, `forwarded`), the always-staple
 wire format, and **header encryption** (the symmetric steady-state layer) — previously
 listed here — are implemented; see the [API Reference](./api-reference.md) for the

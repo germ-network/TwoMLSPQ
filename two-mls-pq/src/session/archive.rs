@@ -217,7 +217,7 @@ pub(crate) mod archive_wire {
     #[derive(MlsSize, MlsEncode, MlsDecode)]
     pub(in crate::session) struct SessionArchive {
         /// Per-session monotonic mutation counter (see `SessionInner::state_seq`). Stamps
-        /// this blob; `from_persisted` compares a `core` blob's `state_seq` against the
+        /// this blob; `restore` compares a `core` blob's `state_seq` against the
         /// `checkpoint`'s to pick the newer non-PQ state.
         pub(in crate::session) state_seq: u64,
         /// PQ-epoch manifest: the current epoch of each PQ half at the time this blob was
@@ -409,13 +409,13 @@ impl TwoMlsPqSession {
     /// be absent (a session that only ever checkpointed has no `core`); at least the
     /// `checkpoint` must be present.
     #[uniffi::constructor]
-    pub fn from_persisted(core: Option<Archive>, checkpoint: Option<Archive>) -> Result<Arc<Self>> {
+    pub fn restore(core: Option<Archive>, checkpoint: Option<Archive>) -> Result<Arc<Self>> {
         session_from_wire(reconcile_persisted(core, checkpoint)?)
     }
 }
 
 /// Validate a decoded wire and rebuild the live session; shared by `from_archive` and
-/// `from_persisted`. The restored session starts with no sink — attach one with
+/// `restore`. The restored session starts with no sink — attach one with
 /// `install_sink` (which pushes a fresh baseline checkpoint).
 fn session_from_wire(wire: archive_wire::SessionArchive) -> Result<Arc<TwoMlsPqSession>> {
     // Structural invariants the live session maintains; reject blobs that violate
@@ -596,7 +596,7 @@ fn session_from_wire(wire: archive_wire::SessionArchive) -> Result<Arc<TwoMlsPqS
 }
 
 // Legacy whole-blob archive/restore — NOT on the FFI surface (push persistence via
-// `ArchiveSink` + `from_persisted` replaced it; the pull `archive()` was the root of H1). Kept
+// `ArchiveSink` + `restore` replaced it; the pull `archive()` was the root of H1). Kept
 // `pub` for in-crate tests and the archive-decode fuzz target only.
 impl TwoMlsPqSession {
     /// Restore from a single serialised archive (the legacy whole-blob path). Self-contained:
@@ -843,7 +843,7 @@ fn decode_wire(archive: &Archive) -> Result<archive_wire::SessionArchive> {
     Ok(wire)
 }
 
-/// Reconcile the two pushed blobs into one wire struct (see `from_persisted`). PQ trees come
+/// Reconcile the two pushed blobs into one wire struct (see `restore`). PQ trees come
 /// from the checkpoint; the rest from whichever blob has the higher `state_seq`.
 fn reconcile_persisted(
     core: Option<Archive>,

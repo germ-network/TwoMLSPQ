@@ -110,7 +110,7 @@ Constructors: `initiate(client, their_key_package, app_payload)` — `app_payloa
 host's opaque app-layer welcome (or `None`), composed with the MLS welcome and
 HPKE-enveloped to the peer's KP′ so `pending_outbound` is one opaque blob the peer opens
 with `TwoMlsPqInvitation::open_initial`; `accept(client, welcome, their_key_package)` —
-the plaintext-welcome path (tests/embedded); `from_persisted(core, checkpoint)` —
+the plaintext-welcome path (tests/embedded); `restore(core, checkpoint)` —
 self-contained restore from the two pushed blobs: they carry the session's signing
 identity, so restore rebuilds the exact client internally (no client argument),
 byte-exact in ClientId and signing keys, and the restored groups still sign with the keys
@@ -179,7 +179,7 @@ reuse against a real transcript (security review finding H1). The getter survive
 an in-crate test/fuzz helper, off the FFI. Every classical mutation pushes one `Core` and
 every PQ op one `Checkpoint`, atomically and independently; the PQ trees never move
 between checkpoints, so a `Core` is always consistent with the latest `Checkpoint`
-(restore via `from_persisted` above).
+(the `restore` constructor above reconciles the pair).
 
 Transmit gating: `EncryptResult.depends_on_seq` is the `state_seq` at which the commit a
 frame staples was persisted. A frame that publishes stored-private-key material (a fresh
