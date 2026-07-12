@@ -63,9 +63,18 @@ extension AbstractTwoMLS {
 	public struct PQInbound: Sendable {
 		public let kind: PQOperationKind
 		public let advancedGroup: SendGroupRole
+		/// This side's SEND group epoch pair after the apply (nil when nothing
+		/// moved). NOTE: when `advancedGroup == .theirs` the group that advanced
+		/// is the peer's — this field still reports our own send group's pair,
+		/// which is unchanged by such an apply. It answers "what are MY epochs
+		/// now", not "what did the advanced group move to".
 		public let newEpochs: APQEpochs?
-		public let rotatedCredential: ClientID?  // A.4/A.5 agent handoff
+		public let rotatedCredential: ClientID?  // A.4/A.5 principal handoff
 		/// The app message stapled onto an A.3 bind, decrypted while applying it.
+		/// Always nil through this backend today: `ingest` applies binds with an
+		/// empty payload and `begin(.ratchet)` offers no way to supply one — the
+		/// crate supports the stapled A.3 app message, but the wrapper does not
+		/// yet expose sending it (deliberate follow-up).
 		public let plaintext: Data?
 
 		public init(

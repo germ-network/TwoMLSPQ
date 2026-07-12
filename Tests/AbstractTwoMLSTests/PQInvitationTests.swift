@@ -140,4 +140,48 @@ struct PQInvitationReceiveTests {
 			// expected
 		}
 	}
+
+	/// An empty dedicated-principal id is rejected BEFORE any invitation state is
+	/// claimed: the same welcome then succeeds on retry with a valid id. (Staging
+	/// used to run after `base.receive`, so this failure orphaned the established
+	/// session and burned the welcome — retry got `DuplicateWelcome`.)
+	@Test func receiveRejectsEmptyDedicatedPrincipalBeforeConsuming() throws {
+		let invitation = try AbstractTwoMLS.PQInvitation(
+			archive: try AbstractTwoMLS.PQClient(clientId: .mock()).makeInvitation()
+		)
+
+		let initiator = try TwoMlsPqPrincipal(clientId: AbstractTwoMLS.ClientID.mock())
+		let acceptorPair = try decodeCombinerKeyPackage(bytes: invitation.encodedKeyPackage)
+		let initiatorSession = try TwoMlsPqSession.initiate(
+			client: initiator,
+			theirKeyPackage: acceptorPair,
+			appPayload: nil
+		)
+		let welcome = try #require(initiatorSession.pendingOutbound())
+		let initiatorKp = encodeCombinerKeyPackage(
+			keyPackage: try initiator.generateCombinerKeyPackage()
+		)
+		let token = AbstractTwoMLS.WelcomeToken(TypedDigest(prefix: .sha256, over: welcome))
+
+		#expect(throws: TwoMlsPqError.InvalidClientId) {
+			_ = try invitation.receive(
+				sendGroupWelcome: welcome,
+				remoteKeyPackage: initiatorKp,
+				remoteClientId: initiator.clientId().bytes,
+				welcomeToken: token,
+				stapledMessage: nil,
+				newClientId: Data()
+			)
+		}
+
+		// Nothing was consumed: the identical welcome establishes on retry.
+		_ = try invitation.receive(
+			sendGroupWelcome: welcome,
+			remoteKeyPackage: initiatorKp,
+			remoteClientId: initiator.clientId().bytes,
+			welcomeToken: token,
+			stapledMessage: nil,
+			newClientId: .mock()
+		)
+	}
 }

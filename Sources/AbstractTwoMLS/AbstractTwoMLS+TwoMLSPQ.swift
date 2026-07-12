@@ -211,6 +211,12 @@ extension AbstractTwoMLS {
 		let base: TwoMLSPQ.TwoMlsPqSession
 
 		init(_ base: TwoMLSPQ.TwoMlsPqSession) {
+			// Warm-start archive restore is the likeliest FIRST FFI touch after an
+			// app update, so the binding/binary pairing guard must run here too —
+			// not only at client/invitation construction — or a mismatch traps at
+			// the first Record buffer read instead of the precondition message.
+			// (`init(archive:)` delegates here, so this covers both inits.)
+			_ = TwoMLSPQBindingContract.verified
 			self.base = base
 		}
 
@@ -322,10 +328,14 @@ extension AbstractTwoMLS {
 			rotating: AbstractTwoMLS.ClientID?
 		) throws -> PQOutbound {
 			// `rotating` is the A.4/A.5 credential handoff: it must name the session's
-			// CURRENT agent (the Phase 8 classical rotation — receive staging +
-			// prepareToEncrypt(proposing:) — has already swapped to it), and the
-			// operation then moves the PQ leaves to that agent's signing key. The
-			// peer observes it as PQInbound.rotatedCredential on the rekey Upd'.
+			// CURRENT principal — i.e. the Phase 8 classical rotation must have
+			// COMPLETED first (contract v9+: proposing puts the candidate on the
+			// wire, the peer's approval + commit canonicalizes, and the staple back
+			// swaps the session client; proposing alone has not swapped anything —
+			// `begin(rotating:)` before that round-trip returns SessionNotReady).
+			// The operation then moves the PQ leaves to that principal's signing
+			// key; the peer observes it as PQInbound.rotatedCredential on the
+			// rekey Upd'.
 			switch kind {
 			case .finishBootstrap:
 				return PQOutbound(
@@ -522,6 +532,15 @@ extension AbstractTwoMLS {
 			stapledMessage: Data?,
 			newClientId: AbstractTwoMLS.ClientID
 		) throws -> (PQSession, plaintext: Data?) {
+			// Validate the dedicated principal id BEFORE any invitation state is
+			// claimed: `stageRotation` (below) throws `InvalidClientId` on an empty
+			// id, but by then `base.receive` has consumed the welcome — the session
+			// would be orphaned and a retry refused as `DuplicateWelcome`. Same
+			// error identity, fixed ordering.
+			guard !newClientId.isEmpty else {
+				throw TwoMlsPqError.InvalidClientId
+			}
+
 			let pair = try decodeCombinerKeyPackage(bytes: remoteKeyPackage)
 
 			// Bind the key package to the authenticated identity from the validated
@@ -545,19 +564,21 @@ extension AbstractTwoMLS {
 			// the invitation) to recover the MLS welcome `receive` joins from. The
 			// app-layer payload rides this backend's own outer frame, so it is empty here.
 			let opened = try base.openInitial(blob: sendGroupWelcome)
-			// v12 `receive` grew `newClientId:` (establish directly under the dedicated
-			// principal) and `expectedRemote:` (crate-side identity pin, checked before
-			// any invitation state is claimed). Adopted mechanically as nil/nil for now:
-			// this wrapper still pins the remote via the key-package guard above and
-			// stages the dedicated principal for the Phase 8 rotation below — switching
-			// those to the crate-side path is a deliberate follow-up, not a re-pin.
+			// `expectedRemote:` is the crate's own identity pin, checked BEFORE any
+			// invitation state is claimed — redundant with the key-package guard
+			// above by construction, kept so the binding is enforced independently
+			// on both sides of the FFI (defense-in-depth of two, not one).
+			// `newClientId: nil` stays deliberate: passing it would establish
+			// directly under the dedicated principal and retire the
+			// stage→propose→approve dance below — a semantic change deferred to its
+			// own follow-up.
 			let session = PQSession(
 				try base.receive(
 					welcome: opened.welcome,
 					theirKeyPackage: pair,
 					spawnToken: welcomeToken.wireFormat,
 					newClientId: nil,
-					expectedRemote: nil
+					expectedRemote: remoteClientId
 				))
 
 			// Deliberately fail open on the staple: an untrusted, optional early-delivery
@@ -572,10 +593,13 @@ extension AbstractTwoMLS {
 				return result.applicationMessage?.appMessageData
 			}
 
-			// Stage the app-spawned session-dedicated agent for the Phase 8 rotation.
-			// The handoff commits when the app drives the first reply with
-			// `prepareToEncrypt(proposing: newClientId)`; the PQ leaves catch up at
-			// the next `begin(.rekey, rotating: newClientId)` (A.5).
+			// Stage the app-spawned session-dedicated principal for the Phase 8
+			// rotation (contract v9+ candidate lifecycle): `prepareToEncrypt(
+			// proposing: newClientId)` puts the candidate on the wire as this
+			// side's Upd proposal — the PEER's approval (`queueProposal`) plus
+			// commit canonicalizes it, and the staple back swaps the session
+			// client. Only then do the PQ leaves catch up at the next
+			// `begin(.rekey, rotating: newClientId)` (A.5).
 			try session.base.stageRotation(newClientId: newClientId)
 
 			return (session, plaintext)
