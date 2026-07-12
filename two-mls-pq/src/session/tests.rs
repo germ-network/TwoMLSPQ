@@ -2178,6 +2178,46 @@ fn test_proposal_hash_is_digest_of_the_staple_both_sides_agree_on() {
     );
 }
 
+/// `staged_rotation_proposal` returns the RAW staged Upd(self): `sha256(bytes)` equals the
+/// sender's `proposal_hash` AND the receiver's independently derived digest for the same
+/// rotation Upd — the coherence a signed anchor handoff relies on. Mirrors
+/// `test_proposal_hash_is_digest_of_the_staple_both_sides_agree_on` for raw bytes.
+#[test]
+fn test_staged_rotation_proposal_bytes_digest_to_the_value_both_sides_agree_on() {
+    let (alice_session, bob_session) = establish_confirmed_sessions();
+
+    let new_alice = make_client();
+    let new_alice_id = new_alice.client_id();
+
+    // None until a prepare materializes the Upd — staging alone mints only the candidate.
+    assert!(alice_session.staged_rotation_proposal().is_none());
+    assert_ok!(alice_session.stage_rotation(new_alice_id.bytes.clone()));
+    assert!(alice_session.staged_rotation_proposal().is_none());
+
+    let prep = assert_ok!(alice_session.prepare_to_encrypt(Some(new_alice_id.clone())));
+
+    // Pure read: repeated calls return the identical message, no re-derivation.
+    let staged = assert_some!(alice_session.staged_rotation_proposal());
+    assert_eq!(
+        staged,
+        assert_some!(alice_session.staged_rotation_proposal())
+    );
+
+    // Sender coherence — the binding assert a handoff signer performs.
+    assert_eq!(crate::sha256(&staged), prep.proposal_hash);
+
+    // Cross-side coherence: the receiver digests the bytes it pulls off the frame, and
+    // the Upd carries the rotation candidate's credential.
+    let enc = assert_ok!(alice_session.encrypt(b"rotation".to_vec()));
+    let got = assert_some!(assert_ok!(bob_session.process_incoming(enc.cipher_text)));
+    let proposal = assert_some!(got.proposal);
+    assert_eq!(crate::sha256(&staged), proposal.digest);
+    assert_eq!(proposal.proposing, new_alice_id);
+
+    // `encrypt` consumed the staged proposal.
+    assert!(alice_session.staged_rotation_proposal().is_none());
+}
+
 #[test]
 fn test_prepare_to_encrypt_did_commit_true_when_remote_proposal_staged() {
     let (alice_session, bob_session) = establish_sessions();
