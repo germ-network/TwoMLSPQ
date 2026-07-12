@@ -149,7 +149,13 @@ pub fn version() -> String {
 // TwoMlsPqError gained `SinkAlreadyInstalled` (install_sink is once-only). SESSION_ARCHIVE_VERSION
 // -> 9, INVITATION_VERSION -> 3. Persisted state is not portable — regenerate sessions and
 // invitations.
-const BINDING_CONTRACT_VERSION: u64 = 13;
+// v14 (2026-07-12): PrepareEncryptResult gained `proposal_message` — the raw staged
+// Upd(self) proposal (the bytes whose SHA-256 is `proposal_hash`), returned from the same
+// critical section as the hash so a host binding a signature to the proposal (the anchor
+// agent handoff) gets bytes and digest atomically; there is deliberately NO staged-slot
+// getter (a decoupled read could return an Upd a later prepare staged). No wire, archive,
+// or semantic change — a pure Record shape change.
+const BINDING_CONTRACT_VERSION: u64 = 14;
 
 /// See `BINDING_CONTRACT_VERSION`. Exported so the Swift layer can verify the
 /// binding it was generated with matches the binary it loaded.
@@ -205,13 +211,19 @@ pub struct RendezvousId {
 // stacks bind the same bytes); the app layer wraps them in whatever typed-digest
 // encoding it uses. No app-layer type tags or enum values appear on this surface.
 
-/// Returned by `prepare_to_encrypt`. `proposal_hash` is the SHA-256 of the staged
-/// outbound object (the Upd(self) proposal message, or the rotation commit); `encrypt`
-/// also binds it into the app message's authenticated data, and the receiver reports
-/// the same value as `QueuedRemoteProposal.digest`. `did_commit` is false when stuck in
-/// a prior epoch (no pending remote proposal to commit).
+/// Returned by `prepare_to_encrypt`. `proposal_message` is the staged Upd(self)
+/// proposal, raw — the exact message the paired `encrypt` staples and the peer
+/// independently digests; `proposal_hash` is its SHA-256. Both come from the same
+/// critical section, so a host binding a signature to the proposal (the anchor agent
+/// handoff signs `sha256(message)`, matching the classical backend) reads the bytes
+/// here and owns the digest convention — with no staged-slot read that a later prepare
+/// could have replaced. `encrypt` also binds `proposal_hash` into the app message's
+/// authenticated data, and the receiver reports the same value as
+/// `QueuedRemoteProposal.digest`. `did_commit` is false when stuck in a prior epoch
+/// (no pending remote proposal to commit).
 #[derive(Debug, uniffi::Record)]
 pub struct PrepareEncryptResult {
+    pub proposal_message: Vec<u8>,
     pub proposal_hash: Vec<u8>,
     pub committed_remote_client_id: Option<ClientId>,
     pub did_commit: bool,

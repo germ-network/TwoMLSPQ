@@ -592,12 +592,13 @@ impl SessionInner {
         // backend's convention. `encrypt` carries it as the app message's authenticated
         // data, so the staple is verifiable against the frame it rides in.
         let proposal_hash = crate::sha256(&proposal_bytes);
-        self.pending_proposal_message = Some((proposing, proposal_bytes));
+        self.pending_proposal_message = Some((proposing, proposal_bytes.clone()));
 
         let their_id = self.their_state.client_id();
         self.pending_proposal_hash = Some(proposal_hash.clone());
 
         Ok(crate::PrepareEncryptResult {
+            proposal_message: proposal_bytes,
             proposal_hash,
             committed_remote_client_id: if did_commit { Some(their_id) } else { None },
             did_commit,
@@ -1053,28 +1054,6 @@ impl TwoMlsPqSession {
             .recv_group
             .as_ref()
             .map(|rg| crate::sha256(rg.classical.group_id()))
-    }
-
-    /// Raw bytes of the staged outbound Upd(self) proposal — the exact message the next
-    /// `encrypt` staples and the peer digests on receipt. Non-mutating. `Some` between the
-    /// `prepare_to_encrypt` that materializes the Upd (`stage_rotation` alone does not; the
-    /// randomized proposal only exists after prepare) and the `encrypt` that consumes it;
-    /// a re-prepare replaces it.
-    ///
-    /// `sha256(bytes)` == the sender's `proposal_hash` == the receiver's independently
-    /// derived `QueuedRemoteProposal.digest`. Returned raw so the caller owns the digest
-    /// convention (the anchor handoff signs `sha256(message)`, matching classical).
-    ///
-    /// Binding rule for signers: the slot holds whatever Upd the LAST prepare staged — a
-    /// `prepare_to_encrypt(None)` self-refresh or a promoted deferred candidate, not only
-    /// the rotation you selected. Before signing, assert `sha256(bytes)` equals the
-    /// `proposal_hash` returned by your own `prepare_to_encrypt(Some(id))`; that call fails
-    /// unless `id` is staged, so the equality pins these bytes to the intended candidate.
-    pub fn staged_update_proposal(&self) -> Option<Vec<u8>> {
-        self.lock()
-            .pending_proposal_message
-            .as_ref()
-            .map(|(_proposing, proposal_bytes)| proposal_bytes.clone())
     }
 
     /// Where to post outbound frames: the recv group's classical-half exporter at its

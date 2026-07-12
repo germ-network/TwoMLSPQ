@@ -125,7 +125,12 @@ State: `is_established`, `is_fully_established`, `has_receive_group`,
 
 Messaging: `prepare_to_encrypt(proposing)` — `Some(id)` selects which staged rotation
 candidate this round's Upd proposes (`None` re-proposes the current identity; the
-commit path is unchanged); `encrypt`; `process_incoming`; `proposal_context`;
+commit path is unchanged); its result carries the staged Upd both raw
+(`proposal_message` — the exact message the paired `encrypt` staples) and digested
+(`proposal_hash`), from one critical section, so a host binding a signature to the
+proposal (the anchor agent handoff) applies its own digest to the returned bytes with
+no staged-slot read a later prepare could have replaced; `encrypt`;
+`process_incoming`; `proposal_context`;
 `queue_proposal` — approve the peer's Upd (single-occupancy running tally,
 latest-wins; validates then leaves the proposal cache untouched, so a rejected call is
 a no-op and a replacement never doubles up; dropped when the send epoch advances via an
@@ -133,14 +138,7 @@ A.3 bind); `queued_remote_successor() -> Option<ClientId>` — the credential cu
 queued, for the app's replace policy; `stage_rotation` — mints a successor candidate
 (re-staging adds candidates, never evicting a sent one; overflow beyond the in-flight
 window defers to a single slot and is proposed next round; the peer's commit picks the
-winner); `staged_update_proposal() -> Option<Vec<u8>>` — non-mutating read of the
-staged Upd(self)'s raw message bytes, `Some` between `prepare_to_encrypt` (which
-materializes it — `stage_rotation` alone does not) and the `encrypt` that consumes it.
-`sha256(bytes)` equals `proposal_hash` and the receiver's digest, so a host binding a
-signature to the rotation (the anchor agent handoff) applies its own digest to these
-bytes — and must assert it equals the `proposal_hash` from its own
-`prepare_to_encrypt(Some(id))`, since the slot holds whatever Upd the last prepare
-staged. See [Group Rules](./group-rules.md) for the Authentication Service semantics.
+winner). See [Group Rules](./group-rules.md) for the Authentication Service semantics.
 
 Header encryption: `open_incoming(blob) -> Option<OpenedFrame { kind, frame }>` removes
 the outer seal from a rendezvous-channel blob and returns the plaintext `frame` plus a

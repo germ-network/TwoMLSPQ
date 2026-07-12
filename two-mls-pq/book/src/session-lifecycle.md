@@ -75,10 +75,14 @@ half, so the two ends compute identical addresses:
 Sending is two-phase so CommProtocol can bind a per-round proposal hash:
 
 - **`prepare_to_encrypt(proposing)`** — stages key material and returns a
-  `PrepareEncryptResult { proposal_hash, committed_remote_client_id, did_commit }`.
-  `proposal_hash` is the raw 32-byte SHA-256 of the staged `Upd(self)` proposal —
-  every round stages one, rotation rounds included — and the receiver independently
-  derives the same value as `QueuedRemoteProposal.digest`.
+  `PrepareEncryptResult { proposal_message, proposal_hash, committed_remote_client_id,
+  did_commit }`. `proposal_message` is the staged `Upd(self)` proposal, raw — every
+  round stages one, rotation rounds included — and `proposal_hash` its 32-byte
+  SHA-256; the receiver independently derives the same value as
+  `QueuedRemoteProposal.digest`. A host that must sign over the proposal (the anchor
+  agent handoff binds the rotation Upd's digest) applies its own digest to
+  `proposal_message`: bytes and hash come from the same critical section, so no later
+  prepare can interpose a different Upd.
   - `proposing: None` → routine round. Our own send group commits only when a
     queued, app-approved remote proposal is pending — then `did_commit: true` and
     the cross-party PSK refreshes.
@@ -91,14 +95,6 @@ Sending is two-phase so CommProtocol can bind a per-round proposal hash:
   the `[staple][proposal][app]` triple: the staple (our latest send-group commit, or
   our APQWelcome until the first commit) rides every frame, so a peer that missed a
   frame is healed by the next one.
-
-Between the two phases, **`staged_update_proposal()`** returns the staged Upd(self)'s
-raw message bytes (`None` outside the prepare → encrypt window). `sha256(bytes)` equals
-`proposal_hash`, so a host that must sign over the proposal — the anchor agent handoff
-binds the rotation Upd's digest — reads the bytes here and applies its own digest
-convention, asserting it against the `proposal_hash` from its own
-`prepare_to_encrypt(Some(id))` (the slot holds whatever Upd the last prepare staged,
-routine self-refreshes included).
 
 ## Receiving
 
