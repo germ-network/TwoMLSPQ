@@ -1,5 +1,5 @@
 ---
-"@germ-network/two-mls-pq": patch
+"@germ-network/two-mls-pq": minor
 ---
 
 Push-based persistence; the pull `archive()` is removed from the FFI

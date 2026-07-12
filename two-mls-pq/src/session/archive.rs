@@ -857,8 +857,10 @@ fn reconcile_persisted(
         // alone is a complete, consistent state.
         None => return Ok(ck),
     };
-    // The checkpoint is at least as new: it already carries everything through its seq. (Each
-    // seq is written to exactly one slot, so the two are never equal.)
+    // The checkpoint is at least as new: it already carries everything through its seq. The `>=`
+    // (not `>`) is load-bearing: `install_sink` re-pushes a baseline checkpoint at the restored
+    // seq WITHOUT bumping, so a checkpoint and a pre-restore core can share a seq — the tie must
+    // break toward the checkpoint, which re-encodes the full reconciled state.
     if ck.state_seq >= core.state_seq {
         return Ok(ck);
     }
@@ -875,9 +877,15 @@ fn reconcile_persisted(
             rg.pq = ck_rg.and_then(|c| c.pq);
             Some(rg)
         }
-        // Core has no recv group; the epoch check above already confirmed the checkpoint agrees
-        // (both recv_pq_epoch None), so there is nothing to splice.
-        (None, _) => None,
+        // Core has no recv group and neither does the checkpoint (the epoch check above already
+        // confirmed both recv_pq_epoch are None) — nothing to splice.
+        (None, None) => None,
+        // A newer core lacking a recv group the older checkpoint HAS would mean `recv_group`
+        // regressed Some→None. That is impossible today — nothing clears it once set (reconnect/
+        // reset is not implemented) — so this pairs a passing PQ-epoch check (both None) with a
+        // dropped recv group. Fail closed rather than silently discard the checkpoint's recv
+        // group if a future change ever breaks that monotonicity.
+        (None, Some(_)) => return Err(TwoMlsPqError::ArchiveInvalid),
     };
     Ok(merged)
 }

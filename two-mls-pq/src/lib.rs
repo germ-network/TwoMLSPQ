@@ -232,6 +232,13 @@ pub struct EncryptResult {
     /// before transmitting — otherwise a crash-restore could rewind past keys the peer will
     /// rely on. A routine app message re-staples an already-persisted commit, so its
     /// `depends_on_seq` is already durable and imposes no wait. See `ArchiveSink`.
+    ///
+    /// Boundary of the durability gate: only frames that publish key material are gated. A
+    /// routine app frame advances the sender ratchet but is NOT gated on that advance being
+    /// durable, so a crash-restore can rewind one generation and re-send it; MLS's per-message
+    /// random `reuse_guard` (RFC 9420 §5.3) is what bounds AEAD nonce reuse there (~2⁻³² residual),
+    /// not durability. This is deliberate — gating every app message on a disk write would be a
+    /// latency killer, and only key-material frames carry the rewind hazard the gate exists for.
     pub depends_on_seq: u64,
 }
 
@@ -323,9 +330,17 @@ pub enum BlobKind {
 /// - `archive` is PLAINTEXT SECRET MATERIAL (signing keys, epoch secrets, KEM material) — seal
 ///   it before writing (the key belongs in the platform keystore).
 ///
+/// Driving the object: mutate each session/invitation SEQUENTIALLY — one state-advancing FFI
+/// call at a time per object. The seq/blob-kind model assumes this. Concurrent mutation of one
+/// object can interleave pushes; the worst case a lost or out-of-order checkpoint across a crash
+/// then restores fail-closed (`ArchiveInvalid`), never a stale-PQ splice — an availability loss,
+/// not a safety one.
+///
 /// Transmission stays the app's concern: outbound frames carry `depends_on_seq`, and the app
 /// waits until it has durably persisted that `seq` before transmitting frames that publish
-/// stored-private-key material.
+/// stored-private-key material. "Durably persisted seq N" means CONTIGUOUSLY up to N — persist
+/// blobs in `seq` order so a durable `Core` at seq N implies the earlier `Checkpoint` bearing the
+/// PQ keys is durable too.
 #[uniffi::export(with_foreign)]
 pub trait ArchiveSink: Send + Sync {
     fn persist(&self, seq: u64, kind: BlobKind, archive: Vec<u8>);

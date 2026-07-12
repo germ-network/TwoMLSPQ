@@ -447,6 +447,9 @@ struct InvitationInner {
     sink: Option<Arc<dyn crate::ArchiveSink>>,
 }
 
+/// A checkpoint ready to push once the caller has dropped the lock: `(sink, seq, bytes)`.
+type PendingCheckpointPush = (Arc<dyn crate::ArchiveSink>, u64, Vec<u8>);
+
 impl InvitationInner {
     /// Encode this invitation's persisted form (everything but the live `sink`).
     fn encode(&self) -> Result<Vec<u8>> {
@@ -462,14 +465,21 @@ impl InvitationInner {
     /// Bump `state_seq` and, if a sink is installed, encode a fresh checkpoint UNDER the
     /// caller's lock — returning `(sink, seq, bytes)` for the caller to `persist` once the
     /// guard is dropped (encode inside the lock, push outside, mirroring the session).
-    /// `None` when there is no sink or the counter saturated (unreachable in practice); the
-    /// bump still lands so `state_seq` counts mutations whether or not a sink is attached.
-    fn bump_and_encode(&mut self) -> Option<(Arc<dyn crate::ArchiveSink>, u64, Vec<u8>)> {
-        let next = self.state_seq.checked_add(1)?;
+    /// `Ok(None)` when there is no sink or the counter saturated (unreachable in practice); the
+    /// bump still lands so `state_seq` counts mutations whether or not a sink is attached. An
+    /// encode-after-mutation failure is SURFACED (`Err`) — mirroring the session's
+    /// `mutate_and_persist` — so the caller reports it rather than silently returning a session
+    /// whose state was mutated but never persisted.
+    fn bump_and_encode(&mut self) -> Result<Option<PendingCheckpointPush>> {
+        let Some(next) = self.state_seq.checked_add(1) else {
+            return Ok(None);
+        };
         self.state_seq = next;
-        let sink = self.sink.clone()?;
-        let bytes = self.encode().ok()?;
-        Some((sink, next, bytes))
+        let Some(sink) = self.sink.clone() else {
+            return Ok(None);
+        };
+        let bytes = self.encode()?;
+        Ok(Some((sink, next, bytes)))
     }
 }
 
@@ -661,8 +671,9 @@ impl TwoMlsPqInvitation {
 
         // A successful receive advanced state: bump the counter and (if a sink is installed)
         // encode the checkpoint under the lock, then push it once the guard is dropped. A
-        // failed receive never reaches here, so it pushes nothing.
-        let push = inner.bump_and_encode();
+        // failed receive never reaches here, so it pushes nothing; a failed encode surfaces as
+        // `Err` (state was mutated but not persisted — the caller must not treat it as durable).
+        let push = inner.bump_and_encode()?;
         drop(inner);
         if let Some((sink, seq, bytes)) = push {
             sink.persist(seq, crate::BlobKind::Checkpoint, bytes);
