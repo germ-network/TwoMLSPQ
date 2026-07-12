@@ -516,6 +516,15 @@ struct ProposalBindingDemo {
 		#expect(prep.proposalHash == offered.digest)
 		#expect(prep.proposalHash.type == .sha256)
 
+		//v14: the raw staged proposal bytes are exposed so the ADOPTER digests
+		//them itself (anchor agent-handoff signing) — an app-side sha256 over
+		//proposalMessage must equal both the crate's proposalHash and the
+		//receiver's independently derived digest
+		#expect(!prep.proposalMessage.isEmpty)
+		let appSideDigest = TypedDigest(prefix: .sha256, over: prep.proposalMessage)
+		#expect(appSideDigest == prep.proposalHash)
+		#expect(appSideDigest == offered.digest)
+
 		//the receiver's ordering context equals its own proposalContext (sha256 of
 		//its recv group's classical group id) — self-consistent across surfaces
 		#expect(offered.context == localSession.proposalContext)

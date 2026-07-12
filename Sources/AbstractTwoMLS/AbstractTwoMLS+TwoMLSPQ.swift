@@ -73,7 +73,12 @@ import TwoMLSPQ
 //     second call) + static fromPersisted(core:checkpoint:) + stateSeq(); EncryptResult
 //     gained dependsOnSeq (durability gate for key-material frames). SESSION_ARCHIVE 9 /
 //     INVITATION 3 — persisted state not portable, regenerate.
-private let expectedBindingContract: UInt64 = 13
+// v14: PrepareEncryptResult gained proposalMessage (the raw staged Upd(self) proposal —
+//     the exact message the paired encrypt staples; sha256 over it == proposalHash ==
+//     the receiver's QueuedRemoteProposal.digest). Adopters digest the bytes themselves
+//     (anchor agent-handoff signing). Record shape change only — no wire, archive, or
+//     semantic change; persisted state carries over.
+private let expectedBindingContract: UInt64 = 14
 
 enum TwoMLSPQBindingContract {
 	static let verified: Void = {
@@ -174,6 +179,12 @@ extension AbstractTwoMLS {
 	}
 
 	public struct PQPrepareEncryptResult: PrepareEncryptResultProtocol {
+		// The raw staged Upd(self) proposal — the exact message the paired
+		// `encrypt` staples and the peer independently digests. Exposed as bytes
+		// so the ADOPTER chooses the digest/wireformat (the anchor agent-handoff
+		// signs over sha256 of these bytes; crate guarantee: that equals
+		// `proposalHash` and the receiver's `QueuedRemoteProposal.digest`).
+		public let proposalMessage: Data
 		public let proposalHash: TypedDigest
 		// NB: protocol spells this `commitedRemoteClientId` (single "t");
 		// the FFI struct spells it `committedRemoteClientId`.
@@ -181,6 +192,7 @@ extension AbstractTwoMLS {
 		public let didCommit: Bool
 
 		init(_ base: TwoMLSPQ.PrepareEncryptResult) throws {
+			proposalMessage = base.proposalMessage
 			proposalHash = try liftDigest(base.proposalHash)
 			commitedRemoteClientId = base.committedRemoteClientId?.bytes
 			didCommit = base.didCommit

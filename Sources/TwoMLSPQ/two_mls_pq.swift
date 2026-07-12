@@ -3680,20 +3680,27 @@ public func FfiConverterTypeParsedCombinerKeyPackage_lower(_ value: ParsedCombin
 
 
 /**
- * Returned by `prepare_to_encrypt`. `proposal_hash` is the SHA-256 of the staged
- * outbound object (the Upd(self) proposal message, or the rotation commit); `encrypt`
- * also binds it into the app message's authenticated data, and the receiver reports
- * the same value as `QueuedRemoteProposal.digest`. `did_commit` is false when stuck in
- * a prior epoch (no pending remote proposal to commit).
+ * Returned by `prepare_to_encrypt`. `proposal_message` is the staged Upd(self)
+ * proposal, raw — the exact message the paired `encrypt` staples and the peer
+ * independently digests; `proposal_hash` is its SHA-256. Both come from the same
+ * critical section, so a host binding a signature to the proposal (the anchor agent
+ * handoff signs `sha256(message)`, matching the classical backend) reads the bytes
+ * here and owns the digest convention — with no staged-slot read that a later prepare
+ * could have replaced. `encrypt` also binds `proposal_hash` into the app message's
+ * authenticated data, and the receiver reports the same value as
+ * `QueuedRemoteProposal.digest`. `did_commit` is false when stuck in a prior epoch
+ * (no pending remote proposal to commit).
  */
 public struct PrepareEncryptResult: Equatable, Hashable {
+    public var proposalMessage: Data
     public var proposalHash: Data
     public var committedRemoteClientId: ClientId?
     public var didCommit: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(proposalHash: Data, committedRemoteClientId: ClientId?, didCommit: Bool) {
+    public init(proposalMessage: Data, proposalHash: Data, committedRemoteClientId: ClientId?, didCommit: Bool) {
+        self.proposalMessage = proposalMessage
         self.proposalHash = proposalHash
         self.committedRemoteClientId = committedRemoteClientId
         self.didCommit = didCommit
@@ -3715,6 +3722,7 @@ public struct FfiConverterTypePrepareEncryptResult: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PrepareEncryptResult {
         return
             try PrepareEncryptResult(
+                proposalMessage: FfiConverterData.read(from: &buf), 
                 proposalHash: FfiConverterData.read(from: &buf), 
                 committedRemoteClientId: FfiConverterOptionTypeClientId.read(from: &buf), 
                 didCommit: FfiConverterBool.read(from: &buf)
@@ -3722,6 +3730,7 @@ public struct FfiConverterTypePrepareEncryptResult: FfiConverterRustBuffer {
     }
 
     public static func write(_ value: PrepareEncryptResult, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.proposalMessage, into: &buf)
         FfiConverterData.write(value.proposalHash, into: &buf)
         FfiConverterOptionTypeClientId.write(value.committedRemoteClientId, into: &buf)
         FfiConverterBool.write(value.didCommit, into: &buf)
