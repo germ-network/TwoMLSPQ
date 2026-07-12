@@ -48,9 +48,11 @@ hub for group operations (see [Concepts](./concepts.md)).
 
 The receiving side of a published key package — no live client required.
 
-- `new(archive)` — restore from a pushed blob; it carries the signing identity, the key
+- `restore(archive)` — materialise from serialised bytes (from `generate_invitation` on
+  first use, or a pushed blob on restore); they carry the signing identity, the key
   package's private material, the consumed-remote set, the spawned-group forward table,
-  and the processed-welcome ledger.
+  and the processed-welcome ledger. Named `restore`, not `new` — the state lives in the
+  bytes.
 - `install_sink(sink)` — attach the `ArchiveSink` this invitation pushes to after every
   state-advancing `receive` (once-only — a second call is `SinkAlreadyInstalled`; the
   first pushes a baseline `Checkpoint`). Persistence is push, not pull — the old

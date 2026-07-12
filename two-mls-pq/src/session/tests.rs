@@ -1802,9 +1802,9 @@ fn test_archive_preserves_spawn_token() {
     let alice = make_client();
     let bob = make_client();
     let alice_kp = make_combiner_kp(&alice);
-    let bob_inv = assert_ok!(crate::key_packages::TwoMlsPqInvitation::new(assert_ok!(
-        bob.generate_invitation(true)
-    )));
+    let bob_inv = assert_ok!(crate::key_packages::TwoMlsPqInvitation::restore(
+        assert_ok!(bob.generate_invitation(true))
+    ));
     let bob_kp = bob_inv.combiner_key_package();
     let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
     let welcome_a = alice_session.test_initial_welcome();
@@ -2814,7 +2814,7 @@ fn test_initial_envelope_roundtrip_return_welcome_sealed() {
     let alice = make_client();
     let bob = make_client();
     let alice_kp = make_combiner_kp(&alice);
-    let bob_inv = assert_ok!(TwoMlsPqInvitation::new(assert_ok!(
+    let bob_inv = assert_ok!(TwoMlsPqInvitation::restore(assert_ok!(
         bob.generate_invitation(true)
     )));
     let bob_kp = bob_inv.combiner_key_package();
@@ -2864,7 +2864,7 @@ fn test_initial_envelope_no_app_payload() {
     let alice = make_client();
     let bob = make_client();
     let alice_kp = make_combiner_kp(&alice);
-    let bob_inv = assert_ok!(TwoMlsPqInvitation::new(assert_ok!(
+    let bob_inv = assert_ok!(TwoMlsPqInvitation::restore(assert_ok!(
         bob.generate_invitation(true)
     )));
     let bob_kp = bob_inv.combiner_key_package();
@@ -2886,7 +2886,7 @@ fn test_receive_under_dedicated_principal() {
     let alice = make_client();
     let bob = make_client();
     let alice_kp = make_combiner_kp(&alice);
-    let bob_inv = assert_ok!(TwoMlsPqInvitation::new(assert_ok!(
+    let bob_inv = assert_ok!(TwoMlsPqInvitation::restore(assert_ok!(
         bob.generate_invitation(true)
     )));
     let bob_kp = bob_inv.combiner_key_package();
@@ -2957,7 +2957,7 @@ fn test_empty_principal_id_rejected() {
     let alice = make_client();
     let bob = make_client();
     let alice_kp = make_combiner_kp(&alice);
-    let bob_inv = assert_ok!(TwoMlsPqInvitation::new(assert_ok!(
+    let bob_inv = assert_ok!(TwoMlsPqInvitation::restore(assert_ok!(
         bob.generate_invitation(true)
     )));
     let bob_kp = bob_inv.combiner_key_package();
@@ -2993,7 +2993,7 @@ fn test_standalone_welcome_surfaces_dedicated_principal() {
     let alice = make_client();
     let bob = make_client();
     let alice_kp = make_combiner_kp(&alice);
-    let bob_inv = assert_ok!(TwoMlsPqInvitation::new(assert_ok!(
+    let bob_inv = assert_ok!(TwoMlsPqInvitation::restore(assert_ok!(
         bob.generate_invitation(true)
     )));
     let bob_kp = bob_inv.combiner_key_package();
@@ -3032,7 +3032,7 @@ fn test_dedicated_principal_full_lifecycle() {
     let alice = make_client();
     let bob = make_client();
     let alice_kp = make_combiner_kp(&alice);
-    let bob_inv = assert_ok!(TwoMlsPqInvitation::new(assert_ok!(
+    let bob_inv = assert_ok!(TwoMlsPqInvitation::restore(assert_ok!(
         bob.generate_invitation(true)
     )));
     let bob_kp = bob_inv.combiner_key_package();
@@ -3141,7 +3141,7 @@ fn test_initial_envelope_resend_same_plaintext() {
     use crate::key_packages::TwoMlsPqInvitation;
     let alice = make_client();
     let bob = make_client();
-    let bob_inv = assert_ok!(TwoMlsPqInvitation::new(assert_ok!(
+    let bob_inv = assert_ok!(TwoMlsPqInvitation::restore(assert_ok!(
         bob.generate_invitation(true)
     )));
     let bob_kp = bob_inv.combiner_key_package();
@@ -3183,7 +3183,7 @@ fn test_spent_invitation_cannot_open_initial() {
     let carol = make_client();
     let bob = make_client();
     let alice_kp = make_combiner_kp(&alice);
-    let bob_inv = assert_ok!(TwoMlsPqInvitation::new(assert_ok!(
+    let bob_inv = assert_ok!(TwoMlsPqInvitation::restore(assert_ok!(
         bob.generate_invitation(false)
     )));
     let bob_kp = bob_inv.combiner_key_package();

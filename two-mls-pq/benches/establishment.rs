@@ -28,7 +28,7 @@ fn bench_establishment(c: &mut Criterion) {
                 let bob = client();
                 let alice_kp = combiner_kp(&alice);
                 let bob_inv =
-                    TwoMlsPqInvitation::new(bob.generate_invitation(true).unwrap()).unwrap();
+                    TwoMlsPqInvitation::restore(bob.generate_invitation(true).unwrap()).unwrap();
                 let bob_kp = bob_inv.combiner_key_package();
                 (alice, bob_inv, bob_kp, alice_kp)
             },

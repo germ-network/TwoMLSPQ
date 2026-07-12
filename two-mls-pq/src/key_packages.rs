@@ -494,10 +494,12 @@ pub struct TwoMlsPqInvitation {
 
 #[uniffi::export]
 impl TwoMlsPqInvitation {
-    /// Restore an invitation from its archive (from `TwoMlsPqPrincipal.generateInvitation` or
-    /// `archive()`).
+    /// Materialise a live invitation from its serialised bytes — the output of
+    /// `TwoMlsPqPrincipal.generateInvitation` on first use, or a pushed checkpoint blob on
+    /// restore. Named `restore`, not `new`: the state lives in the bytes and this mints none of
+    /// it (mirrors the session's `from_persisted`).
     #[uniffi::constructor]
-    pub fn new(archive: Vec<u8>) -> Result<Arc<Self>> {
+    pub fn restore(archive: Vec<u8>) -> Result<Arc<Self>> {
         let (invitation, consumed, spawned, processed, state_seq) = decode_archive(&archive)?;
         Ok(Arc::new(Self {
             inner: Mutex::new(InvitationInner {
@@ -916,7 +918,7 @@ mod tests {
         let alice_kp = make_combiner_kp(&alice);
 
         // Bob publishes an invitation instead of retaining key-package state on the client.
-        let bob_inv = assert_ok!(super::TwoMlsPqInvitation::new(assert_ok!(
+        let bob_inv = assert_ok!(super::TwoMlsPqInvitation::restore(assert_ok!(
             bob.generate_invitation(true)
         )));
         let bob_kp = bob_inv.combiner_key_package();
@@ -944,7 +946,7 @@ mod tests {
         let bob = make_client();
         let alice_kp = make_combiner_kp(&alice);
 
-        let bob_inv = assert_ok!(super::TwoMlsPqInvitation::new(assert_ok!(
+        let bob_inv = assert_ok!(super::TwoMlsPqInvitation::restore(assert_ok!(
             bob.generate_invitation(true)
         )));
         let bob_kp = bob_inv.combiner_key_package();
@@ -977,7 +979,7 @@ mod tests {
         let bob = make_client();
         let alice_kp = make_combiner_kp(&alice);
 
-        let bob_inv = assert_ok!(super::TwoMlsPqInvitation::new(assert_ok!(
+        let bob_inv = assert_ok!(super::TwoMlsPqInvitation::restore(assert_ok!(
             bob.generate_invitation(true)
         )));
         let bob_kp = bob_inv.combiner_key_package();
@@ -1013,9 +1015,9 @@ mod tests {
         );
 
         // The ledger survives the archive round-trip.
-        let restored = assert_ok!(super::TwoMlsPqInvitation::new(
-            assert_ok!(bob_inv.archive())
-        ));
+        let restored = assert_ok!(super::TwoMlsPqInvitation::restore(assert_ok!(
+            bob_inv.archive()
+        )));
         assert_some!(restored.processed_welcome_group_id(welcome_a));
     }
 
@@ -1024,7 +1026,7 @@ mod tests {
         use crate::test_utils::make_client;
 
         let bob = make_client();
-        let bob_inv = assert_ok!(super::TwoMlsPqInvitation::new(assert_ok!(
+        let bob_inv = assert_ok!(super::TwoMlsPqInvitation::restore(assert_ok!(
             bob.generate_invitation(true)
         )));
 
@@ -1048,7 +1050,7 @@ mod tests {
         use crate::test_utils::make_client;
 
         let bob = make_client();
-        let bob_inv = assert_ok!(super::TwoMlsPqInvitation::new(assert_ok!(
+        let bob_inv = assert_ok!(super::TwoMlsPqInvitation::restore(assert_ok!(
             bob.generate_invitation(true)
         )));
 
@@ -1077,7 +1079,7 @@ mod tests {
         let bob = make_client();
         let alice_kp = make_combiner_kp(&alice);
 
-        let bob_inv = assert_ok!(super::TwoMlsPqInvitation::new(assert_ok!(
+        let bob_inv = assert_ok!(super::TwoMlsPqInvitation::restore(assert_ok!(
             bob.generate_invitation(true)
         )));
         let bob_kp = bob_inv.combiner_key_package();
@@ -1095,9 +1097,9 @@ mod tests {
         ));
 
         // Archive + restore; the consumed set must survive so the replay is still rejected.
-        let restored = assert_ok!(super::TwoMlsPqInvitation::new(
-            assert_ok!(bob_inv.archive())
-        ));
+        let restored = assert_ok!(super::TwoMlsPqInvitation::restore(assert_ok!(
+            bob_inv.archive()
+        )));
         assert_err!(
             restored.receive(welcome_a, alice_kp, b"token".to_vec(), None, None),
             crate::TwoMlsPqError::DuplicateWelcome
@@ -1107,7 +1109,7 @@ mod tests {
     #[test]
     fn test_invitation_new_rejects_malformed_archive() {
         assert_err!(
-            super::TwoMlsPqInvitation::new(vec![0xFF, 0xFF, 0xFF]),
+            super::TwoMlsPqInvitation::restore(vec![0xFF, 0xFF, 0xFF]),
             crate::TwoMlsPqError::ArchiveInvalid
         );
     }
@@ -1126,7 +1128,7 @@ mod tests {
         let bob = make_client();
         let alice_kp = make_combiner_kp(&alice);
 
-        let bob_inv = assert_ok!(super::TwoMlsPqInvitation::new(assert_ok!(
+        let bob_inv = assert_ok!(super::TwoMlsPqInvitation::restore(assert_ok!(
             bob.generate_invitation(true)
         )));
         let bob_kp = bob_inv.combiner_key_package();
@@ -1168,7 +1170,7 @@ mod tests {
         let bob = make_client();
         let alice_kp = make_combiner_kp(&alice);
 
-        let bob_inv = assert_ok!(super::TwoMlsPqInvitation::new(assert_ok!(
+        let bob_inv = assert_ok!(super::TwoMlsPqInvitation::restore(assert_ok!(
             bob.generate_invitation(true)
         )));
         let bob_kp = bob_inv.combiner_key_package();
@@ -1181,9 +1183,9 @@ mod tests {
             assert_ok!(bob_inv.receive(welcome_a, alice_kp, token.clone(), None, None));
         let recv = assert_some!(bob_session.receive_group_id());
 
-        let restored = assert_ok!(super::TwoMlsPqInvitation::new(
-            assert_ok!(bob_inv.archive())
-        ));
+        let restored = assert_ok!(super::TwoMlsPqInvitation::restore(assert_ok!(
+            bob_inv.archive()
+        )));
         let gid = assert_some!(restored.forward_group_id(token));
         assert_eq!(gid.bytes, recv.classical.bytes);
         assert!(restored.forward_group_id(b"other".to_vec()).is_none());
@@ -1240,7 +1242,7 @@ mod tests {
         let bob = make_client();
         let alice_kp = make_combiner_kp(&alice);
 
-        let bob_inv = assert_ok!(super::TwoMlsPqInvitation::new(assert_ok!(
+        let bob_inv = assert_ok!(super::TwoMlsPqInvitation::restore(assert_ok!(
             bob.generate_invitation(true)
         )));
         let bob_kp = bob_inv.combiner_key_package();
@@ -1279,7 +1281,7 @@ mod tests {
         let alice_kp = make_combiner_kp(&alice);
         let carol_kp = make_combiner_kp(&carol);
 
-        let bob_inv = assert_ok!(super::TwoMlsPqInvitation::new(assert_ok!(
+        let bob_inv = assert_ok!(super::TwoMlsPqInvitation::restore(assert_ok!(
             bob.generate_invitation(false)
         )));
         let bob_kp = bob_inv.combiner_key_package();
@@ -1315,7 +1317,7 @@ mod tests {
         let alice_kp = make_combiner_kp(&alice);
         let carol_kp = make_combiner_kp(&carol);
 
-        let bob_inv = assert_ok!(super::TwoMlsPqInvitation::new(assert_ok!(
+        let bob_inv = assert_ok!(super::TwoMlsPqInvitation::restore(assert_ok!(
             bob.generate_invitation(false)
         )));
         let bob_kp = bob_inv.combiner_key_package();
@@ -1328,9 +1330,9 @@ mod tests {
         let welcome_a = alice_session.test_initial_welcome();
         assert_ok!(bob_inv.receive(welcome_a, alice_kp, b"token-a".to_vec(), None, None));
 
-        let restored = assert_ok!(super::TwoMlsPqInvitation::new(
-            assert_ok!(bob_inv.archive())
-        ));
+        let restored = assert_ok!(super::TwoMlsPqInvitation::restore(assert_ok!(
+            bob_inv.archive()
+        )));
         let carol_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&carol), bob_kp, None));
         let welcome_c = carol_session.test_initial_welcome();
         assert_err!(
@@ -1356,7 +1358,7 @@ mod tests {
         let bob = make_client();
         let alice_kp = make_combiner_kp(&alice);
 
-        let bob_inv = assert_ok!(super::TwoMlsPqInvitation::new(assert_ok!(
+        let bob_inv = assert_ok!(super::TwoMlsPqInvitation::restore(assert_ok!(
             bob.generate_invitation(false)
         )));
         let bob_kp = bob_inv.combiner_key_package();
@@ -1392,7 +1394,7 @@ mod tests {
         let alice_kp = make_combiner_kp(&alice);
         let carol_kp = make_combiner_kp(&carol);
 
-        let bob_inv = assert_ok!(super::TwoMlsPqInvitation::new(assert_ok!(
+        let bob_inv = assert_ok!(super::TwoMlsPqInvitation::restore(assert_ok!(
             bob.generate_invitation(true)
         )));
         let bob_kp = bob_inv.combiner_key_package();
@@ -1475,7 +1477,7 @@ mod tests {
         };
         archive[STATE_SEQ_LEN + header + 1] ^= 1;
         assert_err!(
-            super::TwoMlsPqInvitation::new(archive),
+            super::TwoMlsPqInvitation::restore(archive),
             crate::TwoMlsPqError::ArchiveInvalid
         );
     }
@@ -1493,7 +1495,7 @@ mod tests {
         let bob = make_client();
         let alice_kp = make_combiner_kp(&alice);
 
-        let bob_inv = assert_ok!(super::TwoMlsPqInvitation::new(assert_ok!(
+        let bob_inv = assert_ok!(super::TwoMlsPqInvitation::restore(assert_ok!(
             bob.generate_invitation(true)
         )));
         let bob_kp = bob_inv.combiner_key_package();
@@ -1540,7 +1542,7 @@ mod tests {
         let bob = make_client();
         let mallory_kp = make_combiner_kp(&mallory);
 
-        let bob_inv = assert_ok!(super::TwoMlsPqInvitation::new(assert_ok!(
+        let bob_inv = assert_ok!(super::TwoMlsPqInvitation::restore(assert_ok!(
             bob.generate_invitation(true)
         )));
         let bob_kp = bob_inv.combiner_key_package();
@@ -1602,7 +1604,7 @@ mod tests {
         let bob = make_client();
         let alice_kp = make_combiner_kp(&alice);
 
-        let bob_inv = assert_ok!(super::TwoMlsPqInvitation::new(assert_ok!(
+        let bob_inv = assert_ok!(super::TwoMlsPqInvitation::restore(assert_ok!(
             bob.generate_invitation(true)
         )));
         let bob_kp = bob_inv.combiner_key_package();
@@ -1643,7 +1645,7 @@ mod tests {
 
         // Restore from the newest pushed blob: the advanced seq and the processed ledger
         // survive, so the replay is still resolved to the spawned session.
-        let restored = assert_ok!(super::TwoMlsPqInvitation::new(sink.latest()));
+        let restored = assert_ok!(super::TwoMlsPqInvitation::restore(sink.latest()));
         assert_eq!(restored.state_seq(), 1);
         assert_some!(restored.processed_welcome_group_id(welcome_a));
     }
