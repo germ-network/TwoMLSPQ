@@ -136,6 +136,9 @@ impl TwoMlsPqPrincipal {
             &BTreeSet::new(),
             &SpawnedGroups::new(),
             &ProcessedWelcomes::new(),
+            // A freshly generated invitation starts at seq 0 (no mutations yet); a sink is
+            // attached later via `install_sink`, which pushes the baseline at this seq.
+            0,
         )
     }
 }
@@ -413,27 +416,70 @@ pub(crate) fn validate_combiner_kp(
 /// at-most-once guard; a *single-use* invitation accepts exactly one welcome, then drops its
 /// key package (a later `receive` fails `InvitationSpent`). A remote whose welcome has
 /// already been consumed is rejected with `DuplicateWelcome`.
+/// All of a `TwoMlsPqInvitation`'s mutable state, behind one lock so `receive` runs its
+/// whole critical section (checks → join → commit) under a single acquisition — no
+/// cross-lock ordering to reason about, and no rollback: every fallible step happens
+/// before the first field is mutated, so an error path leaves this untouched.
+struct InvitationInner {
+    /// The self-contained invitation. A single-use invitation mutates it (the captured
+    /// key package is dropped once consumed); a last-resort one never does.
+    invitation: CombinerInvitation,
+    /// Remote client ids already turned into a session — the transport at-most-once guard.
+    /// A `BTreeSet` for deterministic encoding; persisted so the guard survives a restore.
+    consumed: BTreeSet<Vec<u8>>,
+    /// The forward table: opaque spawn token → the spawned session's receive-group ids. A
+    /// replayed initial frame decodes to a token already here; the caller routes it to the
+    /// owning session instead of treating it as a fresh welcome. Persisted.
+    spawned: SpawnedGroups,
+    /// The processed-welcome ledger: SHA-256 of each accepted welcome's exact bytes → the
+    /// spawned session's receive-group classical id. Welcomes cannot be assumed to arrive
+    /// exactly once; a re-delivered welcome resolves here (content-keyed — no host token
+    /// convention required, unlike `spawned`) instead of erroring or re-spawning. Persisted.
+    processed: ProcessedWelcomes,
+    /// Per-invitation monotonic mutation counter, bumped once per state-advancing call (a
+    /// successful `receive`). Serialized in the archive so it continues across a restore and
+    /// stamps each pushed blob. `u64` so it cannot overflow; the bump is a `checked_add` that
+    /// stops persisting rather than wrapping (the crate denies panic).
+    state_seq: u64,
+    /// The foreign persistence hook this invitation pushes to after every state-advancing
+    /// mutation (see [`crate::ArchiveSink`]). `None` opts out (tests, benches). Not part of
+    /// the archive — it is live plumbing supplied at construction via `install_sink`.
+    sink: Option<Arc<dyn crate::ArchiveSink>>,
+}
+
+impl InvitationInner {
+    /// Encode this invitation's persisted form (everything but the live `sink`).
+    fn encode(&self) -> Result<Vec<u8>> {
+        encode_archive(
+            &self.invitation,
+            &self.consumed,
+            &self.spawned,
+            &self.processed,
+            self.state_seq,
+        )
+    }
+
+    /// Bump `state_seq` and, if a sink is installed, encode a fresh checkpoint UNDER the
+    /// caller's lock — returning `(sink, seq, bytes)` for the caller to `persist` once the
+    /// guard is dropped (encode inside the lock, push outside, mirroring the session).
+    /// `None` when there is no sink or the counter saturated (unreachable in practice); the
+    /// bump still lands so `state_seq` counts mutations whether or not a sink is attached.
+    fn bump_and_encode(&mut self) -> Option<(Arc<dyn crate::ArchiveSink>, u64, Vec<u8>)> {
+        let next = self.state_seq.checked_add(1)?;
+        self.state_seq = next;
+        let sink = self.sink.clone()?;
+        let bytes = self.encode().ok()?;
+        Some((sink, next, bytes))
+    }
+}
+
 #[derive(uniffi::Object)]
 pub struct TwoMlsPqInvitation {
-    // Behind a `Mutex` because a single-use invitation mutates it: the captured key package
-    // is claimed at the start of `receive` and either kept consumed (success) or restored
-    // (failure). A last-resort invitation never mutates the key-package material.
-    invitation: Mutex<CombinerInvitation>,
-    // Remote client ids already turned into a session — the transport at-most-once guard.
-    // Persisted in `archive()` (a `BTreeSet` for deterministic encoding) so the guard
-    // survives a restore.
-    consumed: Mutex<BTreeSet<Vec<u8>>>,
-    // The forward table: opaque spawn token → the spawned session's receive-group ids.
-    // A replayed initial frame decodes to a token already in this table; the caller
-    // routes it to the owning session instead of treating it as a fresh welcome.
-    // Persisted in `archive()` so forwarding survives a restore.
-    spawned: Mutex<SpawnedGroups>,
-    // The processed-welcome ledger: SHA-256 of each accepted welcome's exact bytes → the
-    // spawned session's receive-group classical id. Welcomes cannot be assumed to arrive
-    // exactly once; a re-delivered welcome resolves here (content-keyed — no host token
-    // convention required, unlike `spawned`) instead of erroring or re-spawning.
-    // Persisted in `archive()`.
-    processed: Mutex<ProcessedWelcomes>,
+    // One lock over all mutable state (see `InvitationInner`): a single-use `receive`
+    // mutates the captured key package, the consumed set, the forward table, and the
+    // processed ledger together, so guarding them as one unit keeps the critical section
+    // atomic and rollback-free. Persisted fields survive `archive()`/restore.
+    inner: Mutex<InvitationInner>,
 }
 
 #[uniffi::export]
@@ -442,47 +488,59 @@ impl TwoMlsPqInvitation {
     /// `archive()`).
     #[uniffi::constructor]
     pub fn new(archive: Vec<u8>) -> Result<Arc<Self>> {
-        let (invitation, consumed, spawned, processed) = decode_archive(&archive)?;
+        let (invitation, consumed, spawned, processed, state_seq) = decode_archive(&archive)?;
         Ok(Arc::new(Self {
-            invitation: Mutex::new(invitation),
-            consumed: Mutex::new(consumed),
-            spawned: Mutex::new(spawned),
-            processed: Mutex::new(processed),
+            inner: Mutex::new(InvitationInner {
+                invitation,
+                consumed,
+                spawned,
+                processed,
+                state_seq,
+                // Attached post-construction via `install_sink` (same as the session's
+                // restore path); a fresh invitation starts with no persistence hook.
+                sink: None,
+            }),
         }))
     }
 
+    /// Attach the persistence hook (see [`crate::ArchiveSink`]) this invitation pushes to
+    /// after every state-advancing mutation, and immediately push a baseline `Checkpoint` at
+    /// the current `state_seq` so the sink starts from a complete snapshot. Call once, right
+    /// after construction and before use — mutations made before installing are not pushed (a
+    /// fresh invitation has none; a restored one re-baselines here). Installing does not
+    /// itself advance `state_seq`. The invitation is monolithic (no ML-KEM ratchet trees to
+    /// split off), so it only ever pushes `Checkpoint`.
+    pub fn install_sink(&self, sink: Arc<dyn crate::ArchiveSink>) -> Result<()> {
+        let mut inner = self.lock();
+        inner.sink = Some(Arc::clone(&sink));
+        let seq = inner.state_seq;
+        let bytes = inner.encode()?;
+        drop(inner);
+        sink.persist(seq, crate::BlobKind::Checkpoint, bytes);
+        Ok(())
+    }
+
+    /// The current per-invitation mutation counter (bumped once per successful `receive`),
+    /// which stamps each pushed blob and feeds the app's `depends_on_seq` transmit gate.
+    pub fn state_seq(&self) -> u64 {
+        self.lock().state_seq
+    }
+
     /// Serialise the invitation's signing identity + key-package private material (or, once a
-    /// single-use invitation is spent, the absence of it), plus the consumed-remote set and
-    /// the spawned-group forward table so the transport dedup guard and replay routing survive
-    /// a restore.
+    /// single-use invitation is spent, the absence of it), plus the mutation counter, the
+    /// consumed-remote set, the spawned-group forward table, and the processed-welcome ledger
+    /// so the transport dedup guard and replay routing survive a restore.
     ///
-    /// Each field is cloned out under its own lock and released before encoding, so no two of
-    /// the invitation's locks are ever held at once — this keeps a consistent global lock
-    /// order with `receive` and rules out a lock-order inversion.
+    /// One lock now guards all of it, so this is a single acquisition — the whole state is
+    /// snapshotted consistently with no cross-lock ordering to reason about.
     pub fn archive(&self) -> Result<Vec<u8>> {
-        let invitation = self.lock_invitation().clone();
-        let consumed = self
-            .consumed
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        let spawned = self
-            .spawned
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        let processed = self
-            .processed
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        encode_archive(&invitation, &consumed, &spawned, &processed)
+        self.lock().encode()
     }
 
     /// The principal's ClientId.
     pub fn client_id(&self) -> ClientId {
         ClientId {
-            bytes: self.lock_invitation().client_id.clone(),
+            bytes: self.lock().invitation.client_id.clone(),
         }
     }
 
@@ -490,10 +548,10 @@ impl TwoMlsPqInvitation {
     /// available after a single-use invitation is spent (the published key package is public);
     /// only the private material is dropped on consume.
     pub fn combiner_key_package(&self) -> CombinerKeyPackage {
-        let invitation = self.lock_invitation();
+        let inner = self.lock();
         CombinerKeyPackage {
-            classical: invitation.classical_public.clone(),
-            pq: invitation.pq_public.clone(),
+            classical: inner.invitation.classical_public.clone(),
+            pq: inner.invitation.pq_public.clone(),
         }
     }
 
@@ -530,8 +588,8 @@ impl TwoMlsPqInvitation {
         new_client_id: Option<Vec<u8>>,
         expected_remote: Option<Vec<u8>>,
     ) -> Result<Arc<TwoMlsPqSession>> {
-        // Everything up to the claim below is free of side effects, so a rejection here
-        // consumes nothing.
+        // --- Lock-free validations: pure, side-effect-free, so a rejection here touches
+        // nothing and needs no lock. ---
         //
         // Empty ids are reserved (the rotation-AD discriminator can never announce
         // one) — reject rather than mint an unannounceable principal.
@@ -546,55 +604,37 @@ impl TwoMlsPqInvitation {
             return Err(TwoMlsPqError::RemoteIdentityMismatch);
         }
         let session_client = new_client_id.map(TwoMlsPqPrincipal::new).transpose()?;
-        // Content-keyed idempotency, checked before anything is claimed or reserved: a
-        // welcome these exact bytes already spawned a session from is a re-delivery, not
-        // a fresh invite — the caller resolves it via `processed_welcome_group_id` and
-        // routes to the owning session.
         let welcome_digest = crate::sha256(&welcome);
-        if self
-            .processed
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains_key(&welcome_digest)
-        {
+
+        // --- One critical section: every check, the join, and the commit run under a single
+        // lock acquisition. Crucially, none of the invitation's fields are mutated until the
+        // commit point below, so any early return (a rejected check or a failed establishment)
+        // drops the guard with the state exactly as it was — this is what replaces the old
+        // claim/reserve-then-rollback dance. `accept_with` does not touch this invitation, so
+        // running it under the lock is safe. ---
+        let mut inner = self.lock();
+
+        // Content-keyed idempotency: a welcome these exact bytes already spawned a session from
+        // is a re-delivery, not a fresh invite — the caller resolves it via
+        // `processed_welcome_group_id` and routes to the owning session.
+        if inner.processed.contains_key(&welcome_digest) {
+            return Err(TwoMlsPqError::DuplicateWelcome);
+        }
+        // Single-use gate: a spent single-use invitation has dropped its captured key-package
+        // material, so it rejects every further welcome from any remote.
+        if inner.invitation.classical_kpd.is_none() {
+            return Err(TwoMlsPqError::InvitationSpent);
+        }
+        // Per-remote at-most-once guard (a replay from an already-established remote).
+        if inner.consumed.contains(&their_id.bytes) {
             return Err(TwoMlsPqError::DuplicateWelcome);
         }
 
-        // Claim this invitation's captured key package for the attempt. This is the single-use
-        // gate: under the lock we take a snapshot to build the client from, and for a
-        // single-use invitation we null out the stored material *now* so a concurrent or later
-        // `receive` (from any remote) sees it spent and cannot reuse the key package. A
-        // last-resort invitation leaves the material in place (retained for reuse). A snapshot
-        // whose material is already `None` means a single-use invitation was already consumed.
-        let snapshot = {
-            let mut invitation = self.lock_invitation();
-            if invitation.classical_kpd.is_none() {
-                return Err(TwoMlsPqError::InvitationSpent);
-            }
-            let snapshot = invitation.clone();
-            if !invitation.last_resort {
-                invitation.classical_kpd = None;
-                invitation.pq_kpd = None;
-            }
-            snapshot
-        };
-
-        // Reserve this remote so two concurrent welcomes from it can't both establish;
-        // `insert` returns false if it was already consumed (a replay). For a last-resort
-        // invitation this is the reuse bound; for a single-use one the key-package claim above
-        // is already decisive, but the reservation keeps the forward-table bookkeeping honest.
-        if !self
-            .consumed
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(their_id.bytes.clone())
-        {
-            self.restore_claim(&snapshot);
-            return Err(TwoMlsPqError::DuplicateWelcome);
-        }
-
-        match TwoMlsPqPrincipal::from_combiner_invitation(&snapshot)
-            .and_then(|client| {
+        // Build the stateless client from the still-present captured material and establish the
+        // session. Both fallible steps happen before any mutation, so a failure here returns
+        // without having claimed or reserved anything.
+        let session =
+            TwoMlsPqPrincipal::from_combiner_invitation(&inner.invitation).and_then(|client| {
                 // R1: the spawn token is set inside `accept_with` before the birth checkpoint,
                 // so it rides the persisted birth state (the old post-construction setter
                 // would miss it).
@@ -605,35 +645,35 @@ impl TwoMlsPqInvitation {
                     their_key_package,
                     Some(spawn_token.clone()),
                 )
-            })
-            .and_then(|session| {
-                // Enter the spawn in the forward table and the welcome in the
-                // processed ledger; the acceptor always has a receive group straight
-                // out of `accept`, but any failure in this bookkeeping must release
-                // the reservation like a failed accept.
-                let gid = session.receive_group_id().ok_or(TwoMlsPqError::Mls)?;
-                self.spawned
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(spawn_token.clone(), gid.classical.bytes.clone());
-                self.processed
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(welcome_digest.clone(), gid.classical.bytes);
-                Ok(session)
-            }) {
-            Ok(session) => Ok(session),
-            Err(e) => {
-                // Establishment failed — release the remote reservation and, for a single-use
-                // invitation, put the claimed key package back so a valid retry can proceed.
-                self.consumed
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remove(&their_id.bytes);
-                self.restore_claim(&snapshot);
-                Err(e)
-            }
+            })?;
+        // The acceptor always has a receive group straight out of `accept`; its absence is a
+        // library invariant violation. Resolved before the commit so this too is a clean
+        // early return.
+        let gid = session.receive_group_id().ok_or(TwoMlsPqError::Mls)?;
+
+        // --- Commit point: all fallible work is done. From here nothing can fail out, so the
+        // mutations below are the only writes and they are all-or-nothing. ---
+        inner.consumed.insert(their_id.bytes);
+        inner
+            .spawned
+            .insert(spawn_token, gid.classical.bytes.clone());
+        inner.processed.insert(welcome_digest, gid.classical.bytes);
+        // Single-use consume: drop the captured material so a later `receive` sees it spent. A
+        // last-resort invitation retains it for reuse.
+        if !inner.invitation.last_resort {
+            inner.invitation.classical_kpd = None;
+            inner.invitation.pq_kpd = None;
         }
+
+        // A successful receive advanced state: bump the counter and (if a sink is installed)
+        // encode the checkpoint under the lock, then push it once the guard is dropped. A
+        // failed receive never reaches here, so it pushes nothing.
+        let push = inner.bump_and_encode();
+        drop(inner);
+        if let Some((sink, seq, bytes)) = push {
+            sink.persist(seq, crate::BlobKind::Checkpoint, bytes);
+        }
+        Ok(session)
     }
 
     /// Resolve an initial frame's spawn token against the forward table: `Some` names
@@ -642,9 +682,8 @@ impl TwoMlsPqInvitation {
     /// `TwoMlsPqSession::forwarded`), `None` means the frame is fresh and should
     /// proceed through app validation to `receive`.
     pub fn forward_group_id(&self, spawn_token: Vec<u8>) -> Option<MlsGroupId> {
-        self.spawned
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        self.lock()
+            .spawned
             .get(&spawn_token)
             .map(|classical| MlsGroupId {
                 bytes: classical.clone(),
@@ -658,9 +697,8 @@ impl TwoMlsPqInvitation {
     /// `None` means the welcome is fresh. The content-keyed counterpart of
     /// `forward_group_id`: this one needs no host token convention, only the bytes.
     pub fn processed_welcome_group_id(&self, welcome: Vec<u8>) -> Option<MlsGroupId> {
-        self.processed
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        self.lock()
+            .processed
             .get(&crate::sha256(&welcome))
             .map(|classical| MlsGroupId {
                 bytes: classical.clone(),
@@ -684,7 +722,8 @@ impl TwoMlsPqInvitation {
         use mls_rs::crypto::HpkeCiphertext;
         use mls_rs::CipherSuiteProvider;
 
-        let invitation = self.lock_invitation();
+        let inner = self.lock();
+        let invitation = &inner.invitation;
 
         // Public init key: published in the PQ key package (spec A.1: the envelope is
         // sealed to the PQ EK in KP'). Matching secret: the invitation's captured PQ
@@ -747,22 +786,12 @@ impl TwoMlsPqInvitation {
 }
 
 impl TwoMlsPqInvitation {
-    /// Lock the invitation state, recovering from a poisoned mutex (the guarded data is plain
-    /// records; a panic mid-update can't leave it torn).
-    fn lock_invitation(&self) -> std::sync::MutexGuard<'_, CombinerInvitation> {
-        self.invitation.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    /// Put a single-use invitation's claimed key package back after a failed `receive`, so a
-    /// valid retry can proceed. A no-op for a last-resort invitation (its material was never
-    /// taken) and for the already-spent snapshot (its material is `None`).
-    fn restore_claim(&self, snapshot: &CombinerInvitation) {
-        if snapshot.last_resort {
-            return;
-        }
-        let mut invitation = self.lock_invitation();
-        invitation.classical_kpd = snapshot.classical_kpd.clone();
-        invitation.pq_kpd = snapshot.pq_kpd.clone();
+    /// Lock the invitation's single state cell, recovering from a poisoned mutex (the guarded
+    /// data is plain records; a panic mid-update can't leave it torn). Every method takes this
+    /// one guard — `receive` holds it across its whole critical section, so there is no
+    /// cross-lock ordering and no rollback to reason about.
+    fn lock(&self) -> std::sync::MutexGuard<'_, InvitationInner> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -1421,15 +1450,18 @@ mod tests {
 
         let bob = make_client();
         let mut archive = assert_ok!(bob.generate_invitation(true));
-        // Layout: [varint len][version][classical u16 BE][pq u16 BE]…; the MLS varint's top two
-        // bits give the header width. Flip a byte of the classical suite so the archived pair no
-        // longer equals this build's pinned suite (mimicking an archive from another build/suite).
-        let header = match archive[0] >> 6 {
+        // Layout: [state_seq u64 BE (8 bytes)][varint len][version][classical u16 BE][pq u16 BE]…
+        // `state_seq` is a fixed 8-byte big-endian prefix (0 for a fresh invitation); the framed
+        // invitation byte_vec follows it. The MLS varint's top two bits give the length width.
+        // Flip a byte of the classical suite so the archived pair no longer equals this build's
+        // pinned suite (mimicking an archive from another build/suite).
+        const STATE_SEQ_LEN: usize = 8;
+        let header = match archive[STATE_SEQ_LEN] >> 6 {
             0 => 1,
             1 => 2,
             _ => 4,
         };
-        archive[header + 1] ^= 1;
+        archive[STATE_SEQ_LEN + header + 1] ^= 1;
         assert_err!(
             super::TwoMlsPqInvitation::new(archive),
             crate::TwoMlsPqError::ArchiveInvalid
@@ -1511,5 +1543,96 @@ mod tests {
             bob_inv.receive(welcome_a, mallory_kp, b"token".to_vec(), None, None),
             crate::TwoMlsPqError::RemoteIdentityMismatch
         );
+    }
+
+    /// Push-based persistence: `install_sink` pushes exactly one baseline `Checkpoint` at the
+    /// current seq (no bump); a successful `receive` bumps the seq and pushes another
+    /// `Checkpoint`; a failed (replayed) `receive` pushes nothing and leaves the seq alone;
+    /// and restoring from the newest pushed blob carries the processed ledger and the advanced
+    /// `state_seq` forward.
+    #[test]
+    fn test_invitation_push_persistence_smoke() {
+        use crate::session::TwoMlsPqSession;
+        use crate::test_utils::{make_client, make_combiner_kp};
+        use std::sync::{Arc, Mutex};
+
+        /// Records every pushed blob — the test analogue of a persistence layer.
+        #[derive(Default)]
+        struct RecordingSink {
+            pushes: Mutex<Vec<(u64, crate::BlobKind, Vec<u8>)>>,
+        }
+        impl crate::ArchiveSink for RecordingSink {
+            fn persist(&self, seq: u64, kind: crate::BlobKind, archive: Vec<u8>) {
+                self.pushes
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((seq, kind, archive));
+            }
+        }
+        impl RecordingSink {
+            fn snapshot(&self) -> Vec<(u64, crate::BlobKind, Vec<u8>)> {
+                self.pushes
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone()
+            }
+            /// The newest pushed blob (highest seq) — the newest-per-slot a real sink keeps.
+            fn latest(&self) -> Vec<u8> {
+                self.snapshot()
+                    .into_iter()
+                    .max_by_key(|(seq, _, _)| *seq)
+                    .map(|(_, _, bytes)| bytes)
+                    .unwrap_or_default()
+            }
+        }
+
+        let alice = make_client();
+        let bob = make_client();
+        let alice_kp = make_combiner_kp(&alice);
+
+        let bob_inv = assert_ok!(super::TwoMlsPqInvitation::new(assert_ok!(
+            bob.generate_invitation(true)
+        )));
+        let bob_kp = bob_inv.combiner_key_package();
+
+        // install_sink pushes exactly one baseline checkpoint at seq 0, without bumping.
+        let sink = Arc::new(RecordingSink::default());
+        assert_ok!(bob_inv.install_sink(sink.clone()));
+        assert_eq!(bob_inv.state_seq(), 0);
+        let baseline = sink.snapshot();
+        assert_eq!(baseline.len(), 1);
+        assert_eq!(baseline[0].0, 0);
+        assert_eq!(baseline[0].1, crate::BlobKind::Checkpoint);
+
+        let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
+        let welcome_a = alice_session.test_initial_welcome();
+
+        // A successful receive bumps the seq and pushes a fresh checkpoint.
+        assert_ok!(bob_inv.receive(
+            welcome_a.clone(),
+            alice_kp.clone(),
+            b"token".to_vec(),
+            None,
+            None
+        ));
+        assert_eq!(bob_inv.state_seq(), 1);
+        let after_receive = sink.snapshot();
+        assert_eq!(after_receive.len(), 2);
+        assert_eq!(after_receive[1].0, 1);
+        assert_eq!(after_receive[1].1, crate::BlobKind::Checkpoint);
+
+        // A failed (replayed) receive pushes nothing and does not advance the seq.
+        assert_err!(
+            bob_inv.receive(welcome_a.clone(), alice_kp, b"token".to_vec(), None, None),
+            crate::TwoMlsPqError::DuplicateWelcome
+        );
+        assert_eq!(bob_inv.state_seq(), 1);
+        assert_eq!(sink.snapshot().len(), 2);
+
+        // Restore from the newest pushed blob: the advanced seq and the processed ledger
+        // survive, so the replay is still resolved to the spawned session.
+        let restored = assert_ok!(super::TwoMlsPqInvitation::new(sink.latest()));
+        assert_eq!(restored.state_seq(), 1);
+        assert_some!(restored.processed_welcome_group_id(welcome_a));
     }
 }
