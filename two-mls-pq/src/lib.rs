@@ -145,9 +145,10 @@ pub fn version() -> String {
 // the new `install_sink`. Session restore is the new `from_persisted(core, checkpoint)` (the
 // two-blob model — classical mutations rewrite a `core` blob omitting the ML-KEM trees, PQ ops
 // write a full `checkpoint`); invitation restore stays `new(archive)`. New read-only `state_seq()`
-// on both. EncryptResult gained `depends_on_seq` (persist-before-transmit correlation).
-// SESSION_ARCHIVE_VERSION -> 9, INVITATION_VERSION -> 3. Persisted state is not portable —
-// regenerate sessions and invitations.
+// on both. EncryptResult gained `depends_on_seq` (persist-before-transmit correlation), and
+// TwoMlsPqError gained `SinkAlreadyInstalled` (install_sink is once-only). SESSION_ARCHIVE_VERSION
+// -> 9, INVITATION_VERSION -> 3. Persisted state is not portable — regenerate sessions and
+// invitations.
 const BINDING_CONTRACT_VERSION: u64 = 13;
 
 /// See `BINDING_CONTRACT_VERSION`. Exported so the Swift layer can verify the
@@ -504,6 +505,11 @@ pub enum TwoMlsPqError {
     /// post-commit epochs of both groups.
     #[error("APQInfo missing or inconsistent")]
     ApqInfoMismatch,
+    /// `install_sink` was called on an object that already has a persistence sink. Install
+    /// once, right after construction or restore — a second call would silently orphan the
+    /// first sink (its store would go stale with no further pushes), so it fails fast instead.
+    #[error("a persistence sink is already installed")]
+    SinkAlreadyInstalled,
 }
 
 /// SHA-256 over `bytes` — the single hashing primitive behind every digest this

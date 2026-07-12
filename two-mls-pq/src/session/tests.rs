@@ -1577,6 +1577,23 @@ fn test_push_persistence_smoke() {
     message_round(&restored, &bob, b"restore->bob");
 }
 
+/// `install_sink` is once-only: a second call is rejected rather than silently orphaning the
+/// first sink (whose store would then go stale with no error).
+#[test]
+fn test_install_sink_rejects_second_call() {
+    let (alice, _bob) = establish_full();
+    let first = Arc::new(RecordingSink::default());
+    assert_ok!(alice.install_sink(first.clone()));
+    let second = Arc::new(RecordingSink::default());
+    assert_err!(
+        alice.install_sink(second.clone()),
+        TwoMlsPqError::SinkAlreadyInstalled
+    );
+    // The rejected sink received nothing; the first stays the live one.
+    assert_eq!(second.kinds().len(), 0);
+    assert_eq!(first.kinds(), vec![crate::BlobKind::Checkpoint]);
+}
+
 /// Fail-closed restore: a `core` whose PQ-epoch manifest does not match the reconciling
 /// `checkpoint` (a PQ op advanced without emitting a checkpoint — impossible normally, but
 /// the manifest guards a lost/torn checkpoint) is rejected rather than restored spliced.

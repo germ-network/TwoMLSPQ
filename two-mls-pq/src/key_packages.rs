@@ -512,6 +512,11 @@ impl TwoMlsPqInvitation {
     /// split off), so it only ever pushes `Checkpoint`.
     pub fn install_sink(&self, sink: Arc<dyn crate::ArchiveSink>) -> Result<()> {
         let mut inner = self.lock();
+        // Install exactly once (see `TwoMlsPqSession::install_sink`): a second call would
+        // silently orphan the first sink, so reject it.
+        if inner.sink.is_some() {
+            return Err(TwoMlsPqError::SinkAlreadyInstalled);
+        }
         inner.sink = Some(Arc::clone(&sink));
         let seq = inner.state_seq;
         let bytes = inner.encode()?;

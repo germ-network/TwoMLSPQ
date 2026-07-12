@@ -846,9 +846,15 @@ impl TwoMlsPqSession {
     /// current `state_seq` so the sink starts from a complete snapshot. Call once, right after
     /// construction or restore and before using the session — mutations made before installing
     /// are not pushed (a fresh session has none; a restored one re-baselines here). Installing
-    /// does not itself advance `state_seq`.
+    /// does not itself advance `state_seq`. Once-only: a second call returns
+    /// `SinkAlreadyInstalled` rather than silently orphaning the first sink.
     pub fn install_sink(&self, sink: Arc<dyn crate::ArchiveSink>) -> Result<()> {
         let mut inner = self.lock();
+        // Install exactly once. A second call would silently orphan the first sink (all future
+        // pushes go to the new one), so reject it rather than fail quietly at restore time.
+        if inner.sink.is_some() {
+            return Err(TwoMlsPqError::SinkAlreadyInstalled);
+        }
         inner.sink = Some(Arc::clone(&sink));
         let seq = inner.state_seq;
         let bytes = archive::encode_checkpoint(&mut inner)?;
