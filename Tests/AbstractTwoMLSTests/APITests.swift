@@ -12,7 +12,7 @@ struct ClientWrapper<C: AbstractTwoMLS.Client> {
 
 	init() throws {
 		client = try C(clientId: agentKey.publicKey.wireFormat)
-		currentInvitation = try .init(archive: try client.makeInvitation())
+		currentInvitation = try .init(persisted: try client.makeInvitation())
 	}
 
 	var clientId: Data {
@@ -325,9 +325,14 @@ struct ForwardRoutingDemo {
 			try localSession.forwarded(headerDecrypted: mlsMessageData)
 		}
 
-		//forwarding survives invitation archive/restore
+		//forwarding survives invitation restore — the post-receive state (spawn
+		//table included) leaves only via the sink; restore from its newest
+		//checkpoint. (The sink arrives after receive: the install-time baseline
+		//captures the already-mutated state.)
+		let invitationSink = RecordingSink()
+		try remote.currentInvitation.installSink(invitationSink)
 		let restored = try AbstractTwoMLS.PQInvitation(
-			archive: try remote.currentInvitation.archive
+			persisted: invitationSink.invitationPersisted()
 		)
 		guard
 			case .forward = try restored.decodeHeader(
@@ -352,9 +357,8 @@ struct ForwardRoutingDemo {
 	}
 }
 
-//Session archive/restore round-trips. TwoMLSPQ 0.0.10 made `fromArchive(archive:)`
-//total and self-contained (no owning client), so an archived session restores into a
-//working session that keeps talking to the peer.
+//Session persist/restore round-trips (contract 13, push): the sink's newest
+//Core/Checkpoint pair rebuilds a working session that keeps talking to the peer.
 struct SessionArchiveDemo {
 	let local: ClientWrapper<AbstractTwoMLS.PQClient>
 	let remote: ClientWrapper<AbstractTwoMLS.PQClient>
@@ -377,18 +381,19 @@ struct SessionArchiveDemo {
 		try remoteSession.send(to: localSession)
 		try localSession.exchange(with: remoteSession)
 
-		// Archive the acceptor and restore it into a fresh session object.
+		// Restore the acceptor from its sink's newest slots into a fresh object.
 		let snapshot = remoteSession.epochs
-		let archived = try remoteSession.archive
-		let restored = try AbstractTwoMLS.PQSession(archive: archived)
+		let restored = try roundTripPush(remoteSession)
 
-		// The restored session picks up exactly where the archived one left off...
+		// The restored session picks up exactly where the pushed state left off...
 		#expect(restored.epochs.pqEpoch == snapshot.pqEpoch)
 		#expect(restored.epochs.classicalEpoch == snapshot.classicalEpoch)
 		#expect(restored.isFullyEstablished == remoteSession.isFullyEstablished)
 
-		// ...and keeps talking to the peer. Latest-only discipline: drive `restored`,
-		// not the now-archived `remoteSession`.
+		// ...and keeps talking to the peer. Single-writer discipline: drive
+		// `restored`, not the superseded `remoteSession` (its ratchet position
+		// is now behind the pushed state — exactly the H1 hazard the push
+		// model exists to prevent).
 		try localSession.send(to: restored)
 		try restored.send(to: localSession)
 	}
@@ -399,7 +404,7 @@ struct SessionArchiveDemo {
 struct CipherSuiteParsingTests {
 	@Test func combinerKeyPackageReportsItsPqSuite() throws {
 		let invitation = try AbstractTwoMLS.PQInvitation(
-			archive: try AbstractTwoMLS.PQClient(clientId: .mock()).makeInvitation()
+			persisted: try AbstractTwoMLS.PQClient(clientId: .mock()).makeInvitation()
 		)
 		let suite = try #require(
 			AbstractTwoMLS.PQClient.parseKeyPackageSuite(

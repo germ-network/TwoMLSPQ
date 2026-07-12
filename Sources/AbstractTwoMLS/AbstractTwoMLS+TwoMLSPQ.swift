@@ -12,18 +12,20 @@
 //  are thin adapter types in the `AbstractTwoMLS` namespace rather than
 //  extensions on the generated classes. The generated module stays pristine.
 //
-//  Status (TwoMLSPQ 0.0.10 binding):
+//  Status (TwoMLSPQ v0.1.0 binding, contract 13):
 //   - `PQSession`, the six result adapters, `PQClient`, and `PQInvitation` are wired:
 //     routing (`shouldListenOn`/`sendRendezvous`), the true APQ epoch pair on encrypt
-//     results, A.5 rekey (`begin(.rekey)`); agent rotation — `receive(newClientId:)`
-//     stages the dedicated agent, `prepareToEncrypt(proposing:)` commits the Phase 8
-//     handoff, `begin(.rekey/.finishBootstrap, rotating:)` moves the PQ leaves (the
+//     results, A.5 rekey (`begin(.rekey)`); principal rotation — `receive(newClientId:)`
+//     stages the dedicated principal, the contract-v9 candidate lifecycle canonicalizes
+//     it, `begin(.rekey/.finishBootstrap, rotating:)` moves the PQ leaves (the
 //     peer reads `PQInbound.rotatedCredential`); forward routing — a replayed initial
 //     frame decodes as `.forward` via the invitation's spawn-token table
 //     (the `WelcomeToken` opaque token), acknowledged by the
 //     spawned session via `forwarded(headerDecrypted:)`.
-//   - Session archive/restore is total: `PQSession.archive` / `init(archive:)` ride
-//     0.0.10's self-contained `fromArchive(archive:)` (no owning client).
+//   - Persistence is PUSH (contract 13): `installSink` attaches a `PersistenceSink`
+//     (baseline checkpoint on install), sessions restore via
+//     `init(persisted: Persisted{core?, checkpoint})` → `fromPersisted`, invitations
+//     restore from their monolithic bytes; the pull `archive` getter no longer exists.
 //
 
 import CommProtocol
@@ -81,7 +83,13 @@ public enum TwoMLSPQConformanceError: Error {
 //     recipe, event-driven cross-party injection; combiner key package framing v2 and
 //     session archive v8 (old key packages and archives are rejected — regenerate);
 //     TwoMlsPqError gained ApqInfoMismatch. No call-shape changes.
-private let expectedBindingContract: UInt64 = 12
+// v13: push persistence (security review H1) — pull archive()/fromArchive removed from
+//     the FFI; ArchiveSink foreign trait (persist(seq, kind: BlobKind{core, checkpoint},
+//     archive)) + installSink (once-only, baseline checkpoint; SinkAlreadyInstalled on a
+//     second call) + static fromPersisted(core:checkpoint:) + stateSeq(); EncryptResult
+//     gained dependsOnSeq (durability gate for key-material frames). SESSION_ARCHIVE 9 /
+//     INVITATION 3 — persisted state not portable, regenerate.
+private let expectedBindingContract: UInt64 = 13
 
 enum TwoMLSPQBindingContract {
 	static let verified: Void = {
@@ -106,6 +114,37 @@ enum TwoMLSPQBindingContract {
 /// Rust crate carries no app-layer digest-type values.
 private func liftDigest(_ raw: Data) throws -> TypedDigest {
 	try TypedDigest(prefix: .sha256, checkedData: raw)
+}
+
+// MARK: - Persistence adapter
+
+/// Bridges the abstract `PersistenceSink` onto the generated `ArchiveSink`
+/// foreign trait (the binding's first — Rust holds the adapter via uniffi's
+/// handle map for as long as the object holds the sink, so no wrapper-side
+/// retention is needed). `final` + `let` ⇒ Sendable, matching the generated
+/// protocol's `AnyObject, Sendable` bounds; the enqueue-only / non-blocking /
+/// no-re-entry contract is the wrapped sink's to honor (documented on
+/// `PersistenceSink`).
+private final class PQSinkAdapter: TwoMLSPQ.ArchiveSink {
+	private let wrapped: any AbstractTwoMLS.PersistenceSink
+
+	init(_ wrapped: any AbstractTwoMLS.PersistenceSink) {
+		self.wrapped = wrapped
+	}
+
+	func persist(seq: UInt64, kind: TwoMLSPQ.BlobKind, archive: Data) {
+		wrapped.persist(
+			seq: seq, slot: AbstractTwoMLS.PersistedSlot(kind), bytes: archive)
+	}
+}
+
+extension AbstractTwoMLS.PersistedSlot {
+	fileprivate init(_ kind: TwoMLSPQ.BlobKind) {
+		switch kind {
+		case .core: self = .core
+		case .checkpoint: self = .checkpoint
+		}
+	}
 }
 
 extension AbstractTwoMLS.PrincipalState {
@@ -136,6 +175,7 @@ extension AbstractTwoMLS {
 		public let sender: AbstractTwoMLS.ClientID
 		public let recipient: AbstractTwoMLS.ClientID
 		public let epochs: APQEpochs
+		public let dependsOnSeq: UInt64
 
 		init(_ base: TwoMLSPQ.EncryptResult) {
 			cipherText = base.cipherText
@@ -145,6 +185,7 @@ extension AbstractTwoMLS {
 				pqEpoch: base.epochs.pqEpoch,
 				classicalEpoch: base.epochs.classicalEpoch
 			)
+			dependsOnSeq = base.dependsOnSeq
 		}
 	}
 
@@ -217,33 +258,50 @@ extension AbstractTwoMLS {
 
 	/// Adapter wrapping a `TwoMLSPQ.TwoMlsPqSession`.
 	public struct PQSession: AbstractTwoMLS.PQRatchetingSession {
-		public typealias Archive = Data
-
 		let base: TwoMLSPQ.TwoMlsPqSession
 
 		init(_ base: TwoMLSPQ.TwoMlsPqSession) {
-			// Warm-start archive restore is the likeliest FIRST FFI touch after an
-			// app update, so the binding/binary pairing guard must run here too —
+			// Warm-start restore is the likeliest FIRST FFI touch after an app
+			// update, so the binding/binary pairing guard must run here too —
 			// not only at client/invitation construction — or a mismatch traps at
 			// the first Record buffer read instead of the precondition message.
-			// (`init(archive:)` delegates here, so this covers both inits.)
+			// (`init(persisted:)` delegates here, so this covers restore.)
 			_ = TwoMLSPQBindingContract.verified
 			self.base = base
 		}
 
-		// MARK: Archivable
+		// MARK: Archivable (push)
 
-		public var archive: Data {
-			get throws { try base.archive().bytes }
+		/// The two persistence slots a session's sink receives. `checkpoint`
+		/// is non-optional — the crate rejects a checkpoint-less restore as
+		/// `ArchiveInvalid`; this struct moves that rule to compile time.
+		public struct Persisted: Codable, Sendable {
+			public var core: Data?
+			public var checkpoint: Data
+
+			public init(core: Data?, checkpoint: Data) {
+				self.core = core
+				self.checkpoint = checkpoint
+			}
 		}
 
-		public init(archive: Data) throws {
-			// `fromArchive(archive:)` (TwoMLSPQ 0.0.10) restores from the blob alone —
-			// no owning client. Seal-before-persisting + latest-only discipline is the
-			// caller's, as with invitation archives.
+		public init(persisted: Persisted) throws {
+			// PQ trees come from the checkpoint; identity/classical/meta from
+			// whichever slot has the higher stateSeq; fails closed on a
+			// PQ-epoch manifest mismatch. The restored session has NO sink —
+			// installSink immediately, before use.
 			self.init(
-				try TwoMlsPqSession.fromArchive(
-					archive: TwoMLSPQ.Archive(bytes: archive)))
+				try TwoMlsPqSession.restore(
+					core: persisted.core.map { TwoMLSPQ.Archive(bytes: $0) },
+					checkpoint: TwoMLSPQ.Archive(bytes: persisted.checkpoint)))
+		}
+
+		public func installSink(_ sink: any AbstractTwoMLS.PersistenceSink) throws {
+			try base.installSink(sink: PQSinkAdapter(sink))
+		}
+
+		public var stateSeq: UInt64 {
+			base.stateSeq()
 		}
 
 		// MARK: State
@@ -459,10 +517,11 @@ extension AbstractTwoMLS {
 
 extension AbstractTwoMLS {
 
-	/// Opaque Codable archive for a PQ invitation: the `TwoMlsPqInvitation` archive bytes —
-	/// signing identity, both combiner key packages' private material (opaque to the
-	/// abstraction), and the consumed set. The archive alone restores a fully receivable
-	/// invitation.
+	/// Opaque Codable restore payload for a PQ invitation: `TwoMlsPqInvitation`
+	/// bytes — either the mint artifact (`makeInvitation`/`generateInvitation`)
+	/// or a checkpoint blob the invitation's sink pushed. Contains the signing
+	/// identity and key-package private material; the bytes alone restore a
+	/// fully receivable invitation (the invitation is monolithic — one slot).
 	public struct PQInvitationArchive: Codable, Sendable {
 		public var bytes: Data
 
@@ -474,7 +533,7 @@ extension AbstractTwoMLS {
 	public struct PQInvitation: AbstractTwoMLS.Invitation {
 		public typealias Client = PQClient
 		public typealias Session = PQSession
-		public typealias Archive = PQInvitationArchive
+		public typealias Persisted = PQInvitationArchive
 
 		let base: TwoMLSPQ.TwoMlsPqInvitation
 
@@ -483,14 +542,21 @@ extension AbstractTwoMLS {
 			self.base = base
 		}
 
-		// MARK: Archivable
+		// MARK: Archivable (push)
 
-		public var archive: PQInvitationArchive {
-			get throws { PQInvitationArchive(bytes: try base.archive()) }
+		public init(persisted: PQInvitationArchive) throws {
+			self.init(base: try TwoMlsPqInvitation.restore(archive: persisted.bytes))
 		}
 
-		public init(archive: PQInvitationArchive) throws {
-			self.init(base: try TwoMlsPqInvitation(archive: archive.bytes))
+		/// Monolithic object: the sink receives only `.checkpoint` blobs (one
+		/// per successful `receive`, plus the install-time baseline).
+		public func installSink(_ sink: any AbstractTwoMLS.PersistenceSink) throws {
+			try base.installSink(sink: PQSinkAdapter(sink))
+		}
+
+		/// Bumps once per successful `receive`.
+		public var stateSeq: UInt64 {
+			base.stateSeq()
 		}
 
 		// MARK: Invitation
@@ -500,7 +566,7 @@ extension AbstractTwoMLS {
 			// key package into a self-contained archive. Last-resort (reusable), so a
 			// single-use invitation's `InvitationSpent` never surfaces here.
 			let archive = try TwoMlsPqPrincipal(clientId: clientId).generateInvitation(lastResort: true)
-			self.init(base: try TwoMlsPqInvitation(archive: archive))
+			self.init(base: try TwoMlsPqInvitation.restore(archive: archive))
 		}
 
 		public var clientId: AbstractTwoMLS.ClientID {
@@ -657,9 +723,9 @@ extension AbstractTwoMLS {
 			self.init(base: try TwoMlsPqPrincipal(clientId: clientId))
 		}
 
-		public func makeInvitation() throws -> PQInvitation.Archive {
-			// The client captures a combiner key package into a self-contained invitation
-			// archive; it keeps no key-package private material. Last-resort
+		public func makeInvitation() throws -> PQInvitation.Persisted {
+			// The client captures a combiner key package into self-contained mint
+			// bytes; it keeps no key-package private material. Last-resort
 			// (reusable) — a single-use invitation's `InvitationSpent` is unreachable here.
 			PQInvitationArchive(bytes: try base.generateInvitation(lastResort: true))
 		}

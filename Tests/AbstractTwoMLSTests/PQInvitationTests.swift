@@ -19,7 +19,7 @@ struct PQInvitationReceiveTests {
 	@Test func receiveEstablishesSession() throws {
 		// Acceptor: abstract client publishes an invitation, restored from its archive.
 		let invitation = try AbstractTwoMLS.PQInvitation(
-			archive: try AbstractTwoMLS.PQClient(clientId: .mock()).makeInvitation()
+			persisted: try AbstractTwoMLS.PQClient(clientId: .mock()).makeInvitation()
 		)
 
 		// Initiator (raw FFI): decode the acceptor's opaque published key package
@@ -70,7 +70,7 @@ struct PQInvitationReceiveTests {
 
 	@Test func receiveRejectsDuplicateRemote() throws {
 		let invitation = try AbstractTwoMLS.PQInvitation(
-			archive: try AbstractTwoMLS.PQClient(clientId: .mock()).makeInvitation()
+			persisted: try AbstractTwoMLS.PQClient(clientId: .mock()).makeInvitation()
 		)
 
 		let initiator = try TwoMlsPqPrincipal(clientId: AbstractTwoMLS.ClientID.mock())
@@ -110,7 +110,7 @@ struct PQInvitationReceiveTests {
 
 	@Test func receiveRejectsMismatchedIdentity() throws {
 		let invitation = try AbstractTwoMLS.PQInvitation(
-			archive: try AbstractTwoMLS.PQClient(clientId: .mock()).makeInvitation()
+			persisted: try AbstractTwoMLS.PQClient(clientId: .mock()).makeInvitation()
 		)
 
 		let initiator = try TwoMlsPqPrincipal(clientId: AbstractTwoMLS.ClientID.mock())
@@ -147,7 +147,7 @@ struct PQInvitationReceiveTests {
 	/// session and burned the welcome — retry got `DuplicateWelcome`.)
 	@Test func receiveRejectsEmptyDedicatedPrincipalBeforeConsuming() throws {
 		let invitation = try AbstractTwoMLS.PQInvitation(
-			archive: try AbstractTwoMLS.PQClient(clientId: .mock()).makeInvitation()
+			persisted: try AbstractTwoMLS.PQClient(clientId: .mock()).makeInvitation()
 		)
 
 		let initiator = try TwoMlsPqPrincipal(clientId: AbstractTwoMLS.ClientID.mock())

@@ -79,8 +79,8 @@ let package = Package(
 			// NOTE: tags are v-prefixed from v0.0.13 on (changesets); each release also
 			// publishes this checksum as the TwoMLSPQ.xcframework.zip.checksum asset.
 			url:
-				"https://github.com/germ-network/TwoMLSPQ/releases/download/v0.0.13/TwoMLSPQ.xcframework.zip",
-			checksum: "da9be144531843ec9f20f4d3c5a56aa79c0d72ac05815f4284913034034397bf"
+				"https://github.com/germ-network/TwoMLSPQ/releases/download/v0.1.0/TwoMLSPQ.xcframework.zip",
+			checksum: "7121d750b56cf3a8a0297e86ece2dc22b31efcdf827a962bbadb1653a30c11cd"
 		),
 		.testTarget(
 			name: "AbstractTwoMLSTests",

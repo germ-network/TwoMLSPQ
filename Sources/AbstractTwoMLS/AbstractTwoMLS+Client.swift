@@ -25,7 +25,10 @@ public enum AbstractTwoMLS {
 
 		init(clientId: ClientID) throws
 
-		func makeInvitation() throws -> Invitation.Archive
+		/// Mint artifact: bytes that restore a fresh invitation via
+		/// `Invitation.init(persisted:)`. Minting is the one pull that survives
+		/// the push-persistence model — the object doesn't exist yet.
+		func makeInvitation() throws -> Invitation.Persisted
 
 		//nil when `encoded` is not a parseable (combiner or bare MLS) key package
 		static func parseKeyPackageSuite(encoded: Data) -> RawSuites?
@@ -33,8 +36,11 @@ public enum AbstractTwoMLS {
 		static var supportedSuites: [RawSuites] { get }
 
 		//two-step reply: step one sets up a send group from a remote keyPackage.
-		//Returns the live session (Archivable once session persistence lands) plus
-		//the welcome and this side's published key package for the return group.
+		//Returns the live session plus the welcome and this side's published key
+		//package for the return group. The welcome publishes key material:
+		//installSink on the session, then gate its transmission on the session's
+		//stateSeq being durably persisted (the install-time baseline carries the
+		//pre-install state).
 		func reply(keyPackageMessage: Data) throws -> (
 			sendGroup: Invitation.Session,
 			welcomeMessage: Data,
@@ -73,8 +79,9 @@ public enum AbstractTwoMLS {
 		//package and authenticated client id extracted from it; the conformance
 		//binds the two — the key package's credential must match the authenticated
 		//identity. `remoteKeyPackage` is opaque to the abstraction (the PQ combiner
-		//encodes both halves). Returns the live session, Archivable via
-		//`session.archive` once session persistence lands in the backend.
+		//encodes both halves). Returns the live session with NO sink installed —
+		//installSink immediately (the baseline snapshot captures everything
+		//receive did, including the staged dedicated principal) before driving it.
 		func receive(
 			sendGroupWelcome: Data,
 			remoteKeyPackage: Data,

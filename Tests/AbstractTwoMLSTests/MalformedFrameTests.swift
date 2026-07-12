@@ -13,7 +13,7 @@ import Testing
 struct MalformedFrameTests {
 	@Test func decodeHeaderRejectsMalformedFrames() throws {
 		let invitation = try AbstractTwoMLS.PQInvitation(
-			archive: try AbstractTwoMLS.PQClient(clientId: .mock()).makeInvitation()
+			persisted: try AbstractTwoMLS.PQClient(clientId: .mock()).makeInvitation()
 		)
 		let bad: [Data] = [
 			Data(),  // empty — no version byte

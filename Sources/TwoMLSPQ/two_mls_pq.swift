@@ -414,7 +414,13 @@ fileprivate final class UniffiHandleMap<T>: @unchecked Sendable {
 
 
 // Public interface members begin here.
-
+// Magic number for the Rust proxy to call using the same mechanism as every other method,
+// to free the callback once it's dropped by Rust.
+private let IDX_CALLBACK_FREE: Int32 = 0
+// Callback return codes
+private let UNIFFI_CALLBACK_SUCCESS: Int32 = 0
+private let UNIFFI_CALLBACK_ERROR: Int32 = 1
+private let UNIFFI_CALLBACK_UNEXPECTED_ERROR: Int32 = 2
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
@@ -551,6 +557,263 @@ fileprivate struct FfiConverterData: FfiConverterRustBuffer {
         writeBytes(&buf, value)
     }
 }
+
+
+
+
+/**
+ * Foreign-implemented persistence hook: the object PUSHES its new state after every
+ * state-advancing mutation, inverting the old pull-`archive()` model (which was a move, not a
+ * copy — misusing it re-armed AEAD nonce reuse). Pass one per object at construction (or
+ * `None` to opt out, e.g. in tests).
+ *
+ * Contract on the implementer:
+ * - `persist` is called OUTSIDE the object lock, on the calling Rust thread. It MUST be
+ * enqueue-only and non-blocking, and MUST NOT synchronously re-enter this library.
+ * - Exactly one blob per call. Atomically upsert the slot named by `kind` (write-temp-rename,
+ * or a DB row) — a single-object write, never a multi-object one.
+ * - Persists can arrive out of order; keep the newest `seq` per `kind`.
+ * - `archive` is PLAINTEXT SECRET MATERIAL (signing keys, epoch secrets, KEM material) — seal
+ * it before writing (the key belongs in the platform keystore).
+ *
+ * Driving the object: mutate each session/invitation SEQUENTIALLY — one state-advancing FFI
+ * call at a time per object. The seq/blob-kind model assumes this. Concurrent mutation of one
+ * object can interleave pushes; the worst case a lost or out-of-order checkpoint across a crash
+ * then restores fail-closed (`ArchiveInvalid`), never a stale-PQ splice — an availability loss,
+ * not a safety one.
+ *
+ * Transmission stays the app's concern: outbound frames carry `depends_on_seq`, and the app
+ * waits until it has durably persisted that `seq` before transmitting frames that publish
+ * stored-private-key material. "Durably persisted seq N" means CONTIGUOUSLY up to N — persist
+ * blobs in `seq` order so a durable `Core` at seq N implies the earlier `Checkpoint` bearing the
+ * PQ keys is durable too.
+ */
+public protocol ArchiveSink: AnyObject, Sendable {
+    
+    func persist(seq: UInt64, kind: BlobKind, archive: Data) 
+    
+}
+/**
+ * Foreign-implemented persistence hook: the object PUSHES its new state after every
+ * state-advancing mutation, inverting the old pull-`archive()` model (which was a move, not a
+ * copy — misusing it re-armed AEAD nonce reuse). Pass one per object at construction (or
+ * `None` to opt out, e.g. in tests).
+ *
+ * Contract on the implementer:
+ * - `persist` is called OUTSIDE the object lock, on the calling Rust thread. It MUST be
+ * enqueue-only and non-blocking, and MUST NOT synchronously re-enter this library.
+ * - Exactly one blob per call. Atomically upsert the slot named by `kind` (write-temp-rename,
+ * or a DB row) — a single-object write, never a multi-object one.
+ * - Persists can arrive out of order; keep the newest `seq` per `kind`.
+ * - `archive` is PLAINTEXT SECRET MATERIAL (signing keys, epoch secrets, KEM material) — seal
+ * it before writing (the key belongs in the platform keystore).
+ *
+ * Driving the object: mutate each session/invitation SEQUENTIALLY — one state-advancing FFI
+ * call at a time per object. The seq/blob-kind model assumes this. Concurrent mutation of one
+ * object can interleave pushes; the worst case a lost or out-of-order checkpoint across a crash
+ * then restores fail-closed (`ArchiveInvalid`), never a stale-PQ splice — an availability loss,
+ * not a safety one.
+ *
+ * Transmission stays the app's concern: outbound frames carry `depends_on_seq`, and the app
+ * waits until it has durably persisted that `seq` before transmitting frames that publish
+ * stored-private-key material. "Durably persisted seq N" means CONTIGUOUSLY up to N — persist
+ * blobs in `seq` order so a durable `Core` at seq N implies the earlier `Checkpoint` bearing the
+ * PQ keys is durable too.
+ */
+open class ArchiveSinkImpl: ArchiveSink, @unchecked Sendable {
+    fileprivate let handle: UInt64
+
+    /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoHandle {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromHandle handle: UInt64) {
+        self.handle = handle
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noHandle: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing handle the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noHandle: NoHandle) {
+        self.handle = 0
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiCloneHandle() -> UInt64 {
+        return try! rustCall { uniffi_two_mls_pq_fn_clone_archivesink(self.handle, $0) }
+    }
+    // No primary constructor declared for this class.
+
+    deinit {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
+            return
+        }
+
+        try! rustCall { uniffi_two_mls_pq_fn_free_archivesink(handle, $0) }
+    }
+
+    
+
+    
+open func persist(seq: UInt64, kind: BlobKind, archive: Data)  {try! rustCall() {
+    uniffi_two_mls_pq_fn_method_archivesink_persist(
+            self.uniffiCloneHandle(),
+        FfiConverterUInt64.lower(seq),
+        FfiConverterTypeBlobKind_lower(kind),
+        FfiConverterData.lower(archive),$0
+    )
+}
+}
+    
+
+    
+}
+
+
+
+// Put the implementation in a struct so we don't pollute the top-level namespace
+fileprivate struct UniffiCallbackInterfaceArchiveSink {
+
+    // Create the VTable using a series of closures.
+    // Swift automatically converts these into C callback functions.
+    //
+    // Store the vtable directly.
+    static let vtable: UniffiVTableCallbackInterfaceArchiveSink = UniffiVTableCallbackInterfaceArchiveSink(
+        uniffiFree: { (uniffiHandle: UInt64) -> () in
+            do {
+                try FfiConverterTypeArchiveSink.handleMap.remove(handle: uniffiHandle)
+            } catch {
+                print("Uniffi callback interface ArchiveSink: handle missing in uniffiFree")
+            }
+        },
+        uniffiClone: { (uniffiHandle: UInt64) -> UInt64 in
+            do {
+                return try FfiConverterTypeArchiveSink.handleMap.clone(handle: uniffiHandle)
+            } catch {
+                fatalError("Uniffi callback interface ArchiveSink: handle missing in uniffiClone")
+            }
+        },
+        persist: { (
+            uniffiHandle: UInt64,
+            seq: UInt64,
+            kind: RustBuffer,
+            archive: RustBuffer,
+            uniffiOutReturn: UnsafeMutableRawPointer,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> () in
+                guard let uniffiObj = try? FfiConverterTypeArchiveSink.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return uniffiObj.persist(
+                     seq: try FfiConverterUInt64.lift(seq),
+                     kind: try FfiConverterTypeBlobKind_lift(kind),
+                     archive: try FfiConverterData.lift(archive)
+                )
+            }
+
+            
+            let writeReturn = { () }
+            uniffiTraitInterfaceCall(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn
+            )
+        }
+    )
+
+    // Rust stores this pointer for future callback invocations, so it must live
+    // for the process lifetime (not just for the init function call).
+    //
+    // `nonisolated(unsafe)` is needed under Swift 6 strict concurrency.
+    // This is safe because the pointee is initialized once during static init
+    // and never mutated by either side of the FFI.  Its fields are C function pointers.
+    nonisolated(unsafe) static let vtablePtr: UnsafePointer<UniffiVTableCallbackInterfaceArchiveSink> = {
+        let ptr = UnsafeMutablePointer<UniffiVTableCallbackInterfaceArchiveSink>.allocate(capacity: 1)
+        ptr.initialize(to: vtable)
+        return UnsafePointer(ptr)
+    }()
+}
+
+private func uniffiCallbackInitArchiveSink() {
+    uniffi_two_mls_pq_fn_init_callback_vtable_archivesink(UniffiCallbackInterfaceArchiveSink.vtablePtr)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeArchiveSink: FfiConverter {
+    fileprivate static let handleMap = UniffiHandleMap<ArchiveSink>()
+
+    typealias FfiType = UInt64
+    typealias SwiftType = ArchiveSink
+
+    public static func lift(_ handle: UInt64) throws -> ArchiveSink {
+        if ((handle & 1) == 0) {
+            // Rust-generated handle, construct a new class that uses the handle to implement the
+            // interface
+            return ArchiveSinkImpl(unsafeFromHandle: handle)
+        } else {
+            // Swift-generated handle, get the object from the handle map
+            return try handleMap.remove(handle: handle)
+        }
+    }
+
+    public static func lower(_ value: ArchiveSink) -> UInt64 {
+         if let rustImpl = value as? ArchiveSinkImpl {
+             // Rust-implemented object.  Clone the handle and return it
+            return rustImpl.uniffiCloneHandle()
+         } else {
+            // Swift object, generate a new vtable handle and return that.
+            return handleMap.insert(obj: value)
+         }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ArchiveSink {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+    public static func write(_ value: ArchiveSink, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeArchiveSink_lift(_ handle: UInt64) throws -> ArchiveSink {
+    return try FfiConverterTypeArchiveSink.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeArchiveSink_lower(_ value: ArchiveSink) -> UInt64 {
+    return FfiConverterTypeArchiveSink.lower(value)
+}
+
+
 
 
 
@@ -774,32 +1037,7 @@ public func FfiConverterTypeMlsCipherSuite_lower(_ value: MlsCipherSuite) -> UIn
 
 
 
-/**
- * The receiving/holding side of a published combiner key package: a self-contained
- * invitation that owns one key package's private material plus the signing identity, and
- * can turn a remote initiator's welcome into a session with no live `TwoMlsPqPrincipal`. The
- * Rust analogue of the classical `MLSInvitationClientV2`.
- *
- * The private key-package material lives here (not in a `TwoMlsPqPrincipal`); each `receive`
- * rebuilds a stateless client from the archived invitation. A *last-resort* invitation can
- * service multiple welcomes (its key package is retained), bounded only by the per-remote
- * at-most-once guard; a *single-use* invitation accepts exactly one welcome, then drops its
- * key package (a later `receive` fails `InvitationSpent`). A remote whose welcome has
- * already been consumed is rejected with `DuplicateWelcome`.
- */
 public protocol TwoMlsPqInvitationProtocol: AnyObject, Sendable {
-    
-    /**
-     * Serialise the invitation's signing identity + key-package private material (or, once a
-     * single-use invitation is spent, the absence of it), plus the consumed-remote set and
-     * the spawned-group forward table so the transport dedup guard and replay routing survive
-     * a restore.
-     *
-     * Each field is cloned out under its own lock and released before encoding, so no two of
-     * the invitation's locks are ever held at once — this keeps a consistent global lock
-     * order with `receive` and rules out a lock-order inversion.
-     */
-    func archive() throws  -> Data
     
     /**
      * The principal's ClientId.
@@ -832,6 +1070,17 @@ public protocol TwoMlsPqInvitationProtocol: AnyObject, Sendable {
      * captured PQ key-package material, and thus the init key this opens with, is then gone.
      */
     func hpkeOpen(kemOutput: Data, ciphertext: Data, info: Data?, aad: Data?) throws  -> Data
+    
+    /**
+     * Attach the persistence hook (see [`crate::ArchiveSink`]) this invitation pushes to
+     * after every state-advancing mutation, and immediately push a baseline `Checkpoint` at
+     * the current `state_seq` so the sink starts from a complete snapshot. Call once, right
+     * after construction and before use — mutations made before installing are not pushed (a
+     * fresh invitation has none; a restored one re-baselines here). Installing does not
+     * itself advance `state_seq`. The invitation is monolithic (no ML-KEM ratchet trees to
+     * split off), so it only ever pushes `Checkpoint`.
+     */
+    func installSink(sink: ArchiveSink) throws 
     
     /**
      * Open the initiator's first frame (the §A.1 envelope produced by `initiate`),
@@ -890,20 +1139,13 @@ public protocol TwoMlsPqInvitationProtocol: AnyObject, Sendable {
      */
     func receive(welcome: Data, theirKeyPackage: CombinerKeyPackage, spawnToken: Data, newClientId: Data?, expectedRemote: Data?) throws  -> TwoMlsPqSession
     
+    /**
+     * The current per-invitation mutation counter (bumped once per successful `receive`),
+     * which stamps each pushed blob and feeds the app's `depends_on_seq` transmit gate.
+     */
+    func stateSeq()  -> UInt64
+    
 }
-/**
- * The receiving/holding side of a published combiner key package: a self-contained
- * invitation that owns one key package's private material plus the signing identity, and
- * can turn a remote initiator's welcome into a session with no live `TwoMlsPqPrincipal`. The
- * Rust analogue of the classical `MLSInvitationClientV2`.
- *
- * The private key-package material lives here (not in a `TwoMlsPqPrincipal`); each `receive`
- * rebuilds a stateless client from the archived invitation. A *last-resort* invitation can
- * service multiple welcomes (its key package is retained), bounded only by the per-remote
- * at-most-once guard; a *single-use* invitation accepts exactly one welcome, then drops its
- * key package (a later `receive` fails `InvitationSpent`). A remote whose welcome has
- * already been consumed is rejected with `DuplicateWelcome`.
- */
 open class TwoMlsPqInvitation: TwoMlsPqInvitationProtocol, @unchecked Sendable {
     fileprivate let handle: UInt64
 
@@ -943,19 +1185,7 @@ open class TwoMlsPqInvitation: TwoMlsPqInvitationProtocol, @unchecked Sendable {
     public func uniffiCloneHandle() -> UInt64 {
         return try! rustCall { uniffi_two_mls_pq_fn_clone_twomlspqinvitation(self.handle, $0) }
     }
-    /**
-     * Restore an invitation from its archive (from `TwoMlsPqPrincipal.generateInvitation` or
-     * `archive()`).
-     */
-public convenience init(archive: Data)throws  {
-    let handle =
-        try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
-    uniffi_two_mls_pq_fn_constructor_twomlspqinvitation_new(
-        FfiConverterData.lower(archive),$0
-    )
-}
-    self.init(unsafeFromHandle: handle)
-}
+    // No primary constructor declared for this class.
 
     deinit {
         if handle == 0 {
@@ -967,25 +1197,21 @@ public convenience init(archive: Data)throws  {
     }
 
     
-
-    
     /**
-     * Serialise the invitation's signing identity + key-package private material (or, once a
-     * single-use invitation is spent, the absence of it), plus the consumed-remote set and
-     * the spawned-group forward table so the transport dedup guard and replay routing survive
-     * a restore.
-     *
-     * Each field is cloned out under its own lock and released before encoding, so no two of
-     * the invitation's locks are ever held at once — this keeps a consistent global lock
-     * order with `receive` and rules out a lock-order inversion.
+     * Materialise a live invitation from its serialised bytes — the output of
+     * `TwoMlsPqPrincipal.generateInvitation` on first use, or a pushed checkpoint blob on
+     * restore. Named `restore`, not `new`: the state lives in the bytes and this mints none of
+     * it (mirrors the session's `restore`).
      */
-open func archive()throws  -> Data  {
-    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
-    uniffi_two_mls_pq_fn_method_twomlspqinvitation_archive(
-            self.uniffiCloneHandle(),$0
+public static func restore(archive: Data)throws  -> TwoMlsPqInvitation  {
+    return try  FfiConverterTypeTwoMlsPqInvitation_lift(try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
+    uniffi_two_mls_pq_fn_constructor_twomlspqinvitation_restore(
+        FfiConverterData.lower(archive),$0
     )
 })
 }
+    
+
     
     /**
      * The principal's ClientId.
@@ -1046,6 +1272,23 @@ open func hpkeOpen(kemOutput: Data, ciphertext: Data, info: Data?, aad: Data?)th
         FfiConverterOptionData.lower(aad),$0
     )
 })
+}
+    
+    /**
+     * Attach the persistence hook (see [`crate::ArchiveSink`]) this invitation pushes to
+     * after every state-advancing mutation, and immediately push a baseline `Checkpoint` at
+     * the current `state_seq` so the sink starts from a complete snapshot. Call once, right
+     * after construction and before use — mutations made before installing are not pushed (a
+     * fresh invitation has none; a restored one re-baselines here). Installing does not
+     * itself advance `state_seq`. The invitation is monolithic (no ML-KEM ratchet trees to
+     * split off), so it only ever pushes `Checkpoint`.
+     */
+open func installSink(sink: ArchiveSink)throws   {try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
+    uniffi_two_mls_pq_fn_method_twomlspqinvitation_install_sink(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeArchiveSink_lower(sink),$0
+    )
+}
 }
     
     /**
@@ -1126,6 +1369,18 @@ open func receive(welcome: Data, theirKeyPackage: CombinerKeyPackage, spawnToken
         FfiConverterData.lower(spawnToken),
         FfiConverterOptionData.lower(newClientId),
         FfiConverterOptionData.lower(expectedRemote),$0
+    )
+})
+}
+    
+    /**
+     * The current per-invitation mutation counter (bumped once per successful `receive`),
+     * which stamps each pushed blob and feeds the app's `depends_on_seq` transmit gate.
+     */
+open func stateSeq() -> UInt64  {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_two_mls_pq_fn_method_twomlspqinvitation_state_seq(
+            self.uniffiCloneHandle(),$0
     )
 })
 }
@@ -1433,6 +1688,17 @@ public protocol TwoMlsPqSessionProtocol: AnyObject, Sendable {
     
     func hasReceiveGroup()  -> Bool
     
+    /**
+     * Attach the persistence hook (see [`crate::ArchiveSink`]) this session pushes to after
+     * every state-advancing mutation, and immediately push a baseline `Checkpoint` at the
+     * current `state_seq` so the sink starts from a complete snapshot. Call once, right after
+     * construction or restore and before using the session — mutations made before installing
+     * are not pushed (a fresh session has none; a restored one re-baselines here). Installing
+     * does not itself advance `state_seq`. Once-only: a second call returns
+     * `SinkAlreadyInstalled` rather than silently orphaning the first sink.
+     */
+    func installSink(sink: ArchiveSink) throws 
+    
     func isEstablished()  -> Bool
     
     /**
@@ -1450,31 +1716,18 @@ public protocol TwoMlsPqSessionProtocol: AnyObject, Sendable {
     
     func receiveGroupId()  -> CombinerGroupId?
     
-    func theirPrincipalState()  -> PrincipalState
-    
     /**
-     * Serialise the session for persistence; restore with `from_archive`. Archive is
-     * **total** — a session is ALWAYS archivable, in any state, so this never refuses.
-     *
-     * The bytes are **plaintext secret material** (the current signing identity, group
-     * snapshots including signing keys and epoch secrets, the PSK ledger, and any
-     * mid-round KEM material) — seal them before persisting (`apq::archive::seal` is the
-     * provided tool; the key belongs in the platform keystore). An archive is a **move,
-     * not a copy**: any further use of the live session (or of a second restore) rewinds
-     * the sender ratchet, which re-derives AEAD keys/nonces for new plaintexts. The
-     * caller owns single-use/latest-only discipline, as with invitation archives.
-     *
-     * A mid-A.3 PQ round is serialized whole (`Initiating` holds the decapsulation key,
-     * `Responding` the held shared secret). This does not weaken the ratchet in a way
-     * the archive doesn't already: the blob carries the PSK ledger, epoch secrets, and
-     * leaf signing keys, and the seal-before-persisting contract covers the round
-     * material alongside them; the marginal exposure is at most one round of PCS against
-     * an archive thief who already holds the epoch secrets. The alternative is unsound:
-     * a responder that discarded its held secret could never process the initiator's
-     * incoming bind (0x09) — a permanent side-band desync — so serialization is the only
-     * correct choice.
+     * The session's current persistence `state_seq` (the monotonic mutation counter). Lets
+     * the app correlate a frame's `depends_on_seq` against its own durable high-water mark,
+     * and gate transmission of the key-material-bearing frames whose return type does not
+     * carry the seq — the establishment envelope from `pending_outbound` and the PQ side-band
+     * frames from `pq_take_pending_outbound` (both publish stored-private-key material, so the
+     * app should read `state_seq()` right after taking them and wait for it to be durable
+     * before transmitting).
      */
-    func archive() throws  -> Archive
+    func stateSeq()  -> UInt64
+    
+    func theirPrincipalState()  -> PrincipalState
     
     /**
      * Encrypt `app_message` using the PQ send group.
@@ -1554,6 +1807,8 @@ public protocol TwoMlsPqSessionProtocol: AnyObject, Sendable {
      * rejected as `DecryptionFailed`.
      */
     func processIncoming(ciphertext: Data) throws  -> DecryptResult?
+    
+    func processIncomingInner(ciphertext: Data) throws  -> DecryptResult?
     
     /**
      * The SHA-256 of the receive group's classical (message-half) group id — the
@@ -1816,17 +2071,21 @@ public static func initiate(client: TwoMlsPqPrincipal, theirKeyPackage: Combiner
 }
     
     /**
-     * Restore a session from a serialised archive (see `archive` for the single-use
-     * contract). Self-contained: the archive carries the session's signing identity, so
-     * restore rebuilds the exact client internally — no client argument, matching the
-     * classical stack's fully-internalized MLS state. The rebuilt client is byte-exact
-     * (same ClientId and signing keys), giving continuity for any group or leaf created
-     * after the restore; the group snapshots supply their own signing keys as before.
+     * Restore from the two pushed blobs (`ArchiveSink`): the last `core` and the last full
+     * `checkpoint`. Reconciles in one place — the PQ ratchet trees always come from the
+     * `checkpoint`; identity/classical/meta from whichever of the two has the higher
+     * `state_seq` (a `core` written after a checkpoint is always consistent with it, since
+     * the PQ trees never change between checkpoints). A `core` whose PQ-epoch manifest does
+     * not match the checkpoint's PQ halves (a PQ op that failed to checkpoint) is rejected
+     * as `ArchiveInvalid` — fail closed rather than restore a spliced state. Either slot may
+     * be absent (a session that only ever checkpointed has no `core`); at least the
+     * `checkpoint` must be present.
      */
-public static func fromArchive(archive: Archive)throws  -> TwoMlsPqSession  {
+public static func restore(core: Archive?, checkpoint: Archive?)throws  -> TwoMlsPqSession  {
     return try  FfiConverterTypeTwoMlsPqSession_lift(try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
-    uniffi_two_mls_pq_fn_constructor_twomlspqsession_from_archive(
-        FfiConverterTypeArchive_lower(archive),$0
+    uniffi_two_mls_pq_fn_constructor_twomlspqsession_restore(
+        FfiConverterOptionTypeArchive.lower(core),
+        FfiConverterOptionTypeArchive.lower(checkpoint),$0
     )
 })
 }
@@ -1859,6 +2118,23 @@ open func hasReceiveGroup() -> Bool  {
             self.uniffiCloneHandle(),$0
     )
 })
+}
+    
+    /**
+     * Attach the persistence hook (see [`crate::ArchiveSink`]) this session pushes to after
+     * every state-advancing mutation, and immediately push a baseline `Checkpoint` at the
+     * current `state_seq` so the sink starts from a complete snapshot. Call once, right after
+     * construction or restore and before using the session — mutations made before installing
+     * are not pushed (a fresh session has none; a restored one re-baselines here). Installing
+     * does not itself advance `state_seq`. Once-only: a second call returns
+     * `SinkAlreadyInstalled` rather than silently orphaning the first sink.
+     */
+open func installSink(sink: ArchiveSink)throws   {try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
+    uniffi_two_mls_pq_fn_method_twomlspqsession_install_sink(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeArchiveSink_lower(sink),$0
+    )
+}
 }
     
 open func isEstablished() -> Bool  {
@@ -1908,39 +2184,26 @@ open func receiveGroupId() -> CombinerGroupId?  {
 })
 }
     
-open func theirPrincipalState() -> PrincipalState  {
-    return try!  FfiConverterTypePrincipalState_lift(try! rustCall() {
-    uniffi_two_mls_pq_fn_method_twomlspqsession_their_principal_state(
+    /**
+     * The session's current persistence `state_seq` (the monotonic mutation counter). Lets
+     * the app correlate a frame's `depends_on_seq` against its own durable high-water mark,
+     * and gate transmission of the key-material-bearing frames whose return type does not
+     * carry the seq — the establishment envelope from `pending_outbound` and the PQ side-band
+     * frames from `pq_take_pending_outbound` (both publish stored-private-key material, so the
+     * app should read `state_seq()` right after taking them and wait for it to be durable
+     * before transmitting).
+     */
+open func stateSeq() -> UInt64  {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_two_mls_pq_fn_method_twomlspqsession_state_seq(
             self.uniffiCloneHandle(),$0
     )
 })
 }
     
-    /**
-     * Serialise the session for persistence; restore with `from_archive`. Archive is
-     * **total** — a session is ALWAYS archivable, in any state, so this never refuses.
-     *
-     * The bytes are **plaintext secret material** (the current signing identity, group
-     * snapshots including signing keys and epoch secrets, the PSK ledger, and any
-     * mid-round KEM material) — seal them before persisting (`apq::archive::seal` is the
-     * provided tool; the key belongs in the platform keystore). An archive is a **move,
-     * not a copy**: any further use of the live session (or of a second restore) rewinds
-     * the sender ratchet, which re-derives AEAD keys/nonces for new plaintexts. The
-     * caller owns single-use/latest-only discipline, as with invitation archives.
-     *
-     * A mid-A.3 PQ round is serialized whole (`Initiating` holds the decapsulation key,
-     * `Responding` the held shared secret). This does not weaken the ratchet in a way
-     * the archive doesn't already: the blob carries the PSK ledger, epoch secrets, and
-     * leaf signing keys, and the seal-before-persisting contract covers the round
-     * material alongside them; the marginal exposure is at most one round of PCS against
-     * an archive thief who already holds the epoch secrets. The alternative is unsound:
-     * a responder that discarded its held secret could never process the initiator's
-     * incoming bind (0x09) — a permanent side-band desync — so serialization is the only
-     * correct choice.
-     */
-open func archive()throws  -> Archive  {
-    return try  FfiConverterTypeArchive_lift(try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
-    uniffi_two_mls_pq_fn_method_twomlspqsession_archive(
+open func theirPrincipalState() -> PrincipalState  {
+    return try!  FfiConverterTypePrincipalState_lift(try! rustCall() {
+    uniffi_two_mls_pq_fn_method_twomlspqsession_their_principal_state(
             self.uniffiCloneHandle(),$0
     )
 })
@@ -2054,6 +2317,15 @@ open func prepareToEncrypt(proposing: ClientId?)throws  -> PrepareEncryptResult 
 open func processIncoming(ciphertext: Data)throws  -> DecryptResult?  {
     return try  FfiConverterOptionTypeDecryptResult.lift(try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
     uniffi_two_mls_pq_fn_method_twomlspqsession_process_incoming(
+            self.uniffiCloneHandle(),
+        FfiConverterData.lower(ciphertext),$0
+    )
+})
+}
+    
+open func processIncomingInner(ciphertext: Data)throws  -> DecryptResult?  {
+    return try  FfiConverterOptionTypeDecryptResult.lift(try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
+    uniffi_two_mls_pq_fn_method_twomlspqsession_process_incoming_inner(
             self.uniffiCloneHandle(),
         FfiConverterData.lower(ciphertext),$0
     )
@@ -2794,14 +3066,46 @@ public struct EncryptResult: Equatable, Hashable {
     public var sender: ClientId
     public var recipient: ClientId
     public var epochs: ApqEpochs
+    /**
+     * The persistence `state_seq` this frame depends on: the seq at which the commit it
+     * staples was persisted. If the frame publishes new stored-private-key material (it
+     * staples a fresh commit), the app should wait until it has durably persisted this seq
+     * before transmitting — otherwise a crash-restore could rewind past keys the peer will
+     * rely on. A routine app message re-staples an already-persisted commit, so its
+     * `depends_on_seq` is already durable and imposes no wait. See `ArchiveSink`.
+     *
+     * Boundary of the durability gate: only frames that publish key material are gated. A
+     * routine app frame advances the sender ratchet but is NOT gated on that advance being
+     * durable, so a crash-restore can rewind one generation and re-send it; MLS's per-message
+     * random `reuse_guard` (RFC 9420 §5.3) is what bounds AEAD nonce reuse there (~2⁻³² residual),
+     * not durability. This is deliberate — gating every app message on a disk write would be a
+     * latency killer, and only key-material frames carry the rewind hazard the gate exists for.
+     */
+    public var dependsOnSeq: UInt64
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(cipherText: Data, sender: ClientId, recipient: ClientId, epochs: ApqEpochs) {
+    public init(cipherText: Data, sender: ClientId, recipient: ClientId, epochs: ApqEpochs, 
+        /**
+         * The persistence `state_seq` this frame depends on: the seq at which the commit it
+         * staples was persisted. If the frame publishes new stored-private-key material (it
+         * staples a fresh commit), the app should wait until it has durably persisted this seq
+         * before transmitting — otherwise a crash-restore could rewind past keys the peer will
+         * rely on. A routine app message re-staples an already-persisted commit, so its
+         * `depends_on_seq` is already durable and imposes no wait. See `ArchiveSink`.
+         *
+         * Boundary of the durability gate: only frames that publish key material are gated. A
+         * routine app frame advances the sender ratchet but is NOT gated on that advance being
+         * durable, so a crash-restore can rewind one generation and re-send it; MLS's per-message
+         * random `reuse_guard` (RFC 9420 §5.3) is what bounds AEAD nonce reuse there (~2⁻³² residual),
+         * not durability. This is deliberate — gating every app message on a disk write would be a
+         * latency killer, and only key-material frames carry the rewind hazard the gate exists for.
+         */dependsOnSeq: UInt64) {
         self.cipherText = cipherText
         self.sender = sender
         self.recipient = recipient
         self.epochs = epochs
+        self.dependsOnSeq = dependsOnSeq
     }
 
     
@@ -2823,7 +3127,8 @@ public struct FfiConverterTypeEncryptResult: FfiConverterRustBuffer {
                 cipherText: FfiConverterData.read(from: &buf), 
                 sender: FfiConverterTypeClientId.read(from: &buf), 
                 recipient: FfiConverterTypeClientId.read(from: &buf), 
-                epochs: FfiConverterTypeApqEpochs.read(from: &buf)
+                epochs: FfiConverterTypeApqEpochs.read(from: &buf), 
+                dependsOnSeq: FfiConverterUInt64.read(from: &buf)
         )
     }
 
@@ -2832,6 +3137,7 @@ public struct FfiConverterTypeEncryptResult: FfiConverterRustBuffer {
         FfiConverterTypeClientId.write(value.sender, into: &buf)
         FfiConverterTypeClientId.write(value.recipient, into: &buf)
         FfiConverterTypeApqEpochs.write(value.epochs, into: &buf)
+        FfiConverterUInt64.write(value.dependsOnSeq, into: &buf)
     }
 }
 
@@ -3619,6 +3925,81 @@ public func FfiConverterTypeSessionId_lower(_ value: SessionId) -> RustBuffer {
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
+ * Which persistence slot a pushed blob targets — see [`ArchiveSink`]. `Core` holds
+ * everything except the two ML-KEM ratchet trees and is rewritten on every classical
+ * mutation; `Checkpoint` is the complete state (incl. the PQ trees) and is written on every
+ * PQ-touching mutation and at birth. Each slot is upserted atomically and independently, and
+ * a `Core` is only ever consistent with the latest `Checkpoint` (the PQ trees never change
+ * between checkpoints), so restore needs no cross-slot transaction.
+ */
+
+public enum BlobKind: Equatable, Hashable {
+    
+    case core
+    case checkpoint
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension BlobKind: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeBlobKind: FfiConverterRustBuffer {
+    typealias SwiftType = BlobKind
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> BlobKind {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .core
+        
+        case 2: return .checkpoint
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: BlobKind, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .core:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .checkpoint:
+            writeInt(&buf, Int32(2))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeBlobKind_lift(_ buf: RustBuffer) throws -> BlobKind {
+    return try FfiConverterTypeBlobKind.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeBlobKind_lower(_ value: BlobKind) -> RustBuffer {
+    return FfiConverterTypeBlobKind.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
  * What `open_incoming` found once the header seal was removed — the routing signal the
  * plaintext tag byte carried before header encryption hid it. The host dispatches on
  * this: `Message` to `process_incoming`, `PqSideBand` to the named `pq_*` entry point.
@@ -3989,6 +4370,12 @@ public enum TwoMlsPqError: Swift.Error, Equatable, Hashable, Foundation.Localize
      * post-commit epochs of both groups.
      */
     case ApqInfoMismatch
+    /**
+     * `install_sink` was called on an object that already has a persistence sink. Install
+     * once, right after construction or restore — a second call would silently orphan the
+     * first sink (its store would go stale with no further pushes), so it fails fast instead.
+     */
+    case SinkAlreadyInstalled
 
     
 
@@ -4038,6 +4425,7 @@ public struct FfiConverterTypeTwoMlsPqError: FfiConverterRustBuffer {
         case 18: return .RemoteIdentityMismatch
         case 19: return .CredentialRejected
         case 20: return .ApqInfoMismatch
+        case 21: return .SinkAlreadyInstalled
 
          default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -4129,6 +4517,10 @@ public struct FfiConverterTypeTwoMlsPqError: FfiConverterRustBuffer {
         case .ApqInfoMismatch:
             writeInt(&buf, Int32(20))
         
+        
+        case .SinkAlreadyInstalled:
+            writeInt(&buf, Int32(21))
+        
         }
     }
 }
@@ -4167,6 +4559,30 @@ fileprivate struct FfiConverterOptionData: FfiConverterRustBuffer {
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterData.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeArchive: FfiConverterRustBuffer {
+    typealias SwiftType = Archive?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeArchive.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeArchive.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -4583,6 +4999,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_two_mls_pq_checksum_func_pq_frame_kind() != 28753) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_two_mls_pq_checksum_method_archivesink_persist() != 64624) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_two_mls_pq_checksum_method_mlsciphersuite_is_combiner_classical() != 42584) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -4590,9 +5009,6 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_mlsciphersuite_value() != 46029) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqinvitation_archive() != 62389) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqinvitation_client_id() != 2420) {
@@ -4607,6 +5023,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_two_mls_pq_checksum_method_twomlspqinvitation_hpke_open() != 19762) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_two_mls_pq_checksum_method_twomlspqinvitation_install_sink() != 4147) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_two_mls_pq_checksum_method_twomlspqinvitation_open_initial() != 31433) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -4614,6 +5033,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqinvitation_receive() != 291) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_two_mls_pq_checksum_method_twomlspqinvitation_state_seq() != 33948) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqprincipal_client_id() != 3607) {
@@ -4637,6 +5059,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_has_receive_group() != 35549) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_install_sink() != 61277) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_is_established() != 41629) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -4652,10 +5077,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_receive_group_id() != 24855) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_their_principal_state() != 51428) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_state_seq() != 41299) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_archive() != 10049) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_their_principal_state() != 51428) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_encrypt() != 60293) {
@@ -4671,6 +5096,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_process_incoming() != 5172) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_process_incoming_inner() != 44377) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_proposal_context() != 63573) {
@@ -4739,7 +5167,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_two_mls_pq_checksum_constructor_mlsciphersuite_x25519_chacha() != 46953) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_constructor_twomlspqinvitation_new() != 14507) {
+    if (uniffi_two_mls_pq_checksum_constructor_twomlspqinvitation_restore() != 29080) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_constructor_twomlspqprincipal_new() != 59164) {
@@ -4751,10 +5179,11 @@ private let initializationResult: InitializationResult = {
     if (uniffi_two_mls_pq_checksum_constructor_twomlspqsession_initiate() != 29769) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_constructor_twomlspqsession_from_archive() != 48582) {
+    if (uniffi_two_mls_pq_checksum_constructor_twomlspqsession_restore() != 61833) {
         return InitializationResult.apiChecksumMismatch
     }
 
+    uniffiCallbackInitArchiveSink()
     return InitializationResult.ok
 }()
 
