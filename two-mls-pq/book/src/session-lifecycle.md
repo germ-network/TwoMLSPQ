@@ -180,7 +180,8 @@ caller-chosen, replay-stable token for the initial frame and records
   `receive` consults the same ledger up front and rejects a re-delivery as
   `DuplicateWelcome` before claiming or reserving anything.
 
-The invitation's `archive()` persists the consumed set, the forward table, and the
-processed-welcome ledger, so all three guards survive a restore. The token is opaque
+The invitation pushes these to its `ArchiveSink` after every `receive` — the consumed
+set, the forward table, and the processed-welcome ledger — so all three guards survive a
+restore. The token is opaque
 to this crate — the caller picks the convention (Germ's adapter uses the app-layer
 digest of the decrypted frame).

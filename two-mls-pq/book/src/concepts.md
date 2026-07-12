@@ -47,19 +47,46 @@ invitation rebuilds a stateless one from its captured material on each `receive`
 and a session holds the client backing its groups (plus the successor client staged
 by a principal rotation) — but those are hidden plumbing, never handed to the app.
 
-The consequence is that persistence is **per-object, not per-client**: each object
-serialises what it owns (`TwoMlsPqInvitation.archive()` and
-`TwoMlsPqSession.archive()`; see the [API Reference](./api-reference.md) for the
-session archive's single-use contract). There is no mls-rs-style "restore the
-client and find your groups again" path — you restore an invitation or a session.
+The consequence is that persistence is **per-object, not per-client**, and it is
+**push-based**: rather than the app pulling a snapshot when it chooses, each stateful
+object PUSHES its new state to an app-provided sink after every state-advancing mutation.
+The app attaches one `ArchiveSink` per object with `install_sink`, and the object calls
+`persist(seq, kind, bytes)` from inside the mutation. There is no mls-rs-style "restore
+the client and find your groups again" path — you restore an invitation
+(`TwoMlsPqInvitation(archive)`) or a session
+(`TwoMlsPqSession.from_persisted(core, checkpoint)`).
 
-Concretely, a session archives by **enumerating its groups**: each of its (up to
-four) MLS groups is exported per group through the group object and the storage
-handle captured when that group was created or joined (`apq`'s
-`CombinerGroup::export_state` / `load_combiner_group`), never by snapshotting a
-client's whole store. This keeps archival correct across principal rotation — rotation
-swaps the session's internal client, and a group's state keeps flowing through the
-handle it was born with.
+Push, not pull, closes a soundness gap. The old pull `archive()` was a *move, not a
+copy* — using the live object after snapshotting it, then restoring, rewound the sender
+ratchet and re-derived AEAD keys/nonces against a real transcript (security review
+finding H1). Pushing after every mutation keeps the persisted state always current
+without the app ever holding a stale-yet-live snapshot. The pull getter survives only as
+an in-crate test/fuzz helper, off the FFI.
+
+A session's state splits by **encode cost**: the ML-KEM ratchet trees dominate the encode
+(≈1.2 KB per node) and change only on a PQ operation, while classical mutations are cheap
+and frequent. So a session pushes one of two blob kinds:
+
+- **`Core`** — everything *except* the two ML-KEM trees (identity, both classical group
+  snapshots, the PSK ledger, the listen map, a staged rotation, parked frames, meta).
+  Written on every *classical* mutation.
+- **`Checkpoint`** — the complete state, *including* the PQ trees. Written on every
+  *PQ-touching* mutation and once at `install_sink`.
+
+Each blob is a single atomic push, so the sink needs no cross-object transaction, and
+because the PQ trees never change between checkpoints a `Core` is always consistent with
+the latest `Checkpoint`. Restore reconciles the two (PQ halves from the checkpoint, the
+rest by whichever blob has the higher `state_seq`) and **fails closed** if their PQ-epoch
+manifests disagree. An invitation carries no ML-KEM trees, so it is monolithic — it only
+ever pushes a `Checkpoint`.
+
+Concretely, a session encodes by **enumerating its groups**: each of its (up to four)
+MLS groups is exported per group through the group object and the storage handle captured
+when that group was created or joined (`apq`'s `CombinerGroup::export_state` /
+`export_classical` for a `Core` / `load_combiner_group`), never by snapshotting a
+client's whole store. This keeps encoding correct across principal rotation — rotation
+swaps the session's internal client, and a group's state keeps flowing through the handle
+it was born with.
 
 The same ownership rule covers PSKs: the session keeps a small ledger of its send
 group's recent cross-party TwoMLS-PSKs and **live-injects** them into the stores a
@@ -67,9 +94,10 @@ group actually resolves from, immediately before building or processing the comm
 that references them; retired and one-shot entries are deleted afterwards, so the
 mls-rs secret stores are ephemeral plumbing that holds nothing the session doesn't.
 The ledger resolves frames that crossed one of our commits (which reference an epoch
-mls-rs can no longer export), and — being session-owned state — it rides in the
-session archive, so a restored session (whose rebuilt client's PSK stores start
-empty; the key-package stores are preloaded from the archive) still resolves them.
+mls-rs can no longer export), and — being session-owned state — it rides in every pushed
+blob (`Core` and `Checkpoint` alike; it is not a PQ tree), so a restored session (whose
+rebuilt client's PSK stores start empty; the key-package stores are preloaded from the
+blob) still resolves them.
 
 ## Two asymmetric send groups
 

@@ -282,7 +282,7 @@ group, which is my send group):
   epoch of my send group. Captured live-at-epoch beside the rendezvous address in
   `record_listen_rendezvous` (exporters can't be derived retroactively), same call
   sites (group creation, the A.2/rotation commits in `prepare_to_encrypt`, the A.3
-  bind, the `should_listen_on`/`archive` backstops), same retention (the send-group
+  bind, the `should_listen_on`/persist-encode backstops), same retention (the send-group
   storage probe). So for the message path, **a frame that can still be routed can
   still be opened**: this window is exactly the rendezvous listen window.
 - **`recv_header_keys_pq`** — `HeaderKeyPQ(send_group.pq, e)` for recent `pq_epoch`s of

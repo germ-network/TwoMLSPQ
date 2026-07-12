@@ -48,9 +48,14 @@ hub for group operations (see [Concepts](./concepts.md)).
 
 The receiving side of a published key package — no live client required.
 
-- `new(archive)` / `archive()` — restore/persist; the archive carries the signing
-  identity, the key package's private material, the consumed-remote set, the
-  spawned-group forward table, and the processed-welcome ledger.
+- `new(archive)` — restore from a pushed blob; it carries the signing identity, the key
+  package's private material, the consumed-remote set, the spawned-group forward table,
+  and the processed-welcome ledger.
+- `install_sink(sink)` — attach the `ArchiveSink` this invitation pushes to after every
+  state-advancing `receive` (once-only — a second call is `SinkAlreadyInstalled`; the
+  first pushes a baseline `Checkpoint`). Persistence is push, not pull — the old
+  `archive()` getter is off the FFI (see `TwoMlsPqSession` below for why). `state_seq()`
+  reports the current push sequence.
 - `client_id()`, `combiner_key_package()` — what to publish.
 - `receive(welcome, their_key_package, spawn_token, new_client_id, expected_remote)
   -> TwoMlsPqSession` — establish from a remote initiator's welcome; rejects a
@@ -103,10 +108,13 @@ Constructors: `initiate(client, their_key_package, app_payload)` — `app_payloa
 host's opaque app-layer welcome (or `None`), composed with the MLS welcome and
 HPKE-enveloped to the peer's KP′ so `pending_outbound` is one opaque blob the peer opens
 with `TwoMlsPqInvitation::open_initial`; `accept(client, welcome, their_key_package)` —
-the plaintext-welcome path (tests/embedded); `from_archive(archive)` — self-contained:
-the archive carries the session's signing identity, so restore rebuilds the exact client
-internally (no client argument), byte-exact in ClientId and signing keys. The restored
-groups still sign with the keys embedded in their snapshots.
+the plaintext-welcome path (tests/embedded); `from_persisted(core, checkpoint)` —
+self-contained restore from the two pushed blobs: they carry the session's signing
+identity, so restore rebuilds the exact client internally (no client argument),
+byte-exact in ClientId and signing keys, and the restored groups still sign with the keys
+embedded in their snapshots. It reconciles the pair (PQ halves from the checkpoint, the
+rest by higher `state_seq`) and fails closed (`ArchiveInvalid`) on a PQ-epoch manifest
+mismatch.
 
 State: `is_established`, `is_fully_established`, `has_receive_group`,
 `active_session_id`, `receive_group_id`, `my_principal_state`, `their_principal_state`,
@@ -148,18 +156,38 @@ PQ side-band (see [Session Lifecycle](./session-lifecycle.md)): `my_pq_turn`,
 parameters carry the principal credential handoff and must name the session's current
 principal.
 
-Persistence: `archive() -> Archive` is **total** — a session is always archivable, in
-any state, so it never refuses. It serialises the full session — the current signing
-identity, both group snapshots, the cross-party PSK ledger, the per-epoch listen map,
-the spawn token, a staged-but-uncommitted rotation, the full PQ round state (including
-a mid-A.3 KEM round), and every parked one-shot frame. The bytes are **plaintext secret
-material**: seal them before persisting (`apq::archive::seal` is the provided tool; the
-key belongs in the platform keystore). An archive is **single-use** — any further use of
-the live session (or a second restore) rewinds the sender ratchet into AEAD nonce reuse.
-Serializing a mid-A.3 round costs at most one round of PCS against an archive thief who
-already holds the epoch secrets; discarding the round state instead would permanently
-desync the side-band, so it is not an option. Reconnect is not planned — see
-[Planned Features](./planned-features.md).
+Persistence (push): attach an `ArchiveSink` with `install_sink` (once-only —
+`SinkAlreadyInstalled` on a second call; the first pushes a baseline `Checkpoint`). The
+session then PUSHES its new state after every state-advancing mutation via
+`persist(seq, kind, bytes)`, where `kind` is **`Core`** (everything but the two ML-KEM
+trees; written on classical mutations) or **`Checkpoint`** (the complete state incl. the
+PQ trees; written on PQ-touching mutations and at baseline). The state is **total** — a
+session is always encodable, in any state, so a push never refuses: it serialises the
+current signing identity, both group snapshots, the cross-party PSK ledger, the per-epoch
+listen map, the spawn token, a staged-but-uncommitted rotation, the full PQ round state
+(including a mid-A.3 KEM round), and every parked one-shot frame. The bytes are
+**plaintext secret material**: the sink must seal them before writing (the key belongs in
+the platform keystore). Serializing a mid-A.3 round costs at most one round of PCS against
+an archive thief who already holds the epoch secrets; discarding the round state instead
+would permanently desync the side-band, so it is not an option.
+
+Push replaced a pull `archive()` getter that was a *move, not a copy* — using the live
+session after snapshotting it, then restoring, rewound the sender ratchet into AEAD nonce
+reuse against a real transcript (security review finding H1). The getter survives only as
+an in-crate test/fuzz helper, off the FFI. Every classical mutation pushes one `Core` and
+every PQ op one `Checkpoint`, atomically and independently; the PQ trees never move
+between checkpoints, so a `Core` is always consistent with the latest `Checkpoint`
+(restore via `from_persisted` above).
+
+Transmit gating: `EncryptResult.depends_on_seq` is the `state_seq` at which the commit a
+frame staples was persisted. A frame that publishes stored-private-key material (a fresh
+commit) must not go out until the app has durably persisted that seq — otherwise a
+crash-restore could rewind past keys the peer will rely on. A routine app message
+re-staples an already-persisted commit, so its `depends_on_seq` is already durable and
+imposes no wait; the durability gate covers only key-material frames (routine frames rely
+on MLS's per-message `reuse_guard`, by design). `state_seq()` reports the current sequence
+for the frames — the establishment envelope, PQ side-band — whose return type carries none.
+Reconnect is not planned — see [Planned Features](./planned-features.md).
 
 ## Errors
 
