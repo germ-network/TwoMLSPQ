@@ -24,9 +24,10 @@ struct MalformedFrameTests {
 		for frame in bad {
 			do {
 				_ = try invitation.decodeHeader(ciphertext: frame)
-				Issue.record("expected malformedHeaderFrame, frame len \(frame.count)")
-			} catch TwoMLSPQConformanceError.malformedHeaderFrame {
-				// expected
+				Issue.record("expected .malformedFrame, frame len \(frame.count)")
+			} catch {
+				// `decodeHeader` is throws(SessionError) — `error` is typed.
+				#expect(error.code == .malformedFrame)
 			}
 		}
 	}
@@ -39,12 +40,15 @@ struct MalformedFrameTests {
 			encodedRemoteKpkg: remote.currentInvitation.encodedKeyPackage
 		)
 		let pq = session as any AbstractTwoMLS.PQRatchetingSession
-		for frame in [Data([0x00]), Data()] {  // unknown tag, then empty
+		// No receive-window key opens these (M2a) — the reconnect-signal code,
+		// distinct from a misrouted message frame.
+		for frame in [Data([0x00]), Data()] {
 			do {
 				_ = try pq.ingest(frame)
-				Issue.record("expected malformedHeaderFrame")
-			} catch TwoMLSPQConformanceError.malformedHeaderFrame {
-				// expected
+				Issue.record("expected .unopenableFrame")
+			} catch let error as AbstractTwoMLS.SessionError {
+				#expect(error.code == .unopenableFrame)
+				#expect(error.disposition == .discardFrame)
 			}
 		}
 	}

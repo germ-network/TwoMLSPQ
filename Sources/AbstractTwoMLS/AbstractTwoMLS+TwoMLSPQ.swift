@@ -32,22 +32,6 @@ import CommProtocol
 import Foundation
 import TwoMLSPQ
 
-// MARK: - Errors
-
-public enum TwoMLSPQConformanceError: Error {
-	/// The remote key package's credential does not match the authenticated
-	/// remote identity extracted from the validated welcome.
-	case remoteIdentityMismatch
-	/// The initial-message header envelope failed to parse.
-	case malformedHeaderFrame
-	/// A.3 ratchet rounds inject a PSK with no updatePath, so `begin(.ratchet,
-	/// rotating:)` has nothing to carry a new leaf credential — rotations ride
-	/// `.rekey` (A.5) or `.finishBootstrap` (A.4).
-	case rotationCannotRideRatchet
-	/// No TwoMLSPQ FFI surface backs this abstract member yet.
-	case notImplemented(String)
-}
-
 // MARK: - Binding/binary pairing guard
 
 /// The uniffi Record-shape contract this vendored binding was generated against.
@@ -285,19 +269,29 @@ extension AbstractTwoMLS {
 			}
 		}
 
-		public init(persisted: Persisted) throws {
+		public init(persisted: Persisted) throws(AbstractTwoMLS.SessionError) {
 			// PQ trees come from the checkpoint; identity/classical/meta from
-			// whichever slot has the higher stateSeq; fails closed on a
-			// PQ-epoch manifest mismatch. The restored session has NO sink —
-			// installSink immediately, before use.
-			self.init(
-				try TwoMlsPqSession.restore(
+			// whichever slot has the higher stateSeq; fails closed
+			// (`.archiveInvalid`) on a PQ-epoch manifest mismatch. The restored
+			// session has NO sink — installSink immediately, before use.
+			let restored: TwoMlsPqSession
+			do {
+				restored = try TwoMlsPqSession.restore(
 					core: persisted.core.map { TwoMLSPQ.Archive(bytes: $0) },
-					checkpoint: TwoMLSPQ.Archive(bytes: persisted.checkpoint)))
+					checkpoint: TwoMLSPQ.Archive(bytes: persisted.checkpoint))
+			} catch {
+				throw AbstractTwoMLS.SessionError(pqError: error, at: .restore)
+			}
+			self.init(restored)
 		}
 
-		public func installSink(_ sink: any AbstractTwoMLS.PersistenceSink) throws {
-			try base.installSink(sink: PQSinkAdapter(sink))
+		public func installSink(
+			_ sink: any AbstractTwoMLS.PersistenceSink
+		) throws(AbstractTwoMLS.SessionError) {
+			// `.sinkAlreadyInstalled` on a second call.
+			try mapPQErrors(.installSink) {
+				try base.installSink(sink: PQSinkAdapter(sink))
+			}
 		}
 
 		public var stateSeq: UInt64 {
@@ -328,48 +322,71 @@ extension AbstractTwoMLS {
 		}
 
 		public var sendRendezvous: AbstractTwoMLS.RendezvousID? {
-			get throws { try base.sendRendezvous()?.bytes }
+			get throws(AbstractTwoMLS.SessionError) {
+				try mapPQErrors(.pqOperation) { try base.sendRendezvous()?.bytes }
+			}
 		}
 
 		// MARK: Encrypt / decrypt
 
 		public func prepareToEncrypt(
 			proposing: AbstractTwoMLS.ClientID?
-		) throws -> PQPrepareEncryptResult? {
-			let result = try base.prepareToEncrypt(
-				proposing: proposing?.pqClientId
-			)
-			return try PQPrepareEncryptResult(result)
+		) throws(AbstractTwoMLS.SessionError) -> PQPrepareEncryptResult? {
+			try mapPQErrors(.prepareToEncrypt) {
+				try PQPrepareEncryptResult(
+					base.prepareToEncrypt(proposing: proposing?.pqClientId))
+			}
 		}
 
-		public func encrypt(appMessage: Data) throws -> PQEncryptResult {
-			PQEncryptResult(try base.encrypt(appMessage: appMessage))
+		public func encrypt(
+			appMessage: Data
+		) throws(AbstractTwoMLS.SessionError) -> PQEncryptResult {
+			try mapPQErrors(.encrypt) {
+				PQEncryptResult(try base.encrypt(appMessage: appMessage))
+			}
 		}
 
-		public func processIncoming(ciphertext: Data) throws -> PQDecryptResult? {
-			try base.processIncoming(ciphertext: ciphertext)
-				.map(PQDecryptResult.init)
+		public func processIncoming(
+			ciphertext: Data
+		) throws(AbstractTwoMLS.SessionError) -> PQDecryptResult? {
+			// `.misroutedFrame` if a PQ side-band frame lands here (route it to
+			// `ingest`); `.decryptionFailed` is transient (retry); `.epochDesync`
+			// means reconnect. After a `.retryLater` failure, reconcile identity
+			// via `theirPrincipalState` — a staple may have applied.
+			try mapPQErrors(.processIncoming) {
+				try base.processIncoming(ciphertext: ciphertext)
+					.map(PQDecryptResult.init)
+			}
 		}
 
-		public func queueProposal(digest: TypedDigest) throws {
-			try base.queueProposal(digest: digest.digest)
+		public func queueProposal(
+			digest: TypedDigest
+		) throws(AbstractTwoMLS.SessionError) {
+			try mapPQErrors(.pqOperation) {
+				try base.queueProposal(digest: digest.digest)
+			}
 		}
 
-		public func forwarded(headerDecrypted: Data) throws -> PQSenderMessage? {
+		public func forwarded(
+			headerDecrypted: Data
+		) throws(AbstractTwoMLS.SessionError) -> PQSenderMessage? {
 			// The forward table and this session's spawn token are keyed by the
 			// app-layer digest of the header-decrypted frame; recompute it here so the
 			// FFI stays digest-convention-agnostic (opaque token). Always nil for the
 			// PQ backend today: a replayed initial frame carries nothing undelivered.
-			try base.forwarded(
-				spawnToken: TypedDigest(prefix: .sha256, over: headerDecrypted)
-					.wireFormat
-			)
-			.map(PQSenderMessage.init)
+			return try mapPQErrors(.forwarded) {
+				try base.forwarded(
+					spawnToken: TypedDigest(prefix: .sha256, over: headerDecrypted)
+						.wireFormat
+				)
+				.map(PQSenderMessage.init)
+			}
 		}
 
-		public func shouldListenOn() throws -> (
+		public func shouldListenOn() throws(AbstractTwoMLS.SessionError) -> (
 			AbstractTwoMLS.GroupID, [UInt64: AbstractTwoMLS.RendezvousID]
 		) {
+			return try mapPQErrors(.pqOperation) {
 			let channels = try base.shouldListenOn()
 			// CombinerGroupId carries both halves; the abstraction wants one GroupID.
 			// Use the classical half: it exists from creation for both roles, whereas
@@ -385,6 +402,7 @@ extension AbstractTwoMLS {
 				uniquingKeysWith: { first, _ in first }
 			)
 			return (groupId, rendezvous)
+			}
 		}
 
 		// MARK: PQRatchet
@@ -409,7 +427,8 @@ extension AbstractTwoMLS {
 		public func begin(
 			_ kind: PQOperationKind,
 			rotating: AbstractTwoMLS.ClientID?
-		) throws -> PQOutbound {
+		) throws(AbstractTwoMLS.SessionError) -> PQOutbound {
+			try mapPQErrors(.pqOperation) {
 			// `rotating` is the A.4/A.5 credential handoff: it must name the session's
 			// CURRENT principal — i.e. the Phase 8 classical rotation must have
 			// COMPLETED first (contract v9+: proposing puts the candidate on the
@@ -430,7 +449,9 @@ extension AbstractTwoMLS {
 				// A.3 injects a PSK with no updatePath — nothing carries a new
 				// leaf credential.
 				guard rotating == nil else {
-					throw TwoMLSPQConformanceError.rotationCannotRideRatchet
+					throw AbstractTwoMLS.SessionError(
+						code: .rotationCannotRideRatchet,
+						detail: "A.3 has no updatePath; rotate via .rekey or .finishBootstrap")
 				}
 				return PQOutbound(kind: kind, payload: try base.pqRatchetBegin())
 			case .rekey:
@@ -440,27 +461,40 @@ extension AbstractTwoMLS {
 						rotating: rotating?.pqClientId)
 				)
 			}
+			}
 		}
 
-		public func advance(after inbound: PQInbound) throws -> PQOutbound? {
+		public func advance(
+			after inbound: PQInbound
+		) throws(AbstractTwoMLS.SessionError) -> PQOutbound? {
 			base.pqTakePendingOutbound().map {
 				PQOutbound(kind: inbound.kind, payload: $0)
 			}
 		}
 
-		public func ingest(_ message: Data) throws -> PQInbound {
+		public func ingest(
+			_ message: Data
+		) throws(AbstractTwoMLS.SessionError) -> PQInbound {
+			return try mapPQErrors(.ingest) {
 			// Frames leave the peer sealed (header encryption, contract v7): the leading
 			// tag is no longer in the clear, so classify by removing the outer seal and
 			// reading the routing `kind` rather than switching on `message.first`. The
 			// pq_* receivers open the seal transparently, so hand them the sealed blob.
 			guard let opened = try base.openIncoming(blob: message) else {
-				// No header key opened it — a stranger's frame or a reconnect-gap frame
-				// for an epoch we no longer hold a key for.
-				throw TwoMLSPQConformanceError.malformedHeaderFrame
+				// No header key opened it (M2a). One alone may be a stranger's
+				// garbage or a reconnect-gap frame; treat a RUN of these on a live
+				// session as a reconnect signal (count at the call site).
+				throw AbstractTwoMLS.SessionError(
+					code: .unopenableFrame,
+					detail: "no receive-window key opens this blob; "
+						+ "a run of these is a reconnect signal")
 			}
 			guard case let .pqSideBand(kind) = opened.kind else {
-				// A message-path frame (welcome/0x03) reached the side-band entry point.
-				throw TwoMLSPQConformanceError.malformedHeaderFrame
+				// A message-path frame reached the side-band entry point (M2b).
+				throw AbstractTwoMLS.SessionError(
+					code: .misroutedFrame,
+					detail: "message-path frame at the PQ side-band entry — "
+						+ "route to processIncoming")
 			}
 			switch kind {
 			case .rekeyUpdate:
@@ -508,6 +542,7 @@ extension AbstractTwoMLS {
 					newEpochs: epochs, rotatedCredential: nil,
 					plaintext: plaintext.isEmpty ? nil : plaintext)
 			}
+			}
 		}
 	}
 
@@ -544,14 +579,22 @@ extension AbstractTwoMLS {
 
 		// MARK: Archivable (push)
 
-		public init(persisted: PQInvitationArchive) throws {
-			self.init(base: try TwoMlsPqInvitation.restore(archive: persisted.bytes))
+		public init(persisted: PQInvitationArchive) throws(AbstractTwoMLS.SessionError) {
+			do {
+				self.init(base: try TwoMlsPqInvitation.restore(archive: persisted.bytes))
+			} catch {
+				throw AbstractTwoMLS.SessionError(pqError: error, at: .restore)
+			}
 		}
 
 		/// Monolithic object: the sink receives only `.checkpoint` blobs (one
 		/// per successful `receive`, plus the install-time baseline).
-		public func installSink(_ sink: any AbstractTwoMLS.PersistenceSink) throws {
-			try base.installSink(sink: PQSinkAdapter(sink))
+		public func installSink(
+			_ sink: any AbstractTwoMLS.PersistenceSink
+		) throws(AbstractTwoMLS.SessionError) {
+			try mapPQErrors(.installSink) {
+				try base.installSink(sink: PQSinkAdapter(sink))
+			}
 		}
 
 		/// Bumps once per successful `receive`.
@@ -561,12 +604,17 @@ extension AbstractTwoMLS {
 
 		// MARK: Invitation
 
-		public init(clientId: AbstractTwoMLS.ClientID) throws {
+		public init(clientId: AbstractTwoMLS.ClientID) throws(AbstractTwoMLS.SessionError) {
 			// Fresh invitation: mint a client for this identity and capture a combiner
 			// key package into a self-contained archive. Last-resort (reusable), so a
 			// single-use invitation's `InvitationSpent` never surfaces here.
-			let archive = try TwoMlsPqPrincipal(clientId: clientId).generateInvitation(lastResort: true)
-			self.init(base: try TwoMlsPqInvitation.restore(archive: archive))
+			do {
+				let archive = try TwoMlsPqPrincipal(clientId: clientId)
+					.generateInvitation(lastResort: true)
+				self.init(base: try TwoMlsPqInvitation.restore(archive: archive))
+			} catch {
+				throw AbstractTwoMLS.SessionError(pqError: error, at: .invitation)
+			}
 		}
 
 		public var clientId: AbstractTwoMLS.ClientID {
@@ -581,7 +629,8 @@ extension AbstractTwoMLS {
 
 		public func decodeHeader(
 			ciphertext: Data
-		) throws -> AbstractTwoMLS.HeaderDecryptResult {
+		) throws(AbstractTwoMLS.SessionError) -> AbstractTwoMLS.HeaderDecryptResult {
+			return try mapPQErrors(.decodeHeader) {
 			// Strip the outer HPKE layer with this invitation's key-package init key
 			// (info defaults to this ClientId, matching the sender's seal).
 			let (kemOutput, sealed) = try decodeHeaderFrame(ciphertext)
@@ -613,6 +662,7 @@ extension AbstractTwoMLS {
 				appWelcome: decrypted,
 				stapledPrivateMessage: nil
 			)
+			}
 		}
 
 		public func receive(
@@ -622,23 +672,31 @@ extension AbstractTwoMLS {
 			welcomeToken: WelcomeToken,
 			stapledMessage: Data?,
 			newClientId: AbstractTwoMLS.ClientID
-		) throws -> (PQSession, plaintext: Data?) {
+		) throws(AbstractTwoMLS.SessionError) -> (PQSession, plaintext: Data?) {
+			return try mapPQErrors(.receive) {
 			// Validate the dedicated principal id BEFORE any invitation state is
-			// claimed: `stageRotation` (below) throws `InvalidClientId` on an empty
+			// claimed: `stageRotation` (below) throws `.invalidClientId` on an empty
 			// id, but by then `base.receive` has consumed the welcome — the session
-			// would be orphaned and a retry refused as `DuplicateWelcome`. Same
+			// would be orphaned and a retry refused as `.duplicateWelcome`. Same
 			// error identity, fixed ordering.
 			guard !newClientId.isEmpty else {
-				throw TwoMlsPqError.InvalidClientId
+				throw AbstractTwoMLS.SessionError(
+					code: .invalidClientId,
+					detail: "dedicated principal id must be non-empty")
 			}
 
 			let pair = try decodeCombinerKeyPackage(bytes: remoteKeyPackage)
 
 			// Bind the key package to the authenticated identity from the validated
 			// welcome (also checks the pair's two halves agree on one credential).
+			// M4: the crate's own RemoteIdentityMismatch (via base.receive) maps to
+			// the SAME `.identityMismatch` — one code, both origins.
 			let parsed = try parseCombinerKeyPackage(kp: pair)
 			guard parsed.clientId.bytes == remoteClientId else {
-				throw TwoMLSPQConformanceError.remoteIdentityMismatch
+				throw AbstractTwoMLS.SessionError(
+					code: .identityMismatch,
+					detail: "key package credential != authenticated remote id; "
+						+ "invitation not consumed")
 			}
 
 			// Joins both halves from the APQ welcome and stands up the bound return
@@ -694,6 +752,7 @@ extension AbstractTwoMLS {
 			try session.base.stageRotation(newClientId: newClientId)
 
 			return (session, plaintext)
+			}
 		}
 	}
 }
@@ -719,15 +778,23 @@ extension AbstractTwoMLS {
 			self.base = base
 		}
 
-		public init(clientId: AbstractTwoMLS.ClientID) throws {
-			self.init(base: try TwoMlsPqPrincipal(clientId: clientId))
+		public init(clientId: AbstractTwoMLS.ClientID) throws(AbstractTwoMLS.SessionError) {
+			do {
+				self.init(base: try TwoMlsPqPrincipal(clientId: clientId))
+			} catch {
+				throw AbstractTwoMLS.SessionError(pqError: error, at: .client)
+			}
 		}
 
-		public func makeInvitation() throws -> PQInvitation.Persisted {
+		public func makeInvitation()
+			throws(AbstractTwoMLS.SessionError) -> PQInvitation.Persisted
+		{
 			// The client captures a combiner key package into self-contained mint
 			// bytes; it keeps no key-package private material. Last-resort
 			// (reusable) — a single-use invitation's `InvitationSpent` is unreachable here.
-			PQInvitationArchive(bytes: try base.generateInvitation(lastResort: true))
+			try mapPQErrors(.client) {
+				PQInvitationArchive(bytes: try base.generateInvitation(lastResort: true))
+			}
 		}
 
 		public static func parseKeyPackageSuite(
@@ -749,11 +816,12 @@ extension AbstractTwoMLS {
 
 		public func reply(
 			keyPackageMessage: Data
-		) throws -> (
+		) throws(AbstractTwoMLS.SessionError) -> (
 			sendGroup: PQSession,
 			welcomeMessage: Data,
 			myKeyPackage: Data
 		) {
+			return try mapPQErrors(.client) {
 			let pair = try decodeCombinerKeyPackage(bytes: keyPackageMessage)
 			// `appPayload: nil` — this backend carries the app-layer AppWelcome in its own
 			// outer HPKE frame (createTwoMLSGroup/decodeHeader), so the crate's envelope
@@ -762,9 +830,9 @@ extension AbstractTwoMLS {
 			let session = try TwoMlsPqSession.initiate(
 				client: base, theirKeyPackage: pair, appPayload: nil)
 			guard let welcome = session.pendingOutbound() else {
-				throw TwoMLSPQConformanceError.notImplemented(
-					"PQClient.reply — initiate produced no envelope"
-				)
+				throw AbstractTwoMLS.SessionError(
+					code: .internalError,
+					detail: "PQClient.reply — initiate produced no envelope")
 			}
 			// The return-group key package uses the retaining generate path: this live
 			// session joins the acceptor's return welcome through its own client store
@@ -773,6 +841,7 @@ extension AbstractTwoMLS {
 				keyPackage: try base.generateCombinerKeyPackage()
 			)
 			return (PQSession(session), welcome, myKeyPackage)
+			}
 		}
 
 		public func createTwoMLSGroup(
@@ -780,13 +849,18 @@ extension AbstractTwoMLS {
 			mySendGroup: PQSession,
 			theirKeyPackageMessage: Data,
 			appWelcome: Data
-		) throws -> (PQSession, encryptedCombinedWelcome: Data) {
+		) throws(AbstractTwoMLS.SessionError) -> (
+			PQSession, encryptedCombinedWelcome: Data
+		) {
+			return try mapPQErrors(.client) {
 			// Bind the published key package to the remote identity the app is
 			// addressing, then seal the AppWelcome to its (classical) init key.
 			let pair = try decodeCombinerKeyPackage(bytes: theirKeyPackageMessage)
 			guard try parseCombinerKeyPackage(kp: pair).clientId.bytes == remoteAgentId
 			else {
-				throw TwoMLSPQConformanceError.remoteIdentityMismatch
+				throw AbstractTwoMLS.SessionError(
+					code: .identityMismatch,
+					detail: "key package credential != addressed remote id")
 			}
 			// info defaults to the recipient's ClientId (from the key package
 			// credential), matching the invitation's hpkeOpen default.
@@ -797,6 +871,7 @@ extension AbstractTwoMLS {
 				aad: nil
 			)
 			return (mySendGroup, encryptedCombinedWelcome: encodeHeaderFrame(sealed))
+			}
 		}
 	}
 }
@@ -817,17 +892,21 @@ private func encodeHeaderFrame(_ sealed: TwoMLSPQ.HpkeSealed) -> Data {
 	return out
 }
 
-private func decodeHeaderFrame(_ data: Data) throws -> (kemOutput: Data, ciphertext: Data) {
+private func decodeHeaderFrame(
+	_ data: Data
+) throws(AbstractTwoMLS.SessionError) -> (kemOutput: Data, ciphertext: Data) {
 	var rest = data[...]
 	guard rest.popFirst() == pqHeaderFrameVersion, rest.count >= 4 else {
-		throw TwoMLSPQConformanceError.malformedHeaderFrame
+		throw AbstractTwoMLS.SessionError(
+			code: .malformedFrame, detail: "initial-message header envelope")
 	}
 	let kemLength = Int(
 		rest.prefix(4).withUnsafeBytes { $0.loadUnaligned(as: UInt32.self) }.littleEndian
 	)
 	rest = rest.dropFirst(4)
 	guard rest.count >= kemLength else {
-		throw TwoMLSPQConformanceError.malformedHeaderFrame
+		throw AbstractTwoMLS.SessionError(
+			code: .malformedFrame, detail: "initial-message header envelope")
 	}
 	return (Data(rest.prefix(kemLength)), Data(rest.dropFirst(kemLength)))
 }

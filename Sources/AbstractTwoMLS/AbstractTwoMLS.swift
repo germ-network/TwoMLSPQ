@@ -60,6 +60,15 @@ extension AbstractTwoMLS {
 		case checkpoint
 	}
 
+	// ERROR CONTRACT: every throwing requirement on `Session`, `Client`,
+	// `Invitation`, and `PQRatchet` throws `AbstractTwoMLS.SessionError`.
+	// Discriminate on its `code` / `disposition` — never on a backend error type
+	// (that defeats the abstraction). Drive recovery off `disposition`
+	// (`.retryLater`, `.reconnect`, `.approveAndReprocess`, …); a run of
+	// `.unopenableFrame` on a live session is the reconnect signal. After a
+	// `.retryLater` (`.decryptionFailed`) failure from `processIncoming`,
+	// reconcile identity from `theirPrincipalState` — a staple may have applied
+	// before the app message failed (see `PrincipalState`).
 	public protocol Session: Archivable {
 		// `Session` is intentionally decoupled from `Invitation`: a session comes from
 		// an invitation but never needs to name its type, and binding it here forced

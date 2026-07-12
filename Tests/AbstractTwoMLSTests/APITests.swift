@@ -233,9 +233,10 @@ struct RotationDemo {
 		//A.3 cannot carry a rotation — no updatePath rides the ratchet
 		do {
 			_ = try remotePQ.begin(.ratchet, rotating: dedicatedAgentId)
-			Issue.record("expected rotationCannotRideRatchet")
-		} catch TwoMLSPQConformanceError.rotationCannotRideRatchet {
-			// expected
+			Issue.record("expected .rotationCannotRideRatchet")
+		} catch let error as AbstractTwoMLS.SessionError {
+			#expect(error.code == .rotationCannotRideRatchet)
+			#expect(error.disposition == .callerBug)
 		}
 
 		//A.5 with the credential handoff: the rekey hands remote's PQ leaves to
@@ -319,10 +320,14 @@ struct ForwardRoutingDemo {
 		guard try remoteSession.forwarded(headerDecrypted: mlsMessageData) == nil else {
 			throw TestErrors.unexpected
 		}
-		//a mis-routed forward is refused: an initiator-side session has no spawn token,
-		//so `forwarded` must *throw* (SessionNotReady) — not silently return nil.
-		#expect(throws: (any Error).self) {
-			try localSession.forwarded(headerDecrypted: mlsMessageData)
+		//a mis-routed forward is refused: an initiator-side session has no spawn
+		//token, so `forwarded` must *throw* — not silently return nil. The crate's
+		//SessionNotReady at the forwarded surface maps to `.misroutedFrame`.
+		do {
+			_ = try localSession.forwarded(headerDecrypted: mlsMessageData)
+			throw TestErrors.unexpected
+		} catch let error as AbstractTwoMLS.SessionError {
+			#expect(error.code == .misroutedFrame)
 		}
 
 		//forwarding survives invitation restore — the post-receive state (spawn
@@ -444,9 +449,9 @@ struct InitiatorIdentityBindingDemo {
 				theirKeyPackageMessage: acceptor.currentInvitation.encodedKeyPackage,
 				appWelcome: Data("welcome".utf8)
 			)
-			Issue.record("expected remoteIdentityMismatch")
-		} catch TwoMLSPQConformanceError.remoteIdentityMismatch {
-			// expected
+			Issue.record("expected .identityMismatch")
+		} catch {  // createTwoMLSGroup is throws(SessionError) — error is typed
+			#expect(error.code == .identityMismatch)
 		}
 	}
 }

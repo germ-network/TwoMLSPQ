@@ -186,4 +186,77 @@ struct PersistenceContractTests {
 		}
 		#expect(sink.pushCount >= baseline + 3)
 	}
+
+	// MARK: In-flight state survives the two-slot push
+
+	/// The staged dedicated principal (from `receiveReply(newClientId:)`) rides
+	/// the install-time baseline, so the rotation dance completes on a session
+	/// restored BEFORE it drives the rotation.
+	@Test func stagedRotationSurvivesRestore() throws {
+		let (localSession, sealed) = try local.client.reply(
+			remoteClientId: remote.clientId,
+			encodedRemoteKpkg: remote.currentInvitation.encodedKeyPackage
+		)
+		let dedicated = AbstractTwoMLS.ClientID.mock()
+		let (remoteSession, _) = try remote.currentInvitation.receiveReply(
+			ciphertext: sealed, expecting: try local.clientId, newClientId: dedicated
+		)
+		try remoteSession.send(to: localSession)
+
+		let restored = try roundTripPush(remoteSession)
+		try restored.installSink(RecordingSink())
+		try restored.rotate(to: dedicated, peer: localSession)
+	}
+
+	/// The epoch-locked approval tally rides the `core` slot: approving a
+	/// candidate, restoring, then committing still folds the approved proposal.
+	@Test func queuedApprovalSurvivesRestore() throws {
+		let (localSession, sealed) = try local.client.reply(
+			remoteClientId: remote.clientId,
+			encodedRemoteKpkg: remote.currentInvitation.encodedKeyPackage
+		)
+		let dedicated = AbstractTwoMLS.ClientID.mock()
+		let (remoteSession, _) = try remote.currentInvitation.receiveReply(
+			ciphertext: sealed, expecting: try local.clientId, newClientId: dedicated
+		)
+		try remoteSession.send(to: localSession)
+
+		// Remote proposes its candidate; local approves it, then restores BEFORE
+		// committing.
+		_ = try remoteSession.prepareToEncrypt(proposing: dedicated)
+		let frame = try remoteSession.encrypt(appMessage: Data("rotate".utf8))
+		let got = try #require(try localSession.processIncoming(ciphertext: frame.cipherText))
+		let offered = try #require(got.proposal)
+		try localSession.queueProposal(digest: offered.digest)
+		#expect(localSession.queuedRemoteSuccessor == dedicated)
+
+		let restored = try roundTripPush(localSession)
+		try restored.installSink(RecordingSink())
+		#expect(restored.queuedRemoteSuccessor == dedicated)  // tally rode the core
+
+		let prepared = try #require(try restored.prepareToEncrypt(proposing: nil))
+		#expect(prepared.didCommit)
+		#expect(prepared.commitedRemoteClientId == dedicated)
+	}
+
+	/// A parked A.4 bootstrap reply (a checkpoint-touching PQ op) rides the
+	/// baseline checkpoint: the round completes on the restored responder.
+	@Test func parkedBootstrapReplySurvivesRestore() throws {
+		let (localSession, remoteSession) = try establishPair()
+		let localPQ = localSession as any AbstractTwoMLS.PQRatchetingSession
+		let remotePQ = remoteSession as any AbstractTwoMLS.PQRatchetingSession
+
+		let kp = try localPQ.begin(.finishBootstrap, rotating: nil)
+		let inbound = try remotePQ.ingest(kp.payload)  // parks the reply
+
+		// Restore the responder AFTER parking — the parked reply must survive.
+		let restored = try roundTripPush(remoteSession)
+		try restored.installSink(RecordingSink())
+		let restoredPQ = restored as any AbstractTwoMLS.PQRatchetingSession
+
+		let reply = try #require(try restoredPQ.advance(after: inbound))
+		_ = try localPQ.ingest(reply.payload)
+		#expect(localPQ.isFullyEstablished)
+		#expect(restoredPQ.isFullyEstablished)
+	}
 }

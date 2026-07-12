@@ -96,7 +96,7 @@ struct PQInvitationReceiveTests {
 		)
 
 		// A transport re-delivery of the same welcome is dropped.
-		#expect(throws: TwoMlsPqError.DuplicateWelcome) {
+		do {
 			_ = try invitation.receive(
 				sendGroupWelcome: welcome,
 				remoteKeyPackage: initiatorKp,
@@ -105,6 +105,10 @@ struct PQInvitationReceiveTests {
 				stapledMessage: nil,
 				newClientId: .mock()
 			)
+			Issue.record("expected .duplicateWelcome")
+		} catch {  // receive is throws(SessionError) — error is typed
+			#expect(error.code == .duplicateWelcome)
+			#expect(error.disposition == .discardFrame)
 		}
 	}
 
@@ -135,9 +139,12 @@ struct PQInvitationReceiveTests {
 				stapledMessage: nil,
 				newClientId: .mock()
 			)
-			Issue.record("expected remoteIdentityMismatch")
-		} catch TwoMLSPQConformanceError.remoteIdentityMismatch {
-			// expected
+			Issue.record("expected .identityMismatch")
+		} catch {  // receive is throws(SessionError) — error is typed
+			// M4: the wrapper's own key-package guard and the crate's
+			// RemoteIdentityMismatch both surface as one code.
+			#expect(error.code == .identityMismatch)
+			#expect(error.disposition == .rejectEstablishment)
 		}
 	}
 
@@ -163,7 +170,7 @@ struct PQInvitationReceiveTests {
 		)
 		let token = AbstractTwoMLS.WelcomeToken(TypedDigest(prefix: .sha256, over: welcome))
 
-		#expect(throws: TwoMlsPqError.InvalidClientId) {
+		do {
 			_ = try invitation.receive(
 				sendGroupWelcome: welcome,
 				remoteKeyPackage: initiatorKp,
@@ -172,6 +179,9 @@ struct PQInvitationReceiveTests {
 				stapledMessage: nil,
 				newClientId: Data()
 			)
+			Issue.record("expected .invalidClientId")
+		} catch {  // receive is throws(SessionError) — error is typed
+			#expect(error.code == .invalidClientId)
 		}
 
 		// Nothing was consumed: the identical welcome establishes on retry.
