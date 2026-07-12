@@ -607,6 +607,13 @@ extension AbstractTwoMLS {
 	}
 }
 
+// A session is a single-driver state machine — see the PQRatchet doc. This
+// unavailable conformance makes the non-Sendability explicit and blocks a
+// consumer from retroactively re-adding it; the containing type (typically an
+// actor owning the session) asserts its own Sendable story instead.
+@available(*, unavailable)
+extension AbstractTwoMLS.PQSession: Sendable {}
+
 // MARK: - Client (stub)
 
 extension AbstractTwoMLS {

@@ -103,10 +103,16 @@ extension AbstractTwoMLS {
 
 	/// Explicit initiator/responder flow for the PQ side-band, replacing
 	/// currentPQInflight() / received(pqProposal:) / received(pqCommit:).
-	// Sendable is sound (the wrapped uniffi `TwoMlsPqSession` is `@unchecked Sendable`:
-	// Rust Send+Sync, FFI calls lock-serialized) — but it buys memory safety, not ordering.
-	// The begin → ingest → advance ratchet has one parked reply slot: drive it sequentially.
-	public protocol PQRatchet: Sendable {
+	// Deliberately NOT Sendable: a session is a single-driver state machine
+	// (one parked reply slot, one pending-proposal slot), and while the wrapped
+	// uniffi object is lock-serialized (memory-safe), concurrent drivers can
+	// interleave silently — a second prepareToEncrypt replaces the staged
+	// proposal with no signal to the first, and racing advance/ingest can
+	// mislabel a parked frame. Withholding Sendable makes the compiler refuse
+	// to move a session across task boundaries; the CONTAINING type (typically
+	// an actor that owns the session and serializes all driving) asserts its
+	// own Sendable conformance instead.
+	public protocol PQRatchet {
 		var turn: PQTurn { get }
 		var epochs: APQEpochs { get }
 		/// True once both send groups are full APQ pairs (post-A.4).
