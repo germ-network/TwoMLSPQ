@@ -526,17 +526,6 @@ impl TwoMlsPqInvitation {
         self.lock().state_seq
     }
 
-    /// Serialise the invitation's signing identity + key-package private material (or, once a
-    /// single-use invitation is spent, the absence of it), plus the mutation counter, the
-    /// consumed-remote set, the spawned-group forward table, and the processed-welcome ledger
-    /// so the transport dedup guard and replay routing survive a restore.
-    ///
-    /// One lock now guards all of it, so this is a single acquisition — the whole state is
-    /// snapshotted consistently with no cross-lock ordering to reason about.
-    pub fn archive(&self) -> Result<Vec<u8>> {
-        self.lock().encode()
-    }
-
     /// The principal's ClientId.
     pub fn client_id(&self) -> ClientId {
         ClientId {
@@ -786,6 +775,13 @@ impl TwoMlsPqInvitation {
 }
 
 impl TwoMlsPqInvitation {
+    /// Serialise the invitation as one blob — the legacy pull path, NOT on the FFI surface
+    /// (push persistence via `ArchiveSink` + `install_sink` replaced it). Kept `pub` for
+    /// in-crate tests only.
+    pub fn archive(&self) -> Result<Vec<u8>> {
+        self.lock().encode()
+    }
+
     /// Lock the invitation's single state cell, recovering from a poisoned mutex (the guarded
     /// data is plain records; a panic mid-update can't leave it torn). Every method takes this
     /// one guard — `receive` holds it across its whole critical section, so there is no

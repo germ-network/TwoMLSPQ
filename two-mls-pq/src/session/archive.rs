@@ -399,16 +399,6 @@ fn pq_inflight_from_wire(wire: archive_wire::WirePqInflight) -> Result<PqInfligh
 
 #[uniffi::export]
 impl TwoMlsPqSession {
-    /// Restore a session from a single serialised archive — the legacy whole-blob path,
-    /// kept for tests/migration. Push-based restores use [`from_persisted`]. Self-contained:
-    /// the archive carries the session's signing identity, so restore rebuilds the exact
-    /// client internally (byte-exact ClientId and signing keys), giving continuity for any
-    /// group or leaf created after the restore.
-    #[uniffi::constructor]
-    pub fn from_archive(archive: Archive) -> Result<Arc<Self>> {
-        session_from_wire(decode_wire(&archive)?)
-    }
-
     /// Restore from the two pushed blobs (`ArchiveSink`): the last `core` and the last full
     /// `checkpoint`. Reconciles in one place — the PQ ratchet trees always come from the
     /// `checkpoint`; identity/classical/meta from whichever of the two has the higher
@@ -605,10 +595,18 @@ fn session_from_wire(wire: archive_wire::SessionArchive) -> Result<Arc<TwoMlsPqS
     }))
 }
 
-#[uniffi::export]
+// Legacy whole-blob archive/restore — NOT on the FFI surface (push persistence via
+// `ArchiveSink` + `from_persisted` replaced it; the pull `archive()` was the root of H1). Kept
+// `pub` for in-crate tests and the archive-decode fuzz target only.
 impl TwoMlsPqSession {
-    /// Serialise the session for persistence; restore with `from_archive`. Archive is
-    /// **total** — a session is ALWAYS archivable, in any state, so this never refuses.
+    /// Restore from a single serialised archive (the legacy whole-blob path). Self-contained:
+    /// the archive rebuilds the session's exact client internally.
+    pub fn from_archive(archive: Archive) -> Result<Arc<Self>> {
+        session_from_wire(decode_wire(&archive)?)
+    }
+
+    /// Serialise the session as one blob. NOT exported — this is the pull model push
+    /// persistence replaced. Archive is **total** — a session is ALWAYS archivable.
     ///
     /// The bytes are **plaintext secret material** (the current signing identity, group
     /// snapshots including signing keys and epoch secrets, the PSK ledger, and any

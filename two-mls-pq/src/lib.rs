@@ -138,7 +138,17 @@ pub fn version() -> String {
 // A.3 bind on the classical side, a PQ commit on the A.5 side), not procedurally on every
 // commit — so a commit with no new peer entropy to entangle with carries no cross-party PSK.
 // The transient PSK memo is replaced by epoch watermarks (SESSION_ARCHIVE_VERSION -> 8).
-const BINDING_CONTRACT_VERSION: u64 = 12;
+// v13 (2026-07-11, push-based persistence): the pull `archive()` is REMOVED from the FFI on
+// both TwoMlsPqSession and TwoMlsPqInvitation (its move-not-copy contract re-armed AEAD nonce
+// reuse — security review H1). The live object now PUSHES its state to a foreign `ArchiveSink`
+// (new `with_foreign` trait + `BlobKind{Core,Checkpoint}`) after every mutation; attach it with
+// the new `install_sink`. Session restore is the new `from_persisted(core, checkpoint)` (the
+// two-blob model — classical mutations rewrite a `core` blob omitting the ML-KEM trees, PQ ops
+// write a full `checkpoint`); invitation restore stays `new(archive)`. New read-only `state_seq()`
+// on both. EncryptResult gained `depends_on_seq` (persist-before-transmit correlation).
+// SESSION_ARCHIVE_VERSION -> 9, INVITATION_VERSION -> 3. Persisted state is not portable —
+// regenerate sessions and invitations.
+const BINDING_CONTRACT_VERSION: u64 = 13;
 
 /// See `BINDING_CONTRACT_VERSION`. Exported so the Swift layer can verify the
 /// binding it was generated with matches the binary it loaded.
