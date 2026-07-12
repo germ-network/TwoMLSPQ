@@ -1070,7 +1070,7 @@ impl TwoMlsPqSession {
     /// the rotation you selected. Before signing, assert `sha256(bytes)` equals the
     /// `proposal_hash` returned by your own `prepare_to_encrypt(Some(id))`; that call fails
     /// unless `id` is staged, so the equality pins these bytes to the intended candidate.
-    pub fn staged_rotation_proposal(&self) -> Option<Vec<u8>> {
+    pub fn staged_update_proposal(&self) -> Option<Vec<u8>> {
         self.lock()
             .pending_proposal_message
             .as_ref()

@@ -92,6 +92,14 @@ Sending is two-phase so CommProtocol can bind a per-round proposal hash:
   our APQWelcome until the first commit) rides every frame, so a peer that missed a
   frame is healed by the next one.
 
+Between the two phases, **`staged_update_proposal()`** returns the staged Upd(self)'s
+raw message bytes (`None` outside the prepare → encrypt window). `sha256(bytes)` equals
+`proposal_hash`, so a host that must sign over the proposal — the anchor agent handoff
+binds the rotation Upd's digest — reads the bytes here and applies its own digest
+convention, asserting it against the `proposal_hash` from its own
+`prepare_to_encrypt(Some(id))` (the slot holds whatever Upd the last prepare staged,
+routine self-refreshes included).
+
 ## Receiving
 
 **`process_incoming(ciphertext)`** returns `Option<DecryptResult>`:

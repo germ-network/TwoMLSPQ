@@ -133,7 +133,14 @@ A.3 bind); `queued_remote_successor() -> Option<ClientId>` — the credential cu
 queued, for the app's replace policy; `stage_rotation` — mints a successor candidate
 (re-staging adds candidates, never evicting a sent one; overflow beyond the in-flight
 window defers to a single slot and is proposed next round; the peer's commit picks the
-winner). See [Group Rules](./group-rules.md) for the Authentication Service semantics.
+winner); `staged_update_proposal() -> Option<Vec<u8>>` — non-mutating read of the
+staged Upd(self)'s raw message bytes, `Some` between `prepare_to_encrypt` (which
+materializes it — `stage_rotation` alone does not) and the `encrypt` that consumes it.
+`sha256(bytes)` equals `proposal_hash` and the receiver's digest, so a host binding a
+signature to the rotation (the anchor agent handoff) applies its own digest to these
+bytes — and must assert it equals the `proposal_hash` from its own
+`prepare_to_encrypt(Some(id))`, since the slot holds whatever Upd the last prepare
+staged. See [Group Rules](./group-rules.md) for the Authentication Service semantics.
 
 Header encryption: `open_incoming(blob) -> Option<OpenedFrame { kind, frame }>` removes
 the outer seal from a rendezvous-channel blob and returns the plaintext `frame` plus a
