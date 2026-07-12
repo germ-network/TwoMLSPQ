@@ -138,7 +138,18 @@ pub fn version() -> String {
 // A.3 bind on the classical side, a PQ commit on the A.5 side), not procedurally on every
 // commit — so a commit with no new peer entropy to entangle with carries no cross-party PSK.
 // The transient PSK memo is replaced by epoch watermarks (SESSION_ARCHIVE_VERSION -> 8).
-const BINDING_CONTRACT_VERSION: u64 = 12;
+// v13 (2026-07-11, push-based persistence): the pull `archive()` is REMOVED from the FFI on
+// both TwoMlsPqSession and TwoMlsPqInvitation (its move-not-copy contract re-armed AEAD nonce
+// reuse — security review H1). The live object now PUSHES its state to a foreign `ArchiveSink`
+// (new `with_foreign` trait + `BlobKind{Core,Checkpoint}`) after every mutation; attach it with
+// the new `install_sink`. Session restore is the new `from_persisted(core, checkpoint)` (the
+// two-blob model — classical mutations rewrite a `core` blob omitting the ML-KEM trees, PQ ops
+// write a full `checkpoint`); invitation restore stays `new(archive)`. New read-only `state_seq()`
+// on both. EncryptResult gained `depends_on_seq` (persist-before-transmit correlation), and
+// TwoMlsPqError gained `SinkAlreadyInstalled` (install_sink is once-only). SESSION_ARCHIVE_VERSION
+// -> 9, INVITATION_VERSION -> 3. Persisted state is not portable — regenerate sessions and
+// invitations.
+const BINDING_CONTRACT_VERSION: u64 = 13;
 
 /// See `BINDING_CONTRACT_VERSION`. Exported so the Swift layer can verify the
 /// binding it was generated with matches the binary it loaded.
@@ -215,6 +226,20 @@ pub struct EncryptResult {
     pub sender: ClientId,
     pub recipient: ClientId,
     pub epochs: ApqEpochs,
+    /// The persistence `state_seq` this frame depends on: the seq at which the commit it
+    /// staples was persisted. If the frame publishes new stored-private-key material (it
+    /// staples a fresh commit), the app should wait until it has durably persisted this seq
+    /// before transmitting — otherwise a crash-restore could rewind past keys the peer will
+    /// rely on. A routine app message re-staples an already-persisted commit, so its
+    /// `depends_on_seq` is already durable and imposes no wait. See `ArchiveSink`.
+    ///
+    /// Boundary of the durability gate: only frames that publish key material are gated. A
+    /// routine app frame advances the sender ratchet but is NOT gated on that advance being
+    /// durable, so a crash-restore can rewind one generation and re-send it; MLS's per-message
+    /// random `reuse_guard` (RFC 9420 §5.3) is what bounds AEAD nonce reuse there (~2⁻³² residual),
+    /// not durability. This is deliberate — gating every app message on a disk write would be a
+    /// latency killer, and only key-material frames carry the rewind hazard the gate exists for.
+    pub depends_on_seq: u64,
 }
 
 /// Returned by `process_incoming`. Fields are `None` when not applicable to
@@ -277,6 +302,48 @@ impl PrincipalState {
 #[derive(Debug, uniffi::Record)]
 pub struct Archive {
     pub bytes: Vec<u8>,
+}
+
+/// Which persistence slot a pushed blob targets — see [`ArchiveSink`]. `Core` holds
+/// everything except the two ML-KEM ratchet trees and is rewritten on every classical
+/// mutation; `Checkpoint` is the complete state (incl. the PQ trees) and is written on every
+/// PQ-touching mutation and at birth. Each slot is upserted atomically and independently, and
+/// a `Core` is only ever consistent with the latest `Checkpoint` (the PQ trees never change
+/// between checkpoints), so restore needs no cross-slot transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum BlobKind {
+    Core,
+    Checkpoint,
+}
+
+/// Foreign-implemented persistence hook: the object PUSHES its new state after every
+/// state-advancing mutation, inverting the old pull-`archive()` model (which was a move, not a
+/// copy — misusing it re-armed AEAD nonce reuse). Pass one per object at construction (or
+/// `None` to opt out, e.g. in tests).
+///
+/// Contract on the implementer:
+/// - `persist` is called OUTSIDE the object lock, on the calling Rust thread. It MUST be
+///   enqueue-only and non-blocking, and MUST NOT synchronously re-enter this library.
+/// - Exactly one blob per call. Atomically upsert the slot named by `kind` (write-temp-rename,
+///   or a DB row) — a single-object write, never a multi-object one.
+/// - Persists can arrive out of order; keep the newest `seq` per `kind`.
+/// - `archive` is PLAINTEXT SECRET MATERIAL (signing keys, epoch secrets, KEM material) — seal
+///   it before writing (the key belongs in the platform keystore).
+///
+/// Driving the object: mutate each session/invitation SEQUENTIALLY — one state-advancing FFI
+/// call at a time per object. The seq/blob-kind model assumes this. Concurrent mutation of one
+/// object can interleave pushes; the worst case a lost or out-of-order checkpoint across a crash
+/// then restores fail-closed (`ArchiveInvalid`), never a stale-PQ splice — an availability loss,
+/// not a safety one.
+///
+/// Transmission stays the app's concern: outbound frames carry `depends_on_seq`, and the app
+/// waits until it has durably persisted that `seq` before transmitting frames that publish
+/// stored-private-key material. "Durably persisted seq N" means CONTIGUOUSLY up to N — persist
+/// blobs in `seq` order so a durable `Core` at seq N implies the earlier `Checkpoint` bearing the
+/// PQ keys is durable too.
+#[uniffi::export(with_foreign)]
+pub trait ArchiveSink: Send + Sync {
+    fn persist(&self, seq: u64, kind: BlobKind, archive: Vec<u8>);
 }
 
 #[derive(Debug, uniffi::Record)]
@@ -453,6 +520,11 @@ pub enum TwoMlsPqError {
     /// post-commit epochs of both groups.
     #[error("APQInfo missing or inconsistent")]
     ApqInfoMismatch,
+    /// `install_sink` was called on an object that already has a persistence sink. Install
+    /// once, right after construction or restore — a second call would silently orphan the
+    /// first sink (its store would go stale with no further pushes), so it fails fast instead.
+    #[error("a persistence sink is already installed")]
+    SinkAlreadyInstalled,
 }
 
 /// SHA-256 over `bytes` — the single hashing primitive behind every digest this

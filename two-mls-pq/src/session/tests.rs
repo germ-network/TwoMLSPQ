@@ -1482,11 +1482,208 @@ fn message_round(sender: &Arc<TwoMlsPqSession>, receiver: &Arc<TwoMlsPqSession>,
     );
 }
 
-/// Archive `session` and restore it (self-contained — the archive rebuilds its own
-/// client, so no identity is passed).
+/// Restore `session` through the PUSH path: attach a recording sink (whose `install_sink`
+/// pushes a baseline checkpoint of the current state), then rebuild from the pushed blobs.
+/// The whole archive/restore corpus therefore flows through `ArchiveSink` + `from_persisted`,
+/// not just the legacy whole-blob `archive()`. (Equivalent outcome — the baseline checkpoint
+/// is the full state — while exercising install_sink/encode_checkpoint/reconcile.)
 fn round_trip(session: &Arc<TwoMlsPqSession>) -> Arc<TwoMlsPqSession> {
-    let archive = assert_ok!(session.archive());
-    assert_ok!(TwoMlsPqSession::from_archive(archive))
+    let sink = Arc::new(RecordingSink::default());
+    assert_ok!(session.install_sink(sink.clone()));
+    assert_ok!(TwoMlsPqSession::from_persisted(
+        sink.latest(crate::BlobKind::Core),
+        sink.latest(crate::BlobKind::Checkpoint),
+    ))
+}
+
+/// A push-persistence sink that records every blob (the test analogue of a persistence
+/// layer). `latest` returns the newest blob of a kind — exactly the newest-per-slot the
+/// `ArchiveSink` contract asks a real sink to keep.
+#[derive(Default)]
+struct RecordingSink {
+    pushes: std::sync::Mutex<Vec<(u64, crate::BlobKind, Vec<u8>)>>,
+}
+
+impl RecordingSink {
+    fn kinds(&self) -> Vec<crate::BlobKind> {
+        self.pushes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(_, k, _)| *k)
+            .collect()
+    }
+
+    fn latest(&self, kind: crate::BlobKind) -> Option<crate::Archive> {
+        self.pushes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|(_, k, _)| *k == kind)
+            .max_by_key(|(seq, _, _)| *seq)
+            .map(|(_, _, bytes)| crate::Archive {
+                bytes: bytes.clone(),
+            })
+    }
+}
+
+impl crate::ArchiveSink for RecordingSink {
+    fn persist(&self, seq: u64, kind: crate::BlobKind, archive: Vec<u8>) {
+        self.pushes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((seq, kind, archive));
+    }
+}
+
+/// End-to-end smoke test of the push path: install a sink, drive classical + PQ ops, and
+/// confirm the blob kinds, then restore from the pushed blobs and keep messaging.
+#[test]
+fn test_push_persistence_smoke() {
+    let (alice, bob) = establish_full();
+
+    let sink = Arc::new(RecordingSink::default());
+    // `install_sink` pushes exactly one baseline checkpoint.
+    assert_ok!(alice.install_sink(sink.clone()));
+    assert_eq!(sink.kinds(), vec![crate::BlobKind::Checkpoint]);
+
+    // Classical message rounds push ONLY Core — never re-encode the ML-KEM trees.
+    message_round(&alice, &bob, b"one");
+    message_round(&bob, &alice, b"two");
+    assert!(
+        sink.kinds()
+            .iter()
+            .skip(1)
+            .all(|k| *k == crate::BlobKind::Core),
+        "classical ops must push only Core, got {:?}",
+        sink.kinds()
+    );
+
+    // A PQ side-band round (A.5 rekey) pushes Checkpoint(s).
+    rekey_round(&bob, &alice);
+    assert!(
+        sink.kinds()
+            .iter()
+            .any(|k| *k == crate::BlobKind::Checkpoint && sink.kinds().len() > 1),
+        "a PQ op must push a Checkpoint"
+    );
+
+    // Restore from the newest pushed blobs and keep going.
+    let restored = assert_ok!(TwoMlsPqSession::from_persisted(
+        sink.latest(crate::BlobKind::Core),
+        sink.latest(crate::BlobKind::Checkpoint),
+    ));
+    message_round(&bob, &restored, b"after-restore");
+    message_round(&restored, &bob, b"restore->bob");
+}
+
+/// `install_sink` is once-only: a second call is rejected rather than silently orphaning the
+/// first sink (whose store would then go stale with no error).
+#[test]
+fn test_install_sink_rejects_second_call() {
+    let (alice, _bob) = establish_full();
+    let first = Arc::new(RecordingSink::default());
+    assert_ok!(alice.install_sink(first.clone()));
+    let second = Arc::new(RecordingSink::default());
+    assert_err!(
+        alice.install_sink(second.clone()),
+        TwoMlsPqError::SinkAlreadyInstalled
+    );
+    // The rejected sink received nothing; the first stays the live one.
+    assert_eq!(second.kinds().len(), 0);
+    assert_eq!(first.kinds(), vec![crate::BlobKind::Checkpoint]);
+}
+
+/// Guard-first discipline: a call that fails a precondition (or is an idempotent no-op) mutates
+/// nothing, so it must neither advance `state_seq` nor push a blob. Pushing per rejected call —
+/// especially a peer-replayable side-band frame that would force a full ML-KEM Checkpoint — is a
+/// DoS amplifier the choke point must avoid. This pins the checks OUTSIDE `mutate_and_persist`.
+#[test]
+fn test_guard_first_rejection_neither_pushes_nor_bumps() {
+    let (alice, _bob) = establish_full();
+    let sink = Arc::new(RecordingSink::default());
+    assert_ok!(alice.install_sink(sink.clone()));
+
+    // (1) Core path — a real mutation followed by its idempotent Ok no-op: staging a fresh id
+    // pushes a Core; re-staging the SAME id changes nothing and must neither bump nor push.
+    assert_ok!(alice.stage_rotation(b"successor-1".to_vec()));
+    let seq = alice.state_seq();
+    let pushes = sink.kinds().len();
+    assert_ok!(alice.stage_rotation(b"successor-1".to_vec()));
+    assert_eq!(
+        alice.state_seq(),
+        seq,
+        "an idempotent stage_rotation must not advance state_seq"
+    );
+    assert_eq!(
+        sink.kinds().len(),
+        pushes,
+        "an idempotent stage_rotation must not push a blob"
+    );
+
+    // (2) Checkpoint path — a state-guard rejection of a PQ op. The first `pq_ratchet_begin` is a
+    // real mutation (pushes a Checkpoint); the second sees the in-flight ephemeral and rejects.
+    // That rejection is the peer-replayable amplifier class, and it must NOT push a full ML-KEM
+    // Checkpoint for a no-op. (`begin` has no turn guard, so this holds regardless of whose turn
+    // it is.)
+    assert_ok!(alice.pq_ratchet_begin());
+    let seq = alice.state_seq();
+    let pushes = sink.kinds().len();
+    assert_err!(alice.pq_ratchet_begin(), TwoMlsPqError::SessionNotReady);
+    assert_eq!(
+        alice.state_seq(),
+        seq,
+        "a rejected pq_ratchet_begin must not advance state_seq"
+    );
+    assert_eq!(
+        sink.kinds().len(),
+        pushes,
+        "a rejected pq_ratchet_begin must not push a Checkpoint"
+    );
+}
+
+/// Fail-closed restore: a `core` whose PQ-epoch manifest does not match the reconciling
+/// `checkpoint` (a PQ op advanced without emitting a checkpoint — impossible normally, but
+/// the manifest guards a lost/torn checkpoint) is rejected rather than restored spliced.
+#[test]
+fn test_from_persisted_fails_closed_on_stale_checkpoint() {
+    let (alice, bob) = establish_full();
+    let sink = Arc::new(RecordingSink::default());
+    assert_ok!(alice.install_sink(sink.clone()));
+    // The baseline checkpoint carries the pre-rekey PQ epochs.
+    let stale_checkpoint = sink.latest(crate::BlobKind::Checkpoint);
+    assert!(stale_checkpoint.is_some());
+
+    // A PQ rekey advances alice's PQ halves (and pushes a fresh checkpoint we deliberately
+    // ignore); a classical message then pushes a Core whose manifest names the NEW PQ epochs.
+    rekey_round(&bob, &alice);
+    message_round(&alice, &bob, b"post-rekey");
+    let core = sink.latest(crate::BlobKind::Core);
+    assert!(core.is_some());
+
+    // Splicing that newer Core onto the pre-rekey checkpoint would pair classical state with a
+    // stale PQ tree — the manifest catches it.
+    assert_err!(
+        TwoMlsPqSession::from_persisted(core, stale_checkpoint),
+        TwoMlsPqError::ArchiveInvalid
+    );
+}
+
+/// `depends_on_seq`: a routine app message re-staples an already-committed staple, so its
+/// `depends_on_seq` does not advance and never exceeds the live `state_seq`.
+#[test]
+fn test_depends_on_seq_stable_across_routine_messages() {
+    let (alice, bob) = establish_full();
+    assert_ok!(alice.prepare_to_encrypt(None));
+    let first = assert_ok!(alice.encrypt(b"one".to_vec()));
+    let _ = bob.process_incoming(first.cipher_text);
+    assert_ok!(alice.prepare_to_encrypt(None));
+    let second = assert_ok!(alice.encrypt(b"two".to_vec()));
+
+    // Neither routine round committed, so the stapled commit — hence depends_on_seq — is
+    // unchanged, and it can never point past the current state.
+    assert_eq!(first.depends_on_seq, second.depends_on_seq);
+    assert!(second.depends_on_seq <= alice.state_seq());
 }
 
 #[test]

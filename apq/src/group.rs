@@ -126,6 +126,18 @@ where
         Ok(CombinerGroupState { classical, pq })
     }
 
+    /// Flush and export ONLY the classical half — the cheap part (a classical-suite snapshot,
+    /// no ML-KEM ratchet tree). Backs the `core` persistence blob, which omits the PQ half and
+    /// splices it from a `checkpoint` at restore (the PQ tree never changes between
+    /// checkpoints, so it need not be re-encoded on a classical mutation).
+    pub fn export_classical(&mut self) -> Result<Zeroizing<Vec<u8>>> {
+        self.classical
+            .write_to_storage()
+            .map_err(|_| CombinerError::Mls)?;
+        self.classical_storage
+            .export_group(self.classical.group_id())
+    }
+
     // Application messages ride the classical group; the pq group is the side channel that
     // injects PQ secrecy via the APQ-PSK and only ratchets on a full (queued-proposal) round.
     pub fn message_group(&self) -> &MlsGroup<S, C> {

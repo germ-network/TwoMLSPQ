@@ -27,7 +27,11 @@ use super::*;
 // v8 (event-driven cross-party injection): the transient PSK memo is gone, replaced by three
 // small epoch watermarks (`last_cross_injected`, `last_cross_injected_pq`,
 // `last_send_pq_exported`) that gate the cross-party injections, so the archive layout changed.
-const SESSION_ARCHIVE_VERSION: u8 = 8;
+// v9 (push-based persistence): the wire gained `state_seq` (the per-session mutation counter
+// that stamps each pushed blob) and the PQ-epoch manifest (`send_pq_epoch`/`recv_pq_epoch`)
+// that lets a `core` blob (PQ trees omitted) be reconciled against a `checkpoint` blob at
+// restore. A whole-blob archive still round-trips through this same layout.
+const SESSION_ARCHIVE_VERSION: u8 = 9;
 
 // In its own module because the derive-generated impls reference the std `Result`, which
 // the crate-local `Result` alias would shadow (same pattern as `invitation::wire`).
@@ -212,6 +216,17 @@ pub(crate) mod archive_wire {
     /// whose turn already flipped would desync the side-band permanently).
     #[derive(MlsSize, MlsEncode, MlsDecode)]
     pub(in crate::session) struct SessionArchive {
+        /// Per-session monotonic mutation counter (see `SessionInner::state_seq`). Stamps
+        /// this blob; `from_persisted` compares a `core` blob's `state_seq` against the
+        /// `checkpoint`'s to pick the newer non-PQ state.
+        pub(in crate::session) state_seq: u64,
+        /// PQ-epoch manifest: the current epoch of each PQ half at the time this blob was
+        /// written (`None` when that half is absent). In a `checkpoint` these describe the
+        /// PQ trees carried inline; in a `core` (PQ trees omitted) they are the epochs the
+        /// core expects the reconciling checkpoint's PQ halves to be at — a mismatch means a
+        /// PQ op advanced without emitting a checkpoint (forbidden), so restore fails closed.
+        pub(in crate::session) send_pq_epoch: Option<u64>,
+        pub(in crate::session) recv_pq_epoch: Option<u64>,
         #[mls_codec(with = "mls_rs_codec::byte_vec")]
         pub(in crate::session) session_id: Vec<u8>,
         /// The session's current client signing identity, rebuilt byte-exact on restore
@@ -384,208 +399,214 @@ fn pq_inflight_from_wire(wire: archive_wire::WirePqInflight) -> Result<PqInfligh
 
 #[uniffi::export]
 impl TwoMlsPqSession {
-    /// Restore a session from a serialised archive (see `archive` for the single-use
-    /// contract). Self-contained: the archive carries the session's signing identity, so
-    /// restore rebuilds the exact client internally — no client argument, matching the
-    /// classical stack's fully-internalized MLS state. The rebuilt client is byte-exact
-    /// (same ClientId and signing keys), giving continuity for any group or leaf created
-    /// after the restore; the group snapshots supply their own signing keys as before.
+    /// Restore from the two pushed blobs (`ArchiveSink`): the last `core` and the last full
+    /// `checkpoint`. Reconciles in one place — the PQ ratchet trees always come from the
+    /// `checkpoint`; identity/classical/meta from whichever of the two has the higher
+    /// `state_seq` (a `core` written after a checkpoint is always consistent with it, since
+    /// the PQ trees never change between checkpoints). A `core` whose PQ-epoch manifest does
+    /// not match the checkpoint's PQ halves (a PQ op that failed to checkpoint) is rejected
+    /// as `ArchiveInvalid` — fail closed rather than restore a spliced state. Either slot may
+    /// be absent (a session that only ever checkpointed has no `core`); at least the
+    /// `checkpoint` must be present.
     #[uniffi::constructor]
-    pub fn from_archive(archive: Archive) -> Result<Arc<Self>> {
-        use mls_rs::mls_rs_codec::MlsDecode;
+    pub fn from_persisted(core: Option<Archive>, checkpoint: Option<Archive>) -> Result<Arc<Self>> {
+        session_from_wire(reconcile_persisted(core, checkpoint)?)
+    }
+}
 
-        // Header: [version][classical u16 BE][pq u16 BE]. The archived suite pair must equal
-        // this build's pinned suite — fail loudly across builds rather than misinterpret the
-        // group snapshots (equality also confirms the pair is a coherent APQ combination).
-        let mut rest = match archive.bytes.as_slice() {
-            [SESSION_ARCHIVE_VERSION, s0, s1, s2, s3, rest @ ..]
-                if apq::ApqCipherSuite::from_wire([*s0, *s1, *s2, *s3])
-                    == crate::providers::APQ_SUITE =>
-            {
-                rest
-            }
-            _ => return Err(TwoMlsPqError::ArchiveInvalid),
-        };
-        let wire = archive_wire::SessionArchive::mls_decode(&mut rest)
-            .map_err(|_| TwoMlsPqError::ArchiveInvalid)?;
-        if !rest.is_empty() {
-            return Err(TwoMlsPqError::ArchiveInvalid);
-        }
-
-        // Structural invariants the live session maintains; reject blobs that violate
-        // them rather than resurrecting an impossible state.
-        if wire.send_psk_ledger.len() > SEND_PSK_WINDOW {
-            return Err(TwoMlsPqError::ArchiveInvalid);
-        }
-        let digest_ok = |d: &[u8]| d.len() == 32;
-        if wire
-            .pending_proposal_hash
+/// Validate a decoded wire and rebuild the live session; shared by `from_archive` and
+/// `from_persisted`. The restored session starts with no sink — attach one with
+/// `install_sink` (which pushes a fresh baseline checkpoint).
+fn session_from_wire(wire: archive_wire::SessionArchive) -> Result<Arc<TwoMlsPqSession>> {
+    // Structural invariants the live session maintains; reject blobs that violate
+    // them rather than resurrecting an impossible state.
+    if wire.send_psk_ledger.len() > SEND_PSK_WINDOW {
+        return Err(TwoMlsPqError::ArchiveInvalid);
+    }
+    let digest_ok = |d: &[u8]| d.len() == 32;
+    if wire
+        .pending_proposal_hash
+        .as_deref()
+        .is_some_and(|d| !digest_ok(d))
+        || wire
+            .offered_proposal
+            .as_ref()
+            .is_some_and(|o| !digest_ok(&o.digest))
+        || wire
+            .queued_proposal
+            .as_ref()
+            .is_some_and(|q| !digest_ok(&q.digest))
+        || wire
+            .joined_welcome_digest
             .as_deref()
             .is_some_and(|d| !digest_ok(d))
-            || wire
-                .offered_proposal
-                .as_ref()
-                .is_some_and(|o| !digest_ok(&o.digest))
-            || wire
-                .queued_proposal
-                .as_ref()
-                .is_some_and(|q| !digest_ok(&q.digest))
-            || wire
-                .joined_welcome_digest
-                .as_deref()
-                .is_some_and(|d| !digest_ok(d))
-        {
-            return Err(TwoMlsPqError::ArchiveInvalid);
-        }
-        if wire
-            .listen_rendezvous
-            .iter()
-            .any(|e| e.addr.len() != RENDEZVOUS_LEN)
-        {
-            return Err(TwoMlsPqError::ArchiveInvalid);
-        }
-        let hk_len = header_key_len()?;
-        if wire
-            .recv_header_keys
-            .iter()
-            .chain(wire.recv_header_keys_pq.iter())
-            .any(|e| e.key.len() != hk_len)
-        {
-            return Err(TwoMlsPqError::ArchiveInvalid);
-        }
-        // The staple is never empty on a live session (set at construction), and its
-        // first byte is one of the two staple forms: APQWelcome (0x01) or MLSMessage
-        // (0x00). This check also structurally rejects pre-v2 archive layouts, whose
-        // bytes can otherwise alias into these fields (an Option-None byte reads as an
-        // empty byte_vec).
-        if !matches!(wire.current_staple.first(), Some(&0x00) | Some(&APQ_TAG)) {
-            return Err(TwoMlsPqError::ArchiveInvalid);
-        }
-
-        let my_state = principal_state_from_wire(wire.my_state);
-        let their_state = principal_state_from_wire(wire.their_state);
-
-        // Rebuild the session's current client byte-exact from its archived signing
-        // identity, and re-mint any staged-but-uncommitted rotation successor. All group
-        // storage and PSK plumbing below re-homes onto this client.
-        let client = principal_from_wire(wire.client)?;
-        let staged_candidates = wire
-            .staged_candidates
-            .into_iter()
-            .map(principal_from_wire)
-            .collect::<Result<Vec<_>>>()?;
-        // Rebuild the canonical AS core from the archived sequences onto the rebuilt
-        // client's view, and point every candidate's view at it.
-        let seq = |w: archive_wire::WirePartySequence| {
-            apq::authentication::PartySequence::from_parts(
-                w.history.into_iter().map(|b| b.bytes).collect(),
-                w.authorized_next.into_iter().map(|b| b.bytes).collect(),
-            )
-        };
-        let (auth_mine, auth_theirs) = (seq(wire.auth_mine), seq(wire.auth_theirs));
-        client.combiner().auth_view().with(move |core| {
-            core.mine = auth_mine;
-            core.theirs = auth_theirs;
-        });
-        let auth_core_restored = client.combiner().auth_view().core();
-        for candidate in &staged_candidates {
-            candidate.combiner().auth_view().rebind(&auth_core_restored);
-        }
-        let pq_inflight = wire.pq_inflight.map(pq_inflight_from_wire).transpose()?;
-
-        let group_state = |entry: archive_wire::GroupEntry| apq::CombinerGroupState {
-            classical: entry.classical.bytes,
-            pq: entry.pq.map(|blob| blob.bytes),
-        };
-        let send_group =
-            apq::load_combiner_group(client.combiner(), &group_state(wire.send_group))?;
-        let recv_group = match wire.recv_group {
-            Some(entry) => Some(apq::load_combiner_group(
-                client.combiner(),
-                &group_state(entry),
-            )?),
-            None => None,
-        };
-
-        // The imports above re-homed every group's captured storage and PSK handles onto
-        // `client`, so the plumbing collapses to `client`'s handles exactly as
-        // `build_session` derives them — the multi-store history a rotation accumulated
-        // existed only to serve groups born on pre-rotation clients, and those bindings
-        // are dissolved by the import.
-        let send_group_storage = client.combiner().classical_group_storage().clone();
-        let suite = client.combiner().cipher_suite();
-        let psk_stores = vec![
-            client.combiner().classical().secret_store(),
-            client.combiner().pq().secret_store(),
-        ];
-        let psk_stores_from = Arc::clone(&client);
-        Ok(Arc::new(TwoMlsPqSession {
-            inner: Mutex::new(SessionInner {
-                client,
-                suite,
-                send_group: Some(send_group),
-                recv_group,
-                pending_outbound: wire.pending_outbound,
-                pending_proposal_hash: wire.pending_proposal_hash,
-                current_staple: wire.current_staple,
-                pending_proposal_message: wire
-                    .pending_proposal_message
-                    .map(|p| (p.proposing, p.message)),
-                joined_welcome_digest: wire.joined_welcome_digest,
-                offered_proposal: wire
-                    .offered_proposal
-                    .map(|o| (o.digest, o.proposal, o.proposing)),
-                queued_proposal: wire
-                    .queued_proposal
-                    .map(|q| (q.digest, q.proposing, q.proposal)),
-                staged_candidates,
-                deferred_candidate: wire.deferred_candidate,
-                auth_core: auth_core_restored,
-                pq_inflight,
-                session_id: SessionId {
-                    bytes: wire.session_id,
-                },
-                my_state,
-                their_state,
-                pq_turn_mine: wire.pq_turn_mine,
-                pending_pq_outbound: wire.pending_pq_outbound,
-                send_psk_ledger: wire
-                    .send_psk_ledger
-                    .into_iter()
-                    .map(|entry| {
-                        apq::ExportedPsk::from_parts(entry.component_id, entry.psk_id, entry.psk)
-                            .map(|exported| (entry.epoch, exported))
-                    })
-                    .collect::<std::result::Result<_, _>>()?,
-                retired_send_psks: wire.retired_send_psks,
-                last_cross_injected: wire.last_cross_injected,
-                last_cross_injected_pq: wire.last_cross_injected_pq,
-                last_send_pq_exported: wire.last_send_pq_exported,
-                listen_rendezvous: wire
-                    .listen_rendezvous
-                    .into_iter()
-                    .map(|entry| (entry.epoch, entry.addr))
-                    .collect(),
-                recv_header_keys: wire
-                    .recv_header_keys
-                    .into_iter()
-                    .map(|entry| (entry.epoch, entry.key))
-                    .collect(),
-                recv_header_keys_pq: wire
-                    .recv_header_keys_pq
-                    .into_iter()
-                    .map(|entry| (entry.epoch, entry.key))
-                    .collect(),
-                send_group_storage,
-                psk_stores,
-                psk_stores_from,
-                spawn_token: wire.spawn_token,
-            }),
-        }))
+    {
+        return Err(TwoMlsPqError::ArchiveInvalid);
+    }
+    if wire
+        .listen_rendezvous
+        .iter()
+        .any(|e| e.addr.len() != RENDEZVOUS_LEN)
+    {
+        return Err(TwoMlsPqError::ArchiveInvalid);
+    }
+    let hk_len = header_key_len()?;
+    if wire
+        .recv_header_keys
+        .iter()
+        .chain(wire.recv_header_keys_pq.iter())
+        .any(|e| e.key.len() != hk_len)
+    {
+        return Err(TwoMlsPqError::ArchiveInvalid);
+    }
+    // The staple is never empty on a live session (set at construction), and its
+    // first byte is one of the two staple forms: APQWelcome (0x01) or MLSMessage
+    // (0x00). This check also structurally rejects pre-v2 archive layouts, whose
+    // bytes can otherwise alias into these fields (an Option-None byte reads as an
+    // empty byte_vec).
+    if !matches!(wire.current_staple.first(), Some(&0x00) | Some(&APQ_TAG)) {
+        return Err(TwoMlsPqError::ArchiveInvalid);
     }
 
-    /// Serialise the session for persistence; restore with `from_archive`. Archive is
-    /// **total** — a session is ALWAYS archivable, in any state, so this never refuses.
+    let my_state = principal_state_from_wire(wire.my_state);
+    let their_state = principal_state_from_wire(wire.their_state);
+
+    // Rebuild the session's current client byte-exact from its archived signing
+    // identity, and re-mint any staged-but-uncommitted rotation successor. All group
+    // storage and PSK plumbing below re-homes onto this client.
+    let client = principal_from_wire(wire.client)?;
+    let staged_candidates = wire
+        .staged_candidates
+        .into_iter()
+        .map(principal_from_wire)
+        .collect::<Result<Vec<_>>>()?;
+    // Rebuild the canonical AS core from the archived sequences onto the rebuilt
+    // client's view, and point every candidate's view at it.
+    let seq = |w: archive_wire::WirePartySequence| {
+        apq::authentication::PartySequence::from_parts(
+            w.history.into_iter().map(|b| b.bytes).collect(),
+            w.authorized_next.into_iter().map(|b| b.bytes).collect(),
+        )
+    };
+    let (auth_mine, auth_theirs) = (seq(wire.auth_mine), seq(wire.auth_theirs));
+    client.combiner().auth_view().with(move |core| {
+        core.mine = auth_mine;
+        core.theirs = auth_theirs;
+    });
+    let auth_core_restored = client.combiner().auth_view().core();
+    for candidate in &staged_candidates {
+        candidate.combiner().auth_view().rebind(&auth_core_restored);
+    }
+    let pq_inflight = wire.pq_inflight.map(pq_inflight_from_wire).transpose()?;
+
+    let group_state = |entry: archive_wire::GroupEntry| apq::CombinerGroupState {
+        classical: entry.classical.bytes,
+        pq: entry.pq.map(|blob| blob.bytes),
+    };
+    let send_group = apq::load_combiner_group(client.combiner(), &group_state(wire.send_group))?;
+    let recv_group = match wire.recv_group {
+        Some(entry) => Some(apq::load_combiner_group(
+            client.combiner(),
+            &group_state(entry),
+        )?),
+        None => None,
+    };
+
+    // The imports above re-homed every group's captured storage and PSK handles onto
+    // `client`, so the plumbing collapses to `client`'s handles exactly as
+    // `build_session` derives them — the multi-store history a rotation accumulated
+    // existed only to serve groups born on pre-rotation clients, and those bindings
+    // are dissolved by the import.
+    let send_group_storage = client.combiner().classical_group_storage().clone();
+    let suite = client.combiner().cipher_suite();
+    let psk_stores = vec![
+        client.combiner().classical().secret_store(),
+        client.combiner().pq().secret_store(),
+    ];
+    let psk_stores_from = Arc::clone(&client);
+    Ok(Arc::new(TwoMlsPqSession {
+        inner: Mutex::new(SessionInner {
+            client,
+            suite,
+            send_group: Some(send_group),
+            recv_group,
+            pending_outbound: wire.pending_outbound,
+            pending_proposal_hash: wire.pending_proposal_hash,
+            // Not serialized; the staple was persisted no later than the archived seq, so
+            // using it is a safe (never-under) `depends_on_seq` for post-restore frames.
+            current_staple_seq: wire.state_seq,
+            current_staple: wire.current_staple,
+            pending_proposal_message: wire
+                .pending_proposal_message
+                .map(|p| (p.proposing, p.message)),
+            joined_welcome_digest: wire.joined_welcome_digest,
+            offered_proposal: wire
+                .offered_proposal
+                .map(|o| (o.digest, o.proposal, o.proposing)),
+            queued_proposal: wire
+                .queued_proposal
+                .map(|q| (q.digest, q.proposing, q.proposal)),
+            staged_candidates,
+            deferred_candidate: wire.deferred_candidate,
+            auth_core: auth_core_restored,
+            pq_inflight,
+            session_id: SessionId {
+                bytes: wire.session_id,
+            },
+            state_seq: wire.state_seq,
+            my_state,
+            their_state,
+            pq_turn_mine: wire.pq_turn_mine,
+            pending_pq_outbound: wire.pending_pq_outbound,
+            send_psk_ledger: wire
+                .send_psk_ledger
+                .into_iter()
+                .map(|entry| {
+                    apq::ExportedPsk::from_parts(entry.component_id, entry.psk_id, entry.psk)
+                        .map(|exported| (entry.epoch, exported))
+                })
+                .collect::<std::result::Result<_, _>>()?,
+            retired_send_psks: wire.retired_send_psks,
+            last_cross_injected: wire.last_cross_injected,
+            last_cross_injected_pq: wire.last_cross_injected_pq,
+            last_send_pq_exported: wire.last_send_pq_exported,
+            listen_rendezvous: wire
+                .listen_rendezvous
+                .into_iter()
+                .map(|entry| (entry.epoch, entry.addr))
+                .collect(),
+            recv_header_keys: wire
+                .recv_header_keys
+                .into_iter()
+                .map(|entry| (entry.epoch, entry.key))
+                .collect(),
+            recv_header_keys_pq: wire
+                .recv_header_keys_pq
+                .into_iter()
+                .map(|entry| (entry.epoch, entry.key))
+                .collect(),
+            send_group_storage,
+            psk_stores,
+            psk_stores_from,
+            spawn_token: wire.spawn_token,
+            // Attached post-restore via `install_sink`.
+            sink: None,
+        }),
+    }))
+}
+
+// Legacy whole-blob archive/restore — NOT on the FFI surface (push persistence via
+// `ArchiveSink` + `from_persisted` replaced it; the pull `archive()` was the root of H1). Kept
+// `pub` for in-crate tests and the archive-decode fuzz target only.
+impl TwoMlsPqSession {
+    /// Restore from a single serialised archive (the legacy whole-blob path). Self-contained:
+    /// the archive rebuilds the session's exact client internally.
+    pub fn from_archive(archive: Archive) -> Result<Arc<Self>> {
+        session_from_wire(decode_wire(&archive)?)
+    }
+
+    /// Serialise the session as one blob. NOT exported — this is the pull model push
+    /// persistence replaced. Archive is **total** — a session is ALWAYS archivable.
     ///
     /// The bytes are **plaintext secret material** (the current signing identity, group
     /// snapshots including signing keys and epoch secrets, the PSK ledger, and any
@@ -605,147 +626,266 @@ impl TwoMlsPqSession {
     /// incoming bind (0x09) — a permanent side-band desync — so serialization is the only
     /// correct choice.
     pub fn archive(&self) -> Result<Archive> {
-        use mls_rs::mls_rs_codec::{MlsEncode, MlsSize};
-
         let mut inner = self.lock();
-        let pq_inflight = inner.pq_inflight.as_ref().map(wire_pq_inflight);
-        let client = signing_identity_blob(&inner.client);
-        let staged_candidates = inner
-            .staged_candidates
-            .iter()
-            .map(|c| signing_identity_blob(c))
-            .collect::<Vec<_>>();
-        let (auth_mine, auth_theirs) = inner.with_auth(|core| {
-            let seq = |s: &apq::authentication::PartySequence| {
-                let (history, authorized_next) = s.to_parts();
-                archive_wire::WirePartySequence {
-                    history: history
-                        .into_iter()
-                        .map(|bytes| archive_wire::IdBlob { bytes })
-                        .collect(),
-                    authorized_next: authorized_next
-                        .into_iter()
-                        .map(|bytes| archive_wire::IdBlob { bytes })
-                        .collect(),
-                }
-            };
-            (seq(&core.mine), seq(&core.theirs))
-        });
+        Ok(Archive {
+            bytes: encode_checkpoint(&mut inner)?,
+        })
+    }
+}
 
-        // Prune the listen map against the same retention window whose epochs the
-        // exported snapshots carry, so the archive is internally consistent.
-        inner.record_listen_rendezvous()?;
-
-        let group_entry = |state: apq::CombinerGroupState| archive_wire::GroupEntry {
-            classical: archive_wire::GroupBlob {
-                bytes: state.classical,
-            },
-            pq: state.pq.map(|bytes| archive_wire::GroupBlob { bytes }),
+/// Build the archive wire struct from the live session. `include_pq = false` omits the two
+/// ML-KEM ratchet trees (the `core` blob) — exporting only each half's cheap classical
+/// snapshot — while recording their epochs in the manifest so a restore can splice them from a
+/// `checkpoint`; `true` carries them inline (`checkpoint`).
+fn build_archive_wire(
+    inner: &mut SessionInner,
+    include_pq: bool,
+) -> Result<archive_wire::SessionArchive> {
+    let pq_inflight = inner.pq_inflight.as_ref().map(wire_pq_inflight);
+    let client = signing_identity_blob(&inner.client);
+    let staged_candidates = inner
+        .staged_candidates
+        .iter()
+        .map(|c| signing_identity_blob(c))
+        .collect::<Vec<_>>();
+    let (auth_mine, auth_theirs) = inner.with_auth(|core| {
+        let seq = |s: &apq::authentication::PartySequence| {
+            let (history, authorized_next) = s.to_parts();
+            archive_wire::WirePartySequence {
+                history: history
+                    .into_iter()
+                    .map(|bytes| archive_wire::IdBlob { bytes })
+                    .collect(),
+                authorized_next: authorized_next
+                    .into_iter()
+                    .map(|bytes| archive_wire::IdBlob { bytes })
+                    .collect(),
+            }
         };
-        let send_group = group_entry(
-            inner
-                .send_group
-                .as_mut()
-                .ok_or(TwoMlsPqError::SessionNotReady)?
-                .export_state()?,
-        );
-        let recv_group = match inner.recv_group.as_mut() {
-            Some(recv) => Some(group_entry(recv.export_state()?)),
-            None => None,
-        };
+        (seq(&core.mine), seq(&core.theirs))
+    });
 
-        let archive =
-            archive_wire::SessionArchive {
-                session_id: inner.session_id.bytes.clone(),
-                client,
-                my_state: wire_principal_state(&inner.my_state),
-                their_state: wire_principal_state(&inner.their_state),
-                pq_turn_mine: inner.pq_turn_mine,
-                spawn_token: inner.spawn_token.clone(),
-                send_group,
-                recv_group,
-                send_psk_ledger: inner
-                    .send_psk_ledger
-                    .iter()
-                    .map(|(epoch, exported)| archive_wire::PskEntry {
-                        epoch: *epoch,
-                        component_id: exported.component_id(),
-                        psk_id: exported.psk_id().to_vec(),
-                        psk: exported.psk().clone(),
-                    })
-                    .collect(),
-                retired_send_psks: inner.retired_send_psks.clone(),
-                last_cross_injected: inner.last_cross_injected,
-                last_cross_injected_pq: inner.last_cross_injected_pq,
-                last_send_pq_exported: inner.last_send_pq_exported,
-                listen_rendezvous: inner
-                    .listen_rendezvous
-                    .iter()
-                    .map(|(&epoch, addr)| archive_wire::ListenEntry {
-                        epoch,
-                        addr: addr.clone(),
-                    })
-                    .collect(),
-                recv_header_keys: inner
-                    .recv_header_keys
-                    .iter()
-                    .map(|(&epoch, key)| archive_wire::HeaderKeyEntry {
-                        epoch,
-                        key: key.clone(),
-                    })
-                    .collect(),
-                recv_header_keys_pq: inner
-                    .recv_header_keys_pq
-                    .iter()
-                    .map(|(&epoch, key)| archive_wire::HeaderKeyEntry {
-                        epoch,
-                        key: key.clone(),
-                    })
-                    .collect(),
-                pending_outbound: inner.pending_outbound.clone(),
-                pending_proposal_hash: inner.pending_proposal_hash.clone(),
-                current_staple: inner.current_staple.clone(),
-                pending_proposal_message: inner.pending_proposal_message.as_ref().map(
-                    |(proposing, message)| archive_wire::WireStagedProposal {
-                        proposing: proposing.clone(),
-                        message: message.clone(),
-                    },
-                ),
-                joined_welcome_digest: inner.joined_welcome_digest.clone(),
-                offered_proposal: inner.offered_proposal.as_ref().map(
-                    |(digest, proposal, proposing)| archive_wire::OfferedProposal {
-                        digest: digest.clone(),
-                        proposal: proposal.clone(),
-                        proposing: proposing.clone(),
-                    },
-                ),
-                queued_proposal: inner.queued_proposal.as_ref().map(
+    // Prune the listen map against the same retention window whose epochs the
+    // exported snapshots carry, so the archive is internally consistent.
+    inner.record_listen_rendezvous()?;
+
+    let group_entry = |state: apq::CombinerGroupState| archive_wire::GroupEntry {
+        classical: archive_wire::GroupBlob {
+            bytes: state.classical,
+        },
+        pq: state.pq.map(|bytes| archive_wire::GroupBlob { bytes }),
+    };
+    // For a `core` blob export only each half's classical snapshot (the ML-KEM tree is
+    // omitted and spliced from the checkpoint at restore); for a `checkpoint` export both.
+    let export = |g: &mut CombinerGroup| -> Result<apq::CombinerGroupState> {
+        if include_pq {
+            Ok(g.export_state()?)
+        } else {
+            Ok(apq::CombinerGroupState {
+                classical: g.export_classical()?,
+                pq: None,
+            })
+        }
+    };
+    let send_group = group_entry(export(
+        inner
+            .send_group
+            .as_mut()
+            .ok_or(TwoMlsPqError::SessionNotReady)?,
+    )?);
+    let recv_group = match inner.recv_group.as_mut() {
+        Some(recv) => Some(group_entry(export(recv)?)),
+        None => None,
+    };
+
+    // The PQ-epoch manifest: the current epoch of each PQ half (None when absent). Export
+    // does not advance an epoch, so reading them after export is equivalent to before. The
+    // same `pq_epochs` accessor gates `process_incoming`'s Core/Checkpoint choice, so the
+    // manifest and that decision can never diverge on what counts as a PQ change.
+    let (send_pq_epoch, recv_pq_epoch) = inner.pq_epochs();
+
+    let archive =
+        archive_wire::SessionArchive {
+            state_seq: inner.state_seq,
+            send_pq_epoch,
+            recv_pq_epoch,
+            session_id: inner.session_id.bytes.clone(),
+            client,
+            my_state: wire_principal_state(&inner.my_state),
+            their_state: wire_principal_state(&inner.their_state),
+            pq_turn_mine: inner.pq_turn_mine,
+            spawn_token: inner.spawn_token.clone(),
+            send_group,
+            recv_group,
+            send_psk_ledger: inner
+                .send_psk_ledger
+                .iter()
+                .map(|(epoch, exported)| archive_wire::PskEntry {
+                    epoch: *epoch,
+                    component_id: exported.component_id(),
+                    psk_id: exported.psk_id().to_vec(),
+                    psk: exported.psk().clone(),
+                })
+                .collect(),
+            retired_send_psks: inner.retired_send_psks.clone(),
+            last_cross_injected: inner.last_cross_injected,
+            last_cross_injected_pq: inner.last_cross_injected_pq,
+            last_send_pq_exported: inner.last_send_pq_exported,
+            listen_rendezvous: inner
+                .listen_rendezvous
+                .iter()
+                .map(|(&epoch, addr)| archive_wire::ListenEntry {
+                    epoch,
+                    addr: addr.clone(),
+                })
+                .collect(),
+            recv_header_keys: inner
+                .recv_header_keys
+                .iter()
+                .map(|(&epoch, key)| archive_wire::HeaderKeyEntry {
+                    epoch,
+                    key: key.clone(),
+                })
+                .collect(),
+            recv_header_keys_pq: inner
+                .recv_header_keys_pq
+                .iter()
+                .map(|(&epoch, key)| archive_wire::HeaderKeyEntry {
+                    epoch,
+                    key: key.clone(),
+                })
+                .collect(),
+            pending_outbound: inner.pending_outbound.clone(),
+            pending_proposal_hash: inner.pending_proposal_hash.clone(),
+            current_staple: inner.current_staple.clone(),
+            pending_proposal_message: inner.pending_proposal_message.as_ref().map(
+                |(proposing, message)| archive_wire::WireStagedProposal {
+                    proposing: proposing.clone(),
+                    message: message.clone(),
+                },
+            ),
+            joined_welcome_digest: inner.joined_welcome_digest.clone(),
+            offered_proposal: inner.offered_proposal.as_ref().map(
+                |(digest, proposal, proposing)| archive_wire::OfferedProposal {
+                    digest: digest.clone(),
+                    proposal: proposal.clone(),
+                    proposing: proposing.clone(),
+                },
+            ),
+            queued_proposal: inner
+                .queued_proposal
+                .as_ref()
+                .map(
                     |(digest, proposing, proposal)| archive_wire::WireQueuedProposal {
                         digest: digest.clone(),
                         proposing: proposing.clone(),
                         proposal: proposal.clone(),
                     },
                 ),
-                staged_candidates,
-                deferred_candidate: inner.deferred_candidate.clone(),
-                auth_mine,
-                auth_theirs,
-                pending_pq_outbound: inner.pending_pq_outbound.clone(),
-                pq_inflight,
-            };
+            staged_candidates,
+            deferred_candidate: inner.deferred_candidate.clone(),
+            auth_mine,
+            auth_theirs,
+            pending_pq_outbound: inner.pending_pq_outbound.clone(),
+            pq_inflight,
+        };
+    Ok(archive)
+}
 
-        // Exact-size preallocation: a growing Vec would strand unwiped partial copies of
-        // the secrets in freed allocations. The final `Archive.bytes` handed across the
-        // FFI is an unwiped copy regardless — hence the sealing obligation above.
-        // Header: [version][classical u16 BE][pq u16 BE] — 5 bytes.
-        let mut out = Zeroizing::new(Vec::with_capacity(5 + archive.mls_encoded_len()));
-        out.push(SESSION_ARCHIVE_VERSION);
-        out.extend_from_slice(&inner.suite.to_wire());
-        archive
-            .mls_encode(&mut out)
-            .map_err(|_| TwoMlsPqError::ArchiveInvalid)?;
-        Ok(Archive {
-            bytes: out.to_vec(),
-        })
+/// Encode an archive wire struct to bytes: header `[version][suite pair]` + MLS body. Exact-
+/// size `Zeroizing` prealloc so a growing Vec can't strand unwiped secret copies (the returned
+/// Vec is itself unwiped — the `ArchiveSink` sealing obligation covers it).
+fn encode_archive(
+    suite: &apq::ApqCipherSuite,
+    wire: &archive_wire::SessionArchive,
+) -> Result<Vec<u8>> {
+    use mls_rs::mls_rs_codec::{MlsEncode, MlsSize};
+    let mut out = Zeroizing::new(Vec::with_capacity(5 + wire.mls_encoded_len()));
+    out.push(SESSION_ARCHIVE_VERSION);
+    out.extend_from_slice(&suite.to_wire());
+    wire.mls_encode(&mut out)
+        .map_err(|_| TwoMlsPqError::ArchiveInvalid)?;
+    Ok(out.to_vec())
+}
+
+/// Encode the full session (checkpoint): identity + classical + meta + the ML-KEM trees.
+pub(super) fn encode_checkpoint(inner: &mut SessionInner) -> Result<Vec<u8>> {
+    let wire = build_archive_wire(inner, true)?;
+    encode_archive(&inner.suite, &wire)
+}
+
+/// Encode the `core` blob: everything except the two ML-KEM ratchet trees.
+pub(super) fn encode_core(inner: &mut SessionInner) -> Result<Vec<u8>> {
+    let wire = build_archive_wire(inner, false)?;
+    encode_archive(&inner.suite, &wire)
+}
+
+/// Decode + header-validate a single archive blob into its wire struct.
+fn decode_wire(archive: &Archive) -> Result<archive_wire::SessionArchive> {
+    use mls_rs::mls_rs_codec::MlsDecode;
+    // Header: [version][classical u16 BE][pq u16 BE]. The archived suite pair must equal this
+    // build's pinned suite — fail loudly across builds rather than misinterpret the group
+    // snapshots (equality also confirms a coherent APQ pair).
+    let mut rest = match archive.bytes.as_slice() {
+        [SESSION_ARCHIVE_VERSION, s0, s1, s2, s3, rest @ ..]
+            if apq::ApqCipherSuite::from_wire([*s0, *s1, *s2, *s3])
+                == crate::providers::APQ_SUITE =>
+        {
+            rest
+        }
+        _ => return Err(TwoMlsPqError::ArchiveInvalid),
+    };
+    let wire = archive_wire::SessionArchive::mls_decode(&mut rest)
+        .map_err(|_| TwoMlsPqError::ArchiveInvalid)?;
+    if !rest.is_empty() {
+        return Err(TwoMlsPqError::ArchiveInvalid);
     }
+    Ok(wire)
+}
+
+/// Reconcile the two pushed blobs into one wire struct (see `from_persisted`). PQ trees come
+/// from the checkpoint; the rest from whichever blob has the higher `state_seq`.
+fn reconcile_persisted(
+    core: Option<Archive>,
+    checkpoint: Option<Archive>,
+) -> Result<archive_wire::SessionArchive> {
+    let checkpoint = checkpoint.ok_or(TwoMlsPqError::ArchiveInvalid)?;
+    let ck = decode_wire(&checkpoint)?;
+    let core = match core {
+        Some(core) => decode_wire(&core)?,
+        // No core: the session only ever checkpointed (or the core was lost) — the checkpoint
+        // alone is a complete, consistent state.
+        None => return Ok(ck),
+    };
+    // The checkpoint is at least as new: it already carries everything through its seq. The `>=`
+    // (not `>`) is load-bearing: `install_sink` re-pushes a baseline checkpoint at the restored
+    // seq WITHOUT bumping, so a checkpoint and a pre-restore core can share a seq — the tie must
+    // break toward the checkpoint, which re-encodes the full reconciled state.
+    if ck.state_seq >= core.state_seq {
+        return Ok(ck);
+    }
+    // The core is newer. It shares the checkpoint's PQ halves (no PQ op happened since, or
+    // there would be a newer checkpoint); validate that and splice them in. A mismatch means a
+    // PQ op advanced without a checkpoint — fail closed.
+    if core.send_pq_epoch != ck.send_pq_epoch || core.recv_pq_epoch != ck.recv_pq_epoch {
+        return Err(TwoMlsPqError::ArchiveInvalid);
+    }
+    let mut merged = core;
+    merged.send_group.pq = ck.send_group.pq;
+    merged.recv_group = match (merged.recv_group, ck.recv_group) {
+        (Some(mut rg), ck_rg) => {
+            rg.pq = ck_rg.and_then(|c| c.pq);
+            Some(rg)
+        }
+        // Core has no recv group and neither does the checkpoint (the epoch check above already
+        // confirmed both recv_pq_epoch are None) — nothing to splice.
+        (None, None) => None,
+        // A newer core lacking a recv group the older checkpoint HAS would mean `recv_group`
+        // regressed Some→None. That is impossible today — nothing clears it once set (reconnect/
+        // reset is not implemented) — so this pairs a passing PQ-epoch check (both None) with a
+        // dropped recv group. Fail closed rather than silently discard the checkpoint's recv
+        // group if a future change ever breaks that monotonicity.
+        (None, Some(_)) => return Err(TwoMlsPqError::ArchiveInvalid),
+    };
+    Ok(merged)
 }

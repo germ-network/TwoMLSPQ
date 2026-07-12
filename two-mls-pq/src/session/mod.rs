@@ -52,6 +52,13 @@ struct SessionInner {
     /// send group's own APQWelcome. Never empty once the send group exists; re-sent on
     /// every frame so any single received frame heals the peer up to our current epoch.
     current_staple: Vec<u8>,
+    /// The `state_seq` at which `current_staple` was last set (the commit — or the birth
+    /// welcome — that produced it). An outbound frame stapling this commit publishes
+    /// stored-private-key material that was persisted at this seq, so it is the frame's
+    /// `depends_on_seq`: the app waits for this seq to be durable before transmitting. A
+    /// routine frame re-stapling an already-persisted commit therefore imposes no wait. Live
+    /// state (re-derivable from the archived `state_seq` on restore — not itself serialized).
+    current_staple_seq: u64,
     /// Upd(self) proposal for the peer's send group, stapled onto the next outbound
     /// frame, with the identity it proposes (the credential its new leaf carries):
     /// `(proposing, proposal bytes)`.
@@ -94,6 +101,13 @@ struct SessionInner {
     auth_core: AuthCoreHandle,
     pq_inflight: Option<PqInflight>,
     session_id: SessionId,
+    /// Monotonic per-session mutation counter, bumped once per state-advancing FFI call
+    /// (see `mutate_and_persist`). Serialized in the archive so it continues across a
+    /// restore; stamps each pushed blob and feeds `depends_on_seq` on outbound frames. `u64`
+    /// so it cannot overflow (2^64 mutations is unreachable — ~585k years at 1M/s); the bump
+    /// is a `checked_add` that hard-errors rather than wrapping, since a wrap would corrupt
+    /// the app's `durable >= depends_on` transmit gate.
+    state_seq: u64,
     my_state: PrincipalState,
     their_state: PrincipalState,
     /// Responder-side side-band frame awaiting pickup by `pq_take_pending_outbound`.
@@ -184,6 +198,11 @@ struct SessionInner {
     /// interprets the bytes. Must be serialized when `archive()` is implemented, or
     /// restored sessions stop acknowledging replayed initial frames.
     spawn_token: Option<Vec<u8>>,
+    /// The foreign persistence hook this session pushes to after every state-advancing
+    /// mutation (see `mutate_and_persist`). `None` opts out of push persistence (tests,
+    /// benches, fuzz). Not part of the archive — it is live plumbing supplied at every
+    /// construction/restore.
+    sink: Option<Arc<dyn crate::ArchiveSink>>,
 }
 
 /// Ledger depth for `send_psk_ledger`: one entry per send-group epoch. The peer references
@@ -374,6 +393,21 @@ impl SessionInner {
         let mut core = self.auth_core.lock().unwrap_or_else(|e| e.into_inner());
         f(&mut core)
     }
+
+    /// The current epoch of each PQ half (`None` when the half is absent), as
+    /// `(send_pq_epoch, recv_pq_epoch)`. This is the PQ-epoch manifest that
+    /// `build_archive_wire` records and that `reconcile_persisted` validates; it is also
+    /// the signal `process_incoming` uses to decide Core vs. Checkpoint — a frame that
+    /// leaves both epochs untouched is classical-only (Core), any change means a PQ half
+    /// was created or advanced and must be captured by a Checkpoint.
+    fn pq_epochs(&self) -> (Option<u64>, Option<u64>) {
+        let epoch = |g: &Option<CombinerGroup>| {
+            g.as_ref()
+                .and_then(|g| g.pq.as_ref())
+                .map(|p| p.current_epoch())
+        };
+        (epoch(&self.send_group), epoch(&self.recv_group))
+    }
 }
 
 // Two constructors' shared assembly — the parameter list mirrors their divergent
@@ -413,6 +447,7 @@ fn build_session(
             pending_proposal_hash: None,
             current_staple,
             pending_proposal_message: None,
+            current_staple_seq: 0,
             joined_welcome_digest,
             offered_proposal: None,
             queued_proposal: None,
@@ -421,6 +456,7 @@ fn build_session(
             auth_core,
             pq_inflight: None,
             session_id,
+            state_seq: 0,
             my_state: PrincipalState::Sync { client_id: my_id },
             their_state: PrincipalState::Sync {
                 client_id: their_id,
@@ -439,6 +475,9 @@ fn build_session(
             psk_stores,
             psk_stores_from,
             spawn_token: None,
+            // Attached post-construction via `install_sink` (which also pushes the baseline
+            // checkpoint); a fresh session starts with no persistence hook.
+            sink: None,
         }),
     })
 }
@@ -505,11 +544,74 @@ impl TwoMlsPqSession {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Record the opaque spawn token this acceptor session was created under. Called by
-    /// `TwoMlsPqInvitation::receive` right after a successful `accept`; `forwarded`
-    /// matches replayed initial frames against it.
-    pub(crate) fn set_spawn_token(&self, token: Vec<u8>) {
-        self.lock().spawn_token = Some(token);
+    /// The persistence choke point: run a state-advancing mutation under the lock, bump the
+    /// mutation counter, then push the resulting blob to the sink (if any) OUTSIDE the lock.
+    /// `kind` is the blob a mutation of this shape produces — `Core` for classical mutations,
+    /// `Checkpoint` for PQ-touching ones (see the footprint table). Pushes even when `f`
+    /// returns `Err` (partial mutations are real — e.g. the eager cross-injection watermark
+    /// advance); an encode failure after a *successful* mutation is surfaced so the app
+    /// retries rather than transmitting against an un-persisted state.
+    fn mutate_and_persist<T>(
+        &self,
+        kind: crate::BlobKind,
+        f: impl FnOnce(&mut SessionInner) -> Result<T>,
+    ) -> Result<T> {
+        let mut inner = self.lock();
+        // Bump BEFORE running the mutation so a staple-setting mutation can record the seq this
+        // push will land at (that seq feeds `depends_on_seq` on the frame it produces).
+        // `checked_add` never wraps (2^64 mutations is unreachable — ~585k years at 1M/s); if it
+        // somehow saturated we run the mutation without persisting rather than corrupt the seq
+        // ordering that gates transmission. No panic (the crate denies it).
+        match inner.state_seq.checked_add(1) {
+            Some(s) => inner.state_seq = s,
+            None => return f(&mut inner),
+        }
+        let seq = inner.state_seq;
+        let result = f(&mut inner);
+        let Some(sink) = inner.sink.clone() else {
+            return result;
+        };
+        let encoded = match kind {
+            crate::BlobKind::Core => archive::encode_core(&mut inner),
+            crate::BlobKind::Checkpoint => archive::encode_checkpoint(&mut inner),
+        };
+        drop(inner);
+        match encoded {
+            Ok(bytes) => {
+                sink.persist(seq, kind, bytes);
+                result
+            }
+            // Encode failed AFTER the mutation (unreachable in practice): if the mutation
+            // succeeded, surface the encode error (app retries); otherwise keep its error.
+            Err(e) => match result {
+                Ok(_) => Err(e),
+                Err(_) => result,
+            },
+        }
+    }
+
+    /// Bump the counter and push a fresh blob of `kind` for a mutator that can't run inside
+    /// `mutate_and_persist` (e.g. it re-acquires the lock internally). Call at the end, after
+    /// the mutator has released the lock: it encodes the CURRENT state, so it captures the
+    /// mutation even though the bump happens in a separate lock acquisition (mutations are
+    /// serialized per session, so nothing slips between). No-ops without a sink.
+    fn persist_after(&self, kind: crate::BlobKind) {
+        let mut inner = self.lock();
+        match inner.state_seq.checked_add(1) {
+            Some(s) => inner.state_seq = s,
+            None => return,
+        }
+        let seq = inner.state_seq;
+        if let Some(sink) = inner.sink.clone() {
+            let bytes = match kind {
+                crate::BlobKind::Core => archive::encode_core(&mut inner),
+                crate::BlobKind::Checkpoint => archive::encode_checkpoint(&mut inner),
+            };
+            if let Ok(bytes) = bytes {
+                drop(inner);
+                sink.persist(seq, kind, bytes);
+            }
+        }
     }
 
     /// Test-only: the plaintext initial welcome — the initiator's `current_staple` before
@@ -603,7 +705,7 @@ impl TwoMlsPqSession {
         welcome: Vec<u8>,
         their_key_package: CombinerKeyPackage,
     ) -> Result<Arc<Self>> {
-        Self::accept_with(client, None, welcome, their_key_package)
+        Self::accept_with(client, None, welcome, their_key_package, None)
     }
 }
 
@@ -625,6 +727,7 @@ impl TwoMlsPqSession {
         session_client: Option<Arc<TwoMlsPqPrincipal>>,
         welcome: Vec<u8>,
         their_key_package: CombinerKeyPackage,
+        spawn_token: Option<Vec<u8>>,
     ) -> Result<Arc<Self>> {
         validate_combiner_kp(client.combiner().cipher_suite(), &their_key_package)?;
         let their_parsed = parse_mls_key_package(their_key_package.classical.clone())?;
@@ -741,27 +844,81 @@ impl TwoMlsPqSession {
         session.lock().remember_send_psk()?;
         session.lock().record_listen_rendezvous()?;
         session.lock().record_pq_header_key()?;
+        // R1: set the spawn token during construction so it rides the baseline checkpoint
+        // `install_sink` later pushes (the old post-construction `set_spawn_token`, run after
+        // the session was already handed to the caller, could be missed).
+        if let Some(token) = spawn_token {
+            session.lock().spawn_token = Some(token);
+        }
         Ok(session)
     }
 }
 
 #[uniffi::export]
 impl TwoMlsPqSession {
+    /// Attach the persistence hook (see [`crate::ArchiveSink`]) this session pushes to after
+    /// every state-advancing mutation, and immediately push a baseline `Checkpoint` at the
+    /// current `state_seq` so the sink starts from a complete snapshot. Call once, right after
+    /// construction or restore and before using the session — mutations made before installing
+    /// are not pushed (a fresh session has none; a restored one re-baselines here). Installing
+    /// does not itself advance `state_seq`. Once-only: a second call returns
+    /// `SinkAlreadyInstalled` rather than silently orphaning the first sink.
+    pub fn install_sink(&self, sink: Arc<dyn crate::ArchiveSink>) -> Result<()> {
+        let mut inner = self.lock();
+        // Install exactly once. A second call would silently orphan the first sink (all future
+        // pushes go to the new one), so reject it rather than fail quietly at restore time.
+        if inner.sink.is_some() {
+            return Err(TwoMlsPqError::SinkAlreadyInstalled);
+        }
+        inner.sink = Some(Arc::clone(&sink));
+        let seq = inner.state_seq;
+        let bytes = archive::encode_checkpoint(&mut inner)?;
+        drop(inner);
+        sink.persist(seq, crate::BlobKind::Checkpoint, bytes);
+        Ok(())
+    }
+
+    /// The session's current persistence `state_seq` (the monotonic mutation counter). Lets
+    /// the app correlate a frame's `depends_on_seq` against its own durable high-water mark,
+    /// and gate transmission of the key-material-bearing frames whose return type does not
+    /// carry the seq — the establishment envelope from `pending_outbound` and the PQ side-band
+    /// frames from `pq_take_pending_outbound` (both publish stored-private-key material, so the
+    /// app should read `state_seq()` right after taking them and wait for it to be durable
+    /// before transmitting).
+    pub fn state_seq(&self) -> u64 {
+        self.lock().state_seq
+    }
+
     /// Welcome bytes to deliver to the remote party to complete group establishment.
     /// Returns `None` once consumed or when both groups are live.
     pub fn pending_outbound(&self) -> Option<Vec<u8>> {
         let mut inner = self.lock();
+        // `take` is the state change; a `None` here is not one, so no bump/push.
         let frame = inner.pending_outbound.take()?;
         // The acceptor's return welcome (recv group already exists) is sealed like any
         // rendezvous-channel frame — the peer opens it from its send-group window. The
         // initiator's initial welcome (no recv group yet) travels the invitation channel
         // instead and is delivered as-is; the host envelopes it via
         // `hpke_seal_to_key_package`, and the invitation opens it before `receive`.
-        if inner.recv_group.is_some() {
+        let out = if inner.recv_group.is_some() {
             inner.seal(&frame).ok()
         } else {
             Some(frame)
+        };
+        // The take advanced state (whatever the seal returned) — persist Core. Push keyed on
+        // the take, not `out`: an (unreachable) post-establishment seal failure still consumed
+        // the parked frame.
+        if let Some(s) = inner.state_seq.checked_add(1) {
+            inner.state_seq = s;
         }
+        let seq = inner.state_seq;
+        if let Some(sink) = inner.sink.clone() {
+            if let Ok(bytes) = archive::encode_core(&mut inner) {
+                drop(inner);
+                sink.persist(seq, crate::BlobKind::Core, bytes);
+            }
+        }
+        out
     }
 
     /// True once both directions' PQ halves are live (post-A.4 bootstrap).
