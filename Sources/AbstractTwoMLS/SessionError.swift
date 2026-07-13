@@ -83,6 +83,10 @@ extension AbstractTwoMLS {
 			/// Missing or inconsistent APQInfo — a welcome without one is a
 			/// downgrade attempt.
 			case apqInfoMismatch
+			/// The welcome's app-state binding does not match the caller's stated
+			/// expectation (wrong relationship, or a strip/downgrade attempt). The
+			/// invitation is NOT consumed — retry with the right expectation works.
+			case appBindingMismatch
 			/// A different welcome on a live session — a mis-route or unexpected
 			/// re-invite (same-welcome re-deliveries are idempotent, not this).
 			case unexpectedWelcome
@@ -129,7 +133,8 @@ extension AbstractTwoMLS {
 				case .invitationSpent, .archiveInvalid:
 					return .discardArtifact
 				case .identityMismatch, .pqUnavailable, .cipherSuiteMismatch,
-					.invalidKeyPackage, .apqInfoMismatch, .unexpectedWelcome:
+					.invalidKeyPackage, .apqInfoMismatch, .appBindingMismatch,
+					.unexpectedWelcome:
 					return .rejectEstablishment
 				case .misroutedFrame, .sequenceViolation, .sessionNotEstablished,
 					.invalidClientId, .proposalRejected, .rotationCannotRideRatchet,

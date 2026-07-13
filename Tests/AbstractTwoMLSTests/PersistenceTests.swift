@@ -239,6 +239,53 @@ struct PersistenceContractTests {
 		#expect(prepared.commitedRemoteClientId == dedicated)
 	}
 
+	/// THE germDM REPRO MIRROR (`restoredReplierSendsFirst`): the replier session is
+	/// captured at reply — the install-time baseline checkpoint IS the whole capture
+	/// (`core: nil`; nothing has driven the session) — and restored before its first
+	/// send. Contract 15 (§A.1): the restored replier sends FIRST, each frame a fresh
+	/// welcome-re-stapling envelope, so the acceptor joins from ANY single frame and
+	/// establishment completes across the restore boundary. CAPTURE ORDERING: the
+	/// capture happens after `createTwoMLSGroup` (inside the reply harness) — the
+	/// attached app payload rides the baseline; a capture taken between `reply` and
+	/// the attach would restore a replier whose frames carry no identity envelope.
+	@Test func birthCapturedReplierRestoresSendReady() throws {
+		let (liveSession, _) = try local.client.reply(
+			remoteClientId: remote.clientId,
+			encodedRemoteKpkg: remote.currentInvitation.encodedKeyPackage
+		)
+
+		// Capture at reply: a fresh sink's baseline checkpoint, core nil — exactly
+		// the app's capturePersisted() shape.
+		let sink = RecordingSink()
+		try liveSession.installSink(sink)
+		#expect(sink.slots == [.checkpoint])
+		let persisted = try sink.sessionPersisted()
+		#expect(persisted.core == nil)
+
+		// Restore (the live object is discarded — single writer) and send first,
+		// twice: pre-establishment prepare is a no-op round (nothing staged).
+		let restored = try AbstractTwoMLS.PQSession(persisted: persisted)
+		try restored.installSink(RecordingSink())
+		let prep = try #require(try restored.prepareToEncrypt(proposing: nil))
+		#expect(prep.proposalMessage.isEmpty)
+		#expect(!prep.didCommit)
+		_ = try restored.encrypt(appMessage: Data("first".utf8))
+		_ = try #require(try restored.prepareToEncrypt(proposing: nil))
+		let second = try restored.encrypt(appMessage: Data("second".utf8))
+
+		// The initial envelope AND frame 1 are dropped: the acceptor joins from the
+		// second frame alone, and its staple delivers that message with the join.
+		let (remoteSession, stapled) = try remote.currentInvitation.receiveReply(
+			ciphertext: second.cipherText,
+			expecting: try local.clientId
+		)
+		#expect(stapled?.appMessageData == Data("second".utf8))
+
+		// Establishment completes across the restore boundary, both directions.
+		try remoteSession.send(to: restored)
+		try restored.exchange(with: remoteSession)
+	}
+
 	/// A parked A.4 bootstrap reply (a checkpoint-touching PQ op) rides the
 	/// baseline checkpoint: the round completes on the restored responder.
 	@Test func parkedBootstrapReplySurvivesRestore() throws {

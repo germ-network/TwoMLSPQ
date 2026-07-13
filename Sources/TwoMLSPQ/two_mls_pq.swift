@@ -1083,20 +1083,19 @@ public protocol TwoMlsPqInvitationProtocol: AnyObject, Sendable {
     func installSink(sink: ArchiveSink) throws 
     
     /**
-     * Open the initiator's first frame (the §A.1 envelope produced by `initiate`),
-     * returning the app-layer welcome the initiator passed as `app_payload` and the MLS
-     * `welcome` to hand to `receive`. Decrypt-only and **state-free** — it does NOT
-     * consume a single-use invitation's key package (consumption happens in `receive`),
-     * so a host can open a frame to validate it before deciding to join, and re-opens are
-     * harmless. Fails `InvitationSpent` once a single-use invitation is consumed (its KP′
-     * material, and thus the opener, is gone); `DecryptionFailed`/`Mls` on a malformed or
-     * wrong-key blob. The counterpart is the free function `seal_initial_envelope`
-     * (called inside `initiate`).
+     * Open an initiator envelope (the §A.1 blob produced by `initiate` and by every
+     * pre-establishment `encrypt`), returning its parsed sections (see [`InitialFrame`]).
+     * Decrypt-only and **state-free** — it does NOT consume a single-use invitation's
+     * key package (consumption happens in `receive`), so a host can open a frame to
+     * validate it before deciding to join, and re-opens are harmless. Fails
+     * `InvitationSpent` once a single-use invitation is consumed (its KP′ material, and
+     * thus the opener, is gone); `DecryptionFailed`/`Mls` on a malformed or wrong-key
+     * blob. The counterpart is the free function `seal_initial_envelope`.
      *
-     * The returned `welcome` is the plaintext both sides need for the spawn token: a
-     * re-sent envelope has a fresh HPKE ephemeral (different outer bytes, identical
-     * plaintext), so a replay-stable token must be computed over this decrypted frame,
-     * not the sealed bytes.
+     * Every envelope from one initiator is freshly HPKE-sealed (different outer bytes)
+     * and — pre-establishment — may staple a different app message, so a replay-stable
+     * token must be computed over the decrypted STABLE PREFIX: the `app_payload`
+     * section when present, else the `welcome` section (see `decode_initial_plaintext`).
      */
     func openInitial(blob: Data) throws  -> InitialFrame
     
@@ -1136,8 +1135,24 @@ public protocol TwoMlsPqInvitationProtocol: AnyObject, Sendable {
      * package naming anyone else is rejected as `RemoteIdentityMismatch` — before any
      * invitation state is claimed, so the invitation stays fully reusable. `None` skips
      * the check (the welcome-creator ≡ key-package binding below still applies).
+     *
+     * `expected_app_binding` is the app-state binding this welcome must carry — the
+     * opaque bytes the initiator welded into its send group's GroupContext (see
+     * `TwoMlsPqSession::initiate`; a DIGEST of the app's immutable relationship
+     * identity, which this library never interprets). The check is an exact, symmetric
+     * match: `Some` requires the joined group's `AppBinding` extension to be byte-equal
+     * (absent or different — a stripped, downgraded, or wrong-relationship welcome — is
+     * `AppBindingMismatch`); `None` requires the welcome to carry none (a binding the
+     * caller did not state is rejected, never silently accepted — pass the binding you
+     * can verify). Unlike `expected_remote` this necessarily verifies after the join
+     * (GroupContext rides the encrypted welcome), but still BEFORE any invitation state
+     * is claimed: a rejected welcome consumes nothing, and the invitation stays fully
+     * usable for the genuine one. On success the spawned session's send group carries
+     * the same binding back to the initiator. An EMPTY expectation is rejected up
+     * front — empty is reserved (no group can carry an empty binding; `None` is the
+     * unbound state), so it could never match.
      */
-    func receive(welcome: Data, theirKeyPackage: CombinerKeyPackage, spawnToken: Data, newClientId: Data?, expectedRemote: Data?) throws  -> TwoMlsPqSession
+    func receive(welcome: Data, theirKeyPackage: CombinerKeyPackage, spawnToken: Data, newClientId: Data?, expectedRemote: Data?, expectedAppBinding: Data?) throws  -> TwoMlsPqSession
     
     /**
      * The current per-invitation mutation counter (bumped once per successful `receive`),
@@ -1292,20 +1307,19 @@ open func installSink(sink: ArchiveSink)throws   {try rustCallWithError(FfiConve
 }
     
     /**
-     * Open the initiator's first frame (the §A.1 envelope produced by `initiate`),
-     * returning the app-layer welcome the initiator passed as `app_payload` and the MLS
-     * `welcome` to hand to `receive`. Decrypt-only and **state-free** — it does NOT
-     * consume a single-use invitation's key package (consumption happens in `receive`),
-     * so a host can open a frame to validate it before deciding to join, and re-opens are
-     * harmless. Fails `InvitationSpent` once a single-use invitation is consumed (its KP′
-     * material, and thus the opener, is gone); `DecryptionFailed`/`Mls` on a malformed or
-     * wrong-key blob. The counterpart is the free function `seal_initial_envelope`
-     * (called inside `initiate`).
+     * Open an initiator envelope (the §A.1 blob produced by `initiate` and by every
+     * pre-establishment `encrypt`), returning its parsed sections (see [`InitialFrame`]).
+     * Decrypt-only and **state-free** — it does NOT consume a single-use invitation's
+     * key package (consumption happens in `receive`), so a host can open a frame to
+     * validate it before deciding to join, and re-opens are harmless. Fails
+     * `InvitationSpent` once a single-use invitation is consumed (its KP′ material, and
+     * thus the opener, is gone); `DecryptionFailed`/`Mls` on a malformed or wrong-key
+     * blob. The counterpart is the free function `seal_initial_envelope`.
      *
-     * The returned `welcome` is the plaintext both sides need for the spawn token: a
-     * re-sent envelope has a fresh HPKE ephemeral (different outer bytes, identical
-     * plaintext), so a replay-stable token must be computed over this decrypted frame,
-     * not the sealed bytes.
+     * Every envelope from one initiator is freshly HPKE-sealed (different outer bytes)
+     * and — pre-establishment — may staple a different app message, so a replay-stable
+     * token must be computed over the decrypted STABLE PREFIX: the `app_payload`
+     * section when present, else the `welcome` section (see `decode_initial_plaintext`).
      */
 open func openInitial(blob: Data)throws  -> InitialFrame  {
     return try  FfiConverterTypeInitialFrame_lift(try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
@@ -1359,8 +1373,24 @@ open func processedWelcomeGroupId(welcome: Data) -> MlsGroupId?  {
      * package naming anyone else is rejected as `RemoteIdentityMismatch` — before any
      * invitation state is claimed, so the invitation stays fully reusable. `None` skips
      * the check (the welcome-creator ≡ key-package binding below still applies).
+     *
+     * `expected_app_binding` is the app-state binding this welcome must carry — the
+     * opaque bytes the initiator welded into its send group's GroupContext (see
+     * `TwoMlsPqSession::initiate`; a DIGEST of the app's immutable relationship
+     * identity, which this library never interprets). The check is an exact, symmetric
+     * match: `Some` requires the joined group's `AppBinding` extension to be byte-equal
+     * (absent or different — a stripped, downgraded, or wrong-relationship welcome — is
+     * `AppBindingMismatch`); `None` requires the welcome to carry none (a binding the
+     * caller did not state is rejected, never silently accepted — pass the binding you
+     * can verify). Unlike `expected_remote` this necessarily verifies after the join
+     * (GroupContext rides the encrypted welcome), but still BEFORE any invitation state
+     * is claimed: a rejected welcome consumes nothing, and the invitation stays fully
+     * usable for the genuine one. On success the spawned session's send group carries
+     * the same binding back to the initiator. An EMPTY expectation is rejected up
+     * front — empty is reserved (no group can carry an empty binding; `None` is the
+     * unbound state), so it could never match.
      */
-open func receive(welcome: Data, theirKeyPackage: CombinerKeyPackage, spawnToken: Data, newClientId: Data?, expectedRemote: Data?)throws  -> TwoMlsPqSession  {
+open func receive(welcome: Data, theirKeyPackage: CombinerKeyPackage, spawnToken: Data, newClientId: Data?, expectedRemote: Data?, expectedAppBinding: Data?)throws  -> TwoMlsPqSession  {
     return try  FfiConverterTypeTwoMlsPqSession_lift(try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
     uniffi_two_mls_pq_fn_method_twomlspqinvitation_receive(
             self.uniffiCloneHandle(),
@@ -1368,7 +1398,8 @@ open func receive(welcome: Data, theirKeyPackage: CombinerKeyPackage, spawnToken
         FfiConverterTypeCombinerKeyPackage_lower(theirKeyPackage),
         FfiConverterData.lower(spawnToken),
         FfiConverterOptionData.lower(newClientId),
-        FfiConverterOptionData.lower(expectedRemote),$0
+        FfiConverterOptionData.lower(expectedRemote),
+        FfiConverterOptionData.lower(expectedAppBinding),$0
     )
 })
 }
@@ -1681,12 +1712,33 @@ public protocol TwoMlsPqSessionProtocol: AnyObject, Sendable {
     func activeSessionId()  -> SessionId
     
     /**
+     * The app-state binding this session was created with (`initiate`'s `app_binding`,
+     * or the binding the accepted welcome carried), or `None` for an unbound session.
+     * Welded into the send group's GroupContext at creation and immutable for the
+     * session's lifetime, it rides the persisted group state — a restored session's
+     * owner re-verifies here that the session still belongs to the relationship it was
+     * pinned to. The bytes are opaque to this library (the adopter's digest); errors
+     * only if the extension is present but undecodable (corruption must not read back
+     * as "unbound").
+     */
+    func appBinding() throws  -> Data?
+    
+    /**
      * The send group's APQ epoch pair (PQ side-band, classical message group).
      * Zeros until the corresponding group exists.
      */
     func epochs()  -> ApqEpochs
     
     func hasReceiveGroup()  -> Bool
+    
+    /**
+     * The plaintext birth `APQWelcome_A` (the message-frame staple form, first byte
+     * 0x01) while it is still the current staple — for the host to bind into its
+     * app-layer identity envelope at reply time (e.g. sign over the welcome + the
+     * return key package, then attach the result via `set_initial_app_payload`).
+     * `None` once the first send-group commit replaced the staple. Read-only.
+     */
+    func initialWelcome()  -> Data?
     
     /**
      * Attach the persistence hook (see [`crate::ArchiveSink`]) this session pushes to after
@@ -1717,6 +1769,32 @@ public protocol TwoMlsPqSessionProtocol: AnyObject, Sendable {
     func receiveGroupId()  -> CombinerGroupId?
     
     /**
+     * Attach (or replace) the host's app-layer welcome on this initiated session. The
+     * payload MUST be establishment-self-sufficient — it carries the MLS welcome
+     * (`initial_welcome`) and the initiator's return key package inside (e.g. a signed
+     * identity envelope) — because composed envelopes then omit the bare sections (the
+     * either/or rule on `seal_initial_envelope`). Regenerates the parked
+     * `pending_outbound` envelope and rides every later pre-establishment `encrypt`.
+     *
+     * Initiator-only, pre-establishment only (`SessionNotReady` otherwise).
+     * CAPTURE ORDERING: the retained state persists (a session captured at birth can
+     * still send first after restore), so capture AFTER this call — a snapshot taken
+     * between `initiate` and this attach restores a replier whose re-staples carry no
+     * identity payload.
+     */
+    func setInitialAppPayload(payload: Data) throws 
+    
+    /**
+     * Attach the initiator's return-group combiner key package for the BARE envelope
+     * shape (no self-sufficient `set_initial_app_payload`): pre-establishment
+     * envelopes then carry `[welcome][return_kp]`, so any single frame is a complete
+     * establishment vector for the invitation holder. Unused when a host payload is
+     * attached (the payload carries the key package itself). Same guards, capture
+     * ordering, and envelope regeneration as `set_initial_app_payload`.
+     */
+    func setInitialReturnKeyPackage(keyPackage: CombinerKeyPackage) throws 
+    
+    /**
      * The session's current persistence `state_seq` (the monotonic mutation counter). Lets
      * the app correlate a frame's `depends_on_seq` against its own durable high-water mark,
      * and gate transmission of the key-material-bearing frames whose return type does not
@@ -1733,10 +1811,16 @@ public protocol TwoMlsPqSessionProtocol: AnyObject, Sendable {
      * Encrypt `app_message` using the PQ send group.
      * Must be called after `prepare_to_encrypt`; the pending proposal hash is used as
      * authenticated data and cleared on return.
-     * The output is always one message frame `[staple][proposal][app]`: the staple (our
-     * latest send-group commit, or our APQWelcome until the first commit) rides every
-     * frame, so a peer that missed a frame is healed by the next one. `pending_outbound`
-     * is NOT consumed here — the staple carries the welcome; the standalone copy stays
+     *
+     * Post-establishment, the output is one message frame `[staple][proposal][app]`:
+     * the staple (our latest send-group commit, or our APQWelcome until the first
+     * commit) rides every frame, so a peer that missed a frame is healed by the next
+     * one. Pre-establishment (initiated side, no recv group — the marker is the empty
+     * staged-proposal slot a `prepare_pre_establishment` left), the output is instead
+     * a fresh §A.1 envelope HPKE-sealed to the peer's KP′, carrying the establishment
+     * sections plus this app message as its `[0x13]` staple — any single frame lets
+     * the invitation holder join and read it. `pending_outbound` is NOT consumed on
+     * either path — the frame itself carries the welcome; the standalone copy stays
      * available for hosts that also deliver it separately (processing is idempotent).
      */
     func encrypt(appMessage: Data) throws  -> EncryptResult
@@ -1777,11 +1861,16 @@ public protocol TwoMlsPqSessionProtocol: AnyObject, Sendable {
     
     /**
      * Prepare a pending proposal nonce and stage it for binding into the next outbound message.
-     * Returns `Err(SessionNotReady)` until both groups are established.
      *
      * - `proposing: None` with a queued remote proposal → folding commit — folds the approved Upd (epoch advance + PSK refresh), `did_commit: true`
      * - `proposing: Some(new_id)` → rotation commit with new leaf credential, `did_commit: true`
      * - Otherwise → recv self-Update only, `did_commit: false`
+     * - Pre-establishment (initiated side, recv group absent) → a NO-OP prepare
+     * (§A.1: the initiator sends app messages immediately, before the acceptor's
+     * return welcome): nothing is staged (`proposal_message` empty; `proposal_hash`
+     * is the WELCOME digest, the AAD binding each pre-establishment message to its
+     * establishment vector), and the paired `encrypt` emits a §A.1 envelope
+     * re-stapling the welcome. `proposing: Some` here → `SessionNotReady`.
      */
     func prepareToEncrypt(proposing: ClientId?) throws  -> PrepareEncryptResult
     
@@ -2038,13 +2127,20 @@ open class TwoMlsPqSession: TwoMlsPqSessionProtocol, @unchecked Sendable {
      * peer's return welcome, and this clear would drop it. The normal entry point,
      * `TwoMlsPqInvitation::receive`, always builds a fresh invitation-derived client, so this
      * only concerns direct callers of `accept`.
+     *
+     * `expected_app_binding` is the app-state binding this welcome must carry (see
+     * `TwoMlsPqInvitation::receive`, which documents the semantics): `Some` requires the
+     * joined group's `AppBinding` to be byte-equal, `None` requires it to carry none —
+     * any other combination is `AppBindingMismatch`, raised before this client's
+     * key-package store is cleared.
      */
-public static func accept(client: TwoMlsPqPrincipal, welcome: Data, theirKeyPackage: CombinerKeyPackage)throws  -> TwoMlsPqSession  {
+public static func accept(client: TwoMlsPqPrincipal, welcome: Data, theirKeyPackage: CombinerKeyPackage, expectedAppBinding: Data?)throws  -> TwoMlsPqSession  {
     return try  FfiConverterTypeTwoMlsPqSession_lift(try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
     uniffi_two_mls_pq_fn_constructor_twomlspqsession_accept(
         FfiConverterTypeTwoMlsPqPrincipal_lower(client),
         FfiConverterData.lower(welcome),
-        FfiConverterTypeCombinerKeyPackage_lower(theirKeyPackage),$0
+        FfiConverterTypeCombinerKeyPackage_lower(theirKeyPackage),
+        FfiConverterOptionData.lower(expectedAppBinding),$0
     )
 })
 }
@@ -2052,20 +2148,38 @@ public static func accept(client: TwoMlsPqPrincipal, welcome: Data, theirKeyPack
     /**
      * Create a session as the initiating party targeting `their_key_package`.
      *
-     * `app_payload` is the host's opaque app-layer welcome (identity introduction, signed
-     * keys, …), or `None`. It is composed with the MLS welcome and HPKE-sealed to the
-     * peer's KP′ inside the library, so `pending_outbound()` returns one opaque envelope —
-     * the first frame's metadata (including the app-layer welcome that identifies the
-     * initiator) is hidden without the host having to compose the envelope itself. The
-     * peer recovers both halves with `TwoMlsPqInvitation::open_initial`, then joins with
-     * `receive`.
+     * The first frame — and every pre-establishment `encrypt` after it — is a §A.1
+     * envelope HPKE-sealed to the peer's KP′ inside the library: `pending_outbound()`
+     * returns it opaque, the peer recovers the sections with
+     * `TwoMlsPqInvitation::open_initial` and joins with `receive`. An app-layer
+     * welcome (identity introduction, signed keys, …) is attached AFTER construction
+     * with `set_initial_app_payload` — such a payload typically signs over the
+     * welcome (read it via `initial_welcome`) and the return key package, so it
+     * cannot exist before `initiate` returns; the pre-v15 `app_payload` parameter is
+     * gone for the same reason (v16). Until the peer's return welcome arrives,
+     * `prepare_to_encrypt`/`encrypt` keep producing fresh envelopes, each stapling
+     * the current app message (§A.1: the initiator sends app messages immediately).
+     *
+     * `app_binding` is the optional app-state binding: opaque bytes welded into the send
+     * group's GroupContext (an `AppBinding` extension, the APQInfo mechanism) at this
+     * moment and immutable for the session's lifetime — the binding of the session to the
+     * app's IMMUTABLE relationship identity, which the two mutable agents (rotation
+     * lifecycle) cannot carry. The peer verifies it at `receive(expected_app_binding:)`,
+     * mirrors it onto the return group, and this session requires the return welcome to
+     * carry it back unchanged; read it back any time (e.g. after a restore) with
+     * [`app_binding`](Self::app_binding). Pass a DIGEST, not raw identifiers — the first
+     * adopter binds `H(domain-tag ‖ role-ordered did:did)`, sharing its canonicalization
+     * with the delegation binding so the two cannot drift; this library never interprets
+     * the bytes. An EMPTY binding is rejected as `AppBindingMismatch` (reserved — an
+     * accidentally empty digest must not mint a bound-to-nothing session; `None` is the
+     * unbound state, the AppBinding analogue of the empty-ClientId rule).
      */
-public static func initiate(client: TwoMlsPqPrincipal, theirKeyPackage: CombinerKeyPackage, appPayload: Data?)throws  -> TwoMlsPqSession  {
+public static func initiate(client: TwoMlsPqPrincipal, theirKeyPackage: CombinerKeyPackage, appBinding: Data?)throws  -> TwoMlsPqSession  {
     return try  FfiConverterTypeTwoMlsPqSession_lift(try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
     uniffi_two_mls_pq_fn_constructor_twomlspqsession_initiate(
         FfiConverterTypeTwoMlsPqPrincipal_lower(client),
         FfiConverterTypeCombinerKeyPackage_lower(theirKeyPackage),
-        FfiConverterOptionData.lower(appPayload),$0
+        FfiConverterOptionData.lower(appBinding),$0
     )
 })
 }
@@ -2101,6 +2215,24 @@ open func activeSessionId() -> SessionId  {
 }
     
     /**
+     * The app-state binding this session was created with (`initiate`'s `app_binding`,
+     * or the binding the accepted welcome carried), or `None` for an unbound session.
+     * Welded into the send group's GroupContext at creation and immutable for the
+     * session's lifetime, it rides the persisted group state — a restored session's
+     * owner re-verifies here that the session still belongs to the relationship it was
+     * pinned to. The bytes are opaque to this library (the adopter's digest); errors
+     * only if the extension is present but undecodable (corruption must not read back
+     * as "unbound").
+     */
+open func appBinding()throws  -> Data?  {
+    return try  FfiConverterOptionData.lift(try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
+    uniffi_two_mls_pq_fn_method_twomlspqsession_app_binding(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
      * The send group's APQ epoch pair (PQ side-band, classical message group).
      * Zeros until the corresponding group exists.
      */
@@ -2115,6 +2247,21 @@ open func epochs() -> ApqEpochs  {
 open func hasReceiveGroup() -> Bool  {
     return try!  FfiConverterBool.lift(try! rustCall() {
     uniffi_two_mls_pq_fn_method_twomlspqsession_has_receive_group(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * The plaintext birth `APQWelcome_A` (the message-frame staple form, first byte
+     * 0x01) while it is still the current staple — for the host to bind into its
+     * app-layer identity envelope at reply time (e.g. sign over the welcome + the
+     * return key package, then attach the result via `set_initial_app_payload`).
+     * `None` once the first send-group commit replaced the staple. Read-only.
+     */
+open func initialWelcome() -> Data?  {
+    return try!  FfiConverterOptionData.lift(try! rustCall() {
+    uniffi_two_mls_pq_fn_method_twomlspqsession_initial_welcome(
             self.uniffiCloneHandle(),$0
     )
 })
@@ -2185,6 +2332,44 @@ open func receiveGroupId() -> CombinerGroupId?  {
 }
     
     /**
+     * Attach (or replace) the host's app-layer welcome on this initiated session. The
+     * payload MUST be establishment-self-sufficient — it carries the MLS welcome
+     * (`initial_welcome`) and the initiator's return key package inside (e.g. a signed
+     * identity envelope) — because composed envelopes then omit the bare sections (the
+     * either/or rule on `seal_initial_envelope`). Regenerates the parked
+     * `pending_outbound` envelope and rides every later pre-establishment `encrypt`.
+     *
+     * Initiator-only, pre-establishment only (`SessionNotReady` otherwise).
+     * CAPTURE ORDERING: the retained state persists (a session captured at birth can
+     * still send first after restore), so capture AFTER this call — a snapshot taken
+     * between `initiate` and this attach restores a replier whose re-staples carry no
+     * identity payload.
+     */
+open func setInitialAppPayload(payload: Data)throws   {try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
+    uniffi_two_mls_pq_fn_method_twomlspqsession_set_initial_app_payload(
+            self.uniffiCloneHandle(),
+        FfiConverterData.lower(payload),$0
+    )
+}
+}
+    
+    /**
+     * Attach the initiator's return-group combiner key package for the BARE envelope
+     * shape (no self-sufficient `set_initial_app_payload`): pre-establishment
+     * envelopes then carry `[welcome][return_kp]`, so any single frame is a complete
+     * establishment vector for the invitation holder. Unused when a host payload is
+     * attached (the payload carries the key package itself). Same guards, capture
+     * ordering, and envelope regeneration as `set_initial_app_payload`.
+     */
+open func setInitialReturnKeyPackage(keyPackage: CombinerKeyPackage)throws   {try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
+    uniffi_two_mls_pq_fn_method_twomlspqsession_set_initial_return_key_package(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeCombinerKeyPackage_lower(keyPackage),$0
+    )
+}
+}
+    
+    /**
      * The session's current persistence `state_seq` (the monotonic mutation counter). Lets
      * the app correlate a frame's `depends_on_seq` against its own durable high-water mark,
      * and gate transmission of the key-material-bearing frames whose return type does not
@@ -2213,10 +2398,16 @@ open func theirPrincipalState() -> PrincipalState  {
      * Encrypt `app_message` using the PQ send group.
      * Must be called after `prepare_to_encrypt`; the pending proposal hash is used as
      * authenticated data and cleared on return.
-     * The output is always one message frame `[staple][proposal][app]`: the staple (our
-     * latest send-group commit, or our APQWelcome until the first commit) rides every
-     * frame, so a peer that missed a frame is healed by the next one. `pending_outbound`
-     * is NOT consumed here — the staple carries the welcome; the standalone copy stays
+     *
+     * Post-establishment, the output is one message frame `[staple][proposal][app]`:
+     * the staple (our latest send-group commit, or our APQWelcome until the first
+     * commit) rides every frame, so a peer that missed a frame is healed by the next
+     * one. Pre-establishment (initiated side, no recv group — the marker is the empty
+     * staged-proposal slot a `prepare_pre_establishment` left), the output is instead
+     * a fresh §A.1 envelope HPKE-sealed to the peer's KP′, carrying the establishment
+     * sections plus this app message as its `[0x13]` staple — any single frame lets
+     * the invitation holder join and read it. `pending_outbound` is NOT consumed on
+     * either path — the frame itself carries the welcome; the standalone copy stays
      * available for hosts that also deliver it separately (processing is idempotent).
      */
 open func encrypt(appMessage: Data)throws  -> EncryptResult  {
@@ -2278,11 +2469,16 @@ open func openIncoming(blob: Data)throws  -> OpenedFrame?  {
     
     /**
      * Prepare a pending proposal nonce and stage it for binding into the next outbound message.
-     * Returns `Err(SessionNotReady)` until both groups are established.
      *
      * - `proposing: None` with a queued remote proposal → folding commit — folds the approved Upd (epoch advance + PSK refresh), `did_commit: true`
      * - `proposing: Some(new_id)` → rotation commit with new leaf credential, `did_commit: true`
      * - Otherwise → recv self-Update only, `did_commit: false`
+     * - Pre-establishment (initiated side, recv group absent) → a NO-OP prepare
+     * (§A.1: the initiator sends app messages immediately, before the acceptor's
+     * return welcome): nothing is staged (`proposal_message` empty; `proposal_hash`
+     * is the WELCOME digest, the AAD binding each pre-establishment message to its
+     * establishment vector), and the paired `encrypt` emits a §A.1 envelope
+     * re-stapling the welcome. `proposing: Some` here → `SessionNotReady`.
      */
 open func prepareToEncrypt(proposing: ClientId?)throws  -> PrepareEncryptResult  {
     return try  FfiConverterTypePrepareEncryptResult_lift(try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
@@ -2715,7 +2911,9 @@ public func FfiConverterTypeApqEpochs_lower(_ value: ApqEpochs) -> RustBuffer {
 
 
 /**
- * Opaque serialised session state. Restore via `TwoMlsPqSession.fromArchive(_:)`.
+ * Opaque serialised state as pushed to an [`ArchiveSink`]. Sessions restore from the
+ * two newest slots via `TwoMlsPqSession.restore(core:checkpoint:)`; invitations from
+ * their monolithic checkpoint via `TwoMlsPqInvitation.restore(archive:)`.
  */
 public struct Archive: Equatable, Hashable {
     public var bytes: Data
@@ -3271,20 +3469,34 @@ public func FfiConverterTypeHpkeSealed_lower(_ value: HpkeSealed) -> RustBuffer 
 
 
 /**
- * The opened initial frame: the composed `[app_payload ∥ APQWelcome_A]` after
- * `TwoMlsPqInvitation::open_initial` removes the §A.1 envelope. `app_payload` is the
- * host's app-layer welcome bytes it passed to `initiate` (`None` if it passed none);
- * `welcome` is the MLS `APQWelcome_A` to hand to `receive`.
+ * The opened §A.1 envelope after `TwoMlsPqInvitation::open_initial` (or
+ * `decode_initial_plaintext` on an already-HPKE-opened plaintext). Every section is
+ * optional on the wire (empty = absent); which are populated follows the either/or
+ * rule on `seal_initial_envelope`:
+ * - `app_payload` — the host's app-layer welcome. When present it is establishment-
+ * self-sufficient (carries the MLS welcome + the initiator's return key package
+ * inside, e.g. a signed identity envelope), and the bare sections below are absent.
+ * - `welcome` — the bare MLS `APQWelcome_A` to hand to `receive` (no app payload).
+ * - `return_key_package` — the initiator's return-group combiner key package as one
+ * opaque [`encode_combiner_key_package`] blob (decode before handing to `receive`).
+ * - `stapled_message` — a pre-establishment app message (`[0x13][BSG-cl ciphertext]`),
+ * re-stapled on every initiator frame until establishment; hand it to the spawned
+ * session's `process_incoming` AFTER the join (fail-open: it is an optional early
+ * delivery — the sender re-sends until its first commit).
  */
 public struct InitialFrame: Equatable, Hashable {
     public var appPayload: Data?
-    public var welcome: Data
+    public var welcome: Data?
+    public var returnKeyPackage: Data?
+    public var stapledMessage: Data?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(appPayload: Data?, welcome: Data) {
+    public init(appPayload: Data?, welcome: Data?, returnKeyPackage: Data?, stapledMessage: Data?) {
         self.appPayload = appPayload
         self.welcome = welcome
+        self.returnKeyPackage = returnKeyPackage
+        self.stapledMessage = stapledMessage
     }
 
     
@@ -3304,13 +3516,17 @@ public struct FfiConverterTypeInitialFrame: FfiConverterRustBuffer {
         return
             try InitialFrame(
                 appPayload: FfiConverterOptionData.read(from: &buf), 
-                welcome: FfiConverterData.read(from: &buf)
+                welcome: FfiConverterOptionData.read(from: &buf), 
+                returnKeyPackage: FfiConverterOptionData.read(from: &buf), 
+                stapledMessage: FfiConverterOptionData.read(from: &buf)
         )
     }
 
     public static func write(_ value: InitialFrame, into buf: inout [UInt8]) {
         FfiConverterOptionData.write(value.appPayload, into: &buf)
-        FfiConverterData.write(value.welcome, into: &buf)
+        FfiConverterOptionData.write(value.welcome, into: &buf)
+        FfiConverterOptionData.write(value.returnKeyPackage, into: &buf)
+        FfiConverterOptionData.write(value.stapledMessage, into: &buf)
     }
 }
 
@@ -3690,6 +3906,12 @@ public func FfiConverterTypeParsedCombinerKeyPackage_lower(_ value: ParsedCombin
  * authenticated data, and the receiver reports the same value as
  * `QueuedRemoteProposal.digest`. `did_commit` is false when stuck in a prior epoch
  * (no pending remote proposal to commit).
+ *
+ * PRE-ESTABLISHMENT carve-out (v15): an initiated session with no recv group yet
+ * prepares a NO-OP round — `proposal_message` is EMPTY (there is no recv group to
+ * stage an Upd into) and `proposal_hash` is the sha256 of the birth WELCOME instead,
+ * binding each pre-establishment app message to its establishment vector. The peer
+ * stages nothing from such frames (`DecryptResult.proposal` is absent).
  */
 public struct PrepareEncryptResult: Equatable, Hashable {
     public var proposalMessage: Data
@@ -4385,6 +4607,20 @@ public enum TwoMlsPqError: Swift.Error, Equatable, Hashable, Foundation.Localize
      * first sink (its store would go stale with no further pushes), so it fails fast instead.
      */
     case SinkAlreadyInstalled
+    /**
+     * The `AppBinding` app-state binding failed verification: a welcome's binding does
+     * not equal the caller's `expected_app_binding` (absent-when-expected is a
+     * wrong-relationship welcome or a strip — the same downgrade shape a missing APQInfo
+     * signals), a welcome carries a binding the caller did not expect (never silently
+     * accepted — pass the binding you can verify), the return welcome's binding does not
+     * equal the initiating session's own, a PQ half carries one (the binding lives on
+     * the classical halves only), the extension is present but undecodable, or an EMPTY
+     * binding was supplied (reserved as invalid — an accidentally empty digest must not
+     * mint a bound-to-nothing session; `None` is the unbound state).
+     * On `TwoMlsPqInvitation::receive` this is raised before any invitation state is
+     * claimed, so the invitation stays fully reusable for the genuine welcome.
+     */
+    case AppBindingMismatch
 
     
 
@@ -4435,6 +4671,7 @@ public struct FfiConverterTypeTwoMlsPqError: FfiConverterRustBuffer {
         case 19: return .CredentialRejected
         case 20: return .ApqInfoMismatch
         case 21: return .SinkAlreadyInstalled
+        case 22: return .AppBindingMismatch
 
          default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -4529,6 +4766,10 @@ public struct FfiConverterTypeTwoMlsPqError: FfiConverterRustBuffer {
         
         case .SinkAlreadyInstalled:
             writeInt(&buf, Int32(21))
+        
+        
+        case .AppBindingMismatch:
+            writeInt(&buf, Int32(22))
         
         }
     }
@@ -4901,6 +5142,22 @@ public func decodeCombinerKeyPackage(bytes: Data)throws  -> CombinerKeyPackage  
 })
 }
 /**
+ * Parse an HPKE-opened §A.1 envelope plaintext into its four optional sections — the
+ * attacker-facing decoder shared by `open_initial` and any host that HPKE-opens the
+ * envelope itself (`hpke_open`) and needs the sections (e.g. to key a replay-stable
+ * token off the stable prefix: `app_payload` when present, else `welcome` — the two
+ * sections that are identical across an initiator's re-sealed/re-stapled envelopes).
+ * Rejects truncation, trailing bytes, and an envelope carrying neither an
+ * `app_payload` nor a `welcome` (no establishment vector at all).
+ */
+public func decodeInitialPlaintext(plaintext: Data)throws  -> InitialFrame  {
+    return try  FfiConverterTypeInitialFrame_lift(try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
+    uniffi_two_mls_pq_fn_func_decode_initial_plaintext(
+        FfiConverterData.lower(plaintext),$0
+    )
+})
+}
+/**
  * Encode a combiner key package pair into one opaque blob for publication: the -02 §7
  * `APQKeyPackage` TLS encoding inside Germ's version byte. The abstraction layer above
  * carries the pair as a single `Data`; only TwoMLSPQ reads the halves back out (see
@@ -4927,6 +5184,19 @@ public func hpkeSealToKeyPackage(keyPackage: CombinerKeyPackage, plaintext: Data
         FfiConverterData.lower(plaintext),
         FfiConverterOptionData.lower(info),
         FfiConverterOptionData.lower(aad),$0
+    )
+})
+}
+/**
+ * [`INITIAL_ENVELOPE_TAG`] for hosts that parse the outer frame themselves —
+ * splitting kem/ct for `hpke_open` + `decode_initial_plaintext` keeps the raw
+ * plaintext available for replay routing, which `open_initial` would swallow.
+ * Exported as a function so no host hardcodes the tag byte (the `pq_frame_kind`
+ * convention).
+ */
+public func initialEnvelopeTag() -> UInt8  {
+    return try!  FfiConverterUInt8.lift(try! rustCall() {
+    uniffi_two_mls_pq_fn_func_initial_envelope_tag($0
     )
 })
 }
@@ -4993,10 +5263,16 @@ private let initializationResult: InitializationResult = {
     if (uniffi_two_mls_pq_checksum_func_decode_combiner_key_package() != 61532) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_two_mls_pq_checksum_func_decode_initial_plaintext() != 41865) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_two_mls_pq_checksum_func_encode_combiner_key_package() != 48037) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_func_hpke_seal_to_key_package() != 8686) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_two_mls_pq_checksum_func_initial_envelope_tag() != 8037) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_func_parse_combiner_key_package() != 43275) {
@@ -5035,13 +5311,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_two_mls_pq_checksum_method_twomlspqinvitation_install_sink() != 4147) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqinvitation_open_initial() != 31433) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqinvitation_open_initial() != 14550) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqinvitation_processed_welcome_group_id() != 55990) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqinvitation_receive() != 291) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqinvitation_receive() != 55476) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqinvitation_state_seq() != 33948) {
@@ -5062,10 +5338,16 @@ private let initializationResult: InitializationResult = {
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_active_session_id() != 37750) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_app_binding() != 59144) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_epochs() != 27665) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_has_receive_group() != 35549) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_initial_welcome() != 31882) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_install_sink() != 61277) {
@@ -5086,13 +5368,19 @@ private let initializationResult: InitializationResult = {
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_receive_group_id() != 24855) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_set_initial_app_payload() != 5937) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_set_initial_return_key_package() != 56127) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_state_seq() != 41299) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_their_principal_state() != 51428) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_encrypt() != 60293) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_encrypt() != 51152) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_forwarded() != 42883) {
@@ -5101,7 +5389,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_open_incoming() != 33379) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_prepare_to_encrypt() != 5710) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_prepare_to_encrypt() != 59920) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_process_incoming() != 5172) {
@@ -5182,10 +5470,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_two_mls_pq_checksum_constructor_twomlspqprincipal_new() != 59164) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_constructor_twomlspqsession_accept() != 52518) {
+    if (uniffi_two_mls_pq_checksum_constructor_twomlspqsession_accept() != 43270) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_constructor_twomlspqsession_initiate() != 29769) {
+    if (uniffi_two_mls_pq_checksum_constructor_twomlspqsession_initiate() != 37020) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_constructor_twomlspqsession_restore() != 61833) {

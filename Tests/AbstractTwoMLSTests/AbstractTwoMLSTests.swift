@@ -39,10 +39,11 @@ struct LifecycleTests {
 		#expect(!localBase.isFullyEstablished())
 		#expect(localBase.myPqTurn())
 		#expect(localBase.epochs() == ApqEpochs(pqEpoch: 1, classicalEpoch: 1))
-		// reply already consumed the initial frame — the §A.1 envelope wrapping the APQ welcome (v8) — via pendingOutbound (take-once) into the sealed AppWelcome…
+		// createTwoMLSGroup (in the reply harness) attached the AppWelcome and
+		// consumed the parked §A.1 envelope via pendingOutbound (take-once)…
 		#expect(localBase.pendingOutbound() == nil)
-		// …which travels as a v1 header frame.
-		#expect(encryptedCombinedWelcome.first == 1)
+		// …and it travels as the crate's tagged envelope (contract 15).
+		#expect(encryptedCombinedWelcome.first == initialEnvelopeTag())
 
 		// Routing: listening works from birth — addresses derive from our send
 		// group's classical half, one per epoch. Nowhere to post yet: the post

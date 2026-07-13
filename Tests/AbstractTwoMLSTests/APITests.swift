@@ -404,6 +404,64 @@ struct SessionArchiveDemo {
 	}
 }
 
+/// Architecture 08-twoMLSPQ-APQ §A.1 (contract 15): the REPLIER sends app messages
+/// immediately after reply — before the acceptor's return welcome exists. Each
+/// pre-establishment frame is a fresh envelope re-stapling the app welcome plus the
+/// current message, so any single frame both establishes the acceptor and delivers;
+/// later frames from the same replier route `.forward` to the spawned session, which
+/// acknowledges them and hands out their stapled messages.
+struct ReplierFirstDemo {
+	let local: ClientWrapper<AbstractTwoMLS.PQClient>
+	let remote: ClientWrapper<AbstractTwoMLS.PQClient>
+
+	init() throws {
+		local = try .init()
+		remote = try .init()
+	}
+
+	@Test func replierSendsFirstAcceptorJoinsFromAnyFrame() throws {
+		let (localSession, _) = try local.client.reply(
+			remoteClientId: remote.clientId,
+			encodedRemoteKpkg: remote.currentInvitation.encodedKeyPackage
+		)
+		// The initial envelope is deliberately DROPPED: the replier's own app
+		// frames carry everything the acceptor needs.
+		let prep = try #require(try localSession.prepareToEncrypt(proposing: nil))
+		#expect(prep.proposalMessage.isEmpty)  // no-op round: nothing staged
+		#expect(!prep.didCommit)
+		let first = try localSession.encrypt(appMessage: Data("first".utf8))
+		_ = try localSession.prepareToEncrypt(proposing: nil)
+		let second = try localSession.encrypt(appMessage: Data("second".utf8))
+
+		// Frame 1 decodes as a fresh appWelcome whose staple delivers alongside
+		// the join — as the full typed sender message (the decrypt consumed its
+		// generation; this is the one copy).
+		let (remoteSession, stapled) = try remote.currentInvitation.receiveReply(
+			ciphertext: first.cipherText,
+			expecting: try local.clientId
+		)
+		#expect(stapled?.appMessageData == Data("first".utf8))
+		#expect(stapled?.senderClientId == (try local.clientId))
+
+		// Frame 2 shares the stable prefix, so it routes `.forward`; the spawned
+		// session acks the re-delivery and yields the stapled second message.
+		guard
+			case .forward(_, let decrypted) = try remote.currentInvitation.decodeHeader(
+				ciphertext: second.cipherText)
+		else { throw TestErrors.unexpected }
+		let delivered = try #require(try remoteSession.forwarded(headerDecrypted: decrypted))
+		#expect(delivered.appMessageData == Data("second".utf8))
+
+		// Garbage at the forward entry fails open (nil), never as a fatal error.
+		#expect(try remoteSession.forwarded(headerDecrypted: Data([0xFF, 0x01])) == nil)
+
+		// The acceptor's reply establishes the replier; the exchange continues on
+		// the normal message path.
+		try remoteSession.send(to: localSession)
+		try localSession.exchange(with: remoteSession)
+	}
+}
+
 //The suite classifier: a combiner blob reports its PQ half; anything unparseable
 //returns nil (no magic sentinel).
 struct CipherSuiteParsingTests {
@@ -611,7 +669,7 @@ extension AbstractTwoMLS.Invitation {
 		ciphertext: Data,
 		expecting remoteClientId: AbstractTwoMLS.ClientID,
 		newClientId: AbstractTwoMLS.ClientID = .mock()
-	) throws -> (Session, Data?) {
+	) throws -> (Session, Session.MLSSenderMessage?) {
 		let headerDecrypted = try decodeHeader(
 			ciphertext: ciphertext
 		)

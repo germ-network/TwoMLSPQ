@@ -46,7 +46,7 @@ enum PQErrorSurface {
 
 extension AbstractTwoMLS.SessionError {
 	/// Translate one backend error at a known surface. Exhaustive over
-	/// `TwoMlsPqError`'s 21 cases — a binding bump that adds a case fails
+	/// `TwoMlsPqError`'s 22 cases — a binding bump that adds a case fails
 	/// compilation HERE, which is part of the re-sync ritual (see the contract
 	/// ladder in AbstractTwoMLS+TwoMLSPQ.swift). LinearEncodingError (from the
 	/// digest lifts) and everything else — including the fileprivate
@@ -96,6 +96,8 @@ extension AbstractTwoMLS.SessionError {
 				code = .apqInfoMismatch
 			case .SinkAlreadyInstalled:
 				code = .sinkAlreadyInstalled
+			case .AppBindingMismatch:
+				code = .appBindingMismatch
 			}
 			self.init(code: code, underlying: pq)
 

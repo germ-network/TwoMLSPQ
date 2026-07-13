@@ -36,23 +36,30 @@ public enum AbstractTwoMLS {
 		static var supportedSuites: [RawSuites] { get }
 
 		//two-step reply: step one sets up a send group from a remote keyPackage.
-		//Returns the live session plus the welcome and this side's published key
-		//package for the return group. The welcome publishes key material:
-		//installSink on the session, then gate its transmission on the session's
-		//stateSeq being durably persisted (the install-time baseline carries the
-		//pre-install state).
+		//Returns the live session plus the PLAINTEXT welcome and this side's
+		//published key package for the return group — the two establishment
+		//artifacts the app binds into its signed identity envelope (the
+		//`appWelcome` handed back in step two). The welcome publishes key
+		//material: installSink on the session AFTER step two (the attach), and
+		//gate frame transmission on `dependsOnSeq`/`stateSeq` durability as usual
+		//(the install-time baseline carries everything both steps did).
 		func reply(keyPackageMessage: Data) throws -> (
 			sendGroup: Invitation.Session,
 			welcomeMessage: Data,
 			myKeyPackage: Data
 		)
 
-		//step two: package and encrypt the AppWelcome formed from the above
-		//to the remote
+		//step two: attach the identity envelope (`appWelcome`, self-sufficient —
+		//it carries step one's welcome + key package inside) to the session and
+		//return the sealed initial frame. The backend composes and seals the
+		//frame itself; the same envelope rides every pre-establishment send the
+		//session makes (§A.1: the replier sends app messages immediately), so any
+		//single frame establishes the acceptor. CAPTURE ORDERING: persist-capture
+		//the session AFTER this step — the attached envelope rides the archive.
 		func createTwoMLSGroup(
 			remoteAgentId: ClientID,
 			mySendGroup: Invitation.Session,
-			//extract the leaf node HPKE key to encrypt the initial message
+			//bind the addressed remote to the published key package before attach
 			theirKeyPackageMessage: Data,
 			appWelcome: Data
 		) throws -> (
@@ -82,6 +89,13 @@ public enum AbstractTwoMLS {
 		//encodes both halves). Returns the live session with NO sink installed —
 		//installSink immediately (the baseline snapshot captures everything
 		//receive did, including the staged dedicated principal) before driving it.
+		//`stapled` is the sender's early-delivered app message opened during the
+		//join (from `HeaderDecryptResult.stapledPrivateMessage`), as the SAME
+		//typed sender message `processIncoming` yields — the decrypt consumes its
+		//ratchet generation, so the caller must deliver it (it cannot be
+		//recovered from a re-delivered frame). Fail-open: an undecryptable staple
+		//returns nil and the session still establishes (the peer re-staples its
+		//CURRENT message until its first commit, so only that frame's copy drops).
 		func receive(
 			sendGroupWelcome: Data,
 			remoteKeyPackage: Data,
@@ -89,15 +103,25 @@ public enum AbstractTwoMLS {
 			welcomeToken: WelcomeToken,
 			stapledMessage: Data?,
 			newClientId: ClientID
-		) throws -> (Session, plaintext: Data?)
+		) throws -> (Session, stapled: Session.MLSSenderMessage?)
 	}
 
 	public enum HeaderDecryptResult {
+		//A frame whose welcome this invitation already turned into a session: an
+		//exact re-delivery, or (PQ, §A.1) a LATER pre-establishment frame from
+		//the same sender carrying a fresh stapled message. `mlsMessageData` is
+		//the backend-opaque decrypted payload — hand it verbatim to the spawned
+		//session's `forwarded(headerDecrypted:)`, which acknowledges the replay
+		//and returns any newly-delivered stapled message.
 		case forward(groupId: DataIdentifier, mlsMessageData: Data)
 		case appWelcome(
 			//opaque token for this welcome; pass it back verbatim to `receive`
 			welcomeToken: WelcomeToken,
 			appWelcome: Data,
+			//the sender's early-delivered app message riding the establishment
+			//frame (classical parity; PQ staples the sender's current message on
+			//EVERY pre-establishment frame) — thread it into `receive`, which
+			//opens it fail-open with the join
 			stapledPrivateMessage: Data?
 		)
 	}

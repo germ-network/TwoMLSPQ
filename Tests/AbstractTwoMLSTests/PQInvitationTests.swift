@@ -23,23 +23,24 @@ struct PQInvitationReceiveTests {
 		)
 
 		// Initiator (raw FFI): decode the acceptor's opaque published key package
-		// and form the send group. The initiator cannot encrypt until both groups
-		// are established, so there is no stapled message at receive time.
+		// and form the send group. These tests deliver the PLAINTEXT welcome
+		// (`initialWelcome`) with no app envelope and no staple — the bare two-step
+		// receive path; the enveloped/stapled §A.1 flow is ReplierFirstDemo's.
 		let initiator = try TwoMlsPqPrincipal(clientId: AbstractTwoMLS.ClientID.mock())
 		let acceptorPair = try decodeCombinerKeyPackage(bytes: invitation.encodedKeyPackage)
 		let initiatorSession = try TwoMlsPqSession.initiate(
 			client: initiator,
 			theirKeyPackage: acceptorPair,
-			appPayload: nil
+			appBinding: nil
 		)
-		let welcome = try #require(initiatorSession.pendingOutbound())
+		let welcome = try #require(initiatorSession.initialWelcome())
 
 		// The initiator's own published key package (for the bound return group). Uses the
 		// retaining generate path — the initiator's live session joins the return welcome
 		// through its own client store, unlike an invitation-held key package.
 		let initiatorKp = try initiator.generateCombinerKeyPackage()
 
-		let (acceptorSession, plaintext) = try invitation.receive(
+		let (acceptorSession, stapled) = try invitation.receive(
 			sendGroupWelcome: welcome,
 			remoteKeyPackage: encodeCombinerKeyPackage(keyPackage: initiatorKp),
 			remoteClientId: initiator.clientId().bytes,
@@ -47,7 +48,7 @@ struct PQInvitationReceiveTests {
 			stapledMessage: nil,
 			newClientId: .mock()
 		)
-		#expect(plaintext == nil)
+		#expect(stapled == nil)
 
 		// Complete establishment: the acceptor's first frame staples its return
 		// welcome; the initiator processes it in-band.
@@ -78,9 +79,9 @@ struct PQInvitationReceiveTests {
 		let initiatorSession = try TwoMlsPqSession.initiate(
 			client: initiator,
 			theirKeyPackage: acceptorPair,
-			appPayload: nil
+			appBinding: nil
 		)
-		let welcome = try #require(initiatorSession.pendingOutbound())
+		let welcome = try #require(initiatorSession.initialWelcome())
 		let initiatorKp = encodeCombinerKeyPackage(
 			keyPackage: try initiator.generateCombinerKeyPackage()
 		)
@@ -122,9 +123,9 @@ struct PQInvitationReceiveTests {
 		let initiatorSession = try TwoMlsPqSession.initiate(
 			client: initiator,
 			theirKeyPackage: acceptorPair,
-			appPayload: nil
+			appBinding: nil
 		)
-		let welcome = try #require(initiatorSession.pendingOutbound())
+		let welcome = try #require(initiatorSession.initialWelcome())
 		let initiatorKp = encodeCombinerKeyPackage(
 			keyPackage: try initiator.generateCombinerKeyPackage()
 		)
@@ -162,9 +163,9 @@ struct PQInvitationReceiveTests {
 		let initiatorSession = try TwoMlsPqSession.initiate(
 			client: initiator,
 			theirKeyPackage: acceptorPair,
-			appPayload: nil
+			appBinding: nil
 		)
-		let welcome = try #require(initiatorSession.pendingOutbound())
+		let welcome = try #require(initiatorSession.initialWelcome())
 		let initiatorKp = encodeCombinerKeyPackage(
 			keyPackage: try initiator.generateCombinerKeyPackage()
 		)
