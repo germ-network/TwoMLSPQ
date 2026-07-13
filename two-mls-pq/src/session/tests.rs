@@ -4483,3 +4483,124 @@ fn test_return_welcome_without_app_binding_rejected() {
     );
     assert!(inner.recv_group.is_none());
 }
+
+/// An EMPTY binding is reserved as invalid: `initiate` rejects it up front (before even
+/// the AS peer admission inside group creation), so an accidentally empty digest cannot
+/// mint a session "bound" to nothing — `None` is the deliberate unbound state.
+#[test]
+fn test_initiate_rejects_empty_app_binding() {
+    let alice = make_client();
+    let bob = make_client();
+    let bob_kp = make_combiner_kp(&bob);
+
+    assert_err!(
+        TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp.clone(), None, Some(Vec::new())),
+        TwoMlsPqError::AppBindingMismatch
+    );
+    // The same client and key package still establish with a real binding.
+    assert_ok!(TwoMlsPqSession::initiate(
+        alice,
+        bob_kp,
+        None,
+        Some(b"relationship-digest".to_vec()),
+    ));
+}
+
+/// Defense-in-depth: the binding lives on the classical halves ONLY. A crafted welcome
+/// whose PQ half smuggles an `AppBinding` — even one equal to the classical half's — is
+/// rejected at `receive` (`verify_pq_half_unbound` runs at every PQ-half join) before
+/// any invitation state is claimed, and the invitation still serves an honest initiator
+/// with the same binding afterwards.
+#[test]
+fn test_welcome_with_pq_half_binding_rejected() {
+    use apq::component::{ApqInfo, ApqInfoUpdate};
+    use apq::{
+        create_group_with_member, encode_apq_welcome, export_and_register_psk, GroupCreation,
+        PskDomain,
+    };
+
+    let alice = make_client();
+    let bob = make_client();
+    let alice_kp = make_combiner_kp(&alice);
+    let binding = b"relationship-digest".to_vec();
+
+    let bob_inv = assert_ok!(crate::key_packages::TwoMlsPqInvitation::restore(
+        assert_ok!(bob.generate_invitation(true))
+    ));
+    let bob_kp = bob_inv.combiner_key_package();
+
+    // Hand-roll `create_combiner_send_group` with the binding ALSO on the PQ half — the
+    // crafted shape a wired initiator cannot produce (its builders bind the classical
+    // half only).
+    let combiner = alice.combiner();
+    let peer_id = assert_ok!(crate::key_packages::parse_combiner_key_package(
+        bob_kp.clone()
+    ))
+    .client_id
+    .bytes;
+    combiner
+        .auth_view()
+        .with(move |core| core.theirs.commit(peer_id));
+    let suite = combiner.cipher_suite();
+    let t_gid = assert_ok!(combiner.random_group_id());
+    let pq_gid = assert_ok!(combiner.random_group_id());
+    let info = ApqInfo::new(suite, t_gid.clone(), pq_gid.clone(), 1, 1);
+    let attestation = ApqInfoUpdate {
+        t_epoch: 1,
+        pq_epoch: 1,
+    };
+    let (mut pq_group, pq_welcome) = assert_ok!(create_group_with_member(
+        combiner.pq(),
+        &bob_kp.pq,
+        &[],
+        assert_ok!(
+            assert_ok!(GroupCreation::new(pq_gid, &info, Some(attestation)))
+                .with_app_binding(Some(&binding))
+        ),
+    ));
+    let apq_psk = assert_ok!(export_and_register_psk(
+        &mut pq_group,
+        combiner,
+        PskDomain::Apq
+    ));
+    let (_classical_group, classical_welcome) = assert_ok!(create_group_with_member(
+        combiner.classical(),
+        &bob_kp.classical,
+        &[apq_psk],
+        assert_ok!(
+            assert_ok!(GroupCreation::new(t_gid, &info, Some(attestation)))
+                .with_app_binding(Some(&binding))
+        ),
+    ));
+    let crafted = encode_apq_welcome(classical_welcome, pq_welcome);
+
+    // Even the matching expectation refuses the smuggled copy — and claims nothing.
+    assert_err!(
+        bob_inv.receive(
+            crafted,
+            alice_kp.clone(),
+            b"token".to_vec(),
+            None,
+            None,
+            Some(binding.clone()),
+        ),
+        TwoMlsPqError::AppBindingMismatch
+    );
+
+    // The invitation still serves an honest, wired initiate with the same binding.
+    let honest = assert_ok!(TwoMlsPqSession::initiate(
+        Arc::clone(&alice),
+        bob_inv.combiner_key_package(),
+        None,
+        Some(binding.clone()),
+    ));
+    let bob_session = assert_ok!(bob_inv.receive(
+        honest.test_initial_welcome(),
+        alice_kp,
+        b"token".to_vec(),
+        None,
+        None,
+        Some(binding.clone()),
+    ));
+    assert_eq!(assert_ok!(bob_session.app_binding()), Some(binding));
+}

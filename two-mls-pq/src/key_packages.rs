@@ -603,7 +603,9 @@ impl TwoMlsPqInvitation {
     /// (GroupContext rides the encrypted welcome), but still BEFORE any invitation state
     /// is claimed: a rejected welcome consumes nothing, and the invitation stays fully
     /// usable for the genuine one. On success the spawned session's send group carries
-    /// the same binding back to the initiator.
+    /// the same binding back to the initiator. An EMPTY expectation is rejected up
+    /// front — empty is reserved (no group can carry an empty binding; `None` is the
+    /// unbound state), so it could never match.
     pub fn receive(
         &self,
         welcome: Vec<u8>,
@@ -620,6 +622,15 @@ impl TwoMlsPqInvitation {
         // one) — reject rather than mint an unannounceable principal.
         if new_client_id.as_deref().is_some_and(<[u8]>::is_empty) {
             return Err(TwoMlsPqError::InvalidClientId);
+        }
+        // Empty bindings are likewise reserved (`AppBindingMismatch` documents the rule):
+        // no group can carry one, so an empty expectation is unsatisfiable — reject it
+        // here, lock-free, rather than let it surface as a confusing post-join mismatch.
+        if expected_app_binding
+            .as_deref()
+            .is_some_and(<[u8]>::is_empty)
+        {
+            return Err(TwoMlsPqError::AppBindingMismatch);
         }
         // The full combiner parse cross-checks that the two halves agree on one
         // identity; compare that identity against the caller's expectation for the
@@ -1963,5 +1974,45 @@ mod tests {
             None,
             Some(binding),
         ));
+    }
+
+    /// An EMPTY expectation is reserved-invalid and rejected up front, lock-free —
+    /// no group can carry an empty binding, so it could never match. The invitation
+    /// is untouched: the same welcome establishes with the honest (None) expectation.
+    #[test]
+    fn test_receive_rejects_empty_expected_app_binding() {
+        use crate::session::TwoMlsPqSession;
+        use crate::test_utils::{make_client, make_combiner_kp};
+        use std::sync::Arc;
+
+        let alice = make_client();
+        let bob = make_client();
+        let alice_kp = make_combiner_kp(&alice);
+
+        let bob_inv = assert_ok!(super::TwoMlsPqInvitation::restore(assert_ok!(
+            bob.generate_invitation(true)
+        )));
+        let bob_kp = bob_inv.combiner_key_package();
+
+        let alice_session = assert_ok!(TwoMlsPqSession::initiate(
+            Arc::clone(&alice),
+            bob_kp,
+            None,
+            None
+        ));
+        let welcome_a = alice_session.test_initial_welcome();
+
+        assert_err!(
+            bob_inv.receive(
+                welcome_a.clone(),
+                alice_kp.clone(),
+                b"token".to_vec(),
+                None,
+                None,
+                Some(Vec::new()),
+            ),
+            crate::TwoMlsPqError::AppBindingMismatch
+        );
+        assert_ok!(bob_inv.receive(welcome_a, alice_kp, b"token".to_vec(), None, None, None));
     }
 }

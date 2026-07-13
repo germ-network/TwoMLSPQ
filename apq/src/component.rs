@@ -314,6 +314,19 @@ pub fn verify_app_binding<Cfg: MlsConfig>(
     }
 }
 
+/// Assert a PQ half carries NO `AppBinding`: the binding lives on the classical
+/// (message) halves only — a PQ half inherits coverage through the `APQInfo`
+/// half-binding, and this crate never reads a binding off one. Enforced at every
+/// PQ-half join anyway, so a smuggled divergent copy can never sit dormant inside a
+/// group this library treats as bound (it would be a trap for any future "read the
+/// binding from either half" refactor).
+pub fn verify_pq_half_unbound<Cfg: MlsConfig>(pq: &Group<Cfg>) -> Result<()> {
+    match read_app_binding(pq)? {
+        None => Ok(()),
+        Some(_) => Err(CombinerError::AppBindingMismatch),
+    }
+}
+
 /// The classical-half checks shared by the full-pair and deferred joiner verifications:
 /// extension present; suites equal the pinned pair and re-validate as a coherent APQ
 /// combination; mode matches; `t_session_group_id` is the joined classical group's id;

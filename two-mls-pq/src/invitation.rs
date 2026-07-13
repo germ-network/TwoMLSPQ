@@ -295,3 +295,54 @@ fn single_captured(captured: Vec<KeyPackageSecret>) -> Result<KeyPackageSecret> 
         _ => Err(TwoMlsPqError::Mls),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use mls_rs::mls_rs_codec::MlsEncode;
+
+    use super::wire::InvitationArchive;
+    use super::*;
+    use crate::test_utils::make_client;
+    use crate::{assert_err, assert_ok};
+
+    /// The v4 prerelease hard cut (the AppBinding capability cut): a stale-version
+    /// invitation blob must be rejected at restore — loudly, instead of resurfacing
+    /// later as an opaque mls-rs error when a binding-carrying `initiate` cannot add its
+    /// pre-AppBinding key package (whose republished blob would wear the current
+    /// `COMBINER_KEY_PACKAGE_VERSION` byte). The layout is unchanged across v3 → v4, so
+    /// only the version byte gates — this pins that it does. Companion of the combiner
+    /// key package's version pin (`test_combiner_kp_v3_round_trips_and_rejects_prior_versions`).
+    #[test]
+    fn test_restore_rejects_stale_invitation_version() {
+        let client = make_client();
+        let inv = assert_ok!(generate_combiner_invitation(client.combiner(), true));
+        let mut framed = assert_ok!(inv.encode());
+        // Pin the current cut (update alongside the const's changelog comment).
+        assert_eq!(framed[0], 4);
+        assert_eq!(framed[0], INVITATION_VERSION);
+
+        // A v3-era (pre-AppBinding) blob: identical layout, stale version byte. The
+        // framed decoder is the choke point every restore funnels through…
+        framed[0] = 3;
+        assert_err!(
+            CombinerInvitation::decode(&framed),
+            TwoMlsPqError::ArchiveInvalid
+        );
+
+        // …and through the public boundary: an otherwise-valid archive wrapping the
+        // stale blob fails `TwoMlsPqInvitation::restore` the same way.
+        let archive = assert_ok!(InvitationArchive {
+            state_seq: 0,
+            invitation: framed,
+            consumed: Vec::new(),
+            spawned: Vec::new(),
+            processed: Vec::new(),
+        }
+        .mls_encode_to_vec()
+        .map_err(|_| TwoMlsPqError::ArchiveInvalid));
+        assert_err!(
+            crate::key_packages::TwoMlsPqInvitation::restore(archive),
+            TwoMlsPqError::ArchiveInvalid
+        );
+    }
+}

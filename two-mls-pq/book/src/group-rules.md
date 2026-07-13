@@ -65,7 +65,11 @@ reusable layer: an `MlsRules` filter every client is built with
    did not state is never silently accepted), the acceptor mirrors the verified binding
    onto its return group, and the initiator requires the return welcome to carry its
    own binding back unchanged — all `AppBindingMismatch`, and on the invitation path
-   raised before any invitation state is claimed. The payload should be a **digest**
+   raised before any invitation state is claimed. PQ halves must carry **no** binding
+   (they inherit coverage; a smuggled PQ-half copy is rejected at every PQ join), and
+   an **empty** binding is reserved as invalid — rejected at creation and as an
+   expectation — so an accidentally empty digest cannot mint a bound-to-nothing
+   session (`None` is the deliberate unbound state). The payload should be a **digest**
    (the first adopter binds `H(domain-tag ‖ role-ordered did:did)`); the crate never
    interprets the bytes. Leaves advertise the extension type, so a binding-carrying
    group can only ever contain capability-bearing leaves.
@@ -86,7 +90,7 @@ checks each cover ingress the others cannot see.
 | No external commits/senders | `CommitSource::NewMember` rejected | external senders never configured |
 | Epoch discipline | — | staple-epoch compare in `process_incoming` (`EpochDesync` / skip) |
 | Identity binding at establishment | — | `expected_remote` pre-claim check; creator-leaf ≡ key-package check at join; A.4 bootstrap KP identity check (`RemoteIdentityMismatch`) |
-| App-state binding at establishment | GCE ban keeps it immutable post-creation | `verify_app_binding` against `expected_app_binding` at `receive`/`accept` (post-join, pre-claim) and against the session's own binding at the initiator's return-welcome join (`AppBindingMismatch`); leaf capability advertisement keeps uncapable leaves out of bound groups |
+| App-state binding at establishment | GCE ban keeps it immutable post-creation | `verify_app_binding` against `expected_app_binding` at `receive`/`accept` (post-join, pre-claim) and against the session's own binding at the initiator's return-welcome join; `verify_pq_half_unbound` at every PQ-half join (the binding lives on the classical halves only); empty bindings rejected at creation and as expectations (all `AppBindingMismatch`); leaf capability advertisement keeps uncapable leaves out of bound groups |
 
 Two properties worth naming:
 

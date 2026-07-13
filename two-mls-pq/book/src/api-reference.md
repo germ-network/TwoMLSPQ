@@ -82,9 +82,11 @@ The receiving side of a published key package — no live client required.
   `expected_app_binding` is the app-state binding the welcome must carry (the bytes
   the initiator passed to `initiate(app_binding:)`): an exact, symmetric match —
   `Some` requires byte-equality, `None` requires an unbound welcome; anything else
-  (a stripped, unequal, or unexpected binding) is `AppBindingMismatch`. Necessarily
-  verified after the join (GroupContext rides the encrypted welcome) but still
-  **before any invitation state is claimed** — a rejected welcome consumes nothing.
+  (a stripped, unequal, or unexpected binding, or a PQ half smuggling one) is
+  `AppBindingMismatch`, as is an empty expectation (empty is reserved — no group can
+  carry an empty binding). Necessarily verified after the join (GroupContext rides
+  the encrypted welcome) but still **before any invitation state is claimed** — a
+  rejected welcome consumes nothing.
   The spawned session mirrors the verified binding onto its own send group.
 - `forward_group_id(spawn_token) -> Option<MlsGroupId>` — resolve a replayed
   initial frame to the spawned session's receive group (its classical message-half id).
@@ -119,7 +121,8 @@ welcome and HPKE-enveloped to the peer's KP′ so `pending_outbound` is one opaq
 peer opens with `TwoMlsPqInvitation::open_initial`; `app_binding` is the optional
 app-state binding welded into the send group's GroupContext at this moment and immutable
 for the session's lifetime — pass a **digest** of the app's immutable relationship
-identity, not raw identifiers (the crate never interprets the bytes; see
+identity, not raw identifiers, and never empty (empty is reserved as invalid; `None` is
+the unbound state) — the crate never interprets the bytes (see
 [Group Rules](./group-rules.md) rule 8);
 `accept(client, welcome, their_key_package, expected_app_binding)` —
 the plaintext-welcome path (tests/embedded); `restore(core, checkpoint)` —
@@ -134,10 +137,11 @@ State: `is_established`, `is_fully_established`, `has_receive_group`,
 `active_session_id`, `receive_group_id`, `my_principal_state`, `their_principal_state`,
 `pending_outbound` (the standalone copy of the own welcome — no longer consumed by
 `encrypt`; the welcome also rides every pre-commit frame as the staple), `epochs`,
-`app_binding() -> Option<Vec<u8>>` (the app-state binding the session was created with,
-read from the send group's GroupContext — it rides the persisted group state, so a
-restored session's owner re-verifies here; errors only on a present-but-undecodable
-extension, so corruption can never read back as "unbound").
+`app_binding() -> Result<Option<Vec<u8>>>` (Swift `try appBinding() -> Data?`; the
+app-state binding the session was created with, read from the send group's GroupContext —
+it rides the persisted group state, so a restored session's owner re-verifies here;
+errors only on a present-but-undecodable extension, so corruption can never read back as
+"unbound").
 
 Messaging: `prepare_to_encrypt(proposing)` — `Some(id)` selects which staged rotation
 candidate this round's Upd proposes (`None` re-proposes the current identity; the

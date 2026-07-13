@@ -470,9 +470,15 @@ impl GroupCreation {
     /// Add the optional `AppBinding` GroupContext extension (see `component.rs`): opaque
     /// app-supplied bytes binding the group to the app's immutable relationship identity,
     /// written here — at creation — and never again. `None` is a no-op (an unbound group
-    /// stays valid).
+    /// stays valid). `Some(&[])` is rejected as [`CombinerError::AppBindingMismatch`]:
+    /// empty is reserved as invalid, so an accidentally empty digest fails loudly at
+    /// creation instead of minting a session bound to nothing (`None` is the deliberate
+    /// unbound state) — the AppBinding analogue of the empty-ClientId rule.
     pub fn with_app_binding(mut self, app_binding: Option<&[u8]>) -> Result<Self> {
         if let Some(data) = app_binding {
+            if data.is_empty() {
+                return Err(CombinerError::AppBindingMismatch);
+            }
             self.extensions
                 .set_from(AppBinding {
                     data: data.to_vec(),
@@ -1446,5 +1452,64 @@ mod tests {
                 .unwrap(),
         )
         .is_err());
+    }
+
+    /// An EMPTY binding is reserved as invalid: `with_app_binding(Some(&[]))` fails at
+    /// the creation choke point, so an accidentally empty digest can never mint a group
+    /// "bound" to nothing (`None` is the deliberate unbound state — the AppBinding
+    /// analogue of the empty-ClientId rule).
+    #[test]
+    fn test_with_app_binding_rejects_empty() {
+        let alice = client();
+        assert!(matches!(
+            GroupCreation::bare(alice.random_group_id().unwrap()).with_app_binding(Some(&[])),
+            Err(crate::CombinerError::AppBindingMismatch)
+        ));
+        // Non-empty (and None) still pass.
+        assert!(GroupCreation::bare(alice.random_group_id().unwrap())
+            .with_app_binding(Some(b"relationship-digest"))
+            .is_ok());
+        assert!(GroupCreation::bare(alice.random_group_id().unwrap())
+            .with_app_binding(None)
+            .is_ok());
+    }
+
+    /// The binding lives on the classical halves only. `verify_pq_half_unbound` — run at
+    /// every PQ-half join — catches a PQ group smuggling an AppBinding (even a "correct"
+    /// one), so no dormant copy can enter a session for a future "read either half"
+    /// refactor to trip over; the PQ halves this crate itself builds pass.
+    #[test]
+    fn test_pq_half_unbound_check_catches_smuggled_binding() {
+        use crate::component::verify_pq_half_unbound;
+
+        let alice = client();
+        let bob = client();
+        admit(&alice, bob.client_id());
+
+        // A PQ group crafted WITH a binding (a wired creator can build one — the leaves
+        // advertise the capability; it is the join-side check that forbids the shape).
+        let (smuggled, _welcome) = create_group_with_member(
+            alice.pq(),
+            &bob.generate_pq_key_package().unwrap(),
+            &[],
+            GroupCreation::bare(alice.random_group_id().unwrap())
+                .with_app_binding(Some(b"relationship-digest"))
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            verify_pq_half_unbound(&smuggled),
+            Err(crate::CombinerError::AppBindingMismatch)
+        ));
+
+        // Every PQ half this crate builds is unbound — including in a bound pair.
+        let (bound_pair, _) = create_combiner_send_group(
+            &bob.generate_classical_key_package().unwrap(),
+            &bob.generate_pq_key_package().unwrap(),
+            &alice,
+            Some(b"relationship-digest"),
+        )
+        .unwrap();
+        assert!(verify_pq_half_unbound(bound_pair.pq.as_ref().unwrap()).is_ok());
     }
 }

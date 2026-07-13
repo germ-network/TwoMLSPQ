@@ -956,6 +956,9 @@ impl TwoMlsPqSession {
                 // membership is enforced by the AS (`validate_member`) inside the join.
                 let classical_info = read_apqinfo(&recv.classical)?;
                 verify_deferred_pq_info(&pq, &classical_info, suite)?;
+                // The app-state binding lives on the classical halves only: a PQ half
+                // smuggling one is rejected at join, like every other PQ-half join site.
+                verify_pq_half_unbound(&pq)?;
                 recv.set_pq(pq, client.combiner());
             }
             inner.pq_turn_mine = false;
