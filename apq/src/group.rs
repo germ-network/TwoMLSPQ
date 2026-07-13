@@ -11,8 +11,8 @@ use zeroize::Zeroizing;
 
 use crate::client::{CombinerClient, OurConfig, PqConfig};
 use crate::component::{
-    apq_info_extensions, ensure_membership_consistent, verify_apqinfo_pair, ApqInfo, ApqInfoUpdate,
-    EPOCH_UNBOUND,
+    apq_info_extensions, ensure_membership_consistent, verify_apqinfo_pair, AppBinding, ApqInfo,
+    ApqInfoUpdate, EPOCH_UNBOUND,
 };
 use crate::storage::PersistableGroupStorage;
 use crate::{CombinerError, Result};
@@ -466,6 +466,27 @@ impl GroupCreation {
             app_data_update: None,
         }
     }
+
+    /// Add the optional `AppBinding` GroupContext extension (see `component.rs`): opaque
+    /// app-supplied bytes binding the group to the app's immutable relationship identity,
+    /// written here — at creation — and never again. `None` is a no-op (an unbound group
+    /// stays valid). `Some(&[])` is rejected as [`CombinerError::AppBindingMismatch`]:
+    /// empty is reserved as invalid, so an accidentally empty digest fails loudly at
+    /// creation instead of minting a session bound to nothing (`None` is the deliberate
+    /// unbound state) — the AppBinding analogue of the empty-ClientId rule.
+    pub fn with_app_binding(mut self, app_binding: Option<&[u8]>) -> Result<Self> {
+        if let Some(data) = app_binding {
+            if data.is_empty() {
+                return Err(CombinerError::AppBindingMismatch);
+            }
+            self.extensions
+                .set_from(AppBinding {
+                    data: data.to_vec(),
+                })
+                .map_err(|_| CombinerError::Mls)?;
+        }
+        Ok(self)
+    }
 }
 
 /// Create a group and commit the given key package in as the first member.
@@ -560,11 +581,15 @@ pub fn join_group_from_welcome<Cfg: MlsConfig>(
 /// Create the initiator's Combiner send group (Group_A) from the remote's key-package bytes.
 /// APQ-PSK chain: PQ Group_A → PSK → classical Group_A — the classical message group absorbs
 /// PQ secrecy, so messages on it are quantum-safe even though the PQ group ratchets rarely.
-/// Returns (send_group, APQWelcome_A bytes).
+/// `app_binding` is the optional app-state binding: carried directly by the classical
+/// (message) half's GroupContext; the PQ half inherits coverage through the APQInfo
+/// half-binding (its id is pinned inside the bound classical context). Returns
+/// (send_group, APQWelcome_A bytes).
 pub fn create_combiner_send_group<S, C, P>(
     classical_kp: &[u8],
     pq_kp: &[u8],
     client: &CombinerClient<S, C, P>,
+    app_binding: Option<&[u8]>,
 ) -> Result<(CombinerGroup<S, C, P>, Vec<u8>)>
 where
     S: KeyPackageStorage + Clone,
@@ -600,7 +625,7 @@ where
         client.classical(),
         classical_kp,
         &[apq_psk],
-        GroupCreation::new(t_gid, &info, Some(attestation))?,
+        GroupCreation::new(t_gid, &info, Some(attestation))?.with_app_binding(app_binding)?,
     )?;
     let apq = encode_apq_welcome(classical_welcome, pq_welcome);
     Ok((
@@ -668,11 +693,15 @@ where
 /// classical only, bound to the cross-party TwoMLS-PSK from the recv group — the sole path
 /// by which this classical-only send group inherits post-quantum protection before A.4 (the
 /// recv group's classical half is PQ-seeded via its own `apq_psk`). The heavy PQ half is
-/// stood up later by the bootstrap flow, off the handshake critical path.
+/// stood up later by the bootstrap flow, off the handshake critical path. `app_binding` is
+/// the optional app-state binding for the classical GroupContext — the caller mirrors the
+/// (verified) binding of the welcome it is replying to, so both directions carry identical
+/// bytes.
 pub fn create_bound_classical_send_group<S, C, P>(
     classical_kp: &[u8],
     client: &CombinerClient<S, C, P>,
     recv_classical: &mut MlsGroup<S, C>,
+    app_binding: Option<&[u8]>,
 ) -> Result<(CombinerGroup<S, C, P>, Vec<u8>)>
 where
     S: KeyPackageStorage + Clone,
@@ -695,7 +724,7 @@ where
         client.classical(),
         classical_kp,
         std::slice::from_ref(&psk_cross),
-        GroupCreation::new(t_gid, &info, None)?,
+        GroupCreation::new(t_gid, &info, None)?.with_app_binding(app_binding)?,
     )?;
     Ok((
         CombinerGroup::from_client(client, classical_group, None),
@@ -705,13 +734,15 @@ where
 
 /// Create the acceptor's bound Combiner send group (Group_B). The classical message group binds
 /// to two PSKs: the cross-party TwoMLS-PSK (from the recv group's classical half, Group_A) and
-/// the intra-party APQ-PSK (from Group_B's PQ side group).
+/// the intra-party APQ-PSK (from Group_B's PQ side group). `app_binding` is the optional
+/// app-state binding for the classical half (see [`create_combiner_send_group`]).
 /// Returns (send_group, APQWelcome_B bytes).
 pub fn create_bound_combiner_send_group<S, C, P>(
     classical_kp: &[u8],
     pq_kp: &[u8],
     client: &CombinerClient<S, C, P>,
     recv_classical: &mut MlsGroup<S, C>,
+    app_binding: Option<&[u8]>,
 ) -> Result<(CombinerGroup<S, C, P>, Vec<u8>)>
 where
     S: KeyPackageStorage + Clone,
@@ -745,7 +776,7 @@ where
         client.classical(),
         classical_kp,
         &[psk_cross, psk_apq],
-        GroupCreation::new(t_gid, &info, Some(attestation))?,
+        GroupCreation::new(t_gid, &info, Some(attestation))?.with_app_binding(app_binding)?,
     )?;
     let apq = encode_apq_welcome(classical_welcome, pq_welcome);
     Ok((
@@ -989,6 +1020,7 @@ mod tests {
             &bob.generate_classical_key_package().unwrap(),
             &bob.generate_pq_key_package().unwrap(),
             &alice,
+            None,
         )
         .unwrap();
         let mut bob_recv = join_combiner_group(&welcome, &bob).unwrap();
@@ -1065,6 +1097,7 @@ mod tests {
             &bob.generate_classical_key_package().unwrap(),
             &bob.generate_pq_key_package().unwrap(),
             &alice,
+            None,
         )
         .unwrap();
         let bob_recv = join_combiner_group(&welcome, &bob).unwrap();
@@ -1087,6 +1120,7 @@ mod tests {
             &bob.generate_classical_key_package().unwrap(),
             &bob.generate_pq_key_package().unwrap(),
             &alice,
+            None,
         )
         .unwrap();
         let mut bob_recv = join_combiner_group(&welcome_a, &bob).unwrap();
@@ -1096,6 +1130,7 @@ mod tests {
             &alice.generate_pq_key_package().unwrap(),
             &bob,
             &mut bob_recv.classical,
+            None,
         )
         .unwrap();
 
@@ -1117,6 +1152,7 @@ mod tests {
             &bob.generate_classical_key_package().unwrap(),
             &bob.generate_pq_key_package().unwrap(),
             &alice,
+            None,
         )
         .unwrap();
         let mut recv = join_combiner_group(&welcome, &bob).unwrap();
@@ -1209,5 +1245,271 @@ mod tests {
         let mut encoded = encode_apq_welcome(b"c".to_vec(), b"p".to_vec());
         encoded[0] = 0xFF;
         assert!(decode_apq_welcome(&encoded).is_err());
+    }
+
+    /// The AppBinding rides the classical half's GroupContext from creation through the
+    /// join (the PQ half carries none — it inherits coverage via the APQInfo
+    /// half-binding), and `verify_app_binding` is an exact, symmetric match: equal
+    /// passes; wrong bytes, a stripped binding against an expectation, and an unexpected
+    /// binding against no expectation all fail.
+    #[test]
+    fn test_app_binding_rides_creation_and_join() {
+        use crate::component::{read_app_binding, verify_app_binding};
+
+        let alice = client();
+        let bob = client();
+        let binding = b"relationship-digest".to_vec();
+
+        let (alice_send, welcome) = create_combiner_send_group(
+            &bob.generate_classical_key_package().unwrap(),
+            &bob.generate_pq_key_package().unwrap(),
+            &alice,
+            Some(&binding),
+        )
+        .unwrap();
+        let bob_recv = join_combiner_group(&welcome, &bob).unwrap();
+
+        // Both parties' classical halves carry the bytes; the PQ half carries none.
+        assert_eq!(
+            read_app_binding(&alice_send.classical).unwrap().as_deref(),
+            Some(binding.as_slice())
+        );
+        assert_eq!(
+            read_app_binding(&bob_recv.classical).unwrap().as_deref(),
+            Some(binding.as_slice())
+        );
+        assert!(read_app_binding(bob_recv.pq.as_ref().unwrap())
+            .unwrap()
+            .is_none());
+
+        // The verification matrix on the joined group.
+        assert!(verify_app_binding(&bob_recv.classical, Some(&binding)).is_ok());
+        assert!(matches!(
+            verify_app_binding(&bob_recv.classical, Some(b"other-relationship")),
+            Err(crate::CombinerError::AppBindingMismatch)
+        ));
+        assert!(matches!(
+            verify_app_binding(&bob_recv.classical, None),
+            Err(crate::CombinerError::AppBindingMismatch)
+        ));
+
+        // An unbound group: absent reads as None, verifies against None, and fails
+        // against an expectation (the strip/absence direction).
+        let carol = client();
+        let (unbound, _) = create_combiner_send_group(
+            &carol.generate_classical_key_package().unwrap(),
+            &carol.generate_pq_key_package().unwrap(),
+            &alice,
+            None,
+        )
+        .unwrap();
+        assert!(read_app_binding(&unbound.classical).unwrap().is_none());
+        assert!(verify_app_binding(&unbound.classical, None).is_ok());
+        assert!(matches!(
+            verify_app_binding(&unbound.classical, Some(&binding)),
+            Err(crate::CombinerError::AppBindingMismatch)
+        ));
+    }
+
+    /// A bound return group minted WITHOUT the incoming welcome's binding (the strip an
+    /// initiator must refuse) is detectable by `verify_app_binding` against the
+    /// initiator's own binding — the check `process_welcome` runs on the return join.
+    #[test]
+    fn test_stripped_bound_send_group_fails_binding_verification() {
+        use crate::component::verify_app_binding;
+
+        let alice = client();
+        let bob = client();
+        let binding = b"relationship-digest";
+
+        let (_alice_send, welcome_a) = create_combiner_send_group(
+            &bob.generate_classical_key_package().unwrap(),
+            &bob.generate_pq_key_package().unwrap(),
+            &alice,
+            Some(binding),
+        )
+        .unwrap();
+        let mut bob_recv = join_combiner_group(&welcome_a, &bob).unwrap();
+
+        let (bob_send, _welcome_b) = create_bound_classical_send_group(
+            &alice.generate_classical_key_package().unwrap(),
+            &bob,
+            &mut bob_recv.classical,
+            None,
+        )
+        .unwrap();
+        assert!(verify_app_binding(&bob_send.classical, None).is_ok());
+        assert!(matches!(
+            verify_app_binding(&bob_send.classical, Some(binding)),
+            Err(crate::CombinerError::AppBindingMismatch)
+        ));
+    }
+
+    /// GroupContextExtensions proposals are DELIBERATELY outside the TwoMLS operation
+    /// whitelist — that is what makes the creation-time AppBinding (and APQInfo)
+    /// immutable for a group's lifetime. A wired client cannot even build a GCE commit,
+    /// and a rogue-built GCE commit (the strip shape: an empty extension list builds
+    /// capability-free) is vetoed on receive before it is applied.
+    #[test]
+    fn test_rules_reject_group_context_extensions_commit() {
+        // A wired client cannot build one: its own leaf advertises every needed
+        // capability, so it is the rules' ForbiddenProposal that fires.
+        let alice = client();
+        let bob = client();
+        admit(&alice, bob.client_id());
+        admit(&bob, alice.client_id());
+        let (mut alice_send, _welcome) = create_group_with_member(
+            alice.classical(),
+            &bob.generate_classical_key_package().unwrap(),
+            &[],
+            GroupCreation::bare(alice.random_group_id().unwrap())
+                .with_app_binding(Some(b"relationship-digest"))
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(alice_send
+            .commit_builder()
+            .set_group_context_ext(ExtensionList::new())
+            .unwrap()
+            .build()
+            .is_err());
+
+        // A rogue creator CAN build one — the victim must veto it on receive, before
+        // application (mirror of `test_rules_reject_add_in_steady_state`).
+        let rogue_id = client_id();
+        let rogue = rogue_client(rogue_id.clone());
+        let victim = client();
+        admit(&victim, &rogue_id);
+        let mut rogue_group = rogue
+            .create_group(ExtensionList::new(), ExtensionList::new(), None)
+            .unwrap();
+        let victim_kp =
+            MlsMessage::from_bytes(&victim.generate_classical_key_package().unwrap()).unwrap();
+        let creation = rogue_group
+            .commit_builder()
+            .add_member(victim_kp)
+            .unwrap()
+            .build()
+            .unwrap();
+        rogue_group.apply_pending_commit().unwrap();
+        let welcome = creation
+            .welcome_messages
+            .first()
+            .unwrap()
+            .to_bytes()
+            .unwrap();
+        let mut victim_recv = join_group_from_welcome(victim.classical(), &welcome).unwrap();
+
+        let gce = rogue_group
+            .commit_builder()
+            .set_group_context_ext(ExtensionList::new())
+            .unwrap()
+            .build()
+            .unwrap();
+        rogue_group.apply_pending_commit().unwrap();
+        let gce_bytes = gce.commit_message.to_bytes().unwrap();
+        assert!(victim_recv
+            .process_incoming_message(MlsMessage::from_bytes(&gce_bytes).unwrap())
+            .is_err());
+    }
+
+    /// The capability cut that COMBINER_KEY_PACKAGE_VERSION v3 stamps: a leaf that does
+    /// not advertise the AppBinding extension type cannot be added to a binding-carrying
+    /// group (mls-rs requires every occupied leaf to support each GroupContext
+    /// extension), while an unbound group still admits it — so old-capability key
+    /// packages are unusable exactly and only where the binding matters.
+    #[test]
+    fn test_binding_group_rejects_uncapable_key_package() {
+        let alice = client();
+        let rogue_id = client_id();
+        let rogue = rogue_client(rogue_id.clone());
+        admit(&alice, &rogue_id);
+
+        let rogue_kp = |rogue: &mls_rs::Client<_>| {
+            rogue
+                .generate_key_package_message(ExtensionList::new(), ExtensionList::new(), None)
+                .unwrap()
+                .to_bytes()
+                .unwrap()
+        };
+
+        // Control: a bare (unbound) group admits the capability-less leaf.
+        assert!(create_group_with_member(
+            alice.classical(),
+            &rogue_kp(&rogue),
+            &[],
+            GroupCreation::bare(alice.random_group_id().unwrap()),
+        )
+        .is_ok());
+
+        // A binding-carrying group refuses it.
+        assert!(create_group_with_member(
+            alice.classical(),
+            &rogue_kp(&rogue),
+            &[],
+            GroupCreation::bare(alice.random_group_id().unwrap())
+                .with_app_binding(Some(b"relationship-digest"))
+                .unwrap(),
+        )
+        .is_err());
+    }
+
+    /// An EMPTY binding is reserved as invalid: `with_app_binding(Some(&[]))` fails at
+    /// the creation choke point, so an accidentally empty digest can never mint a group
+    /// "bound" to nothing (`None` is the deliberate unbound state — the AppBinding
+    /// analogue of the empty-ClientId rule).
+    #[test]
+    fn test_with_app_binding_rejects_empty() {
+        let alice = client();
+        assert!(matches!(
+            GroupCreation::bare(alice.random_group_id().unwrap()).with_app_binding(Some(&[])),
+            Err(crate::CombinerError::AppBindingMismatch)
+        ));
+        // Non-empty (and None) still pass.
+        assert!(GroupCreation::bare(alice.random_group_id().unwrap())
+            .with_app_binding(Some(b"relationship-digest"))
+            .is_ok());
+        assert!(GroupCreation::bare(alice.random_group_id().unwrap())
+            .with_app_binding(None)
+            .is_ok());
+    }
+
+    /// The binding lives on the classical halves only. `verify_pq_half_unbound` — run at
+    /// every PQ-half join — catches a PQ group smuggling an AppBinding (even a "correct"
+    /// one), so no dormant copy can enter a session for a future "read either half"
+    /// refactor to trip over; the PQ halves this crate itself builds pass.
+    #[test]
+    fn test_pq_half_unbound_check_catches_smuggled_binding() {
+        use crate::component::verify_pq_half_unbound;
+
+        let alice = client();
+        let bob = client();
+        admit(&alice, bob.client_id());
+
+        // A PQ group crafted WITH a binding (a wired creator can build one — the leaves
+        // advertise the capability; it is the join-side check that forbids the shape).
+        let (smuggled, _welcome) = create_group_with_member(
+            alice.pq(),
+            &bob.generate_pq_key_package().unwrap(),
+            &[],
+            GroupCreation::bare(alice.random_group_id().unwrap())
+                .with_app_binding(Some(b"relationship-digest"))
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            verify_pq_half_unbound(&smuggled),
+            Err(crate::CombinerError::AppBindingMismatch)
+        ));
+
+        // Every PQ half this crate builds is unbound — including in a bound pair.
+        let (bound_pair, _) = create_combiner_send_group(
+            &bob.generate_classical_key_package().unwrap(),
+            &bob.generate_pq_key_package().unwrap(),
+            &alice,
+            Some(b"relationship-digest"),
+        )
+        .unwrap();
+        assert!(verify_pq_half_unbound(bound_pair.pq.as_ref().unwrap()).is_ok());
     }
 }

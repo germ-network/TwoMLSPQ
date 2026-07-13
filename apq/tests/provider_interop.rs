@@ -194,6 +194,7 @@ mod cryptokit_interop {
             &bob.generate_classical_key_package().unwrap(),
             &bob.generate_pq_key_package().unwrap(),
             &alice,
+            None,
         )
         .unwrap();
         let mut b_recv = join_combiner_group(&welcome, &bob).unwrap();
@@ -207,6 +208,7 @@ mod cryptokit_interop {
             &dave.generate_classical_key_package().unwrap(),
             &dave.generate_pq_key_package().unwrap(),
             &carol,
+            None,
         )
         .unwrap();
         let mut d_recv = join_combiner_group(&welcome, &dave).unwrap();
@@ -226,6 +228,7 @@ mod cryptokit_interop {
             &bob.generate_classical_key_package().unwrap(),
             &bob.generate_pq_key_package().unwrap(),
             &alice,
+            None,
         )
         .unwrap();
         let mut b_recv = join_combiner_group(&welcome, &bob).unwrap();

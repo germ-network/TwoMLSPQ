@@ -155,7 +155,27 @@ pub fn version() -> String {
 // agent handoff) gets bytes and digest atomically; there is deliberately NO staged-slot
 // getter (a decoupled read could return an Upd a later prepare staged). No wire, archive,
 // or semantic change — a pure Record shape change.
-const BINDING_CONTRACT_VERSION: u64 = 14;
+// v15 (2026-07-12): AppBinding — an OPTIONAL app-state binding welded into a session at
+// creation and immutable for its lifetime: opaque app-supplied bytes (a DIGEST of the
+// app's immutable relationship identity; the crate never interprets them) carried in a
+// new AppBinding GroupContext extension (0xF0A2, the APQInfo mechanism) on both classical
+// halves; the PQ halves inherit coverage via the APQInfo half-binding. `initiate` gains
+// `app_binding`, `accept`/`receive` gain `expected_app_binding` (verified on the joined
+// welcome BEFORE any invitation state is claimed — a wrong-relationship welcome leaves
+// the invitation fully reusable; a binding-carrying welcome against a `None` expectation
+// is rejected, never silently accepted), the return group mirrors the verified incoming
+// binding, and the initiator's return-welcome join requires equality with its own send
+// group's binding (absence is a strip/downgrade attempt). New read-back
+// `app_binding() -> Result<Option<Vec<u8>>>` lets a restored session's owner re-verify.
+// An EMPTY binding is reserved as invalid (`None` is the unbound state), and PQ halves
+// must carry none (the binding lives on the classical halves; a smuggled PQ-half copy is
+// rejected at join). TwoMlsPqError gained `AppBindingMismatch`, appended as the last
+// variant so no existing case renumbers (the shape change this bump stamps). Leaves
+// now advertise the extension type: COMBINER_KEY_PACKAGE_VERSION -> 3 and
+// INVITATION_VERSION -> 4 (prerelease hard cut — old published key packages and
+// invitation archives are rejected; regenerate and re-pair). Session archives are
+// unaffected (the binding is optional and rides the persisted group state).
+const BINDING_CONTRACT_VERSION: u64 = 15;
 
 /// See `BINDING_CONTRACT_VERSION`. Exported so the Swift layer can verify the
 /// binding it was generated with matches the binary it loaded.
@@ -537,6 +557,24 @@ pub enum TwoMlsPqError {
     /// first sink (its store would go stale with no further pushes), so it fails fast instead.
     #[error("a persistence sink is already installed")]
     SinkAlreadyInstalled,
+    /// The `AppBinding` app-state binding failed verification: a welcome's binding does
+    /// not equal the caller's `expected_app_binding` (absent-when-expected is a
+    /// wrong-relationship welcome or a strip — the same downgrade shape a missing APQInfo
+    /// signals), a welcome carries a binding the caller did not expect (never silently
+    /// accepted — pass the binding you can verify), the return welcome's binding does not
+    /// equal the initiating session's own, a PQ half carries one (the binding lives on
+    /// the classical halves only), the extension is present but undecodable, or an EMPTY
+    /// binding was supplied (reserved as invalid — an accidentally empty digest must not
+    /// mint a bound-to-nothing session; `None` is the unbound state).
+    /// On `TwoMlsPqInvitation::receive` this is raised before any invitation state is
+    /// claimed, so the invitation stays fully reusable for the genuine welcome.
+    //
+    // Deliberately the LAST variant: uniffi numbers error cases by position, so appending
+    // keeps every prior variant's ordinal stable. Keep appending future variants here (the
+    // contract bump already forces binding/binary pairing, but there is no reason to
+    // renumber the survivors).
+    #[error("AppBinding missing, unexpected, or inconsistent")]
+    AppBindingMismatch,
 }
 
 /// SHA-256 over `bytes` — the single hashing primitive behind every digest this
@@ -584,6 +622,7 @@ impl From<apq::CombinerError> for TwoMlsPqError {
             apq::CombinerError::UnsupportedCipherSuite => TwoMlsPqError::UnsupportedCipherSuite,
             apq::CombinerError::CipherSuiteMismatch => TwoMlsPqError::CipherSuiteMismatch,
             apq::CombinerError::ApqInfoMismatch => TwoMlsPqError::ApqInfoMismatch,
+            apq::CombinerError::AppBindingMismatch => TwoMlsPqError::AppBindingMismatch,
         }
     }
 }

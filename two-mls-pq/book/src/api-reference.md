@@ -59,8 +59,8 @@ The receiving side of a published key package — no live client required.
   `archive()` getter is off the FFI (see `TwoMlsPqSession` below for why). `state_seq()`
   reports the current push sequence.
 - `client_id()`, `combiner_key_package()` — what to publish.
-- `receive(welcome, their_key_package, spawn_token, new_client_id, expected_remote)
-  -> TwoMlsPqSession` — establish from a remote initiator's welcome; rejects a
+- `receive(welcome, their_key_package, spawn_token, new_client_id, expected_remote,
+  expected_app_binding) -> TwoMlsPqSession` — establish from a remote initiator's welcome; rejects a
   re-delivered welcome (byte-identical, via the processed-welcome ledger) and a
   repeat remote (both `DuplicateWelcome`), and, for a single-use invitation whose key
   package has already been consumed, any further welcome (`InvitationSpent`).
@@ -79,6 +79,15 @@ The receiving side of a published key package — no live client required.
   claimed**, so the invitation stays fully reusable. Independently of it, the
   welcome's creator leaf must match the supplied key package (see
   [Group Rules](./group-rules.md)).
+  `expected_app_binding` is the app-state binding the welcome must carry (the bytes
+  the initiator passed to `initiate(app_binding:)`): an exact, symmetric match —
+  `Some` requires byte-equality, `None` requires an unbound welcome; anything else
+  (a stripped, unequal, or unexpected binding, or a PQ half smuggling one) is
+  `AppBindingMismatch`, as is an empty expectation (empty is reserved — no group can
+  carry an empty binding). Necessarily verified after the join (GroupContext rides
+  the encrypted welcome) but still **before any invitation state is claimed** — a
+  rejected welcome consumes nothing.
+  The spawned session mirrors the verified binding onto its own send group.
 - `forward_group_id(spawn_token) -> Option<MlsGroupId>` — resolve a replayed
   initial frame to the spawned session's receive group (its classical message-half id).
 - `processed_welcome_group_id(welcome) -> Option<MlsGroupId>` — the content-keyed
@@ -106,10 +115,16 @@ The receiving side of a published key package — no live client required.
 
 ## `TwoMlsPqSession`
 
-Constructors: `initiate(client, their_key_package, app_payload)` — `app_payload` is the
-host's opaque app-layer welcome (or `None`), composed with the MLS welcome and
-HPKE-enveloped to the peer's KP′ so `pending_outbound` is one opaque blob the peer opens
-with `TwoMlsPqInvitation::open_initial`; `accept(client, welcome, their_key_package)` —
+Constructors: `initiate(client, their_key_package, app_payload, app_binding)` —
+`app_payload` is the host's opaque app-layer welcome (or `None`), composed with the MLS
+welcome and HPKE-enveloped to the peer's KP′ so `pending_outbound` is one opaque blob the
+peer opens with `TwoMlsPqInvitation::open_initial`; `app_binding` is the optional
+app-state binding welded into the send group's GroupContext at this moment and immutable
+for the session's lifetime — pass a **digest** of the app's immutable relationship
+identity, not raw identifiers, and never empty (empty is reserved as invalid; `None` is
+the unbound state) — the crate never interprets the bytes (see
+[Group Rules](./group-rules.md) rule 8);
+`accept(client, welcome, their_key_package, expected_app_binding)` —
 the plaintext-welcome path (tests/embedded); `restore(core, checkpoint)` —
 self-contained restore from the two pushed blobs: they carry the session's signing
 identity, so restore rebuilds the exact client internally (no client argument),
@@ -121,7 +136,12 @@ mismatch.
 State: `is_established`, `is_fully_established`, `has_receive_group`,
 `active_session_id`, `receive_group_id`, `my_principal_state`, `their_principal_state`,
 `pending_outbound` (the standalone copy of the own welcome — no longer consumed by
-`encrypt`; the welcome also rides every pre-commit frame as the staple), `epochs`.
+`encrypt`; the welcome also rides every pre-commit frame as the staple), `epochs`,
+`app_binding() -> Result<Option<Vec<u8>>>` (Swift `try appBinding() -> Data?`; the
+app-state binding the session was created with, read from the send group's GroupContext —
+it rides the persisted group state, so a restored session's owner re-verifies here;
+errors only on a present-but-undecodable extension, so corruption can never read back as
+"unbound").
 
 Messaging: `prepare_to_encrypt(proposing)` — `Some(id)` selects which staged rotation
 candidate this round's Upd proposes (`None` re-proposes the current identity; the
@@ -203,7 +223,8 @@ All failures map to the flat `TwoMlsPqError` enum (`Mls`, `InvalidKeyPackage`,
 `SessionNotReady`, `ProposalRejected`, `DecryptionFailed`, `DuplicateWelcome`,
 `InvitationSpent`, `ArchiveInvalid`, `UnsupportedCipherSuite`, `CipherSuiteMismatch`,
 `EpochDesync`, `UnexpectedWelcome`, `InvalidClientId`, `RemoteIdentityMismatch`,
-`CredentialRejected`).
+`CredentialRejected`, `ApqInfoMismatch`, `AppBindingMismatch`,
+`SinkAlreadyInstalled`).
 mls-rs error types never cross the FFI boundary. `InvalidClientId` rejects an empty
 principal id supplied to `receive(new_client_id:)` or `stage_rotation` — empty is
 reserved (it is the ratchet-commit authenticated-data discriminator, so an empty id
@@ -221,4 +242,10 @@ live session was joined from arrived (re-deliveries of the *same* welcome are si
 idempotent). `CipherSuiteMismatch` is raised when a peer key
 package or welcome carries a cipher-suite pair that isn't the session's fixed suite
 (`PqNotAvailable` when the peer offers no PQ half at all); `UnsupportedCipherSuite` is a local
-provider-capability gap at construction.
+provider-capability gap at construction. `AppBindingMismatch` is the app-state
+binding's verification failure: a welcome that does not carry the caller's
+`expected_app_binding` (absent or unequal), a binding-carrying welcome against no
+expectation (never silently accepted), or a return welcome that fails to mirror the
+initiator's own binding — on `receive` it is raised before any invitation state is
+claimed, so the invitation stays fully reusable (see
+[Group Rules](./group-rules.md)).

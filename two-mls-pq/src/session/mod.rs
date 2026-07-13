@@ -12,8 +12,9 @@ use mls_rs::{
 
 use apq::authentication::{AuthCoreHandle, PartySequence};
 use apq::component::{
-    commit_attestation, read_apqinfo, verify_apqinfo_deferred, verify_apqinfo_pair,
-    verify_deferred_pq_info, ApqInfo, ApqInfoUpdate, EPOCH_UNBOUND,
+    commit_attestation, read_app_binding, read_apqinfo, verify_app_binding,
+    verify_apqinfo_deferred, verify_apqinfo_pair, verify_deferred_pq_info, verify_pq_half_unbound,
+    ApqInfo, ApqInfoUpdate, EPOCH_UNBOUND,
 };
 use apq::{
     create_bound_classical_send_group, create_combiner_send_group, create_group_with_member,
@@ -364,6 +365,22 @@ impl SessionInner {
             .auth_view()
             .with(|core| core.adopting = false);
         let recv_group = joined?;
+        // App-state binding: the return group must carry back exactly this session's own
+        // binding — the acceptor mirrors the (verified) binding of the welcome it replies
+        // to, so on an honest peer both directions match. An absent or different binding
+        // here is a strip/downgrade or wrong-relationship welcome, refused before any
+        // session state adopts the join. Covers both the deferred (A.4) and full-pair
+        // welcome shapes; the binding lives on the classical half.
+        let own_binding = match self.send_group.as_ref() {
+            Some(send) => read_app_binding(&send.classical)?,
+            // Structurally unreachable: every constructor and restore path produces a
+            // send group. Refuse rather than skip the check.
+            None => return Err(TwoMlsPqError::SessionNotEstablished),
+        };
+        verify_app_binding(&recv_group.classical, own_binding.as_deref())?;
+        if let Some(pq) = recv_group.pq.as_ref() {
+            verify_pq_half_unbound(pq)?;
+        }
         // Adopt the peer's principal from the send group's creator leaf. The peer may
         // have created this group under a dedicated per-session principal
         // (`TwoMlsPqInvitation::receive(new_client_id:)`) whose id differs from the
@@ -637,12 +654,33 @@ impl TwoMlsPqSession {
     /// initiator) is hidden without the host having to compose the envelope itself. The
     /// peer recovers both halves with `TwoMlsPqInvitation::open_initial`, then joins with
     /// `receive`.
+    ///
+    /// `app_binding` is the optional app-state binding: opaque bytes welded into the send
+    /// group's GroupContext (an `AppBinding` extension, the APQInfo mechanism) at this
+    /// moment and immutable for the session's lifetime — the binding of the session to the
+    /// app's IMMUTABLE relationship identity, which the two mutable agents (rotation
+    /// lifecycle) cannot carry. The peer verifies it at `receive(expected_app_binding:)`,
+    /// mirrors it onto the return group, and this session requires the return welcome to
+    /// carry it back unchanged; read it back any time (e.g. after a restore) with
+    /// [`app_binding`](Self::app_binding). Pass a DIGEST, not raw identifiers — the first
+    /// adopter binds `H(domain-tag ‖ role-ordered did:did)`, sharing its canonicalization
+    /// with the delegation binding so the two cannot drift; this library never interprets
+    /// the bytes. An EMPTY binding is rejected as `AppBindingMismatch` (reserved — an
+    /// accidentally empty digest must not mint a bound-to-nothing session; `None` is the
+    /// unbound state, the AppBinding analogue of the empty-ClientId rule).
     #[uniffi::constructor]
     pub fn initiate(
         client: Arc<TwoMlsPqPrincipal>,
         their_key_package: CombinerKeyPackage,
         app_payload: Option<Vec<u8>>,
+        app_binding: Option<Vec<u8>>,
     ) -> Result<Arc<Self>> {
+        // Empty bindings are reserved as invalid (see `AppBindingMismatch`): reject before
+        // anything — even the AS peer admission inside group creation — is touched.
+        // `GroupCreation::with_app_binding` enforces the same rule at the choke point.
+        if app_binding.as_deref().is_some_and(<[u8]>::is_empty) {
+            return Err(TwoMlsPqError::AppBindingMismatch);
+        }
         validate_combiner_kp(client.combiner().cipher_suite(), &their_key_package)?;
         let their_parsed = parse_mls_key_package(their_key_package.classical.clone())?;
         let their_id = their_parsed.client_id;
@@ -652,6 +690,7 @@ impl TwoMlsPqSession {
             &their_key_package.classical,
             &their_key_package.pq,
             client.combiner(),
+            app_binding.as_deref(),
         )?;
 
         // The first frame has no symmetric key yet, so it is not header-sealed; instead the
@@ -699,13 +738,27 @@ impl TwoMlsPqSession {
     /// peer's return welcome, and this clear would drop it. The normal entry point,
     /// `TwoMlsPqInvitation::receive`, always builds a fresh invitation-derived client, so this
     /// only concerns direct callers of `accept`.
+    ///
+    /// `expected_app_binding` is the app-state binding this welcome must carry (see
+    /// `TwoMlsPqInvitation::receive`, which documents the semantics): `Some` requires the
+    /// joined group's `AppBinding` to be byte-equal, `None` requires it to carry none —
+    /// any other combination is `AppBindingMismatch`, raised before this client's
+    /// key-package store is cleared.
     #[uniffi::constructor]
     pub fn accept(
         client: Arc<TwoMlsPqPrincipal>,
         welcome: Vec<u8>,
         their_key_package: CombinerKeyPackage,
+        expected_app_binding: Option<Vec<u8>>,
     ) -> Result<Arc<Self>> {
-        Self::accept_with(client, None, welcome, their_key_package, None)
+        Self::accept_with(
+            client,
+            None,
+            welcome,
+            their_key_package,
+            None,
+            expected_app_binding,
+        )
     }
 }
 
@@ -722,13 +775,31 @@ impl TwoMlsPqSession {
     /// The session's owned signing identity becomes `session_client`; the receive group
     /// keeps operating with the invitation identity's keys embedded in its own snapshot
     /// (leaf credential bytes there stay fixed, exactly as under a Phase 8 rotation).
+    ///
+    /// `expected_app_binding` is verified against the joined welcome's `AppBinding`
+    /// extension (exact match, including None==None) BEFORE any state is touched — the
+    /// key-package store purge, the AS seeding, and (on the invitation path) every
+    /// invitation mutation all come after, so a rejected welcome leaves the caller intact.
+    /// The return group is then created carrying the verified incoming binding, so both
+    /// directions hold identical bytes. An empty expectation is rejected up front: empty
+    /// is reserved (no group can carry an empty binding), so it could never match.
     pub(crate) fn accept_with(
         client: Arc<TwoMlsPqPrincipal>,
         session_client: Option<Arc<TwoMlsPqPrincipal>>,
         welcome: Vec<u8>,
         their_key_package: CombinerKeyPackage,
         spawn_token: Option<Vec<u8>>,
+        expected_app_binding: Option<Vec<u8>>,
     ) -> Result<Arc<Self>> {
+        // Empty bindings are reserved as invalid (see `AppBindingMismatch`); an empty
+        // expectation is unsatisfiable, so reject it before the join rather than let it
+        // surface as a confusing post-join mismatch.
+        if expected_app_binding
+            .as_deref()
+            .is_some_and(<[u8]>::is_empty)
+        {
+            return Err(TwoMlsPqError::AppBindingMismatch);
+        }
         validate_combiner_kp(client.combiner().cipher_suite(), &their_key_package)?;
         let their_parsed = parse_mls_key_package(their_key_package.classical.clone())?;
         let their_id = their_parsed.client_id;
@@ -765,6 +836,20 @@ impl TwoMlsPqSession {
                 }
             }
         }
+        // App-state binding: the joined welcome must carry exactly the binding the caller
+        // expects (a wrong or stripped binding is a wrong-relationship welcome; a binding
+        // the caller did not state is never silently accepted). Checked before the
+        // key-package purge and AS seeding below — and, on the invitation path, before
+        // any invitation state is claimed — so a rejected welcome leaves everything
+        // reusable. The binding lives on the classical (message) half; the PQ half
+        // inherits coverage through the APQInfo half-binding verified at join.
+        verify_app_binding(&recv_group.classical, expected_app_binding.as_deref())?;
+        if let Some(pq) = recv_group.pq.as_ref() {
+            verify_pq_half_unbound(pq)?;
+        }
+        // The verified binding is mirrored onto the return group below, so the session
+        // carries identical bytes in both directions.
+        let app_binding = read_app_binding(&recv_group.classical)?;
         // The invitation's key package has served its one purpose: mls-rs obtained it to join
         // the receive group. The store is only that serving interface, so drop the acceptor's
         // key-package material now — nothing migrates from the invitation into the session (or
@@ -808,6 +893,7 @@ impl TwoMlsPqSession {
             &their_key_package.classical,
             group_client.combiner(),
             &mut recv_group.classical,
+            app_binding.as_deref(),
         )?;
         let apq_welcome = encode_apq_welcome(classical_welcome, Vec::new());
 
@@ -963,6 +1049,22 @@ impl TwoMlsPqSession {
 
     pub fn their_principal_state(&self) -> PrincipalState {
         self.lock().their_state.clone()
+    }
+
+    /// The app-state binding this session was created with (`initiate`'s `app_binding`,
+    /// or the binding the accepted welcome carried), or `None` for an unbound session.
+    /// Welded into the send group's GroupContext at creation and immutable for the
+    /// session's lifetime, it rides the persisted group state — a restored session's
+    /// owner re-verifies here that the session still belongs to the relationship it was
+    /// pinned to. The bytes are opaque to this library (the adopter's digest); errors
+    /// only if the extension is present but undecodable (corruption must not read back
+    /// as "unbound").
+    pub fn app_binding(&self) -> Result<Option<Vec<u8>>> {
+        let inner = self.lock();
+        match inner.send_group.as_ref() {
+            Some(send) => Ok(read_app_binding(&send.classical)?),
+            None => Ok(None),
+        }
     }
 
     pub fn receive_group_id(&self) -> Option<CombinerGroupId> {
