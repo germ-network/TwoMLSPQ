@@ -175,7 +175,34 @@ pub fn version() -> String {
 // INVITATION_VERSION -> 4 (prerelease hard cut — old published key packages and
 // invitation archives are rejected; regenerate and re-pair). Session archives are
 // unaffected (the binding is optional and rides the persisted group state).
-const BINDING_CONTRACT_VERSION: u64 = 15;
+// v16 (2026-07-13, §A.1 pre-establishment sends): the initiator sends app messages
+// immediately after `initiate`, before the acceptor's return welcome (architecture
+// 08-twoMLSPQ-APQ §A.1) — `prepare_to_encrypt` pre-establishment is a NO-OP prepare
+// (`proposal_message` EMPTY; `proposal_hash` is the WELCOME digest — the one carve-out
+// on the v14 hash==sha256(message) guarantee) and `encrypt` emits a fresh §A.1 envelope
+// per frame, HPKE-sealed to the retained peer KP′, stapling the app message.
+// Envelope wire v2: tagged `[0x15][u32 kem_len][kem][ct]`; plaintext is four optional
+// u32-LE length-prefixed sections `[app_payload][welcome][return_kp][stapled_message]`
+// under the either/or rule (a host app_payload is establishment-SELF-SUFFICIENT and
+// replaces the bare sections). `initiate` LOST its `app_payload` parameter (a payload
+// that signs over the welcome cannot exist before initiate returns) — attach with the
+// new `set_initial_app_payload` / `set_initial_return_key_package` (initiator-only,
+// pre-establishment-only, regenerate `pending_outbound`; CAPTURE AFTER ATTACH — the
+// retained state rides the archive so a birth-captured replier restores send-ready);
+// new read-only `initial_welcome()`. `InitialFrame` reshaped (all four sections,
+// `welcome` now Optional); new exported `decode_initial_plaintext` parses an
+// HPKE-opened plaintext (token/dedup keying: the STABLE PREFIX — app_payload when
+// present, else welcome — identical across one initiator's re-staples; all
+// consequential state keys off the signed, JOINED welcome via the invitation's
+// `processed` ledger — the other sections are unauthenticated hints). The stapled app
+// message is `[0x13][BSG-cl PrivateMessage]`, handed to `process_incoming` AFTER the
+// join (application-message-only result). Establishment clears the retained state (the
+// cutover in `process_welcome`). Archive layout versions RESET to the pre-release
+// floor alongside this layout change (SESSION_ARCHIVE and INVITATION both -> 1; the
+// accumulated ladders carried no compatibility value — history stays in git): ALL
+// persisted sessions and invitations regenerate. The v15 key-package wire cut
+// (COMBINER_KEY_PACKAGE_VERSION 3, a published artifact, not an archive) is untouched.
+const BINDING_CONTRACT_VERSION: u64 = 16;
 
 /// See `BINDING_CONTRACT_VERSION`. Exported so the Swift layer can verify the
 /// binding it was generated with matches the binary it loaded.
@@ -241,6 +268,12 @@ pub struct RendezvousId {
 /// authenticated data, and the receiver reports the same value as
 /// `QueuedRemoteProposal.digest`. `did_commit` is false when stuck in a prior epoch
 /// (no pending remote proposal to commit).
+///
+/// PRE-ESTABLISHMENT carve-out (v15): an initiated session with no recv group yet
+/// prepares a NO-OP round — `proposal_message` is EMPTY (there is no recv group to
+/// stage an Upd into) and `proposal_hash` is the sha256 of the birth WELCOME instead,
+/// binding each pre-establishment app message to its establishment vector. The peer
+/// stages nothing from such frames (`DecryptResult.proposal` is absent).
 #[derive(Debug, uniffi::Record)]
 pub struct PrepareEncryptResult {
     pub proposal_message: Vec<u8>,
@@ -330,7 +363,9 @@ impl PrincipalState {
     }
 }
 
-/// Opaque serialised session state. Restore via `TwoMlsPqSession.fromArchive(_:)`.
+/// Opaque serialised state as pushed to an [`ArchiveSink`]. Sessions restore from the
+/// two newest slots via `TwoMlsPqSession.restore(core:checkpoint:)`; invitations from
+/// their monolithic checkpoint via `TwoMlsPqInvitation.restore(archive:)`.
 #[derive(Debug, uniffi::Record)]
 pub struct Archive {
     pub bytes: Vec<u8>,

@@ -23,12 +23,28 @@ fn main() {
     let bob_inv = TwoMlsPqInvitation::restore(bob.generate_invitation(true).unwrap()).unwrap();
     let bob_kp = bob_inv.combiner_key_package();
 
-    let alice_s = TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None, None).unwrap();
+    let alice_s = TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None).unwrap();
     let envelope_a = alice_s.pending_outbound().unwrap();
     let opened = bob_inv.open_initial(envelope_a.clone()).unwrap();
+
+    // §A.1 pre-establishment app frames (v15): each send is a fresh envelope
+    // re-stapling the establishment sections plus the app message. Bare shape
+    // (welcome + return-KP sections) vs self-sufficient host payload (which replaces
+    // the bare sections — here a thin wrapper over the welcome; a real identity
+    // envelope also carries the return KP + signatures).
+    alice_s
+        .set_initial_return_key_package(combiner_kp(&alice))
+        .unwrap();
+    alice_s.prepare_to_encrypt(None).unwrap();
+    let pre_est_bare = alice_s.encrypt(payload.to_vec()).unwrap().cipher_text;
+    let mut identity_payload = b"identity-envelope:".to_vec();
+    identity_payload.extend_from_slice(&alice_s.initial_welcome().unwrap());
+    alice_s.set_initial_app_payload(identity_payload).unwrap();
+    alice_s.prepare_to_encrypt(None).unwrap();
+    let pre_est_payload = alice_s.encrypt(payload.to_vec()).unwrap().cipher_text;
     let bob_s = bob_inv
         .receive(
-            opened.welcome,
+            opened.welcome.unwrap(),
             alice_kp,
             b"sizes".to_vec(),
             None,
@@ -68,11 +84,18 @@ fn main() {
         let a_kp = combiner_kp(&a);
         let b_inv = TwoMlsPqInvitation::restore(b.generate_invitation(true).unwrap()).unwrap();
         let b_kp = b_inv.combiner_key_package();
-        let a_s = TwoMlsPqSession::initiate(Arc::clone(&a), b_kp, None, None).unwrap();
+        let a_s = TwoMlsPqSession::initiate(Arc::clone(&a), b_kp, None).unwrap();
         let envelope = a_s.pending_outbound().unwrap();
         let opened = b_inv.open_initial(envelope).unwrap();
         let b_s = b_inv
-            .receive(opened.welcome, a_kp, b"sizes-pq".to_vec(), None, None, None)
+            .receive(
+                opened.welcome.unwrap(),
+                a_kp,
+                b"sizes-pq".to_vec(),
+                None,
+                None,
+                None,
+            )
             .unwrap();
         let wb = b_s.pending_outbound().unwrap();
         a_s.process_incoming(wb).unwrap();
@@ -101,6 +124,11 @@ fn main() {
     println!("\n=== TwoMLSPQ ciphertext sizes ({}) ===", suite_label());
     println!("payload (plaintext)          : {:>6} B", payload.len());
     println!("initial envelope A (§A.1)    : {:>6} B", envelope_a.len());
+    println!("pre-est app frame (bare)     : {:>6} B", pre_est_bare.len());
+    println!(
+        "pre-est app frame (payload)  : {:>6} B",
+        pre_est_payload.len()
+    );
     println!("APQ welcome B (0x01, sealed) : {:>6} B", welcome_b.len());
     println!("no-commit frame + app (0x03) : {:>6} B", no_commit.len());
     println!("folding commit + app (0x03)  : {:>6} B", folding.len());

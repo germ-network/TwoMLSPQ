@@ -345,6 +345,39 @@ impl SessionInner {
         Ok(())
     }
 
+    /// §A.1 pre-establishment round (initiated side, recv group absent): a NO-OP
+    /// prepare — there is no recv group to stage an `Upd(self)` into and nothing to
+    /// fold, exactly like a round right after one's own commit with nothing queued.
+    /// Stages only the app-message AAD — `sha256(welcome)`, binding each
+    /// pre-establishment app message to its establishment vector — and leaves
+    /// `pending_proposal_message` empty, the marker the paired `encrypt` branches on
+    /// to produce a §A.1 envelope instead of a 0x03 frame. `selected` cannot ride
+    /// (no recv group carries an Upd) → `SessionNotReady`. Carve-out on the
+    /// `PrepareEncryptResult` contract: here `proposal_message` is EMPTY and
+    /// `proposal_hash` is the welcome digest, not sha256(proposal_message).
+    pub(in crate::session) fn prepare_pre_establishment(
+        &mut self,
+        selected: Option<ClientId>,
+    ) -> Result<crate::PrepareEncryptResult> {
+        if selected.is_some() {
+            return Err(TwoMlsPqError::SessionNotReady);
+        }
+        // The paired encrypt must be able to seal (the retained KP′) and staple (the
+        // birth welcome) — fail here, at prepare, if either is impossible.
+        if self.initial_their_kp.is_none() || self.current_staple.first() != Some(&APQ_TAG) {
+            return Err(TwoMlsPqError::SessionNotReady);
+        }
+        let proposal_hash = crate::sha256(&self.current_staple);
+        self.pending_proposal_hash = Some(proposal_hash.clone());
+        self.pending_proposal_message = None;
+        Ok(crate::PrepareEncryptResult {
+            proposal_message: Vec::new(),
+            proposal_hash,
+            committed_remote_client_id: None,
+            did_commit: false,
+        })
+    }
+
     /// Routine round (A.2): commit in OUR OWN send group — only the owner commits — and
     /// stage an Upd(self) proposal for the peer's send group to staple alongside. With an
     /// app-approved queued proposal (already cached in the send group via `queue_proposal`),
@@ -609,14 +642,23 @@ impl SessionInner {
 #[uniffi::export]
 impl TwoMlsPqSession {
     /// Prepare a pending proposal nonce and stage it for binding into the next outbound message.
-    /// Returns `Err(SessionNotReady)` until both groups are established.
     ///
     /// - `proposing: None` with a queued remote proposal → folding commit — folds the approved Upd (epoch advance + PSK refresh), `did_commit: true`
     /// - `proposing: Some(new_id)` → rotation commit with new leaf credential, `did_commit: true`
     /// - Otherwise → recv self-Update only, `did_commit: false`
+    /// - Pre-establishment (initiated side, recv group absent) → a NO-OP prepare
+    ///   (§A.1: the initiator sends app messages immediately, before the acceptor's
+    ///   return welcome): nothing is staged (`proposal_message` empty; `proposal_hash`
+    ///   is the WELCOME digest, the AAD binding each pre-establishment message to its
+    ///   establishment vector), and the paired `encrypt` emits a §A.1 envelope
+    ///   re-stapling the welcome. `proposing: Some` here → `SessionNotReady`.
     pub fn prepare_to_encrypt(&self, proposing: Option<ClientId>) -> Result<PrepareEncryptResult> {
         self.mutate_and_persist(crate::BlobKind::Core, |inner| {
-            let result = inner.prepare_ratchet_commit(proposing)?;
+            let result = if inner.recv_group.is_none() {
+                inner.prepare_pre_establishment(proposing)?
+            } else {
+                inner.prepare_ratchet_commit(proposing)?
+            };
             // A committing round advanced the send group's classical epoch — capture
             // the new epoch's listen address.
             inner.record_listen_rendezvous()?;
@@ -627,10 +669,16 @@ impl TwoMlsPqSession {
     /// Encrypt `app_message` using the PQ send group.
     /// Must be called after `prepare_to_encrypt`; the pending proposal hash is used as
     /// authenticated data and cleared on return.
-    /// The output is always one message frame `[staple][proposal][app]`: the staple (our
-    /// latest send-group commit, or our APQWelcome until the first commit) rides every
-    /// frame, so a peer that missed a frame is healed by the next one. `pending_outbound`
-    /// is NOT consumed here — the staple carries the welcome; the standalone copy stays
+    ///
+    /// Post-establishment, the output is one message frame `[staple][proposal][app]`:
+    /// the staple (our latest send-group commit, or our APQWelcome until the first
+    /// commit) rides every frame, so a peer that missed a frame is healed by the next
+    /// one. Pre-establishment (initiated side, no recv group — the marker is the empty
+    /// staged-proposal slot a `prepare_pre_establishment` left), the output is instead
+    /// a fresh §A.1 envelope HPKE-sealed to the peer's KP′, carrying the establishment
+    /// sections plus this app message as its `[0x13]` staple — any single frame lets
+    /// the invitation holder join and read it. `pending_outbound` is NOT consumed on
+    /// either path — the frame itself carries the welcome; the standalone copy stays
     /// available for hosts that also deliver it separately (processing is idempotent).
     pub fn encrypt(&self, app_message: Vec<u8>) -> Result<EncryptResult> {
         self.mutate_and_persist(crate::BlobKind::Core, |inner| {
@@ -638,6 +686,14 @@ impl TwoMlsPqSession {
                 .pending_proposal_hash
                 .take()
                 .ok_or(TwoMlsPqError::SessionNotReady)?;
+            // Take the staged proposal BEFORE advancing the sender ratchet: an empty
+            // slot is either the pre-establishment marker (valid only while the recv
+            // group is still absent) or a prepare gone stale across the establishment
+            // cutover — reject the stale case without burning a message generation.
+            let staged = inner.pending_proposal_message.take();
+            if staged.is_none() && inner.recv_group.is_some() {
+                return Err(TwoMlsPqError::SessionNotReady);
+            }
 
             let (app_bytes, epochs) = {
                 let send = inner
@@ -655,27 +711,32 @@ impl TwoMlsPqSession {
                 (bytes, epochs)
             };
 
-            // Every prepare path stages a proposal, and the staple is set at construction —
-            // an empty slot here means encrypt was reached outside the prepare contract.
-            let (proposing, proposal) = inner
-                .pending_proposal_message
-                .take()
-                .ok_or(TwoMlsPqError::SessionNotReady)?;
-            if inner.current_staple.is_empty() {
-                return Err(TwoMlsPqError::SessionNotReady);
-            }
-            let frame = encode_message_frame(
-                &inner.current_staple,
-                encode_proposal_section(&proposing, &proposal),
-                app_bytes,
-            );
-            // Header encryption: seal the whole frame into one opaque blob before it leaves
-            // the library. `encrypt` only runs post-establishment (prepare needs the recv
-            // group), so the seal key is always available.
-            let cipher_text = inner.seal(&frame)?;
-
             let sender = inner.my_state.client_id();
             let recipient = inner.their_state.client_id();
+
+            let cipher_text = match staged {
+                Some((proposing, proposal)) => {
+                    // The staple is set at construction — an empty slot means encrypt
+                    // was reached outside the prepare contract.
+                    if inner.current_staple.is_empty() {
+                        return Err(TwoMlsPqError::SessionNotReady);
+                    }
+                    let frame = encode_message_frame(
+                        &inner.current_staple,
+                        encode_proposal_section(&proposing, &proposal),
+                        app_bytes,
+                    );
+                    // Header encryption: seal the whole frame into one opaque blob
+                    // before it leaves the library. This path only runs
+                    // post-establishment (the prepare staged into the recv group), so
+                    // the seal key is always available.
+                    inner.seal(&frame)?
+                }
+                // Pre-establishment: no symmetric seal key exists — compose a fresh
+                // §A.1 envelope (HPKE to the retained KP′) stapling this app message.
+                None => inner
+                    .compose_initial_envelope(Some(&encode_pre_establishment_app(&app_bytes)))?,
+            };
 
             Ok(EncryptResult {
                 cipher_text,
@@ -1018,6 +1079,49 @@ impl TwoMlsPqSession {
                 }),
                 proposal,
                 remote_commit,
+            }));
+        }
+
+        // Pre-establishment app staple ([0x13][BSG-cl PrivateMessage]): the peer's app
+        // message extracted from a §A.1 envelope's `stapled_message` section (see
+        // `InitialFrame`). The ciphertext rides the peer's send group — OUR recv group
+        // — so it only decrypts after the join the same envelope's welcome produced;
+        // hand it here AFTER `receive`. It carries no staple of its own and no
+        // proposal (the sender had no recv group to propose into), so the result is
+        // application-message-only. Replays are consumed-generation rejects
+        // (`DecryptionFailed` — the host's fail-open staple handling drops them).
+        if ciphertext.first() == Some(&PRE_ESTABLISHMENT_APP_TAG) {
+            let app_msg = MlsMessage::from_bytes(&ciphertext[1..])
+                .map_err(|_| TwoMlsPqError::DecryptionFailed)?;
+            let mut inner = self.lock();
+            let (app_data, sender_id, epoch) = {
+                let recv = inner
+                    .recv_group
+                    .as_mut()
+                    .ok_or(TwoMlsPqError::SessionNotEstablished)?;
+                match recv
+                    .classical
+                    .process_incoming_message(app_msg)
+                    .map_err(|_| TwoMlsPqError::DecryptionFailed)?
+                {
+                    ReceivedMessage::ApplicationMessage(desc) => {
+                        let sender = ClientId {
+                            bytes: sender_client_id(&recv.classical, desc.sender_index)?,
+                        };
+                        let ep = recv.classical.current_epoch();
+                        (desc.data().to_vec(), sender, ep)
+                    }
+                    _ => return Err(TwoMlsPqError::DecryptionFailed),
+                }
+            };
+            return Ok(Some(DecryptResult {
+                application_message: Some(MlsSenderMessage {
+                    app_message_data: app_data,
+                    sender_client_id: sender_id,
+                    epoch,
+                }),
+                proposal: None,
+                remote_commit: None,
             }));
         }
 

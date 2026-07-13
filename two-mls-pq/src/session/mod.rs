@@ -199,6 +199,25 @@ struct SessionInner {
     /// interprets the bytes. Must be serialized when `archive()` is implemented, or
     /// restored sessions stop acknowledging replayed initial frames.
     spawn_token: Option<Vec<u8>>,
+    /// The peer's published combiner key package this session initiated toward —
+    /// retained so every pre-establishment `encrypt` can HPKE-seal a fresh §A.1
+    /// envelope to its KP′ (§A.1: the initiator keeps sending app messages, stapling
+    /// the welcome, until the acceptor's return welcome arrives). `None` on acceptor
+    /// sessions; cleared at the establishment cutover (`process_welcome`) — the
+    /// envelope machinery is obsolete once the peer provably joined. Rides the archive
+    /// so a session restored at birth (the app captures at reply) can still send first.
+    initial_their_kp: Option<CombinerKeyPackage>,
+    /// The host's app-layer welcome riding every pre-establishment envelope (see
+    /// `set_initial_app_payload`): establishment-SELF-SUFFICIENT by contract (it
+    /// carries the MLS welcome + return key package inside, e.g. a signed identity
+    /// envelope), so composed envelopes omit the bare sections while it is set.
+    /// Initiator-only; cleared at the establishment cutover; rides the archive.
+    initial_app_payload: Option<Vec<u8>>,
+    /// The initiator's return-group combiner key package for the bare-section envelope
+    /// shape (no `initial_app_payload` — hosts that deliver establishment material
+    /// unwrapped; see `set_initial_return_key_package`). Initiator-only; cleared at
+    /// the establishment cutover; rides the archive.
+    initial_return_kp: Option<CombinerKeyPackage>,
     /// The foreign persistence hook this session pushes to after every state-advancing
     /// mutation (see `mutate_and_persist`). `None` opts out of push persistence (tests,
     /// benches, fuzz). Not part of the archive — it is live plumbing supplied at every
@@ -402,6 +421,17 @@ impl SessionInner {
         };
         self.recv_group = Some(recv_group);
         self.joined_welcome_digest = Some(digest);
+        // Establishment cutover: the peer provably joined (its return welcome created
+        // our recv group), so the initiator's pre-establishment envelope machinery is
+        // obsolete — clear the retained seal target / payload / return KP and any
+        // parked envelope. From here the 0x03 message path takes over (its staple
+        // still re-sends the welcome until our first commit; the peer skips repeats
+        // idempotently). Acceptors never reach this line (their recv group exists
+        // from birth, so re-deliveries return early above) and never set these fields.
+        self.initial_their_kp = None;
+        self.initial_app_payload = None;
+        self.initial_return_kp = None;
+        self.pending_outbound = None;
         Ok(())
     }
 
@@ -409,6 +439,43 @@ impl SessionInner {
     fn with_auth<R>(&self, f: impl FnOnce(&mut apq::authentication::AuthCore) -> R) -> R {
         let mut core = self.auth_core.lock().unwrap_or_else(|e| e.into_inner());
         f(&mut core)
+    }
+
+    /// Compose and HPKE-seal a §A.1 envelope from the retained pre-establishment state,
+    /// optionally stapling `stapled` (a `[0x13][app ciphertext]` frame from a
+    /// pre-establishment `encrypt`). Initiator-only, pre-establishment-only: requires
+    /// the retained seal target (`initial_their_kp`) and the birth welcome still being
+    /// the staple — both are cleared at the establishment cutover, and no commit can
+    /// replace the staple before it (a fold needs a recv group). Sections follow the
+    /// either/or rule (see `seal_initial_envelope`): the self-sufficient host payload
+    /// alone, or the bare welcome + return key package.
+    fn compose_initial_envelope(&self, stapled: Option<&[u8]>) -> Result<Vec<u8>> {
+        let their_kp = self
+            .initial_their_kp
+            .as_ref()
+            .ok_or(TwoMlsPqError::SessionNotReady)?;
+        if self.current_staple.first() != Some(&APQ_TAG) {
+            return Err(TwoMlsPqError::SessionNotReady);
+        }
+        let return_kp_blob = self
+            .initial_return_kp
+            .as_ref()
+            .map(|kp| crate::key_packages::encode_combiner_key_package(kp.clone()));
+        let (app_payload, welcome, return_kp) = match &self.initial_app_payload {
+            Some(payload) => (Some(payload.as_slice()), None, None),
+            None => (
+                None,
+                Some(self.current_staple.as_slice()),
+                return_kp_blob.as_deref(),
+            ),
+        };
+        crate::key_packages::seal_initial_envelope(
+            their_kp,
+            app_payload,
+            welcome,
+            return_kp,
+            stapled,
+        )
     }
 
     /// The current epoch of each PQ half (`None` when the half is absent), as
@@ -492,6 +559,11 @@ fn build_session(
             psk_stores,
             psk_stores_from,
             spawn_token: None,
+            // Set by `initiate` right after construction (acceptors never need them);
+            // cleared at the establishment cutover.
+            initial_their_kp: None,
+            initial_app_payload: None,
+            initial_return_kp: None,
             // Attached post-construction via `install_sink` (which also pushes the baseline
             // checkpoint); a fresh session starts with no persistence hook.
             sink: None,
@@ -631,15 +703,22 @@ impl TwoMlsPqSession {
         }
     }
 
-    /// Test-only: the plaintext initial welcome — the initiator's `current_staple` before
-    /// its first commit, which is exactly the plaintext `APQWelcome_A`. Production delivers
-    /// this only inside the §A.1 envelope (`pending_outbound` → `TwoMlsPqInvitation::
-    /// open_initial`); tests that drive `accept`/`receive` directly use this to skip the
-    /// envelope round-trip. The real envelope path is exercised by `establish_sessions` and
-    /// the dedicated envelope tests.
-    #[cfg(test)]
-    pub(crate) fn test_initial_welcome(&self) -> Vec<u8> {
-        self.lock().current_staple.clone()
+    /// Shared body of the two pre-establishment attach setters: guard (initiator-only —
+    /// only an initiated session retains a seal target — and pre-establishment only),
+    /// apply the field, regenerate the parked envelope, and stamp `current_staple_seq`
+    /// so frames that re-staple the new material gate on THIS mutation's persistence
+    /// (`depends_on_seq`).
+    fn set_initial_field(&self, apply: impl FnOnce(&mut SessionInner)) -> Result<()> {
+        self.mutate_and_persist(crate::BlobKind::Core, |inner| {
+            if inner.recv_group.is_some() || inner.initial_their_kp.is_none() {
+                return Err(TwoMlsPqError::SessionNotReady);
+            }
+            apply(inner);
+            let envelope = inner.compose_initial_envelope(None)?;
+            inner.pending_outbound = Some(envelope);
+            inner.current_staple_seq = inner.state_seq;
+            Ok(())
+        })
     }
 }
 
@@ -647,13 +726,17 @@ impl TwoMlsPqSession {
 impl TwoMlsPqSession {
     /// Create a session as the initiating party targeting `their_key_package`.
     ///
-    /// `app_payload` is the host's opaque app-layer welcome (identity introduction, signed
-    /// keys, …), or `None`. It is composed with the MLS welcome and HPKE-sealed to the
-    /// peer's KP′ inside the library, so `pending_outbound()` returns one opaque envelope —
-    /// the first frame's metadata (including the app-layer welcome that identifies the
-    /// initiator) is hidden without the host having to compose the envelope itself. The
-    /// peer recovers both halves with `TwoMlsPqInvitation::open_initial`, then joins with
-    /// `receive`.
+    /// The first frame — and every pre-establishment `encrypt` after it — is a §A.1
+    /// envelope HPKE-sealed to the peer's KP′ inside the library: `pending_outbound()`
+    /// returns it opaque, the peer recovers the sections with
+    /// `TwoMlsPqInvitation::open_initial` and joins with `receive`. An app-layer
+    /// welcome (identity introduction, signed keys, …) is attached AFTER construction
+    /// with `set_initial_app_payload` — such a payload typically signs over the
+    /// welcome (read it via `initial_welcome`) and the return key package, so it
+    /// cannot exist before `initiate` returns; the pre-v15 `app_payload` parameter is
+    /// gone for the same reason (v16). Until the peer's return welcome arrives,
+    /// `prepare_to_encrypt`/`encrypt` keep producing fresh envelopes, each stapling
+    /// the current app message (§A.1: the initiator sends app messages immediately).
     ///
     /// `app_binding` is the optional app-state binding: opaque bytes welded into the send
     /// group's GroupContext (an `AppBinding` extension, the APQInfo mechanism) at this
@@ -672,7 +755,6 @@ impl TwoMlsPqSession {
     pub fn initiate(
         client: Arc<TwoMlsPqPrincipal>,
         their_key_package: CombinerKeyPackage,
-        app_payload: Option<Vec<u8>>,
         app_binding: Option<Vec<u8>>,
     ) -> Result<Arc<Self>> {
         // Empty bindings are reserved as invalid (see `AppBindingMismatch`): reject before
@@ -693,16 +775,6 @@ impl TwoMlsPqSession {
             app_binding.as_deref(),
         )?;
 
-        // The first frame has no symmetric key yet, so it is not header-sealed; instead the
-        // library HPKE-envelopes `[app_payload ∥ APQWelcome_A]` to the peer's KP′ (§A.1), and
-        // `pending_outbound` returns that opaque envelope. The peer opens it with
-        // `TwoMlsPqInvitation::open_initial`.
-        let envelope = crate::key_packages::seal_initial_envelope(
-            &their_key_package,
-            app_payload.as_deref(),
-            &apq_welcome,
-        )?;
-
         let session = build_session(
             client,
             Some(send_group),
@@ -717,7 +789,19 @@ impl TwoMlsPqSession {
             true,
             None,
         );
-        session.lock().pending_outbound = Some(envelope);
+        {
+            // Pre-establishment frames have no symmetric key: every one is a §A.1
+            // envelope HPKE-sealed to the peer's KP′. Retain the key package (the seal
+            // target), then park the birth envelope — `pending_outbound` returns it
+            // opaque; the peer opens it with `TwoMlsPqInvitation::open_initial`. The
+            // same retained state lets every pre-establishment `encrypt` (and a
+            // session restored at birth) compose a fresh envelope stapling the
+            // current app message.
+            let mut inner = session.lock();
+            inner.initial_their_kp = Some(their_key_package);
+            let envelope = inner.compose_initial_envelope(None)?;
+            inner.pending_outbound = Some(envelope);
+        }
         // Seed the PSK ledger with the send group's establishment epoch, and capture
         // the establishment epoch's listen address (and the send-PQ header key when the
         // send-PQ half exists — the initiator's does at `initiate`; the acceptor's is
@@ -983,9 +1067,9 @@ impl TwoMlsPqSession {
         let frame = inner.pending_outbound.take()?;
         // The acceptor's return welcome (recv group already exists) is sealed like any
         // rendezvous-channel frame — the peer opens it from its send-group window. The
-        // initiator's initial welcome (no recv group yet) travels the invitation channel
-        // instead and is delivered as-is; the host envelopes it via
-        // `hpke_seal_to_key_package`, and the invitation opens it before `receive`.
+        // initiator's parked blob (no recv group yet) is already the §A.1 envelope —
+        // composed at `initiate` and regenerated by the attach setters — and travels
+        // the invitation channel as-is; the invitation opens it with `open_initial`.
         let out = if inner.recv_group.is_some() {
             inner.seal(&frame).ok()
         } else {
@@ -1005,6 +1089,42 @@ impl TwoMlsPqSession {
             }
         }
         out
+    }
+
+    /// The plaintext birth `APQWelcome_A` (the message-frame staple form, first byte
+    /// 0x01) while it is still the current staple — for the host to bind into its
+    /// app-layer identity envelope at reply time (e.g. sign over the welcome + the
+    /// return key package, then attach the result via `set_initial_app_payload`).
+    /// `None` once the first send-group commit replaced the staple. Read-only.
+    pub fn initial_welcome(&self) -> Option<Vec<u8>> {
+        let inner = self.lock();
+        (inner.current_staple.first() == Some(&APQ_TAG)).then(|| inner.current_staple.clone())
+    }
+
+    /// Attach (or replace) the host's app-layer welcome on this initiated session. The
+    /// payload MUST be establishment-self-sufficient — it carries the MLS welcome
+    /// (`initial_welcome`) and the initiator's return key package inside (e.g. a signed
+    /// identity envelope) — because composed envelopes then omit the bare sections (the
+    /// either/or rule on `seal_initial_envelope`). Regenerates the parked
+    /// `pending_outbound` envelope and rides every later pre-establishment `encrypt`.
+    ///
+    /// Initiator-only, pre-establishment only (`SessionNotReady` otherwise).
+    /// CAPTURE ORDERING: the retained state persists (a session captured at birth can
+    /// still send first after restore), so capture AFTER this call — a snapshot taken
+    /// between `initiate` and this attach restores a replier whose re-staples carry no
+    /// identity payload.
+    pub fn set_initial_app_payload(&self, payload: Vec<u8>) -> Result<()> {
+        self.set_initial_field(|inner| inner.initial_app_payload = Some(payload))
+    }
+
+    /// Attach the initiator's return-group combiner key package for the BARE envelope
+    /// shape (no self-sufficient `set_initial_app_payload`): pre-establishment
+    /// envelopes then carry `[welcome][return_kp]`, so any single frame is a complete
+    /// establishment vector for the invitation holder. Unused when a host payload is
+    /// attached (the payload carries the key package itself). Same guards, capture
+    /// ordering, and envelope regeneration as `set_initial_app_payload`.
+    pub fn set_initial_return_key_package(&self, key_package: CombinerKeyPackage) -> Result<()> {
+        self.set_initial_field(|inner| inner.initial_return_kp = Some(key_package))
     }
 
     /// True once both directions' PQ halves are live (post-A.4 bootstrap).

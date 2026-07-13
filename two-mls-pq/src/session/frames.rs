@@ -46,6 +46,22 @@ pub(crate) const PQ_BOOTSTRAP_BIND_TAG: u8 = 0x0D;
 pub(crate) const PQ_REKEY_UPD_TAG: u8 = 0x0F;
 pub(crate) const PQ_REKEY_COMMIT_TAG: u8 = 0x11;
 
+/// §A.1 pre-establishment app staple: `[0x13][BSG-cl PrivateMessage]` — the initiator's
+/// app message riding a §A.1 envelope's `stapled_message` section before its recv group
+/// exists (the 0x03 message frame is structurally unavailable then: its proposal section
+/// is mandatory and there is no recv group to propose into). Travels ONLY inside the
+/// HPKE envelope on the invitation channel — never header-sealed, so it is deliberately
+/// NOT an `opened_frame_kind`; the host hands it to `process_incoming` after the join.
+pub(crate) const PRE_ESTABLISHMENT_APP_TAG: u8 = 0x13;
+
+/// Encode a pre-establishment app staple: `[0x13][app message bytes]`.
+pub(crate) fn encode_pre_establishment_app(app: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + app.len());
+    out.push(PRE_ESTABLISHMENT_APP_TAG);
+    out.extend_from_slice(app);
+    out
+}
+
 /// The seven PQ side-band frame kinds the host routes through `TwoMlsPqSession::ingest`
 /// (the `begin`/`ingest`/`advance` surface in the AbstractTwoMLS adapter). Exported so the
 /// host classifies a frame from THIS binary via [`pq_frame_kind`] instead of hardcoding the
@@ -304,8 +320,19 @@ mod pq_frame_kind_tests {
     #[test]
     fn rejects_non_side_band_tags() {
         // Bare-MLS first byte, the APQWelcome and message-frame tags, gaps/evens between
-        // side-band tags, and the first unused odd value are not side-band frames.
-        for tag in [0x00, APQ_TAG, MESSAGE_FRAME_TAG, 0x0A, 0x12, 0x13, 0xFF] {
+        // side-band tags, the pre-establishment staple tag (0x13 — envelope-interior
+        // only), and the envelope tag (0x15 — invitation channel only) are not
+        // side-band frames.
+        for tag in [
+            0x00,
+            APQ_TAG,
+            MESSAGE_FRAME_TAG,
+            0x0A,
+            0x12,
+            PRE_ESTABLISHMENT_APP_TAG,
+            crate::key_packages::INITIAL_ENVELOPE_TAG,
+            0xFF,
+        ] {
             assert_eq!(
                 pq_frame_kind(tag),
                 None,
