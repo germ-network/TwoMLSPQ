@@ -75,6 +75,13 @@ pub enum CombinerError {
     /// does not match the actual post-commit epochs, or the two halves' rosters diverge.
     #[error("APQInfo missing or inconsistent")]
     ApqInfoMismatch,
+    /// The `AppBinding` GroupContext extension failed verification against the caller's
+    /// expectation: expected but absent or unequal (a welcome for the wrong relationship —
+    /// or a downgrade attempt, exactly like a missing `APQInfo`), present but unexpected
+    /// (never silently accepted — the caller must state the binding it can verify), or
+    /// present but undecodable.
+    #[error("AppBinding missing, unexpected, or inconsistent")]
+    AppBindingMismatch,
 }
 
 pub type Result<T> = std::result::Result<T, CombinerError>;

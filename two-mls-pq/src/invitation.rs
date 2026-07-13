@@ -21,7 +21,13 @@ use crate::{Result, TwoMlsPqError};
 // v3 (push-based persistence): the archive gained `state_seq`, the per-invitation mutation
 // counter that stamps each pushed blob (see `InvitationInner::state_seq`); v2 blobs no
 // longer decode.
-const INVITATION_VERSION: u8 = 3;
+// v4 (layout unchanged — a pure compatibility cut): the AppBinding capability cut. A v3
+// invitation's captured key packages predate the AppBinding extension advertisement, so a
+// binding-carrying group could never admit them — and `combiner_key_package()` would
+// re-publish them wearing the current COMBINER_KEY_PACKAGE_VERSION byte, deferring the
+// failure to an opaque mls-rs error deep inside the peer's `initiate`. Reject at restore
+// instead; regenerate invitations.
+const INVITATION_VERSION: u8 = 4;
 
 /// The spawned-group forward table: an opaque caller-supplied spawn token → the spawned
 /// session's receive-group classical (message-half) id. The token is whatever the caller

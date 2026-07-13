@@ -155,7 +155,24 @@ pub fn version() -> String {
 // agent handoff) gets bytes and digest atomically; there is deliberately NO staged-slot
 // getter (a decoupled read could return an Upd a later prepare staged). No wire, archive,
 // or semantic change — a pure Record shape change.
-const BINDING_CONTRACT_VERSION: u64 = 14;
+// v15 (2026-07-12): AppBinding — an OPTIONAL app-state binding welded into a session at
+// creation and immutable for its lifetime: opaque app-supplied bytes (a DIGEST of the
+// app's immutable relationship identity; the crate never interprets them) carried in a
+// new AppBinding GroupContext extension (0xF0A2, the APQInfo mechanism) on both classical
+// halves; the PQ halves inherit coverage via the APQInfo half-binding. `initiate` gains
+// `app_binding`, `accept`/`receive` gain `expected_app_binding` (verified on the joined
+// welcome BEFORE any invitation state is claimed — a wrong-relationship welcome leaves
+// the invitation fully reusable; a binding-carrying welcome against a `None` expectation
+// is rejected, never silently accepted), the return group mirrors the verified incoming
+// binding, and the initiator's return-welcome join requires equality with its own send
+// group's binding (absence is a strip/downgrade attempt). New read-back
+// `app_binding() -> Result<Option<Vec<u8>>>` lets a restored session's owner re-verify.
+// TwoMlsPqError gained `AppBindingMismatch` (the shape change this bump stamps). Leaves
+// now advertise the extension type: COMBINER_KEY_PACKAGE_VERSION -> 3 and
+// INVITATION_VERSION -> 4 (prerelease hard cut — old published key packages and
+// invitation archives are rejected; regenerate and re-pair). Session archives are
+// unaffected (the binding is optional and rides the persisted group state).
+const BINDING_CONTRACT_VERSION: u64 = 15;
 
 /// See `BINDING_CONTRACT_VERSION`. Exported so the Swift layer can verify the
 /// binding it was generated with matches the binary it loaded.
@@ -532,6 +549,16 @@ pub enum TwoMlsPqError {
     /// post-commit epochs of both groups.
     #[error("APQInfo missing or inconsistent")]
     ApqInfoMismatch,
+    /// The `AppBinding` app-state binding failed verification: a welcome's binding does
+    /// not equal the caller's `expected_app_binding` (absent-when-expected is a
+    /// wrong-relationship welcome or a strip — the same downgrade shape a missing APQInfo
+    /// signals), a welcome carries a binding the caller did not expect (never silently
+    /// accepted — pass the binding you can verify), the return welcome's binding does not
+    /// equal the initiating session's own, or the extension is present but undecodable.
+    /// On `TwoMlsPqInvitation::receive` this is raised before any invitation state is
+    /// claimed, so the invitation stays fully reusable for the genuine welcome.
+    #[error("AppBinding missing, unexpected, or inconsistent")]
+    AppBindingMismatch,
     /// `install_sink` was called on an object that already has a persistence sink. Install
     /// once, right after construction or restore — a second call would silently orphan the
     /// first sink (its store would go stale with no further pushes), so it fails fast instead.
@@ -584,6 +611,7 @@ impl From<apq::CombinerError> for TwoMlsPqError {
             apq::CombinerError::UnsupportedCipherSuite => TwoMlsPqError::UnsupportedCipherSuite,
             apq::CombinerError::CipherSuiteMismatch => TwoMlsPqError::CipherSuiteMismatch,
             apq::CombinerError::ApqInfoMismatch => TwoMlsPqError::ApqInfoMismatch,
+            apq::CombinerError::AppBindingMismatch => TwoMlsPqError::AppBindingMismatch,
         }
     }
 }

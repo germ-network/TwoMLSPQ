@@ -80,12 +80,18 @@ fn demo_e2e_full_session() {
     );
 
     // Step 4 — establishment (0x01 APQWelcome both directions).
-    let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
+    let alice_session = assert_ok!(TwoMlsPqSession::initiate(
+        Arc::clone(&alice),
+        bob_kp,
+        None,
+        None
+    ));
     let welcome_a = alice_session.test_initial_welcome();
     let bob_session = assert_ok!(TwoMlsPqSession::accept(
         Arc::clone(&bob),
         welcome_a,
-        alice_kp
+        alice_kp,
+        None
     ));
     let welcome_b = assert_some!(bob_session.pending_outbound());
     assert_ok!(alice_session.process_incoming(welcome_b));

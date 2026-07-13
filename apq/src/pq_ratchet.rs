@@ -281,6 +281,7 @@ mod tests {
             &bob.generate_classical_key_package().unwrap(),
             &bob.generate_pq_key_package().unwrap(),
             &alice,
+            None,
         )
         .unwrap();
         let mut bob_recv = join_combiner_group(&welcome, &bob).unwrap();
@@ -370,6 +371,7 @@ mod tests {
             &bob.generate_classical_key_package().unwrap(),
             &bob.generate_pq_key_package().unwrap(),
             &alice,
+            None,
         )
         .unwrap();
         let _bob_recv = join_combiner_group(&welcome, &bob).unwrap();
@@ -407,6 +409,7 @@ mod tests {
             &bob.generate_classical_key_package().unwrap(),
             &bob.generate_pq_key_package().unwrap(),
             &alice,
+            None,
         )
         .unwrap();
         let mut bob_recv = join_combiner_group(&welcome, &bob).unwrap();

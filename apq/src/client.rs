@@ -17,7 +17,7 @@ use mls_rs::{
 use zeroize::Zeroizing;
 
 use crate::authentication::{AuthView, TwoMlsIdentityProvider};
-use crate::component::{APP_DATA_UPDATE, APQINFO_EXTENSION_TYPE};
+use crate::component::{APP_BINDING_EXTENSION_TYPE, APP_DATA_UPDATE, APQINFO_EXTENSION_TYPE};
 use crate::rules::TwoMlsRules;
 use crate::storage::PersistableGroupStorage;
 use crate::{CombinerError, Result};
@@ -565,8 +565,12 @@ fn build_client<S: KeyPackageStorage + Clone, C: CryptoProvider + Clone>(
         .mls_rules(TwoMlsRules)
         // draft -02 machinery (see `component.rs`): every leaf advertises the APQInfo
         // GroupContext extension and the AppDataUpdate proposal type — mls-rs requires
-        // every occupied leaf to support them before they may appear in a group.
+        // every occupied leaf to support them before they may appear in a group. The
+        // AppBinding extension is advertised the same way, so a binding-carrying group
+        // can only ever contain leaves that support it (an old-capability key package
+        // cannot be added to a bound group).
         .extension_type(APQINFO_EXTENSION_TYPE)
+        .extension_type(APP_BINDING_EXTENSION_TYPE)
         .custom_proposal_type(APP_DATA_UPDATE)
         .signing_identity(signing_identity, secret_key, suite)
         .build()

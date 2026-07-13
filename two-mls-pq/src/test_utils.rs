@@ -37,11 +37,22 @@ pub(crate) fn establish_sessions() -> (Arc<TwoMlsPqSession>, Arc<TwoMlsPqSession
     )));
     let bob_kp = bob_inv.combiner_key_package();
 
-    let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
+    let alice_session = assert_ok!(TwoMlsPqSession::initiate(
+        Arc::clone(&alice),
+        bob_kp,
+        None,
+        None
+    ));
     let envelope = assert_some!(alice_session.pending_outbound());
     let opened = assert_ok!(bob_inv.open_initial(envelope));
-    let bob_session =
-        assert_ok!(bob_inv.receive(opened.welcome, alice_kp, b"establish".to_vec(), None, None));
+    let bob_session = assert_ok!(bob_inv.receive(
+        opened.welcome,
+        alice_kp,
+        b"establish".to_vec(),
+        None,
+        None,
+        None
+    ));
 
     let welcome_b = assert_some!(bob_session.pending_outbound());
     assert_ok!(alice_session.process_incoming(welcome_b));

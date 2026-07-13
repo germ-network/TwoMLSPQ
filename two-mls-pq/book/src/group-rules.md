@@ -52,6 +52,23 @@ reusable layer: an `MlsRules` filter every client is built with
    (an attestation smuggled into one is rejected); their `pq_epoch` reconciles at the
    next A.3 bind. The deferred A.4 PQ group id is pre-allocated in the classical half's
    `APQInfo` with its epoch set to `EPOCH_UNBOUND` until the bootstrap lands.
+8. **The AppBinding is written once and verified at every join.** A session is
+   definitionally bound to its two agents, but agents are *mutable* (the rotation
+   lifecycle); the optional `AppBinding` GroupContext extension (type `0xF0A2`, the
+   `APQInfo` mechanism) binds the session to the app's **immutable** relationship
+   identity instead. Written at group creation into both classical halves (the PQ
+   halves inherit coverage through the `APQInfo` half-binding), riding the Welcome,
+   and never rewritten — rule 1's GroupContextExtensions ban is what makes it
+   immutable. Verification is an exact, symmetric match: `receive(expected_app_binding:)`
+   requires the welcome to carry exactly the stated binding (a stripped or unequal
+   binding is a wrong-relationship welcome or downgrade attempt; a binding the caller
+   did not state is never silently accepted), the acceptor mirrors the verified binding
+   onto its return group, and the initiator requires the return welcome to carry its
+   own binding back unchanged — all `AppBindingMismatch`, and on the invitation path
+   raised before any invitation state is claimed. The payload should be a **digest**
+   (the first adopter binds `H(domain-tag ‖ role-ordered did:did)`); the crate never
+   interprets the bytes. Leaves advertise the extension type, so a binding-carrying
+   group can only ever contain capability-bearing leaves.
 
 ## Enforcement map
 
@@ -69,6 +86,7 @@ checks each cover ingress the others cannot see.
 | No external commits/senders | `CommitSource::NewMember` rejected | external senders never configured |
 | Epoch discipline | — | staple-epoch compare in `process_incoming` (`EpochDesync` / skip) |
 | Identity binding at establishment | — | `expected_remote` pre-claim check; creator-leaf ≡ key-package check at join; A.4 bootstrap KP identity check (`RemoteIdentityMismatch`) |
+| App-state binding at establishment | GCE ban keeps it immutable post-creation | `verify_app_binding` against `expected_app_binding` at `receive`/`accept` (post-join, pre-claim) and against the session's own binding at the initiator's return-welcome join (`AppBindingMismatch`); leaf capability advertisement keeps uncapable leaves out of bound groups |
 
 Two properties worth naming:
 

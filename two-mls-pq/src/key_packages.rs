@@ -225,7 +225,11 @@ pub fn parse_combiner_key_package(kp: CombinerKeyPackage) -> Result<ParsedCombin
 /// Germ's version byte. v2 also marks the capability cut: leaves generated at v2
 /// advertise the APQInfo extension and AppDataUpdate proposal types, which v1-era
 /// leaves lack, so v1 blobs are rejected outright (prerelease hard-cut policy).
-const COMBINER_KEY_PACKAGE_VERSION: u8 = 2;
+/// v3 (payload unchanged): the AppBinding capability cut. Leaves generated at v3
+/// advertise the AppBinding GroupContext extension type (0xF0A2), which v2-era leaves
+/// lack — a binding-carrying group can never admit one — so v2 blobs are rejected
+/// outright (same prerelease hard-cut).
+const COMBINER_KEY_PACKAGE_VERSION: u8 = 3;
 
 // In its own module because the derive-generated impls reference the std `Result`,
 // which the crate-local `Result` alias would shadow (same pattern as `archive_wire`).
@@ -586,6 +590,20 @@ impl TwoMlsPqInvitation {
     /// package naming anyone else is rejected as `RemoteIdentityMismatch` — before any
     /// invitation state is claimed, so the invitation stays fully reusable. `None` skips
     /// the check (the welcome-creator ≡ key-package binding below still applies).
+    ///
+    /// `expected_app_binding` is the app-state binding this welcome must carry — the
+    /// opaque bytes the initiator welded into its send group's GroupContext (see
+    /// `TwoMlsPqSession::initiate`; a DIGEST of the app's immutable relationship
+    /// identity, which this library never interprets). The check is an exact, symmetric
+    /// match: `Some` requires the joined group's `AppBinding` extension to be byte-equal
+    /// (absent or different — a stripped, downgraded, or wrong-relationship welcome — is
+    /// `AppBindingMismatch`); `None` requires the welcome to carry none (a binding the
+    /// caller did not state is rejected, never silently accepted — pass the binding you
+    /// can verify). Unlike `expected_remote` this necessarily verifies after the join
+    /// (GroupContext rides the encrypted welcome), but still BEFORE any invitation state
+    /// is claimed: a rejected welcome consumes nothing, and the invitation stays fully
+    /// usable for the genuine one. On success the spawned session's send group carries
+    /// the same binding back to the initiator.
     pub fn receive(
         &self,
         welcome: Vec<u8>,
@@ -593,6 +611,7 @@ impl TwoMlsPqInvitation {
         spawn_token: Vec<u8>,
         new_client_id: Option<Vec<u8>>,
         expected_remote: Option<Vec<u8>>,
+        expected_app_binding: Option<Vec<u8>>,
     ) -> Result<Arc<TwoMlsPqSession>> {
         // --- Lock-free validations: pure, side-effect-free, so a rejection here touches
         // nothing and needs no lock. ---
@@ -650,6 +669,7 @@ impl TwoMlsPqInvitation {
                     welcome,
                     their_key_package,
                     Some(spawn_token.clone()),
+                    expected_app_binding,
                 )
             })?;
         // The acceptor always has a receive group straight out of `accept`; its absence is a
@@ -923,12 +943,17 @@ mod tests {
         )));
         let bob_kp = bob_inv.combiner_key_package();
 
-        let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
+        let alice_session = assert_ok!(TwoMlsPqSession::initiate(
+            Arc::clone(&alice),
+            bob_kp,
+            None,
+            None
+        ));
         let welcome_a = alice_session.test_initial_welcome();
 
         // Bob accepts through the invitation (no live client that generated the KP).
         let bob_session =
-            assert_ok!(bob_inv.receive(welcome_a, alice_kp, b"token".to_vec(), None, None));
+            assert_ok!(bob_inv.receive(welcome_a, alice_kp, b"token".to_vec(), None, None, None));
         let welcome_b = assert_some!(bob_session.pending_outbound());
         assert_ok!(alice_session.process_incoming(welcome_b));
 
@@ -951,7 +976,12 @@ mod tests {
         )));
         let bob_kp = bob_inv.combiner_key_package();
 
-        let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
+        let alice_session = assert_ok!(TwoMlsPqSession::initiate(
+            Arc::clone(&alice),
+            bob_kp,
+            None,
+            None
+        ));
         let welcome_a = alice_session.test_initial_welcome();
 
         // First receive consumes Alice's identity.
@@ -960,11 +990,12 @@ mod tests {
             alice_kp.clone(),
             b"token".to_vec(),
             None,
+            None,
             None
         ));
         // A second welcome from the same remote is rejected as a replay.
         assert_err!(
-            bob_inv.receive(welcome_a, alice_kp, b"token".to_vec(), None, None),
+            bob_inv.receive(welcome_a, alice_kp, b"token".to_vec(), None, None, None),
             crate::TwoMlsPqError::DuplicateWelcome
         );
     }
@@ -984,7 +1015,12 @@ mod tests {
         )));
         let bob_kp = bob_inv.combiner_key_package();
 
-        let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
+        let alice_session = assert_ok!(TwoMlsPqSession::initiate(
+            Arc::clone(&alice),
+            bob_kp,
+            None,
+            None
+        ));
         let welcome_a = alice_session.test_initial_welcome();
 
         // Fresh welcome: no ledger entry yet.
@@ -996,6 +1032,7 @@ mod tests {
             welcome_a.clone(),
             alice_kp.clone(),
             b"token".to_vec(),
+            None,
             None,
             None
         ));
@@ -1010,7 +1047,14 @@ mod tests {
         // …and `receive` itself rejects it up front, before claiming or reserving
         // anything.
         assert_err!(
-            bob_inv.receive(welcome_a.clone(), alice_kp, b"token2".to_vec(), None, None),
+            bob_inv.receive(
+                welcome_a.clone(),
+                alice_kp,
+                b"token2".to_vec(),
+                None,
+                None,
+                None
+            ),
             crate::TwoMlsPqError::DuplicateWelcome
         );
 
@@ -1084,7 +1128,12 @@ mod tests {
         )));
         let bob_kp = bob_inv.combiner_key_package();
 
-        let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
+        let alice_session = assert_ok!(TwoMlsPqSession::initiate(
+            Arc::clone(&alice),
+            bob_kp,
+            None,
+            None
+        ));
         let welcome_a = alice_session.test_initial_welcome();
 
         // Consume Alice on the live invitation.
@@ -1092,6 +1141,7 @@ mod tests {
             welcome_a.clone(),
             alice_kp.clone(),
             b"token".to_vec(),
+            None,
             None,
             None
         ));
@@ -1101,7 +1151,7 @@ mod tests {
             bob_inv.archive()
         )));
         assert_err!(
-            restored.receive(welcome_a, alice_kp, b"token".to_vec(), None, None),
+            restored.receive(welcome_a, alice_kp, b"token".to_vec(), None, None, None),
             crate::TwoMlsPqError::DuplicateWelcome
         );
     }
@@ -1133,7 +1183,12 @@ mod tests {
         )));
         let bob_kp = bob_inv.combiner_key_package();
 
-        let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
+        let alice_session = assert_ok!(TwoMlsPqSession::initiate(
+            Arc::clone(&alice),
+            bob_kp,
+            None,
+            None
+        ));
         let welcome_a = alice_session.test_initial_welcome();
 
         // Fresh frame: nothing to forward to yet.
@@ -1141,7 +1196,7 @@ mod tests {
         assert!(bob_inv.forward_group_id(token.clone()).is_none());
 
         let bob_session =
-            assert_ok!(bob_inv.receive(welcome_a, alice_kp, token.clone(), None, None));
+            assert_ok!(bob_inv.receive(welcome_a, alice_kp, token.clone(), None, None, None));
 
         // The replayed token now names the spawned session's receive group…
         let gid = assert_some!(bob_inv.forward_group_id(token.clone()));
@@ -1175,12 +1230,17 @@ mod tests {
         )));
         let bob_kp = bob_inv.combiner_key_package();
 
-        let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
+        let alice_session = assert_ok!(TwoMlsPqSession::initiate(
+            Arc::clone(&alice),
+            bob_kp,
+            None,
+            None
+        ));
         let welcome_a = alice_session.test_initial_welcome();
 
         let token = b"spawn-token".to_vec();
         let bob_session =
-            assert_ok!(bob_inv.receive(welcome_a, alice_kp, token.clone(), None, None));
+            assert_ok!(bob_inv.receive(welcome_a, alice_kp, token.clone(), None, None, None));
         let recv = assert_some!(bob_session.receive_group_id());
 
         let restored = assert_ok!(super::TwoMlsPqInvitation::restore(assert_ok!(
@@ -1247,7 +1307,12 @@ mod tests {
         )));
         let bob_kp = bob_inv.combiner_key_package();
 
-        let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
+        let alice_session = assert_ok!(TwoMlsPqSession::initiate(
+            Arc::clone(&alice),
+            bob_kp,
+            None,
+            None
+        ));
         let welcome_a = alice_session.test_initial_welcome();
 
         // A failed establishment must NOT consume the remote — the reservation is rolled
@@ -1258,12 +1323,13 @@ mod tests {
                 alice_kp.clone(),
                 b"bad".to_vec(),
                 None,
+                None,
                 None
             )
             .is_err());
         // …and the failed spawn must not enter the forward table either.
         assert!(bob_inv.forward_group_id(b"bad".to_vec()).is_none());
-        assert_ok!(bob_inv.receive(welcome_a, alice_kp, b"token".to_vec(), None, None));
+        assert_ok!(bob_inv.receive(welcome_a, alice_kp, b"token".to_vec(), None, None, None));
     }
 
     /// A single-use (not last-resort) invitation accepts exactly one welcome; afterwards its
@@ -1290,14 +1356,20 @@ mod tests {
             Arc::clone(&alice),
             bob_kp.clone(),
             None,
+            None,
         ));
         let welcome_a = alice_session.test_initial_welcome();
-        assert_ok!(bob_inv.receive(welcome_a, alice_kp, b"token-a".to_vec(), None, None));
+        assert_ok!(bob_inv.receive(welcome_a, alice_kp, b"token-a".to_vec(), None, None, None));
 
-        let carol_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&carol), bob_kp, None));
+        let carol_session = assert_ok!(TwoMlsPqSession::initiate(
+            Arc::clone(&carol),
+            bob_kp,
+            None,
+            None
+        ));
         let welcome_c = carol_session.test_initial_welcome();
         assert_err!(
-            bob_inv.receive(welcome_c, carol_kp, b"token-c".to_vec(), None, None),
+            bob_inv.receive(welcome_c, carol_kp, b"token-c".to_vec(), None, None, None),
             crate::TwoMlsPqError::InvitationSpent
         );
     }
@@ -1326,17 +1398,23 @@ mod tests {
             Arc::clone(&alice),
             bob_kp.clone(),
             None,
+            None,
         ));
         let welcome_a = alice_session.test_initial_welcome();
-        assert_ok!(bob_inv.receive(welcome_a, alice_kp, b"token-a".to_vec(), None, None));
+        assert_ok!(bob_inv.receive(welcome_a, alice_kp, b"token-a".to_vec(), None, None, None));
 
         let restored = assert_ok!(super::TwoMlsPqInvitation::restore(assert_ok!(
             bob_inv.archive()
         )));
-        let carol_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&carol), bob_kp, None));
+        let carol_session = assert_ok!(TwoMlsPqSession::initiate(
+            Arc::clone(&carol),
+            bob_kp,
+            None,
+            None
+        ));
         let welcome_c = carol_session.test_initial_welcome();
         assert_err!(
-            restored.receive(welcome_c, carol_kp, b"token-c".to_vec(), None, None),
+            restored.receive(welcome_c, carol_kp, b"token-c".to_vec(), None, None, None),
             crate::TwoMlsPqError::InvitationSpent
         );
         assert_err!(
@@ -1363,7 +1441,12 @@ mod tests {
         )));
         let bob_kp = bob_inv.combiner_key_package();
 
-        let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
+        let alice_session = assert_ok!(TwoMlsPqSession::initiate(
+            Arc::clone(&alice),
+            bob_kp,
+            None,
+            None
+        ));
         let welcome_a = alice_session.test_initial_welcome();
 
         assert!(bob_inv
@@ -1372,11 +1455,12 @@ mod tests {
                 alice_kp.clone(),
                 b"bad".to_vec(),
                 None,
+                None,
                 None
             )
             .is_err());
         // The key package was restored, so a valid welcome still establishes.
-        assert_ok!(bob_inv.receive(welcome_a, alice_kp, b"token".to_vec(), None, None));
+        assert_ok!(bob_inv.receive(welcome_a, alice_kp, b"token".to_vec(), None, None, None));
     }
 
     /// The defining last-resort behavior: the same published key package accepts welcomes from
@@ -1403,13 +1487,19 @@ mod tests {
             Arc::clone(&alice),
             bob_kp.clone(),
             None,
+            None,
         ));
         let welcome_a = alice_session.test_initial_welcome();
-        assert_ok!(bob_inv.receive(welcome_a, alice_kp, b"token-a".to_vec(), None, None));
+        assert_ok!(bob_inv.receive(welcome_a, alice_kp, b"token-a".to_vec(), None, None, None));
 
-        let carol_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&carol), bob_kp, None));
+        let carol_session = assert_ok!(TwoMlsPqSession::initiate(
+            Arc::clone(&carol),
+            bob_kp,
+            None,
+            None
+        ));
         let welcome_c = carol_session.test_initial_welcome();
-        assert_ok!(bob_inv.receive(welcome_c, carol_kp, b"token-c".to_vec(), None, None));
+        assert_ok!(bob_inv.receive(welcome_c, carol_kp, b"token-c".to_vec(), None, None, None));
     }
 
     /// The key-package store is only a serving interface: once the acceptor's join has
@@ -1442,10 +1532,17 @@ mod tests {
             "the serving store must hold the invitation key package before the join"
         );
 
-        let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
+        let alice_session = assert_ok!(TwoMlsPqSession::initiate(
+            Arc::clone(&alice),
+            bob_kp,
+            None,
+            None
+        ));
         let welcome_a = alice_session.test_initial_welcome();
 
-        let _bob_session = assert_ok!(TwoMlsPqSession::accept(bob_client, welcome_a, alice_kp));
+        let _bob_session = assert_ok!(TwoMlsPqSession::accept(
+            bob_client, welcome_a, alice_kp, None
+        ));
 
         // After the join the acceptor retains nothing — nothing migrates into the session archive.
         assert!(
@@ -1499,7 +1596,12 @@ mod tests {
             bob.generate_invitation(true)
         )));
         let bob_kp = bob_inv.combiner_key_package();
-        let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
+        let alice_session = assert_ok!(TwoMlsPqSession::initiate(
+            Arc::clone(&alice),
+            bob_kp,
+            None,
+            None
+        ));
         let welcome_a = alice_session.test_initial_welcome();
 
         // Wrong expectation → rejected, nothing consumed or recorded.
@@ -1509,7 +1611,8 @@ mod tests {
                 alice_kp.clone(),
                 b"token".to_vec(),
                 None,
-                Some(fresh_id())
+                Some(fresh_id()),
+                None
             ),
             crate::TwoMlsPqError::RemoteIdentityMismatch
         );
@@ -1524,7 +1627,8 @@ mod tests {
             alice_kp,
             b"token".to_vec(),
             None,
-            Some(alice.client_id().bytes)
+            Some(alice.client_id().bytes),
+            None
         ));
     }
 
@@ -1547,14 +1651,19 @@ mod tests {
         )));
         let bob_kp = bob_inv.combiner_key_package();
         // The welcome really is Alice's…
-        let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
+        let alice_session = assert_ok!(TwoMlsPqSession::initiate(
+            Arc::clone(&alice),
+            bob_kp,
+            None,
+            None
+        ));
         let welcome_a = alice_session.test_initial_welcome();
 
         // …but the caller attributes it to Mallory: the join-time creator≡KP binding
         // rejects it (before this check, the session would have established with
         // Mallory as `their_principal_state`).
         assert_err!(
-            bob_inv.receive(welcome_a, mallory_kp, b"token".to_vec(), None, None),
+            bob_inv.receive(welcome_a, mallory_kp, b"token".to_vec(), None, None, None),
             crate::TwoMlsPqError::RemoteIdentityMismatch
         );
     }
@@ -1618,7 +1727,12 @@ mod tests {
         assert_eq!(baseline[0].0, 0);
         assert_eq!(baseline[0].1, crate::BlobKind::Checkpoint);
 
-        let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
+        let alice_session = assert_ok!(TwoMlsPqSession::initiate(
+            Arc::clone(&alice),
+            bob_kp,
+            None,
+            None
+        ));
         let welcome_a = alice_session.test_initial_welcome();
 
         // A successful receive bumps the seq and pushes a fresh checkpoint.
@@ -1626,6 +1740,7 @@ mod tests {
             welcome_a.clone(),
             alice_kp.clone(),
             b"token".to_vec(),
+            None,
             None,
             None
         ));
@@ -1637,7 +1752,14 @@ mod tests {
 
         // A failed (replayed) receive pushes nothing and does not advance the seq.
         assert_err!(
-            bob_inv.receive(welcome_a.clone(), alice_kp, b"token".to_vec(), None, None),
+            bob_inv.receive(
+                welcome_a.clone(),
+                alice_kp,
+                b"token".to_vec(),
+                None,
+                None,
+                None
+            ),
             crate::TwoMlsPqError::DuplicateWelcome
         );
         assert_eq!(bob_inv.state_seq(), 1);
@@ -1648,5 +1770,198 @@ mod tests {
         let restored = assert_ok!(super::TwoMlsPqInvitation::restore(sink.latest()));
         assert_eq!(restored.state_seq(), 1);
         assert_some!(restored.processed_welcome_group_id(welcome_a));
+    }
+
+    /// AppBinding round-trip through the production establishment path: the binding
+    /// welded at `initiate` rides the §A.1 envelope and welcome, `receive` verifies it
+    /// against the caller's expectation, the return group mirrors it (so the initiator's
+    /// return-welcome join re-verifies equality with its own), and both sessions read
+    /// back the same bytes.
+    #[test]
+    fn test_app_binding_round_trips_through_establishment() {
+        use crate::session::TwoMlsPqSession;
+        use crate::test_utils::{make_client, make_combiner_kp};
+        use std::sync::Arc;
+
+        let alice = make_client();
+        let bob = make_client();
+        let alice_kp = make_combiner_kp(&alice);
+        let binding = b"relationship-digest".to_vec();
+
+        let bob_inv = assert_ok!(super::TwoMlsPqInvitation::restore(assert_ok!(
+            bob.generate_invitation(true)
+        )));
+        let bob_kp = bob_inv.combiner_key_package();
+
+        let alice_session = assert_ok!(TwoMlsPqSession::initiate(
+            Arc::clone(&alice),
+            bob_kp,
+            None,
+            Some(binding.clone()),
+        ));
+        let envelope = assert_some!(alice_session.pending_outbound());
+        let opened = assert_ok!(bob_inv.open_initial(envelope));
+        let bob_session = assert_ok!(bob_inv.receive(
+            opened.welcome,
+            alice_kp,
+            b"token".to_vec(),
+            None,
+            None,
+            Some(binding.clone()),
+        ));
+
+        // The return welcome carries the mirrored binding; alice's join verifies it
+        // against her own before adopting the receive group.
+        let welcome_b = assert_some!(bob_session.pending_outbound());
+        assert_ok!(alice_session.process_incoming(welcome_b));
+        assert!(alice_session.is_established());
+        assert!(bob_session.is_established());
+
+        assert_eq!(
+            assert_ok!(alice_session.app_binding()),
+            Some(binding.clone())
+        );
+        assert_eq!(assert_ok!(bob_session.app_binding()), Some(binding));
+    }
+
+    /// A welcome whose binding does not match the caller's expectation is rejected
+    /// BEFORE any invitation state is claimed — on a single-use invitation (the
+    /// strictest case: consumption drops the captured key package), so the very same
+    /// welcome is still accepted once the caller supplies the right expectation.
+    #[test]
+    fn test_receive_rejects_app_binding_mismatch_before_consumption() {
+        use crate::session::TwoMlsPqSession;
+        use crate::test_utils::{make_client, make_combiner_kp};
+        use std::sync::Arc;
+
+        let alice = make_client();
+        let bob = make_client();
+        let alice_kp = make_combiner_kp(&alice);
+
+        let bob_inv = assert_ok!(super::TwoMlsPqInvitation::restore(assert_ok!(
+            bob.generate_invitation(false)
+        )));
+        let bob_kp = bob_inv.combiner_key_package();
+
+        let alice_session = assert_ok!(TwoMlsPqSession::initiate(
+            Arc::clone(&alice),
+            bob_kp,
+            None,
+            Some(b"right-relationship".to_vec()),
+        ));
+        let welcome_a = alice_session.test_initial_welcome();
+
+        assert_err!(
+            bob_inv.receive(
+                welcome_a.clone(),
+                alice_kp.clone(),
+                b"token".to_vec(),
+                None,
+                None,
+                Some(b"wrong-relationship".to_vec()),
+            ),
+            crate::TwoMlsPqError::AppBindingMismatch
+        );
+        // Nothing was claimed: no ledger entry, no forward entry, and the single-use
+        // key package is not consumed…
+        assert!(bob_inv
+            .processed_welcome_group_id(welcome_a.clone())
+            .is_none());
+        assert!(bob_inv.forward_group_id(b"token".to_vec()).is_none());
+        // …so the genuine welcome still establishes with the correct expectation.
+        assert_ok!(bob_inv.receive(
+            welcome_a,
+            alice_kp,
+            b"token".to_vec(),
+            None,
+            None,
+            Some(b"right-relationship".to_vec()),
+        ));
+    }
+
+    /// An UNBOUND welcome against a stated expectation is the strip/absence direction of
+    /// the mismatch — rejected, and the invitation stays usable without the expectation.
+    #[test]
+    fn test_receive_rejects_missing_app_binding_when_expected() {
+        use crate::session::TwoMlsPqSession;
+        use crate::test_utils::{make_client, make_combiner_kp};
+        use std::sync::Arc;
+
+        let alice = make_client();
+        let bob = make_client();
+        let alice_kp = make_combiner_kp(&alice);
+
+        let bob_inv = assert_ok!(super::TwoMlsPqInvitation::restore(assert_ok!(
+            bob.generate_invitation(true)
+        )));
+        let bob_kp = bob_inv.combiner_key_package();
+
+        let alice_session = assert_ok!(TwoMlsPqSession::initiate(
+            Arc::clone(&alice),
+            bob_kp,
+            None,
+            None
+        ));
+        let welcome_a = alice_session.test_initial_welcome();
+
+        assert_err!(
+            bob_inv.receive(
+                welcome_a.clone(),
+                alice_kp.clone(),
+                b"token".to_vec(),
+                None,
+                None,
+                Some(b"expected-relationship".to_vec()),
+            ),
+            crate::TwoMlsPqError::AppBindingMismatch
+        );
+        assert_ok!(bob_inv.receive(welcome_a, alice_kp, b"token".to_vec(), None, None, None));
+    }
+
+    /// A BOUND welcome against no expectation is never silently accepted — the caller
+    /// must state the binding it can verify; with it, the same welcome establishes.
+    #[test]
+    fn test_receive_rejects_unexpected_app_binding() {
+        use crate::session::TwoMlsPqSession;
+        use crate::test_utils::{make_client, make_combiner_kp};
+        use std::sync::Arc;
+
+        let alice = make_client();
+        let bob = make_client();
+        let alice_kp = make_combiner_kp(&alice);
+        let binding = b"relationship-digest".to_vec();
+
+        let bob_inv = assert_ok!(super::TwoMlsPqInvitation::restore(assert_ok!(
+            bob.generate_invitation(true)
+        )));
+        let bob_kp = bob_inv.combiner_key_package();
+
+        let alice_session = assert_ok!(TwoMlsPqSession::initiate(
+            Arc::clone(&alice),
+            bob_kp,
+            None,
+            Some(binding.clone()),
+        ));
+        let welcome_a = alice_session.test_initial_welcome();
+
+        assert_err!(
+            bob_inv.receive(
+                welcome_a.clone(),
+                alice_kp.clone(),
+                b"token".to_vec(),
+                None,
+                None,
+                None,
+            ),
+            crate::TwoMlsPqError::AppBindingMismatch
+        );
+        assert_ok!(bob_inv.receive(
+            welcome_a,
+            alice_kp,
+            b"token".to_vec(),
+            None,
+            None,
+            Some(binding),
+        ));
     }
 }

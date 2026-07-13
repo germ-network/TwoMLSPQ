@@ -24,7 +24,7 @@ use mls_rs::{ExtensionList, Group};
 use crate::client::{ApqCipherSuite, ApqMode};
 use crate::{CombinerError, Result};
 
-pub use wire::{ApqInfo, ApqInfoUpdate};
+pub use wire::{AppBinding, ApqInfo, ApqInfoUpdate};
 
 /// The combiner component id. The draft's id awaits IANA assignment; this is a high,
 /// uncommon value. It MUST fit the 16-bit Exporter Tree that `SafeExportSecret` walks:
@@ -41,6 +41,10 @@ pub const TWOMLS_COMPONENT_ID: u32 = 0xFF02;
 
 /// The `APQInfo` GroupContext extension type (RFC 9420 private-use extension range).
 pub const APQINFO_EXTENSION_TYPE: ExtensionType = ExtensionType::new(0xF0A1);
+
+/// The `AppBinding` GroupContext extension type (RFC 9420 private-use range, next after
+/// [`APQINFO_EXTENSION_TYPE`]).
+pub const APP_BINDING_EXTENSION_TYPE: ExtensionType = ExtensionType::new(0xF0A2);
 
 /// The mls-extensions `AppDataUpdate` proposal type (suggested IANA code point 0x0008).
 pub const APP_DATA_UPDATE: ProposalType = ProposalType::new(0x0008);
@@ -83,6 +87,31 @@ mod wire {
     impl MlsCodecExtension for ApqInfo {
         fn extension_type() -> ExtensionType {
             super::APQINFO_EXTENSION_TYPE
+        }
+    }
+
+    /// The `AppBinding` GroupContext extension: opaque app-supplied bytes binding the
+    /// session to the app's immutable relationship identity — the piece the two mutable
+    /// agents (see the rotation lifecycle) cannot carry. Like `APQInfo`, it is written
+    /// **once, at group creation**, rides Welcomes automatically, and is never rewritten
+    /// (GroupContextExtensions proposals are outside the TwoMLS operation whitelist), so
+    /// it is immutable for the session's lifetime; joiners verify it against the binding
+    /// they expect.
+    ///
+    /// The payload should be a DIGEST of the app's identifiers, not the identifiers
+    /// themselves (the first adopter binds `H(domain-tag ‖ role-ordered did:did)`, with
+    /// the same canonicalization its delegation binding uses, so the two cannot drift).
+    /// This crate never interprets the bytes — the adopter owns the digest and wire
+    /// format.
+    #[derive(Clone, Debug, PartialEq, Eq, MlsSize, MlsEncode, MlsDecode)]
+    pub struct AppBinding {
+        #[mls_codec(with = "mls_rs_codec::byte_vec")]
+        pub data: Vec<u8>,
+    }
+
+    impl MlsCodecExtension for AppBinding {
+        fn extension_type() -> ExtensionType {
+            super::APP_BINDING_EXTENSION_TYPE
         }
     }
 
@@ -255,6 +284,36 @@ pub fn read_apqinfo<Cfg: MlsConfig>(group: &Group<Cfg>) -> Result<ApqInfo> {
         .ok_or(CombinerError::ApqInfoMismatch)
 }
 
+/// Read the `AppBinding` GroupContext extension out of a group: `Ok(None)` when absent
+/// (an unbound session is valid — the extension is optional), the opaque bytes when
+/// present, and [`CombinerError::AppBindingMismatch`] when present but undecodable (a
+/// corrupt binding must never read as "unbound").
+pub fn read_app_binding<Cfg: MlsConfig>(group: &Group<Cfg>) -> Result<Option<Vec<u8>>> {
+    group
+        .context()
+        .extensions
+        .get_as::<AppBinding>()
+        .map(|binding| binding.map(|b| b.data))
+        .map_err(|_| CombinerError::AppBindingMismatch)
+}
+
+/// Verify a group's `AppBinding` against the binding the caller expects — an exact,
+/// symmetric match: `Some(bytes)` must be carried equal, `None` requires the group to
+/// carry none. Anything else — expected-but-absent (a wrong-relationship welcome, or a
+/// strip: the downgrade shape `APQInfo` verification also refuses), unequal, or
+/// present-but-unexpected (never silently accepted; the caller must state the binding it
+/// can verify) — is [`CombinerError::AppBindingMismatch`].
+pub fn verify_app_binding<Cfg: MlsConfig>(
+    group: &Group<Cfg>,
+    expected: Option<&[u8]>,
+) -> Result<()> {
+    if read_app_binding(group)?.as_deref() == expected {
+        Ok(())
+    } else {
+        Err(CombinerError::AppBindingMismatch)
+    }
+}
+
 /// The classical-half checks shared by the full-pair and deferred joiner verifications:
 /// extension present; suites equal the pinned pair and re-validate as a coherent APQ
 /// combination; mode matches; `t_session_group_id` is the joined classical group's id;
@@ -397,6 +456,20 @@ mod tests {
         let list = apq_info_extensions(&info()).unwrap();
         let read: ApqInfo = list.get_as().unwrap().unwrap();
         assert_eq!(read, info());
+    }
+
+    #[test]
+    fn test_app_binding_extension_round_trips() {
+        let mut list = ExtensionList::new();
+        list.set_from(AppBinding {
+            data: b"relationship-digest".to_vec(),
+        })
+        .unwrap();
+        let read: AppBinding = list.get_as().unwrap().unwrap();
+        assert_eq!(read.data, b"relationship-digest");
+        // Absent from a fresh list — the optional case reads as None, not an error.
+        let empty = ExtensionList::new();
+        assert!(empty.get_as::<AppBinding>().unwrap().is_none());
     }
 
     #[test]

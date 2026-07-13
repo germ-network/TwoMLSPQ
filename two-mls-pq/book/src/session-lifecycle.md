@@ -2,14 +2,18 @@
 
 ## Establishment
 
-1. **`TwoMlsPqSession::initiate(client, their_kp, app_payload)`** — Alice builds her
-   send group (Group_A): the ML-KEM-768 half first, the APQ-PSK exported from it, then
-   the classical half bound by that PSK. `pending_outbound()` returns the first frame as
+1. **`TwoMlsPqSession::initiate(client, their_kp, app_payload, app_binding)`** — Alice
+   builds her send group (Group_A): the ML-KEM-768 half first, the APQ-PSK exported from
+   it, then the classical half bound by that PSK — carrying the optional `app_binding`
+   (the app-state binding, welded into the GroupContext here and immutable for the
+   session's lifetime; see [Group Rules](./group-rules.md) rule 8). `pending_outbound()`
+   returns the first frame as
    one opaque §A.1 envelope — `[app_payload ∥ APQWelcome_A]` HPKE-sealed to Bob's KP′ —
    so the app-layer welcome that identifies Alice is hidden on the invitation channel
    (see [Header Encryption](./header-encryption.md)).
 2. **`TwoMlsPqInvitation::open_initial(envelope) -> { app_payload, welcome }`** then
-   **`receive(welcome, their_kp, spawn_token, new_client_id, expected_remote)`** — Bob
+   **`receive(welcome, their_kp, spawn_token, new_client_id, expected_remote,
+   expected_app_binding)`** — Bob
    opens the envelope
    (the invitation holds the KP′ material), validates the app-layer welcome, and joins
    Group_A as his receive group (PQ half first, re-deriving the APQ-PSK, then the

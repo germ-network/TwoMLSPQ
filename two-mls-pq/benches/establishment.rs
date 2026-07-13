@@ -16,7 +16,7 @@ fn bench_establishment(c: &mut Criterion) {
                 let bob = client();
                 (alice, combiner_kp(&bob))
             },
-            |(alice, bob_kp)| TwoMlsPqSession::initiate(alice, bob_kp, None).unwrap(),
+            |(alice, bob_kp)| TwoMlsPqSession::initiate(alice, bob_kp, None, None).unwrap(),
             BatchSize::SmallInput,
         )
     });
@@ -33,11 +33,18 @@ fn bench_establishment(c: &mut Criterion) {
                 (alice, bob_inv, bob_kp, alice_kp)
             },
             |(alice, bob_inv, bob_kp, alice_kp)| {
-                let alice_session = TwoMlsPqSession::initiate(alice, bob_kp, None).unwrap();
+                let alice_session = TwoMlsPqSession::initiate(alice, bob_kp, None, None).unwrap();
                 let envelope = alice_session.pending_outbound().unwrap();
                 let opened = bob_inv.open_initial(envelope).unwrap();
                 let bob_session = bob_inv
-                    .receive(opened.welcome, alice_kp, b"bench".to_vec(), None, None)
+                    .receive(
+                        opened.welcome,
+                        alice_kp,
+                        b"bench".to_vec(),
+                        None,
+                        None,
+                        None,
+                    )
                     .unwrap();
                 let welcome_b = bob_session.pending_outbound().unwrap();
                 alice_session.process_incoming(welcome_b).unwrap();
