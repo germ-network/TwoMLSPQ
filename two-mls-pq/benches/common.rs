@@ -42,12 +42,12 @@ pub fn established() -> (Arc<TwoMlsPqSession>, Arc<TwoMlsPqSession>) {
     let bob_inv = TwoMlsPqInvitation::restore(bob.generate_invitation(true).unwrap()).unwrap();
     let bob_kp = bob_inv.combiner_key_package();
 
-    let alice_session = TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None, None).unwrap();
+    let alice_session = TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None).unwrap();
     let envelope = alice_session.pending_outbound().unwrap();
     let opened = bob_inv.open_initial(envelope).unwrap();
     let bob_session = bob_inv
         .receive(
-            opened.welcome,
+            opened.welcome.unwrap(),
             alice_kp,
             b"bench-establish".to_vec(),
             None,

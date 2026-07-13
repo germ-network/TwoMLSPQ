@@ -12,26 +12,17 @@ use super::*;
 // The header carries the concrete `ApqCipherSuite` pair (4 bytes, classical then pq,
 // big-endian) in place of the old PQ-mode byte: the suite is a stored session property, and a
 // restored archive whose pair differs from this build's pinned suite fails loudly.
-// v3 (header encryption): the archive gained the per-epoch header receive window
-// (`recv_header_keys`), so a restored session can still open frames sealed under a recent
-// send-group epoch.
-// v4 (PQ-family side-band keys): added the PQ header window (`recv_header_keys_pq`), so a
-// restored session opens PQ side-band frames sealed under a recent pq_epoch too.
-// v6 (draft-02 conformance, phase A): no layout change — a pure compatibility cut. v5-era
-// groups carry no APQInfo GroupContext extension and their leaves lack the AppDataUpdate /
-// APQInfo capabilities, so a restored v5 session could never verify or carry the -02
-// machinery; reject the blob instead of resurrecting a permanently non-conformant session.
-// v7 (draft-02 conformance, phase B): the send-PSK ledger entries changed shape — each now
-// carries (send epoch, component_id, psk_id, value) for the -02 application PSK, replacing the
-// (external id, value) pair, so v6 blobs no longer decode.
-// v8 (event-driven cross-party injection): the transient PSK memo is gone, replaced by three
-// small epoch watermarks (`last_cross_injected`, `last_cross_injected_pq`,
-// `last_send_pq_exported`) that gate the cross-party injections, so the archive layout changed.
-// v9 (push-based persistence): the wire gained `state_seq` (the per-session mutation counter
-// that stamps each pushed blob) and the PQ-epoch manifest (`send_pq_epoch`/`recv_pq_epoch`)
-// that lets a `core` blob (PQ trees omitted) be reconciled against a `checkpoint` blob at
-// restore. A whole-blob archive still round-trips through this same layout.
-const SESSION_ARCHIVE_VERSION: u8 = 9;
+//
+// PRE-RELEASE FLOOR RESET (2026-07-13, with the §A.1 pre-establishment-sends layout
+// change — the wire gained the initiator's retained envelope state `initial_their_kp` /
+// `initial_app_payload` / `initial_return_kp`, so a session captured at birth restores
+// send-ready; all three are None once established and on acceptors): the v1–v10 ladder
+// this byte accumulated carried no compatibility value (every bump was a hard cut; the
+// history stays in git), so the byte returns to the floor. Blobs from every prior cut
+// wear bytes 2–10 and fail the header check; ancient v1-era layouts are additionally
+// rejected structurally (the staple first-byte check in `session_from_wire`, whose
+// fields pre-v2 bytes could otherwise alias into).
+const SESSION_ARCHIVE_VERSION: u8 = 1;
 
 // In its own module because the derive-generated impls reference the std `Result`, which
 // the crate-local `Result` alias would shadow (same pattern as `invitation::wire`).
@@ -114,6 +105,16 @@ pub(crate) mod archive_wire {
     pub(in crate::session) struct IdBlob {
         #[mls_codec(with = "mls_rs_codec::byte_vec")]
         pub(in crate::session) bytes: Vec<u8>,
+    }
+
+    /// A combiner key package pair on the wire (public material — the initiator's
+    /// retained pre-establishment seal target / return key package).
+    #[derive(MlsSize, MlsEncode, MlsDecode)]
+    pub(in crate::session) struct WireCombinerKp {
+        #[mls_codec(with = "mls_rs_codec::byte_vec")]
+        pub(in crate::session) classical: Vec<u8>,
+        #[mls_codec(with = "mls_rs_codec::byte_vec")]
+        pub(in crate::session) pq: Vec<u8>,
     }
 
     /// One party's AS credential sequence (see `apq::authentication::PartySequence`).
@@ -268,6 +269,13 @@ pub(crate) mod archive_wire {
         pub(in crate::session) auth_theirs: WirePartySequence,
         pub(in crate::session) pending_pq_outbound: Option<Vec<u8>>,
         pub(in crate::session) pq_inflight: Option<WirePqInflight>,
+        /// The initiator's retained pre-establishment envelope state (v10): the peer
+        /// key package pre-establishment frames are HPKE-sealed to, the host's
+        /// self-sufficient app payload, and the bare-shape return key package. All
+        /// `None` once established (the cutover clears them) and on acceptors.
+        pub(in crate::session) initial_their_kp: Option<WireCombinerKp>,
+        pub(in crate::session) initial_app_payload: Option<Vec<u8>>,
+        pub(in crate::session) initial_return_kp: Option<WireCombinerKp>,
     }
 }
 
@@ -589,6 +597,9 @@ fn session_from_wire(wire: archive_wire::SessionArchive) -> Result<Arc<TwoMlsPqS
             psk_stores,
             psk_stores_from,
             spawn_token: wire.spawn_token,
+            initial_their_kp: wire.initial_their_kp.map(combiner_kp_from_wire),
+            initial_app_payload: wire.initial_app_payload,
+            initial_return_kp: wire.initial_return_kp.map(combiner_kp_from_wire),
             // Attached post-restore via `install_sink`.
             sink: None,
         }),
@@ -788,8 +799,27 @@ fn build_archive_wire(
             auth_theirs,
             pending_pq_outbound: inner.pending_pq_outbound.clone(),
             pq_inflight,
+            initial_their_kp: inner.initial_their_kp.as_ref().map(wire_combiner_kp),
+            initial_app_payload: inner.initial_app_payload.clone(),
+            initial_return_kp: inner.initial_return_kp.as_ref().map(wire_combiner_kp),
         };
     Ok(archive)
+}
+
+/// A retained combiner key package → its wire form.
+fn wire_combiner_kp(kp: &CombinerKeyPackage) -> archive_wire::WireCombinerKp {
+    archive_wire::WireCombinerKp {
+        classical: kp.classical.clone(),
+        pq: kp.pq.clone(),
+    }
+}
+
+/// Wire form → the retained combiner key package.
+fn combiner_kp_from_wire(wire: archive_wire::WireCombinerKp) -> CombinerKeyPackage {
+    CombinerKeyPackage {
+        classical: wire.classical,
+        pq: wire.pq,
+    }
 }
 
 /// Encode an archive wire struct to bytes: header `[version][suite pair]` + MLS body. Exact-

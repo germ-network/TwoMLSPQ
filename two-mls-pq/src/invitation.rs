@@ -18,16 +18,16 @@ use crate::{Result, TwoMlsPqError};
 // also carries the concrete `ApqCipherSuite` pair (4 bytes, classical then pq, big-endian),
 // matching the session archive; a pair differing from this build's pinned suite
 // (`providers::APQ_SUITE`) is rejected — the suite is an explicit, checked property.
-// v3 (push-based persistence): the archive gained `state_seq`, the per-invitation mutation
-// counter that stamps each pushed blob (see `InvitationInner::state_seq`); v2 blobs no
-// longer decode.
-// v4 (layout unchanged — a pure compatibility cut): the AppBinding capability cut. A v3
-// invitation's captured key packages predate the AppBinding extension advertisement, so a
-// binding-carrying group could never admit them — and `combiner_key_package()` would
-// re-publish them wearing the current COMBINER_KEY_PACKAGE_VERSION byte, deferring the
-// failure to an opaque mls-rs error deep inside the peer's `initiate`. Reject at restore
-// instead; regenerate invitations.
-const INVITATION_VERSION: u8 = 4;
+//
+// PRE-RELEASE FLOOR RESET (2026-07-13, alongside SESSION_ARCHIVE_VERSION): the v1–v4
+// ladder carried no compatibility value (every bump was a hard cut; the history stays in
+// git — most recently v4, the AppBinding capability cut, whose rationale still applies:
+// pre-AppBinding captured key packages can never join a binding-carrying group, so stale
+// blobs reject at restore rather than deep inside the peer's `initiate`). The byte
+// returns to the floor; blobs from every prior cut wear bytes 2–4 and fail the header
+// check, and the layout is disjoint enough from the retired v1 shape that a decode
+// cannot alias.
+const INVITATION_VERSION: u8 = 1;
 
 /// The spawned-group forward table: an opaque caller-supplied spawn token → the spawned
 /// session's receive-group classical (message-half) id. The token is whatever the caller
@@ -317,13 +317,15 @@ mod tests {
         let client = make_client();
         let inv = assert_ok!(generate_combiner_invitation(client.combiner(), true));
         let mut framed = assert_ok!(inv.encode());
-        // Pin the current cut (update alongside the const's changelog comment).
-        assert_eq!(framed[0], 4);
+        // Pin the current cut (update alongside the const's changelog comment):
+        // the pre-release floor.
+        assert_eq!(framed[0], 1);
         assert_eq!(framed[0], INVITATION_VERSION);
 
-        // A v3-era (pre-AppBinding) blob: identical layout, stale version byte. The
-        // framed decoder is the choke point every restore funnels through…
-        framed[0] = 3;
+        // A pre-floor-reset blob (the v0.3.0-era AppBinding cut wore byte 4):
+        // identical layout, stale version byte. The framed decoder is the choke
+        // point every restore funnels through…
+        framed[0] = 4;
         assert_err!(
             CombinerInvitation::decode(&framed),
             TwoMlsPqError::ArchiveInvalid
