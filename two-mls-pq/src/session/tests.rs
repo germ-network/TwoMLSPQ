@@ -2165,8 +2165,11 @@ fn test_queue_proposal_stages_for_next_ratchet() {
 /// The binding values are honest digests with cross-side coherence: the sender's
 /// `proposal_hash` is the SHA-256 of the staged Upd(self) proposal, so the
 /// receiver's `QueuedRemoteProposal.digest` — derived independently from the
-/// received bytes — equals it; and the receiver's ordering `context` equals its own
-/// `proposal_context` (SHA-256 of its recv group's classical group id).
+/// received bytes — equals it; and the receiver's ordering `context` equals the
+/// *sender's* `proposal_context` (the value the sender signs its handoff against).
+/// The sender's recv group is the receiver's send group, so the receiver binds its
+/// send group; binding the receiver's *own* proposal_context (its recv group) would
+/// be the reverse channel and every cross-endpoint handoff signature would fail.
 #[test]
 fn test_proposal_hash_is_digest_of_the_staple_both_sides_agree_on() {
     let (alice_session, bob_session) = establish_sessions();
@@ -2179,10 +2182,11 @@ fn test_proposal_hash_is_digest_of_the_staple_both_sides_agree_on() {
     // Sender's binding value == receiver's independently derived digest.
     assert_eq!(prep.proposal_hash, proposal.digest);
     assert_eq!(prep.proposal_hash.len(), 32);
-    // Self-consistent across the receiver's two surfaces.
+    // Cross-endpoint contract: the receiver's ordering context equals the SENDER's
+    // proposal_context — the exact value the sender signed the handoff against.
     assert_eq!(
         proposal.context,
-        assert_some!(alice_session.proposal_context())
+        assert_some!(bob_session.proposal_context())
     );
 }
 
