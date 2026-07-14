@@ -583,9 +583,15 @@ struct ProposalBindingDemo {
 		#expect(appSideDigest == prep.proposalHash)
 		#expect(appSideDigest == offered.digest)
 
-		//the receiver's ordering context equals its own proposalContext (sha256 of
-		//its recv group's classical group id) — self-consistent across surfaces
-		#expect(offered.context == localSession.proposalContext)
+		//the receiver's ordering context equals the SENDER's proposalContext — the
+		//contract that gates handoff validation, since the sender signs its handoff
+		//against that value and the receiver validates against this one. Asserting
+		//the RECEIVER's own proposalContext here only restated the receiver's view
+		//of itself: the two endpoints' recv groups are distinct MLS groups (ours is
+		//the peer's send group), so that comparison passed only while the binding
+		//was wrong. TwoMLSPQ v0.4.1 binds the queued context to the send group —
+		//the reverse channel, which is the sender's recv group.
+		#expect(offered.context == remoteSession.proposalContext)
 	}
 }
 
