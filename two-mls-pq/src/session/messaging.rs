@@ -1016,7 +1016,7 @@ impl TwoMlsPqSession {
                 }
             }
 
-            let (app_data, sender_id, epoch, group_id) = {
+            let (app_data, sender_id, epoch) = {
                 let recv = inner
                     .recv_group
                     .as_mut()
@@ -1031,12 +1031,25 @@ impl TwoMlsPqSession {
                             bytes: sender_client_id(&recv.classical, desc.sender_index)?,
                         };
                         let ep = recv.classical.current_epoch();
-                        let gid = recv.classical.group_id().to_vec();
-                        (desc.data().to_vec(), sender, ep, gid)
+                        (desc.data().to_vec(), sender, ep)
                     }
                     _ => return Err(TwoMlsPqError::DecryptionFailed),
                 }
             };
+
+            // The proposal's ordering context must equal the *sender's* `proposal_context`,
+            // which is sha256 of THEIR recv group's classical id. Their recv group is our
+            // send group (the reverse channel), so bind against our send group here — not
+            // the recv group the message arrived on. The two endpoints' recv groups are
+            // distinct MLS groups, so binding recv would never match the sender's value
+            // and every cross-endpoint handoff signature would fail to validate.
+            let group_id = inner
+                .send_group
+                .as_ref()
+                .ok_or(TwoMlsPqError::SessionNotEstablished)?
+                .classical
+                .group_id()
+                .to_vec();
 
             // Stage the stapled Upd(sender) proposal for app approval. The section is
             // self-describing — `[proposing][proposal message]` — so the candidate
@@ -1050,8 +1063,9 @@ impl TwoMlsPqSession {
                 digest,
                 sender: sender_id.clone(),
                 proposing: ClientId { bytes: proposing },
-                // The ordering context is the SHA-256 of the receive group's
-                // (classical, message-half) group id — `proposal_context`'s value.
+                // The ordering context is the SHA-256 of our send group's (classical,
+                // message-half) group id — which is the sender's recv group, matching
+                // their `proposal_context` value (see the send_group binding above).
                 context: crate::sha256(&group_id),
             });
 
