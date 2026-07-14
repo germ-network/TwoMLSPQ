@@ -178,9 +178,12 @@ caller-chosen, replay-stable token for the initial frame and records
 - **`forward_group_id(spawn_token)`** — `Some` means this exact initial frame was
   already accepted; route the payload to the owning session instead of surfacing a
   fresh welcome.
-- **`TwoMlsPqSession::forwarded(spawn_token)`** — the session acknowledges the replay
-  (`Ok(None)`: an initiator cannot staple a private message pre-establishment, so a
-  replay never carries an undelivered payload); a mismatched token is a mis-route.
+- **`TwoMlsPqSession::forwarded(spawn_token)`** — the session acknowledges the
+  re-delivery (`Ok(None)` always: the call only validates the routing — a
+  pre-establishment frame staples the sender's current app message §A.1-style, and
+  the host delivers that staple by parsing the envelope
+  (`decode_initial_plaintext`) and feeding it to `process_incoming`); a mismatched
+  token is a mis-route.
 
 - **`processed_welcome_group_id(welcome)`** — the content-keyed counterpart of the
   forward table: resolves a re-delivered welcome (by the digest of its exact bytes)
@@ -191,5 +194,6 @@ caller-chosen, replay-stable token for the initial frame and records
 The invitation pushes these to its `ArchiveSink` after every `receive` — the consumed
 set, the forward table, and the processed-welcome ledger — so all three guards survive a
 restore. The token is opaque
-to this crate — the caller picks the convention (Germ's adapter uses the app-layer
-digest of the decrypted frame).
+to this crate — the caller picks the convention (Germ's adapter digests the envelope's
+STABLE PREFIX — the app payload, else the bare welcome — so every pre-establishment
+re-staple from the same initiator resolves to the same token).
