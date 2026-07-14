@@ -63,9 +63,18 @@ extension AbstractTwoMLS {
 	public struct PQInbound: Sendable {
 		public let kind: PQOperationKind
 		public let advancedGroup: SendGroupRole
+		/// This side's SEND group epoch pair after the apply (nil when nothing
+		/// moved). NOTE: when `advancedGroup == .theirs` the group that advanced
+		/// is the peer's — this field still reports our own send group's pair,
+		/// which is unchanged by such an apply. It answers "what are MY epochs
+		/// now", not "what did the advanced group move to".
 		public let newEpochs: APQEpochs?
-		public let rotatedCredential: ClientID?  // A.4/A.5 agent handoff
+		public let rotatedCredential: ClientID?  // A.4/A.5 principal handoff
 		/// The app message stapled onto an A.3 bind, decrypted while applying it.
+		/// Always nil through this backend today: `ingest` applies binds with an
+		/// empty payload and `begin(.ratchet)` offers no way to supply one — the
+		/// crate supports the stapled A.3 app message, but the wrapper does not
+		/// yet expose sending it (deliberate follow-up).
 		public let plaintext: Data?
 
 		public init(
@@ -94,10 +103,16 @@ extension AbstractTwoMLS {
 
 	/// Explicit initiator/responder flow for the PQ side-band, replacing
 	/// currentPQInflight() / received(pqProposal:) / received(pqCommit:).
-	// Sendable is sound (the wrapped uniffi `TwoMlsPqSession` is `@unchecked Sendable`:
-	// Rust Send+Sync, FFI calls lock-serialized) — but it buys memory safety, not ordering.
-	// The begin → ingest → advance ratchet has one parked reply slot: drive it sequentially.
-	public protocol PQRatchet: Sendable {
+	// Deliberately NOT Sendable: a session is a single-driver state machine
+	// (one parked reply slot, one pending-proposal slot), and while the wrapped
+	// uniffi object is lock-serialized (memory-safe), concurrent drivers can
+	// interleave silently — a second prepareToEncrypt replaces the staged
+	// proposal with no signal to the first, and racing advance/ingest can
+	// mislabel a parked frame. Withholding Sendable makes the compiler refuse
+	// to move a session across task boundaries; the CONTAINING type (typically
+	// an actor that owns the session and serializes all driving) asserts its
+	// own Sendable conformance instead.
+	public protocol PQRatchet {
 		var turn: PQTurn { get }
 		var epochs: APQEpochs { get }
 		/// True once both send groups are full APQ pairs (post-A.4).

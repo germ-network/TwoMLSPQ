@@ -39,10 +39,11 @@ struct LifecycleTests {
 		#expect(!localBase.isFullyEstablished())
 		#expect(localBase.myPqTurn())
 		#expect(localBase.epochs() == ApqEpochs(pqEpoch: 1, classicalEpoch: 1))
-		// reply consumed the APQ welcome into the sealed AppWelcome…
+		// createTwoMLSGroup (in the reply harness) attached the AppWelcome and
+		// consumed the parked §A.1 envelope via pendingOutbound (take-once)…
 		#expect(localBase.pendingOutbound() == nil)
-		// …which travels as a v1 header frame.
-		#expect(encryptedCombinedWelcome.first == 1)
+		// …and it travels as the crate's tagged envelope (contract 15).
+		#expect(encryptedCombinedWelcome.first == initialEnvelopeTag())
 
 		// Routing: listening works from birth — addresses derive from our send
 		// group's classical half, one per epoch. Nowhere to post yet: the post
@@ -73,9 +74,17 @@ struct LifecycleTests {
 		let remoteRecv = try #require(remoteBase.receiveGroupId())
 		#expect(!remoteRecv.classical.bytes.isEmpty)
 		#expect(!remoteRecv.pq.bytes.isEmpty)
-		// Each side's view of the peer matches the peer's self-view.
-		#expect(localBase.myPrincipalState() == remoteBase.theirPrincipalState())
-		#expect(remoteBase.myPrincipalState() == localBase.theirPrincipalState())
+		// Each side's view of the peer matches the peer's self-view — modulo the
+		// acceptor's staged candidate: `receive(newClientId:)` leaves the acceptor
+		// .pending, and a candidate stays PRIVATE to its proposer until a frame
+		// carries it (contract v9 candidate lifecycle), so the initiator still
+		// sees the canonical invitation identity. Asserted through the abstract
+		// truth surface (M6), not the raw binding.
+		#expect(localSession.myPrincipalState == remoteSession.theirPrincipalState)
+		guard case .pending(let old, _) = remoteSession.myPrincipalState else {
+			throw TestErrors.unexpected
+		}
+		#expect(localSession.theirPrincipalState == .sync(old))
 
 		// Routing: remote can post immediately — its post address is the recv
 		// group's current exporter, which is the same MLS group as the initiator's
@@ -169,8 +178,8 @@ struct LifecycleTests {
 		#expect(remoteSession.turn == .theyInitiate)
 		let kp = try localSession.begin(.finishBootstrap, rotating: nil)
 		#expect(kp.kind == .finishBootstrap)
-		// Bootstrap key-package frame tag.
-		#expect(kp.payload.first == 0x11)
+		// Bootstrap key-package frame — classify by opening the seal (wire tag sealed, v7).
+		#expect(try remoteBase.openIncoming(blob: kp.payload)?.kind == .pqSideBand(kind: .bootstrapKeyPackage))
 
 		let remoteClassicalBefore = remoteBase.epochs().classicalEpoch
 		let remoteListenBeforeBootstrap = try remoteBase.shouldListenOn()
@@ -194,7 +203,7 @@ struct LifecycleTests {
 		let reply = try #require(try remoteSession.advance(after: inbound))
 		#expect(reply.kind == .finishBootstrap)
 		// Bootstrap bind frame tag (PQ welcome only — A.4 is PQ-groups-only).
-		#expect(reply.payload.first == 0x13)
+		#expect(try localBase.openIncoming(blob: reply.payload)?.kind == .pqSideBand(kind: .bootstrapBind))
 		// The parked reply is handed out exactly once.
 		#expect(try remoteSession.advance(after: inbound) == nil)
 
@@ -220,8 +229,8 @@ struct LifecycleTests {
 		#expect(remoteSession.turn == .weInitiate)
 		let rekeyUpd = try remoteSession.begin(.rekey, rotating: nil)
 		#expect(rekeyUpd.kind == .rekey)
-		// Rekey Upd' proposal frame tag.
-		#expect(rekeyUpd.payload.first == 0x15)
+		// Rekey Upd' proposal frame — classify by opening the seal (wire tag sealed, v7).
+		#expect(try localBase.openIncoming(blob: rekeyUpd.payload)?.kind == .pqSideBand(kind: .rekeyUpdate))
 		// The proposal alone moves no epochs on the initiator's side.
 		#expect(remoteBase.epochs().pqEpoch == 1)
 
@@ -241,8 +250,8 @@ struct LifecycleTests {
 		// Local's parked reply carries its Commit' plus the counter-Upd'(local).
 		let rekeyReply = try #require(try localSession.advance(after: rekeyInbound1))
 		#expect(rekeyReply.kind == .rekey)
-		// Rekey Commit' frame tag.
-		#expect(rekeyReply.payload.first == 0x17)
+		// Rekey Commit' frame — classify by opening the seal (wire tag sealed, v7).
+		#expect(try remoteBase.openIncoming(blob: rekeyReply.payload)?.kind == .pqSideBand(kind: .rekeyCommit))
 		#expect(try localSession.advance(after: rekeyInbound1) == nil)
 
 		// Remote applies local's Commit' to its recv mirror and commits the
@@ -251,7 +260,7 @@ struct LifecycleTests {
 		#expect(rekeyInbound2.kind == .rekey)
 		#expect(remoteBase.epochs().pqEpoch == 2)
 		let rekeyFinal = try #require(try remoteSession.advance(after: rekeyInbound2))
-		#expect(rekeyFinal.payload.first == 0x17)
+		#expect(try localBase.openIncoming(blob: rekeyFinal.payload)?.kind == .pqSideBand(kind: .rekeyCommit))
 
 		// Local applies the final Commit'; the operation completes and the turn
 		// passes back to local.

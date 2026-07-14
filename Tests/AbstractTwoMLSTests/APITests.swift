@@ -12,7 +12,7 @@ struct ClientWrapper<C: AbstractTwoMLS.Client> {
 
 	init() throws {
 		client = try C(clientId: agentKey.publicKey.wireFormat)
-		currentInvitation = try .init(archive: try client.makeInvitation())
+		currentInvitation = try .init(persisted: try client.makeInvitation())
 	}
 
 	var clientId: Data {
@@ -160,8 +160,10 @@ struct APIDemo {
 
 //Increment B: agent rotation. Phase 8 (classical) rides the session surface —
 //receive(newClientId:) stages the dedicated agent, prepareToEncrypt(proposing:)
-//commits the handoff — and the PQ side-band catches the PQ leaves up via
-//begin(.rekey, rotating:), which the peer observes as PQInbound.rotatedCredential.
+//puts the candidate on the wire, and the PEER's approval + commit canonicalizes
+//it (contract v9 candidate lifecycle; see `rotate(to:peer:)`) — then the PQ
+//side-band catches the PQ leaves up via begin(.rekey, rotating:), which the peer
+//observes as PQInbound.rotatedCredential.
 struct RotationDemo {
 	let local: ClientWrapper<AbstractTwoMLS.PQClient>
 	let remote: ClientWrapper<AbstractTwoMLS.PQClient>
@@ -186,15 +188,11 @@ struct RotationDemo {
 			newClientId: dedicatedAgentId
 		)
 
-		//Phase 8: the acceptor's first reply bundles the rotation commit (and
-		//staples the return welcome); the initiator observes the new identity
-		let prep = try remoteSession.prepareToEncrypt(proposing: dedicatedAgentId)
-		guard prep?.didCommit == true else { throw TestErrors.unexpected }
-		let frame = try remoteSession.encrypt(appMessage: Data("rotate".utf8))
-		let decrypted = try #require(
-			try localSession.processIncoming(ciphertext: frame.cipherText))
-		#expect(decrypted.remoteCommit?.newSender == dedicatedAgentId)
-		#expect(decrypted.applicationMessage?.appMessageData == Data("rotate".utf8))
+		//Phase 8, contract v9+ candidate lifecycle: the acceptor's first reply
+		//CARRIES the candidate proposal (and staples the return welcome); the
+		//initiator's approval + commit canonicalizes it, and the staple back
+		//completes the handoff — see `rotate(to:peer:)`.
+		try remoteSession.rotate(to: dedicatedAgentId, peer: localSession)
 
 		//messaging still flows both ways under the rotated agent
 		try localSession.exchange(with: remoteSession)
@@ -212,16 +210,10 @@ struct RotationDemo {
 			newClientId: dedicatedAgentId
 		)
 
-		//Phase 8 first: the classical rotation announces the dedicated agent and
-		//swaps the session client (the first reply also staples the return welcome)
-		_ = try remoteSession.prepareToEncrypt(proposing: dedicatedAgentId)
-		let frame = try remoteSession.encrypt(appMessage: Data("rotate".utf8))
-		guard
-			try localSession.processIncoming(ciphertext: frame.cipherText)?
-				.remoteCommit?.newSender == dedicatedAgentId
-		else { throw TestErrors.unexpected }
-		//a reply confirms the rotation on the acceptor's side
-		try localSession.send(to: remoteSession)
+		//Phase 8 first, contract v9+ dance: the classical rotation canonicalizes
+		//the dedicated agent and swaps the session client — the dance's closing
+		//staple doubles as the confirming reply (see `rotate(to:peer:)`)
+		try remoteSession.rotate(to: dedicatedAgentId, peer: localSession)
 
 		//PQSession always conforms; take the abstract PQ view directly
 		let localPQ = localSession as any AbstractTwoMLS.PQRatchetingSession
@@ -241,9 +233,10 @@ struct RotationDemo {
 		//A.3 cannot carry a rotation — no updatePath rides the ratchet
 		do {
 			_ = try remotePQ.begin(.ratchet, rotating: dedicatedAgentId)
-			Issue.record("expected rotationCannotRideRatchet")
-		} catch TwoMLSPQConformanceError.rotationCannotRideRatchet {
-			// expected
+			Issue.record("expected .rotationCannotRideRatchet")
+		} catch let error as AbstractTwoMLS.SessionError {
+			#expect(error.code == .rotationCannotRideRatchet)
+			#expect(error.disposition == .callerBug)
 		}
 
 		//A.5 with the credential handoff: the rekey hands remote's PQ leaves to
@@ -327,15 +320,24 @@ struct ForwardRoutingDemo {
 		guard try remoteSession.forwarded(headerDecrypted: mlsMessageData) == nil else {
 			throw TestErrors.unexpected
 		}
-		//a mis-routed forward is refused: an initiator-side session has no spawn token,
-		//so `forwarded` must *throw* (SessionNotReady) — not silently return nil.
-		#expect(throws: (any Error).self) {
-			try localSession.forwarded(headerDecrypted: mlsMessageData)
+		//a mis-routed forward is refused: an initiator-side session has no spawn
+		//token, so `forwarded` must *throw* — not silently return nil. The crate's
+		//SessionNotReady at the forwarded surface maps to `.misroutedFrame`.
+		do {
+			_ = try localSession.forwarded(headerDecrypted: mlsMessageData)
+			throw TestErrors.unexpected
+		} catch let error as AbstractTwoMLS.SessionError {
+			#expect(error.code == .misroutedFrame)
 		}
 
-		//forwarding survives invitation archive/restore
+		//forwarding survives invitation restore — the post-receive state (spawn
+		//table included) leaves only via the sink; restore from its newest
+		//checkpoint. (The sink arrives after receive: the install-time baseline
+		//captures the already-mutated state.)
+		let invitationSink = RecordingSink()
+		try remote.currentInvitation.installSink(invitationSink)
 		let restored = try AbstractTwoMLS.PQInvitation(
-			archive: try remote.currentInvitation.archive
+			persisted: invitationSink.invitationPersisted()
 		)
 		guard
 			case .forward = try restored.decodeHeader(
@@ -360,9 +362,8 @@ struct ForwardRoutingDemo {
 	}
 }
 
-//Session archive/restore round-trips. TwoMLSPQ 0.0.10 made `fromArchive(archive:)`
-//total and self-contained (no owning client), so an archived session restores into a
-//working session that keeps talking to the peer.
+//Session persist/restore round-trips (contract 13, push): the sink's newest
+//Core/Checkpoint pair rebuilds a working session that keeps talking to the peer.
 struct SessionArchiveDemo {
 	let local: ClientWrapper<AbstractTwoMLS.PQClient>
 	let remote: ClientWrapper<AbstractTwoMLS.PQClient>
@@ -385,20 +386,79 @@ struct SessionArchiveDemo {
 		try remoteSession.send(to: localSession)
 		try localSession.exchange(with: remoteSession)
 
-		// Archive the acceptor and restore it into a fresh session object.
+		// Restore the acceptor from its sink's newest slots into a fresh object.
 		let snapshot = remoteSession.epochs
-		let archived = try remoteSession.archive
-		let restored = try AbstractTwoMLS.PQSession(archive: archived)
+		let restored = try roundTripPush(remoteSession)
 
-		// The restored session picks up exactly where the archived one left off...
+		// The restored session picks up exactly where the pushed state left off...
 		#expect(restored.epochs.pqEpoch == snapshot.pqEpoch)
 		#expect(restored.epochs.classicalEpoch == snapshot.classicalEpoch)
 		#expect(restored.isFullyEstablished == remoteSession.isFullyEstablished)
 
-		// ...and keeps talking to the peer. Latest-only discipline: drive `restored`,
-		// not the now-archived `remoteSession`.
+		// ...and keeps talking to the peer. Single-writer discipline: drive
+		// `restored`, not the superseded `remoteSession` (its ratchet position
+		// is now behind the pushed state — exactly the H1 hazard the push
+		// model exists to prevent).
 		try localSession.send(to: restored)
 		try restored.send(to: localSession)
+	}
+}
+
+/// Architecture 08-twoMLSPQ-APQ §A.1 (contract 15): the REPLIER sends app messages
+/// immediately after reply — before the acceptor's return welcome exists. Each
+/// pre-establishment frame is a fresh envelope re-stapling the app welcome plus the
+/// current message, so any single frame both establishes the acceptor and delivers;
+/// later frames from the same replier route `.forward` to the spawned session, which
+/// acknowledges them and hands out their stapled messages.
+struct ReplierFirstDemo {
+	let local: ClientWrapper<AbstractTwoMLS.PQClient>
+	let remote: ClientWrapper<AbstractTwoMLS.PQClient>
+
+	init() throws {
+		local = try .init()
+		remote = try .init()
+	}
+
+	@Test func replierSendsFirstAcceptorJoinsFromAnyFrame() throws {
+		let (localSession, _) = try local.client.reply(
+			remoteClientId: remote.clientId,
+			encodedRemoteKpkg: remote.currentInvitation.encodedKeyPackage
+		)
+		// The initial envelope is deliberately DROPPED: the replier's own app
+		// frames carry everything the acceptor needs.
+		let prep = try #require(try localSession.prepareToEncrypt(proposing: nil))
+		#expect(prep.proposalMessage.isEmpty)  // no-op round: nothing staged
+		#expect(!prep.didCommit)
+		let first = try localSession.encrypt(appMessage: Data("first".utf8))
+		_ = try localSession.prepareToEncrypt(proposing: nil)
+		let second = try localSession.encrypt(appMessage: Data("second".utf8))
+
+		// Frame 1 decodes as a fresh appWelcome whose staple delivers alongside
+		// the join — as the full typed sender message (the decrypt consumed its
+		// generation; this is the one copy).
+		let (remoteSession, stapled) = try remote.currentInvitation.receiveReply(
+			ciphertext: first.cipherText,
+			expecting: try local.clientId
+		)
+		#expect(stapled?.appMessageData == Data("first".utf8))
+		#expect(stapled?.senderClientId == (try local.clientId))
+
+		// Frame 2 shares the stable prefix, so it routes `.forward`; the spawned
+		// session acks the re-delivery and yields the stapled second message.
+		guard
+			case .forward(_, let decrypted) = try remote.currentInvitation.decodeHeader(
+				ciphertext: second.cipherText)
+		else { throw TestErrors.unexpected }
+		let delivered = try #require(try remoteSession.forwarded(headerDecrypted: decrypted))
+		#expect(delivered.appMessageData == Data("second".utf8))
+
+		// Garbage at the forward entry fails open (nil), never as a fatal error.
+		#expect(try remoteSession.forwarded(headerDecrypted: Data([0xFF, 0x01])) == nil)
+
+		// The acceptor's reply establishes the replier; the exchange continues on
+		// the normal message path.
+		try remoteSession.send(to: localSession)
+		try localSession.exchange(with: remoteSession)
 	}
 }
 
@@ -407,7 +467,7 @@ struct SessionArchiveDemo {
 struct CipherSuiteParsingTests {
 	@Test func combinerKeyPackageReportsItsPqSuite() throws {
 		let invitation = try AbstractTwoMLS.PQInvitation(
-			archive: try AbstractTwoMLS.PQClient(clientId: .mock()).makeInvitation()
+			persisted: try AbstractTwoMLS.PQClient(clientId: .mock()).makeInvitation()
 		)
 		let suite = try #require(
 			AbstractTwoMLS.PQClient.parseKeyPackageSuite(
@@ -447,9 +507,9 @@ struct InitiatorIdentityBindingDemo {
 				theirKeyPackageMessage: acceptor.currentInvitation.encodedKeyPackage,
 				appWelcome: Data("welcome".utf8)
 			)
-			Issue.record("expected remoteIdentityMismatch")
-		} catch TwoMLSPQConformanceError.remoteIdentityMismatch {
-			// expected
+			Issue.record("expected .identityMismatch")
+		} catch {  // createTwoMLSGroup is throws(SessionError) — error is typed
+			#expect(error.code == .identityMismatch)
 		}
 	}
 }
@@ -514,9 +574,56 @@ struct ProposalBindingDemo {
 		#expect(prep.proposalHash == offered.digest)
 		#expect(prep.proposalHash.type == .sha256)
 
-		//the receiver's ordering context equals its own proposalContext (sha256 of
-		//its recv group's classical group id) — self-consistent across surfaces
-		#expect(offered.context == localSession.proposalContext)
+		//v14: the raw staged proposal bytes are exposed so the ADOPTER digests
+		//them itself (anchor agent-handoff signing) — an app-side sha256 over
+		//proposalMessage must equal both the crate's proposalHash and the
+		//receiver's independently derived digest
+		#expect(!prep.proposalMessage.isEmpty)
+		let appSideDigest = TypedDigest(prefix: .sha256, over: prep.proposalMessage)
+		#expect(appSideDigest == prep.proposalHash)
+		#expect(appSideDigest == offered.digest)
+
+		//the receiver's ordering context equals the SENDER's proposalContext — the
+		//contract that gates handoff validation, since the sender signs its handoff
+		//against that value and the receiver validates against this one. Asserting
+		//the RECEIVER's own proposalContext here only restated the receiver's view
+		//of itself: the two endpoints' recv groups are distinct MLS groups (ours is
+		//the peer's send group), so that comparison passed only while the binding
+		//was wrong. TwoMLSPQ v0.4.1 binds the queued context to the send group —
+		//the reverse channel, which is the sender's recv group.
+		#expect(offered.context == remoteSession.proposalContext)
+	}
+}
+
+//Group-id surface coherence: the acceptor's receive group IS the group the
+//initiator created (classical half), so an adopter can bind the id it reads off
+//its fresh session (shouldListenOn) into a signed welcome envelope and the peer
+//can verify it post-join via receiveGroupId — the card role's envelope check.
+struct GroupIdSurfaceDemo {
+	let local: ClientWrapper<AbstractTwoMLS.PQClient>
+	let remote: ClientWrapper<AbstractTwoMLS.PQClient>
+
+	init() throws {
+		local = try .init()
+		remote = try .init()
+	}
+
+	@Test func receiveGroupIdMatchesPeerSendGroup() throws {
+		let (localSession, sealed) = try local.client.reply(
+			remoteClientId: remote.clientId,
+			encodedRemoteKpkg: remote.currentInvitation.encodedKeyPackage
+		)
+		let (remoteSession, _) = try remote.currentInvitation.receiveReply(
+			ciphertext: sealed,
+			expecting: try local.clientId
+		)
+		//the acceptor joined the initiator's send group as its receive group
+		#expect(try remoteSession.receiveGroupId == localSession.shouldListenOn().0)
+		//the initiator has no receive group until the stapled return welcome lands
+		#expect(localSession.receiveGroupId == nil)
+
+		try remoteSession.send(to: localSession)  //first frame staples; local joins
+		#expect(try localSession.receiveGroupId == remoteSession.shouldListenOn().0)
 	}
 }
 
@@ -568,7 +675,7 @@ extension AbstractTwoMLS.Invitation {
 		ciphertext: Data,
 		expecting remoteClientId: AbstractTwoMLS.ClientID,
 		newClientId: AbstractTwoMLS.ClientID = .mock()
-	) throws -> (Session, Data?) {
+	) throws -> (Session, Session.MLSSenderMessage?) {
 		let headerDecrypted = try decodeHeader(
 			ciphertext: ciphertext
 		)
@@ -602,6 +709,46 @@ extension AbstractTwoMLS.Invitation {
 }
 
 extension AbstractTwoMLS.Session {
+	/// Phase 8 classical rotation — the contract v9+ candidate lifecycle, mirroring
+	/// the crate's `rotate_round` test helper. The rotating party's frame CARRIES the
+	/// staged candidate as its Upd proposal (the proposer never commits its own
+	/// rotation); the peer's approval (`queueProposal`) plus commit defines the
+	/// canonical next credential; the staple back canonicalizes this side onto it
+	/// (including the session-client swap).
+	func rotate(
+		to newClientId: AbstractTwoMLS.ClientID,
+		peer: some AbstractTwoMLS.Session
+	) throws {
+		// Propose: no commit rides this frame.
+		_ = try prepareToEncrypt(proposing: newClientId)
+		let frame = try encrypt(appMessage: Data("rotate".utf8))
+		let got = try peer.processIncoming(ciphertext: frame.cipherText).tryUnwrap
+		let offered = try got.proposal.tryUnwrap
+		guard offered.proposing == newClientId else { throw TestErrors.unexpected }
+		// Approve + commit: the peer's commit folds the Upd and defines the
+		// canonical next credential. Approval populates the tally (M6 truth
+		// surface); the commit consumes it.
+		try peer.queueProposal(digest: offered.digest)
+		guard peer.queuedRemoteSuccessor == newClientId else {
+			throw TestErrors.unexpected
+		}
+		let prepared = try peer.prepareToEncrypt(proposing: nil).tryUnwrap
+		guard prepared.didCommit, prepared.commitedRemoteClientId == newClientId
+		else { throw TestErrors.unexpected }
+		guard peer.theirPrincipalState == .sync(newClientId) else {
+			throw TestErrors.unexpected
+		}
+		let back = try peer.encrypt(appMessage: Data("canonicalize".utf8))
+		// The staple back canonicalizes the rotating side onto the new principal —
+		// remoteCommit is the one-shot hint; the principal state is the truth.
+		let confirmed = try processIncoming(ciphertext: back.cipherText).tryUnwrap
+		guard confirmed.remoteCommit?.newRecipient == newClientId
+		else { throw TestErrors.unexpected }
+		guard myPrincipalState == .sync(newClientId) else {
+			throw TestErrors.unexpected
+		}
+	}
+
 	func exchange(with remote: some AbstractTwoMLS.Session) throws {
 		try send(to: remote)
 		try remote.send(to: self)

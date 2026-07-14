@@ -19,26 +19,28 @@ struct PQInvitationReceiveTests {
 	@Test func receiveEstablishesSession() throws {
 		// Acceptor: abstract client publishes an invitation, restored from its archive.
 		let invitation = try AbstractTwoMLS.PQInvitation(
-			archive: try AbstractTwoMLS.PQClient(clientId: .mock()).makeInvitation()
+			persisted: try AbstractTwoMLS.PQClient(clientId: .mock()).makeInvitation()
 		)
 
 		// Initiator (raw FFI): decode the acceptor's opaque published key package
-		// and form the send group. The initiator cannot encrypt until both groups
-		// are established, so there is no stapled message at receive time.
+		// and form the send group. These tests deliver the PLAINTEXT welcome
+		// (`initialWelcome`) with no app envelope and no staple — the bare two-step
+		// receive path; the enveloped/stapled §A.1 flow is ReplierFirstDemo's.
 		let initiator = try TwoMlsPqPrincipal(clientId: AbstractTwoMLS.ClientID.mock())
 		let acceptorPair = try decodeCombinerKeyPackage(bytes: invitation.encodedKeyPackage)
 		let initiatorSession = try TwoMlsPqSession.initiate(
 			client: initiator,
-			theirKeyPackage: acceptorPair
+			theirKeyPackage: acceptorPair,
+			appBinding: nil
 		)
-		let welcome = try #require(initiatorSession.pendingOutbound())
+		let welcome = try #require(initiatorSession.initialWelcome())
 
 		// The initiator's own published key package (for the bound return group). Uses the
 		// retaining generate path — the initiator's live session joins the return welcome
 		// through its own client store, unlike an invitation-held key package.
 		let initiatorKp = try initiator.generateCombinerKeyPackage()
 
-		let (acceptorSession, plaintext) = try invitation.receive(
+		let (acceptorSession, stapled) = try invitation.receive(
 			sendGroupWelcome: welcome,
 			remoteKeyPackage: encodeCombinerKeyPackage(keyPackage: initiatorKp),
 			remoteClientId: initiator.clientId().bytes,
@@ -46,7 +48,7 @@ struct PQInvitationReceiveTests {
 			stapledMessage: nil,
 			newClientId: .mock()
 		)
-		#expect(plaintext == nil)
+		#expect(stapled == nil)
 
 		// Complete establishment: the acceptor's first frame staples its return
 		// welcome; the initiator processes it in-band.
@@ -69,16 +71,17 @@ struct PQInvitationReceiveTests {
 
 	@Test func receiveRejectsDuplicateRemote() throws {
 		let invitation = try AbstractTwoMLS.PQInvitation(
-			archive: try AbstractTwoMLS.PQClient(clientId: .mock()).makeInvitation()
+			persisted: try AbstractTwoMLS.PQClient(clientId: .mock()).makeInvitation()
 		)
 
 		let initiator = try TwoMlsPqPrincipal(clientId: AbstractTwoMLS.ClientID.mock())
 		let acceptorPair = try decodeCombinerKeyPackage(bytes: invitation.encodedKeyPackage)
 		let initiatorSession = try TwoMlsPqSession.initiate(
 			client: initiator,
-			theirKeyPackage: acceptorPair
+			theirKeyPackage: acceptorPair,
+			appBinding: nil
 		)
-		let welcome = try #require(initiatorSession.pendingOutbound())
+		let welcome = try #require(initiatorSession.initialWelcome())
 		let initiatorKp = encodeCombinerKeyPackage(
 			keyPackage: try initiator.generateCombinerKeyPackage()
 		)
@@ -94,7 +97,7 @@ struct PQInvitationReceiveTests {
 		)
 
 		// A transport re-delivery of the same welcome is dropped.
-		#expect(throws: TwoMlsPqError.DuplicateWelcome) {
+		do {
 			_ = try invitation.receive(
 				sendGroupWelcome: welcome,
 				remoteKeyPackage: initiatorKp,
@@ -103,21 +106,26 @@ struct PQInvitationReceiveTests {
 				stapledMessage: nil,
 				newClientId: .mock()
 			)
+			Issue.record("expected .duplicateWelcome")
+		} catch {  // receive is throws(SessionError) — error is typed
+			#expect(error.code == .duplicateWelcome)
+			#expect(error.disposition == .discardFrame)
 		}
 	}
 
 	@Test func receiveRejectsMismatchedIdentity() throws {
 		let invitation = try AbstractTwoMLS.PQInvitation(
-			archive: try AbstractTwoMLS.PQClient(clientId: .mock()).makeInvitation()
+			persisted: try AbstractTwoMLS.PQClient(clientId: .mock()).makeInvitation()
 		)
 
 		let initiator = try TwoMlsPqPrincipal(clientId: AbstractTwoMLS.ClientID.mock())
 		let acceptorPair = try decodeCombinerKeyPackage(bytes: invitation.encodedKeyPackage)
 		let initiatorSession = try TwoMlsPqSession.initiate(
 			client: initiator,
-			theirKeyPackage: acceptorPair
+			theirKeyPackage: acceptorPair,
+			appBinding: nil
 		)
-		let welcome = try #require(initiatorSession.pendingOutbound())
+		let welcome = try #require(initiatorSession.initialWelcome())
 		let initiatorKp = encodeCombinerKeyPackage(
 			keyPackage: try initiator.generateCombinerKeyPackage()
 		)
@@ -132,9 +140,59 @@ struct PQInvitationReceiveTests {
 				stapledMessage: nil,
 				newClientId: .mock()
 			)
-			Issue.record("expected remoteIdentityMismatch")
-		} catch TwoMLSPQConformanceError.remoteIdentityMismatch {
-			// expected
+			Issue.record("expected .identityMismatch")
+		} catch {  // receive is throws(SessionError) — error is typed
+			// M4: the wrapper's own key-package guard and the crate's
+			// RemoteIdentityMismatch both surface as one code.
+			#expect(error.code == .identityMismatch)
+			#expect(error.disposition == .rejectEstablishment)
 		}
+	}
+
+	/// An empty dedicated-principal id is rejected BEFORE any invitation state is
+	/// claimed: the same welcome then succeeds on retry with a valid id. (Staging
+	/// used to run after `base.receive`, so this failure orphaned the established
+	/// session and burned the welcome — retry got `DuplicateWelcome`.)
+	@Test func receiveRejectsEmptyDedicatedPrincipalBeforeConsuming() throws {
+		let invitation = try AbstractTwoMLS.PQInvitation(
+			persisted: try AbstractTwoMLS.PQClient(clientId: .mock()).makeInvitation()
+		)
+
+		let initiator = try TwoMlsPqPrincipal(clientId: AbstractTwoMLS.ClientID.mock())
+		let acceptorPair = try decodeCombinerKeyPackage(bytes: invitation.encodedKeyPackage)
+		let initiatorSession = try TwoMlsPqSession.initiate(
+			client: initiator,
+			theirKeyPackage: acceptorPair,
+			appBinding: nil
+		)
+		let welcome = try #require(initiatorSession.initialWelcome())
+		let initiatorKp = encodeCombinerKeyPackage(
+			keyPackage: try initiator.generateCombinerKeyPackage()
+		)
+		let token = AbstractTwoMLS.WelcomeToken(TypedDigest(prefix: .sha256, over: welcome))
+
+		do {
+			_ = try invitation.receive(
+				sendGroupWelcome: welcome,
+				remoteKeyPackage: initiatorKp,
+				remoteClientId: initiator.clientId().bytes,
+				welcomeToken: token,
+				stapledMessage: nil,
+				newClientId: Data()
+			)
+			Issue.record("expected .invalidClientId")
+		} catch {  // receive is throws(SessionError) — error is typed
+			#expect(error.code == .invalidClientId)
+		}
+
+		// Nothing was consumed: the identical welcome establishes on retry.
+		_ = try invitation.receive(
+			sendGroupWelcome: welcome,
+			remoteKeyPackage: initiatorKp,
+			remoteClientId: initiator.clientId().bytes,
+			welcomeToken: token,
+			stapledMessage: nil,
+			newClientId: .mock()
+		)
 	}
 }

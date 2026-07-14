@@ -5,15 +5,24 @@ import PackageDescription
 
 let package = Package(
 	name: "AbstractTwoMLS",
+	// Import/link floors. The PQ backend's ML-KEM paths additionally require
+	// OS 26 (CryptoKit ML-KEM-768) at RUNTIME — that floor applies only to
+	// calling the PQ API, not to importing or linking this package.
 	platforms: [.iOS(.v17), .macOS(.v15)],
 	products: [
-		// Vend the abstraction plus each concrete UniFFI wrapper. The wrappers must be
-		// separate modules: each imports its own `*FFI` C module, and both FFI modules
-		// declare a C `RustBuffer` / `ForeignBytes` / `RustCallStatus` — ambiguous if
-		// imported into one Swift module.
+		// Vend ONLY the abstraction. The concrete UniFFI wrapper modules stay
+		// internal targets (they still link transitively): uniffi stamps its
+		// interface classes `@unchecked Sendable` (Rust Send+Sync, lock-serialized
+		// — memory-safe but with no ordering guarantees), so exposing them would
+		// hand consumers a freely-shareable session handle and defeat the
+		// deliberately non-Sendable wrapper types, which are the only supported
+		// session handles. The wrappers also must remain separate MODULES from
+		// each other: each imports its own `*FFI` C module, and both FFI modules
+		// declare a C `RustBuffer` / `ForeignBytes` / `RustCallStatus` —
+		// ambiguous if imported into one Swift module.
 		.library(
 			name: "AbstractTwoMLS",
-			targets: ["AbstractTwoMLS", "TwoMLSPQ"]
+			targets: ["AbstractTwoMLS"]
 		)
 	],
 	dependencies: [
@@ -66,13 +75,20 @@ let package = Package(
 			// binary + binding MUST come from the same build (see above). Keep that
 			// swap uncommitted.
 			// path: "../TwoMLSPQ/buildIos/TwoMLSPQ.xcframework"
+			//
+			// NOTE: tags are v-prefixed from v0.0.13 on (changesets); each release also
+			// publishes this checksum as the TwoMLSPQ.xcframework.zip.checksum asset.
 			url:
-				"https://github.com/germ-network/TwoMLSPQ/releases/download/0.0.10/TwoMLSPQ.xcframework.zip",
-			checksum: "f83f43d1d35afadcfc9adbadae290b6c83209c9c53e6680fcaa4d243108a3acf"
+				"https://github.com/germ-network/TwoMLSPQ/releases/download/v0.4.1/TwoMLSPQ.xcframework.zip",
+			checksum: "2a11b1fea558c2b155e01cc49a20f3b7855c53fab23d4c01c41da87900bcf17c"
 		),
 		.testTarget(
 			name: "AbstractTwoMLSTests",
-			dependencies: ["AbstractTwoMLS", "MLSrsClassic"]
+			// TwoMLSPQ is named explicitly: the tests exercise the concrete
+			// backend directly (in-package target imports are unaffected by the
+			// product narrowing above — external consumers can import only
+			// AbstractTwoMLS).
+			dependencies: ["AbstractTwoMLS", "TwoMLSPQ", "MLSrsClassic"]
 		),
 	],
 	swiftLanguageModes: [.v6]
