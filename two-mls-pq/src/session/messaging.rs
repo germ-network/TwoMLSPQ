@@ -1301,14 +1301,17 @@ impl TwoMlsPqSession {
         })
     }
 
-    /// Acknowledge a replayed initial frame routed here by the invitation's forward
-    /// table. `spawn_token` is the caller's opaque identifier for the frame (the same
-    /// value it computes for `TwoMlsPqInvitation::forward_group_id`); it must equal the
-    /// token this session was spawned under. Returns `Ok(None)`: a PQ initiator cannot
-    /// staple a private message pre-establishment, so a replay of the initial frame
-    /// never carries an undelivered payload. A mismatched token is a mis-route
-    /// (`DecryptionFailed`); initiator-side sessions have no spawn token and refuse
-    /// (`SessionNotReady`).
+    /// Acknowledge a re-delivered pre-establishment frame routed here by the
+    /// invitation's forward table. `spawn_token` is the caller's opaque identifier for
+    /// the frame (the same value it computes for
+    /// `TwoMlsPqInvitation::forward_group_id`); it must equal the token this session
+    /// was spawned under. Returns `Ok(None)` always: this call only validates the
+    /// routing — since §A.1 replier-first sends (contract 16) every pre-establishment
+    /// frame staples the sender's CURRENT app message, but the staple rides the
+    /// envelope itself; the host parses it out (`decode_initial_plaintext`) and
+    /// delivers it through `process_incoming` — nothing is parked here. A mismatched
+    /// token is a mis-route (`DecryptionFailed`); initiator-side sessions have no
+    /// spawn token and refuse (`SessionNotReady`).
     pub fn forwarded(&self, spawn_token: Vec<u8>) -> Result<Option<MlsSenderMessage>> {
         let inner = self.lock();
         let expected = inner
