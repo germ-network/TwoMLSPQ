@@ -4,7 +4,7 @@
 //
 //  Pins the SessionError contract: the abstract surface throws ONE type; every
 //  backend error maps to a stable code with the documented disposition; and the
-//  translation is total over the 21 TwoMlsPqError cases (a binding bump that
+//  translation is total over the 22 TwoMlsPqError cases (a binding bump that
 //  adds a case fails compilation in SessionError+TwoMLSPQ.swift, and this
 //  totality test catches a silent remapping of an existing one).
 //
@@ -37,6 +37,7 @@ struct ErrorContractTests {
 			(.cipherSuiteMismatch, .rejectEstablishment),
 			(.invalidKeyPackage, .rejectEstablishment),
 			(.apqInfoMismatch, .rejectEstablishment),
+			(.appBindingMismatch, .rejectEstablishment),
 			(.unexpectedWelcome, .rejectEstablishment),
 			(.misroutedFrame, .callerBug),
 			(.sequenceViolation, .callerBug),
@@ -55,7 +56,7 @@ struct ErrorContractTests {
 		}
 	}
 
-	// MARK: Totality over the 21 TwoMlsPqError cases
+	// MARK: Totality over the 22 TwoMlsPqError cases
 
 	/// Every crate case, mapped at a neutral surface. `SessionNotReady` is
 	/// surface-dependent and covered separately below.
@@ -81,8 +82,9 @@ struct ErrorContractTests {
 			(.CredentialRejected, .credentialRejected),
 			(.ApqInfoMismatch, .apqInfoMismatch),
 			(.SinkAlreadyInstalled, .sinkAlreadyInstalled),
+			(.AppBindingMismatch, .appBindingMismatch),
 		]
-		#expect(expected.count == 20)  // + SessionNotReady (per-surface) = 21 cases
+		#expect(expected.count == 21)  // + SessionNotReady (per-surface) = 22 cases
 		for (crate, code) in expected {
 			let mapped = AbstractTwoMLS.SessionError(pqError: crate, at: .client)
 			#expect(mapped.code == code, "\(crate) -> \(mapped.code)")

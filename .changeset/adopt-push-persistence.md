@@ -22,8 +22,10 @@ BREAKING for conformers and callers:
   invitations stay monolithic and restore from bytes; `makeInvitation` still
   mints pull bytes (the object doesn't exist yet).
 
-Persisted state is NOT portable (`SESSION_ARCHIVE_VERSION` → 9,
-`INVITATION_VERSION` → 3) — regenerate all persisted sessions and invitations.
+Persisted state is NOT portable — regenerate all persisted sessions and
+invitations. (This adoption bumped `SESSION_ARCHIVE_VERSION` → 9 /
+`INVITATION_VERSION` → 3; contract 16 later reset both ladders to 1 — the
+§A.1 replier-first changeset carries the final pin, TwoMLSPQ v0.4.1.)
 
 germDM migration: implement `PersistenceSink` (two atomic slots, sealed);
 `installSink` after construction/restore; restore sessions via
