@@ -1187,6 +1187,37 @@ fn test_pq_ratchet_bind_guarded_while_commit_staged() {
     assert_eq!(assert_ok!(bob.pq_ratchet_apply(bind)), b"app");
 }
 
+/// A.4's bind calls the same `bind_with_secret` as A.3's, so it carries the identical
+/// hazard: a prepared-but-unsent classical commit is sitting in `current_staple` waiting for
+/// its `encrypt`, and the bind's commit would silently displace it. A displaced commit never
+/// rides a frame again, so the peer hits the epoch-ahead desync with zero loss on the wire.
+///
+/// A.3 guards this; A.4 did not. The exposure is worse here, because A.4's trigger is
+/// INBOUND: a host that prepares a round and then receives the peer's welcome before its
+/// `encrypt` hits this without doing anything wrong, and the ordering is not its to control.
+#[test]
+fn test_pq_bootstrap_bind_guarded_while_commit_staged() {
+    let (alice, bob) = establish_confirmed_sessions();
+    let kp = assert_ok!(alice.pq_bootstrap_begin(None));
+    assert_ok!(bob.pq_bootstrap_respond(kp));
+    let welcome = assert_some!(bob.pq_pending_outbound(SideBandSealing::Fresh));
+
+    assert_ok!(alice.prepare_to_encrypt(None));
+    assert_err!(
+        alice.pq_bootstrap_bind(welcome.clone(), Vec::new()),
+        TwoMlsPqError::SessionNotReady
+    );
+
+    // Retriable, and the refusal cost nothing: the guard sits above the persist choke point,
+    // so the round is untouched and the welcome still good once the encrypt has gone out.
+    let enc = assert_ok!(alice.encrypt(b"round".to_vec()));
+    assert_some!(assert_ok!(bob.process_incoming(enc.cipher_text)));
+    assert_ok!(alice.pq_bootstrap_bind(welcome, Vec::new()));
+    let bind = assert_some!(alice.pq_pending_outbound(SideBandSealing::Fresh));
+    assert_ok!(bob.pq_bootstrap_apply(bind));
+    assert!(alice.is_fully_established());
+}
+
 #[test]
 fn test_message_frame_overtaking_bind_fails_retriably() {
     let (alice, bob) = establish_full();

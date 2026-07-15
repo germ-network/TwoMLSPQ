@@ -975,6 +975,25 @@ impl TwoMlsPqSession {
             {
                 return Err(TwoMlsPqError::DuplicateSideBand);
             }
+            // Staple-stacking guard, as `pq_ratchet_bind` has: a prepared-but-unsent classical
+            // commit is sitting in `current_staple` waiting for its `encrypt`, and the bind
+            // commit below would replace it. A displaced commit never rides a frame again, so
+            // the peer hits the epoch-ahead desync with zero loss on the wire. Retriable: bind
+            // after `encrypt`.
+            //
+            // A.4 shares `bind_with_secret` with A.3, so it always had A.3's hazard — in a
+            // sharper form. A.3's trigger is a CT the host asked for; A.4's is an INBOUND
+            // welcome, so a host that prepares a round and then receives it before its
+            // `encrypt` arrives here without having done anything wrong, and the ordering is
+            // not its to control.
+            //
+            // Ordered after the duplicate check, where A.3 puts its guard first: a re-sent
+            // welcome for a round we already closed is a discard whatever our staple state is,
+            // and answering it with a retriable SessionNotReady would invite the host to retry
+            // a round that is over.
+            if inner.pending_proposal_hash.is_some() {
+                return Err(TwoMlsPqError::SessionNotReady);
+            }
             pq_welcome
         };
         self.mutate_and_persist(crate::BlobKind::Checkpoint, |inner| {

@@ -91,7 +91,13 @@ Three things fall out:
   first cut of this change added is gone.
 
 `pq_bootstrap_apply` now means the RESPONDER's leg-4 apply and returns the stapled app, as
-`pq_ratchet_apply` does; the initiator's join-and-bind is `pq_bootstrap_bind`. The old
+`pq_ratchet_apply` does; the initiator's join-and-bind is `pq_bootstrap_bind`. Like
+`pq_ratchet_bind`, it refuses with `SessionNotReady` while a prepared-but-unsent classical
+commit is staged — the bind's own commit would displace one that has never ridden a frame,
+and the peer would then hit `EpochDesync` with nothing lost on the wire. Retriable: bind
+after the round's `encrypt`. The exposure is sharper than A.3's, whose trigger the host asks
+for: A.4's is an INBOUND welcome, so a host that prepares a round and then receives it before
+its `encrypt` meets this without having done anything wrong. The old
 `PQ_BOOTSTRAP_BIND` tag is renamed `PQ_BOOTSTRAP_WELCOME` — it has always carried a welcome,
 and the bind name goes to the frame that earns it.
 
