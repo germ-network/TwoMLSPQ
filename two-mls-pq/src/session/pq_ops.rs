@@ -74,7 +74,7 @@ impl TwoMlsPqSession {
             // carrier, and losing it strands the round — `pq_inflight` blocks a re-begin
             // and nothing else can re-emit the ephemeral's public half. Seeding the seal
             // cache keeps a Stable hand-out byte-identical to what we return here.
-            inner.retain_side_band(msg, &sealed);
+            inner.pending_side_band = Some(RetainedFrame::seeded(msg, &sealed));
             Ok(sealed)
         })
     }
@@ -87,7 +87,7 @@ impl TwoMlsPqSession {
         // a full-Checkpoint push for a no-op. Frame validation comes first to preserve the
         // precedence a stranger's blob is rejected as `Mls` before the state is consulted.
         let ek = {
-            let inner = self.lock();
+            let mut inner = self.lock();
             let ek_msg = inner.open_or_raw(ek_msg);
             let (&tag, ek) = ek_msg.split_first().ok_or(TwoMlsPqError::Mls)?;
             if tag != PQ_EK_TAG {
@@ -116,7 +116,7 @@ impl TwoMlsPqSession {
             let mut msg = vec![PQ_CT_TAG];
             msg.extend_from_slice(&ct);
             // Replaces the previous round's terminal frame, if any.
-            inner.pending_pq_outbound = Some(msg);
+            inner.pending_side_band = Some(RetainedFrame::unsealed(msg));
             Ok(())
         })
     }
@@ -132,7 +132,7 @@ impl TwoMlsPqSession {
         // a Checkpoint — and, crucially, never reaches the `take` that would consume a held
         // ephemeral or the `remember_send_psk` that mutates.
         let ct = {
-            let inner = self.lock();
+            let mut inner = self.lock();
             let ct_msg = inner.open_or_raw(ct_msg);
             let (&tag, ct) = ct_msg.split_first().ok_or(TwoMlsPqError::Mls)?;
             if tag != PQ_CT_TAG {
@@ -230,7 +230,19 @@ impl TwoMlsPqSession {
             inner.current_staple_seq = inner.state_seq;
             // Our operation is complete once the peer applies; the turn passes.
             inner.pq_turn_mine = false;
-            inner.pending_pq_outbound = Some(encode_pq_bind(pq_commit, cl_commit, app_ct));
+            // TERMINAL: the round ends here for us — the peer applies and the turn flips,
+            // with no inbound of our own to retire this. Stamp CLASSICAL: the bind advanced
+            // both epochs, and the peer's ordinary message frames seal classically, so they
+            // are the fastest proof it landed.
+            let bind_retires_at = inner
+                .send_group
+                .as_ref()
+                .map(|g| g.classical.current_epoch())
+                .unwrap_or(0);
+            inner.pending_side_band = Some(
+                RetainedFrame::unsealed(encode_pq_bind(pq_commit, cl_commit, app_ct))
+                    .retiring_at(HeaderFamily::Classical, bind_retires_at),
+            );
             // The bind committed classically in our send group — capture the new
             // epoch's listen address — and advanced our send-PQ's pq_epoch — capture its
             // new header key.
@@ -250,7 +262,7 @@ impl TwoMlsPqSession {
         // before any KEM/turn state is consulted; the closure still `take`s the (now guaranteed
         // `Responding`) inflight state.
         let (pq_commit, cl_commit, app_ct) = {
-            let inner = self.lock();
+            let mut inner = self.lock();
             let bind_msg = inner.open_or_raw(bind_msg);
             let decoded = decode_pq_bind(&bind_msg)?;
             match inner.pq_inflight {
@@ -333,7 +345,7 @@ impl TwoMlsPqSession {
             // Our part in the round is over: drop the retained CT so the side-band falls
             // silent until we open the next round. The peer's bind landed, which is the
             // only acknowledgement its CT needed.
-            inner.pending_pq_outbound = None;
+            inner.pending_side_band = None;
             out
         })
     }
@@ -409,7 +421,7 @@ impl TwoMlsPqSession {
             let sealed = inner.seal_side_band(&msg)?;
             inner.pq_inflight = Some(PqInflight::RekeyInitiated { rotating });
             // Retain for re-send (see `pq_ratchet_begin`): a lost Upd' strands the rekey.
-            inner.retain_side_band(msg, &sealed);
+            inner.pending_side_band = Some(RetainedFrame::seeded(msg, &sealed));
             Ok(sealed)
         })
     }
@@ -429,7 +441,7 @@ impl TwoMlsPqSession {
         // Guard-first (see `pq_ratchet_begin`): check the slot/inflight state and validate the
         // frame before the persist choke point, so a replayed or ill-timed Upd' is a no-op.
         let proposal_msg = {
-            let inner = self.lock();
+            let mut inner = self.lock();
             let upd_msg = inner.open_or_raw(upd_msg);
             let (&tag, proposal_bytes) = upd_msg.split_first().ok_or(TwoMlsPqError::Mls)?;
             if tag != PQ_REKEY_UPD_TAG {
@@ -538,7 +550,10 @@ impl TwoMlsPqSession {
                     .map_err(|_| TwoMlsPqError::Mls)?
             };
             inner.pq_inflight = Some(PqInflight::RekeyResponded);
-            inner.pending_pq_outbound = Some(encode_pq_rekey_commit(commit_bytes, counter));
+            inner.pending_side_band = Some(RetainedFrame::unsealed(encode_pq_rekey_commit(
+                commit_bytes,
+                counter,
+            )));
             // Our send-PQ's pq_epoch advanced (updatePath commit) — capture its new key.
             inner.record_pq_header_key()?;
             Ok(rotated)
@@ -556,7 +571,7 @@ impl TwoMlsPqSession {
         // choke point (a pure read of the inflight state) and decode the frame here. The closure
         // still `take`s the (now guaranteed rekey) inflight state below.
         let (commit_bytes, counter_bytes) = {
-            let inner = self.lock();
+            let mut inner = self.lock();
             let msg = inner.open_or_raw(msg);
             let decoded = decode_pq_rekey_commit(&msg)?;
             if !matches!(
@@ -722,7 +737,18 @@ impl TwoMlsPqSession {
                     }
                     // Our operation completes once the peer applies; the turn passes.
                     inner.pq_turn_mine = false;
-                    inner.pending_pq_outbound = Some(encode_pq_rekey_commit(commit2, Vec::new()));
+                    // TERMINAL, and PQ-only (A.5 never touches the classical group), so
+                    // only a peer SIDE-BAND frame can confirm it — the peer's next round.
+                    let retires_at = inner
+                        .send_group
+                        .as_ref()
+                        .and_then(|g| g.pq.as_ref())
+                        .map(|pq| pq.current_epoch())
+                        .unwrap_or(0);
+                    inner.pending_side_band = Some(
+                        RetainedFrame::unsealed(encode_pq_rekey_commit(commit2, Vec::new()))
+                            .retiring_at(HeaderFamily::Pq, retires_at),
+                    );
                     // Our send-PQ's pq_epoch advanced (the counter-Upd' commit) — capture it.
                     inner.record_pq_header_key()?;
                     Ok(true)
@@ -759,7 +785,7 @@ impl TwoMlsPqSession {
                     inner.pq_turn_mine = true;
                     // Our part in the rekey is over (see `pq_ratchet_apply`): drop the
                     // retained Commit' so the side-band falls silent until the next round.
-                    inner.pending_pq_outbound = None;
+                    inner.pending_side_band = None;
                     Ok(false)
                 }
                 // Unreachable: the guard at the top of this function admits only the two
@@ -782,14 +808,19 @@ impl TwoMlsPqSession {
         self.lock().pq_turn_mine
     }
 
-    /// The current round's outbound side-band frame, sealed, WITHOUT consuming it — the
-    /// side-band analogue of re-stapling `current_staple` onto every message frame. `None`
-    /// when the side-band is quiescent (no round in flight), which is what lets a host send
-    /// a bare message.
+    /// The outbound side-band frames in flight, sealed, WITHOUT consuming them — the
+    /// side-band analogue of re-stapling `current_staple` onto every message frame. EMPTY
+    /// when the side-band is quiescent, which is what lets a host send a bare message.
     ///
-    /// Call it on every send for as long as it returns `Some`: a side-band frame is the
+    /// Zero, one, or TWO frames: A.4 runs concurrently with A.3/A.5 and has its own slot,
+    /// so a bootstrap can be in flight while a ratchet round is open. Send them all — they
+    /// are independent, and one is not a substitute for the other. Bootstrap comes first
+    /// (it is establishment, and the frame nothing else can re-emit), but a host is free to
+    /// order the wire as it likes; the receiver's two doors are order-independent.
+    ///
+    /// Call it on every send for as long as it returns anything: a side-band frame is the
     /// only carrier of its PQ half, so re-sending is how a dropped one heals (see
-    /// [`SessionInner::pending_pq_outbound`]). Duplicates are benign discards on the
+    /// [`SessionInner::pending_side_band`]). Duplicates are benign discards on the
     /// receiver, so over-sending is safe where under-sending stalls the ratchet.
     ///
     /// `sealing` picks the wire behaviour, and only the host can: [`SideBandSealing::Fresh`]
@@ -811,26 +842,12 @@ impl TwoMlsPqSession {
     /// tracks the CLASSICAL epoch that ordinary messaging advances: a `Stable` pass over that
     /// frame wants to finish inside the peer's classical header window. `Fresh` has no such
     /// constraint.
-    pub fn pq_pending_outbound(&self, sealing: SideBandSealing) -> Option<Vec<u8>> {
+    pub fn pq_pending_outbound(&self, sealing: SideBandSealing) -> Vec<Vec<u8>> {
         let mut inner = self.lock();
-        let frame = inner.pending_pq_outbound.clone()?;
-        match sealing {
-            SideBandSealing::Fresh => inner.seal_side_band(&frame).ok(),
-            SideBandSealing::Stable => {
-                // Serve the cache only if it sealed the frame we are actually holding —
-                // the frame moves on every step of the round, and a chunking host handed
-                // the seal of a superseded frame would emit a pass that reassembles into
-                // a stale one.
-                if let Some((sealed_frame, sealed)) = &inner.pq_outbound_seal {
-                    if *sealed_frame == frame {
-                        return Some(sealed.clone());
-                    }
-                }
-                let sealed = inner.seal_side_band(&frame).ok()?;
-                inner.pq_outbound_seal = Some((frame, sealed.clone()));
-                Some(sealed)
-            }
-        }
+        [SideBandSlot::Bootstrap, SideBandSlot::SideBand]
+            .into_iter()
+            .filter_map(|which| inner.hand_out(which, sealing))
+            .collect()
     }
 
     /// Consume the current round's side-band frame.
@@ -841,15 +858,17 @@ impl TwoMlsPqSession {
     /// request/response and accept that.
     pub fn pq_take_pending_outbound(&self) -> Option<Vec<u8>> {
         let mut inner = self.lock();
-        let frame = inner.pending_pq_outbound.take()?;
+        // Bootstrap first, matching the peek's order. A take-once host drains the slot as
+        // soon as its producing call returns, so only one is ever occupied on this path —
+        // the concurrency that forced two slots is a property of RETAINED frames.
+        let which = [SideBandSlot::Bootstrap, SideBandSlot::SideBand]
+            .into_iter()
+            .find(|&which| !inner.retire_if_spent(which))?;
+        let retained = inner.slot_mut(which).take()?;
         // Side-band frames seal under the PQ family (the responder is post-establishment,
         // so its recv-PQ group exists); the classical fallback in `seal_side_band` is
         // never hit here.
-        let out = inner.seal_side_band(&frame).ok();
-        // The frame is gone, so its cached seal has nothing left to describe. Dropping it is
-        // hygiene rather than correctness — a hand-out re-seals on a frame mismatch anyway —
-        // but it keeps the cache from outliving the frame it sealed.
-        inner.pq_outbound_seal = None;
+        let out = inner.seal_side_band(&retained.frame).ok();
         // The take advanced state — persist Core (a side-band frame changes no group).
         // Keyed on the take, like `pending_outbound`: an (unreachable) seal failure still
         // consumed the parked frame.
@@ -908,7 +927,9 @@ impl TwoMlsPqSession {
             // Retain for re-send (see `pq_ratchet_begin`). A lost KP' is the worst of the
             // three to strand: without A.4 the session never reaches full establishment,
             // and this frame is what the peer's deferred send-PQ half is built around.
-            inner.retain_side_band(msg, &sealed);
+            // Its OWN slot: A.4 runs concurrently with A.3, which shared this slot and
+            // evicted it.
+            inner.pending_bootstrap = Some(RetainedFrame::seeded(msg, &sealed));
             Ok(sealed)
         })
     }
@@ -925,7 +946,7 @@ impl TwoMlsPqSession {
         // bootstrap KP is a no-op rather than a full-Checkpoint push. The closure below assumes
         // these hold (sequential driving) and proceeds straight to standing up the group.
         let kp = {
-            let inner = self.lock();
+            let mut inner = self.lock();
             let kp_msg = inner.open_or_raw(kp_msg);
             let (&tag, kp) = kp_msg.split_first().ok_or(TwoMlsPqError::Mls)?;
             if tag != PQ_BOOTSTRAP_KP_TAG {
@@ -1002,7 +1023,17 @@ impl TwoMlsPqSession {
                 encode_bootstrap_bind(pq_welcome)
             };
             inner.pq_turn_mine = true;
-            inner.pending_pq_outbound = Some(frame);
+            // TERMINAL: nothing comes back for it. PQ-only, so it is retired by the peer's
+            // first PQ-sealed side-band frame — a key derivable only inside the group this
+            // welcome carried, which is exactly proof the peer joined.
+            let retires_at = inner
+                .send_group
+                .as_ref()
+                .and_then(|g| g.pq.as_ref())
+                .map(|pq| pq.current_epoch())
+                .unwrap_or(0);
+            inner.pending_bootstrap =
+                Some(RetainedFrame::unsealed(frame).retiring_at(HeaderFamily::Pq, retires_at));
             // Our send-PQ half now exists (Group_B.pq) — capture its header key so we can
             // open side-band frames the peer seals to it.
             inner.record_pq_header_key()?;
@@ -1019,7 +1050,7 @@ impl TwoMlsPqSession {
         // validate the welcome suite before the persist choke point, so a replayed or malformed
         // bootstrap bind is a no-op rather than a full-Checkpoint push.
         let pq_welcome = {
-            let inner = self.lock();
+            let mut inner = self.lock();
             let bind_msg = inner.open_or_raw(bind_msg);
             let pq_welcome = decode_bootstrap_bind(&bind_msg)?;
             // Validate the peer's PQ welcome suite before joining — an early, clear
@@ -1070,7 +1101,7 @@ impl TwoMlsPqSession {
             inner.pq_turn_mine = false;
             // A.4 is complete on our side: drop the retained KP'. Both halves are live now,
             // so nothing is left for it to heal.
-            inner.pending_pq_outbound = None;
+            inner.pending_bootstrap = None;
             Ok(())
         })
     }

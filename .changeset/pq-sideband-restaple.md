@@ -2,8 +2,6 @@
 "@germ-network/two-mls-pq": minor
 ---
 
-**DO NOT RELEASE YET — one open defect, see "Slot collision" at the bottom.**
-
 Retain the PQ side-band's in-flight frame so a host can re-send it.
 
 A side-band frame is the only carrier of its PQ half, and until now it was handed
@@ -60,35 +58,44 @@ that any single received frame heals the peer.
 Hosts that keep using `pq_take_pending_outbound` are unaffected: initiator frames
 are still returned as before, and taking still consumes.
 
-## Slot collision (open — needs a protocol decision before release)
+## Two slots, because A.4 is concurrent
 
-A.4 and A.3 are separate flows sharing ONE retained slot, so retention lets an A.3
-round evict an in-flight A.4's frame — and a bootstrap frame is irreplaceable, so
-losing it strands establishment for good. Take-once had no such collision: the slot
-only ever held responder frames and the host drained it immediately.
+A.3 and A.5 are mutually exclusive — every entry point gates on `pq_inflight`, so one
+round is open at a time and one slot serves both. A.4 does NOT gate on it and runs
+alongside them, so it gets its own: `pq_bootstrap_respond` parks its bind AND takes the
+turn, so the responder opening an A.3 round (its move, legitimately) shared the slot with
+an unfinished A.4 and evicted it. A BootstrapBind is irreplaceable — the peer's deferred
+PQ half is built from it and nothing else can re-emit it — so eviction stranded
+establishment for good, in a normal flow.
 
-Reachable in a NORMAL flow, not just a misbehaving one:
+`pq_pending_outbound` therefore returns a LIST: zero, one, or two frames, since a
+bootstrap can be in flight while a ratchet round is open. Send them all; they are
+independent. Bootstrap comes first, but the receiver's two doors are order-independent.
 
-1. Alice `pq_bootstrap_begin` → KP'.
-2. Bob `pq_bootstrap_respond` → parks the BootstrapBind **and takes the turn**.
-3. Bob, holding the turn, opens an A.3 round — legitimate; it is his move.
-4. The EK replaces the BootstrapBind. Alice can never complete A.4
-   (`pq_bootstrap_apply` fails `Mls`).
+## Terminal frames retire on the peer's application receipt
 
-The existing suite cannot see this: `establish_full` drives A.4 with
-`pq_take_pending_outbound`, which empties the slot, so no test drives A.4 through
-the peek this change asks hosts to adopt.
+A round's last frame — A.3's bind, A.4's BootstrapBind, A.5's final Commit′ — has no reply,
+so retention alone would re-send it forever, riding every message send.
 
-The root cause is that a TERMINAL frame has no retirement rule — its sender never
-learns it landed, so it lingers and collides. Three ways out, all protocol calls:
+The receipt was already on the wire and was being thrown away. We seal to the peer under
+OUR recv group, so the peer seals to us under ITS recv group — which is our SEND group — at
+the epoch it has actually applied. `recv_header_keys`' own doc said as much: "the peer seals
+frames to me under my send group (their recv group) *as they last applied it*". `try_open`
+iterated a map keyed by exactly that epoch and returned only the plaintext. It now returns
+the epoch and the window that matched, and a terminal frame carries the `(family, epoch)`
+that spends it.
 
-- **Give A.4 its own retained slot.** Honest (A.4 *is* a distinct one-time flow) and
-  it rides the archive like the existing one. Costs an API shape: two frames can then
-  be pending at once, so the peek must return a list rather than an `Option`.
-- **Retire a terminal frame on positive evidence the peer advanced** (e.g. their
-  post-bind epoch), rather than letting it linger. Fixes the general case, including
-  the initiator's lingering bind noted below.
-- **Order A.4 strictly before A.3.** Simplest, but it is a real protocol constraint
-  and the guard cannot live on `pq_ratchet_begin`: A.3 needs only the initiator's
-  send-PQ and the responder's recv-PQ, both of which predate A.4 (verified — eight
-  tests ratchet before A.4 today).
+Consequences worth knowing:
+
+- **The A.3 bind retires fast.** It advances both epochs, so it stamps CLASSICAL and any
+  ordinary message frame confirms it — and messages flow.
+- **A.4 and A.5 retire on a peer SIDE-BAND frame**, because both are PQ-only. A.5 is
+  deliberately so ("updatePath commits run on the PQ groups alone so the classical ratchet
+  is never blocked behind a large ML-KEM updatePath"), and welding it to a classical round
+  to get a faster receipt would reintroduce exactly that coupling. Accepted: the lingering
+  is bounded by the host's PQ cadence, not by the protocol.
+- **Unforgeable and free** — the key is derivable only inside the group at that epoch, and
+  it already rides every frame. No new wire bytes, no protocol change, and nothing that
+  could leak processing outcome.
+- **Monotone**: old epochs are retained so a lagging peer still lands, so a frame opening at
+  an older epoch is not evidence of regression — evidence only accrues.

@@ -38,6 +38,112 @@ use zeroize::Zeroizing;
 
 use crate::providers;
 
+/// A retained outbound side-band frame: the plaintext to re-send, plus its
+/// [`SideBandSealing::Stable`] seal cache.
+///
+/// The frame is kept UNSEALED and sealed at hand-out — `seal_side_band` draws a fresh
+/// random nonce per call and mutates nothing, so re-sealing is safe and a `Fresh` re-send
+/// tracks the current header epoch. A chunking host needs the opposite (a base that holds
+/// still) and asks for it with `Stable`, served from `seal`.
+///
+/// The cache lives INSIDE the frame it seals, which is what makes the invariant
+/// structural: replacing or clearing the frame drops its cache with it, so no set site can
+/// forget to invalidate and hand a chunking host the seal of a superseded frame. (An
+/// earlier draft kept the two in separate fields and needed the cache to store its own copy
+/// of the frame to validate against — co-location deletes the problem instead of policing
+/// it.)
+///
+/// `seal` is live-only and deliberately not archived: a restore restarts a chunking pass
+/// with a fresh base, which a host must already tolerate — a lost pass demands the same.
+/// The frame itself rides the archive, so re-sending resumes across a restore either way.
+///
+/// Epoch note: a cached seal keeps the epoch it was sealed at, where a `Fresh` re-seal
+/// would not. Near-moot for the PQ family (`seal_side_band` seals under recv-PQ, which
+/// advances only when the PEER commits, and applying a peer commit clears the retained
+/// frame anyway; the peer's `recv_pq_header_keys` window covers the rest). The exception is
+/// the one frame taking the classical fallback, the pre-A.4 `BOOTSTRAP_KP`: its key tracks
+/// the CLASSICAL epoch that ordinary messaging advances, so a long `Stable` pass over it
+/// could age past the peer's classical window. `Fresh` never meets this.
+struct RetainedFrame {
+    frame: Vec<u8>,
+    seal: Option<Vec<u8>>,
+    /// What the peer must have applied for this frame to be spent, as `(family, epoch)`.
+    ///
+    /// Set only on a TERMINAL frame — the last of its round, which has no reply to retire
+    /// it and so would otherwise re-send forever. A frame that publishes no commit (an EK,
+    /// an `Upd'`, a `KP'`) carries `None`: its round retires it, because the peer's answer
+    /// is what replaces or clears it.
+    ///
+    /// Stamped with the FASTEST family the frame's commit reaches. The A.3 bind advances
+    /// both epochs, so it stamps CLASSICAL and ordinary message frames confirm it — those
+    /// flow. A.4's bind and A.5's final commit are PQ-only, so they stamp PQ and wait on
+    /// the peer's next side-band frame.
+    retire_at: Option<(HeaderFamily, u64)>,
+}
+
+/// Which header-key window opened a frame. Message frames seal under the classical family
+/// and side-band frames under the PQ one (the pre-A.4 `BOOTSTRAP_KP` under classical, via
+/// `seal_side_band`'s fallback), so the window that matched also names the family — and the
+/// epoch within it is the peer's application receipt.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(in crate::session) enum HeaderFamily {
+    Classical,
+    Pq,
+}
+
+/// A frame opened from a header-key window, with the receipt that opening it proved.
+pub(in crate::session) struct Opened {
+    pub(in crate::session) plaintext: Vec<u8>,
+    pub(in crate::session) family: HeaderFamily,
+    /// The epoch of the key that opened it — what the peer has demonstrably APPLIED of our
+    /// commits in that family. See `SessionInner::observe_receipt`.
+    pub(in crate::session) epoch: u64,
+}
+
+/// Which retained slot a hand-out is reading. Two, because A.4 runs CONCURRENTLY with
+/// A.3/A.5 rather than as an alternative to them — see the field docs on
+/// [`SessionInner::pending_bootstrap`].
+#[derive(Clone, Copy)]
+pub(in crate::session) enum SideBandSlot {
+    SideBand,
+    Bootstrap,
+}
+
+impl RetainedFrame {
+    /// Retain `frame`, seeding the `Stable` cache with `sealed` — the bytes a `*_begin` is
+    /// about to return to the caller.
+    ///
+    /// The seed is what makes `begin`'s return and a subsequent `Stable` hand-out AGREE.
+    /// Without it the first peek re-seals (a fresh nonce), so a chunking host that sent
+    /// `begin`'s return and then peeked for the rest of the pass would cut pieces from two
+    /// different seals — which reassemble into nothing, silently. `Fresh` hosts are
+    /// unaffected: they re-seal per send by definition.
+    fn seeded(frame: Vec<u8>, sealed: &[u8]) -> Self {
+        Self {
+            frame,
+            seal: Some(sealed.to_vec()),
+            retire_at: None,
+        }
+    }
+
+    /// Retain `frame` with no cached seal — for the responder frames, which are never
+    /// handed back from their producing call and so only ever reach the wire through a
+    /// hand-out.
+    fn unsealed(frame: Vec<u8>) -> Self {
+        Self {
+            frame,
+            seal: None,
+            retire_at: None,
+        }
+    }
+
+    /// Mark this a TERMINAL frame, spent once the peer reaches `epoch` in `family`.
+    fn retiring_at(mut self, family: HeaderFamily, epoch: u64) -> Self {
+        self.retire_at = Some((family, epoch));
+        self
+    }
+}
+
 struct SessionInner {
     client: Arc<TwoMlsPqPrincipal>,
     /// The cipher-suite pair this session is locked to — a fixed property, captured from the
@@ -111,52 +217,36 @@ struct SessionInner {
     state_seq: u64,
     my_state: PrincipalState,
     their_state: PrincipalState,
-    /// The current round's outbound side-band frame, UNSEALED and RETAINED for re-send —
-    /// the side-band analogue of [`current_staple`](Self::current_staple), and set by both
-    /// roles (initiator `*_begin`/`pq_ratchet_bind`, responder `*_respond`).
+    /// The A.3/A.5 round's outbound side-band frame, retained for re-send. Set by both
+    /// roles (initiator `pq_ratchet_begin`/`pq_ratchet_bind`/`pq_rekey_begin`, responder
+    /// `*_respond`), REPLACED when this side produces the round's next frame, and CLEARED
+    /// when this side's part in the round completes (the `*_apply` receivers).
     ///
-    /// Retained rather than handed out once: a side-band frame is the only carrier of its
-    /// PQ half, so a lost one has no other way to reach the peer. The A.3 bind is the sharp
-    /// case — its classical commit re-staples on message frames, but the peer cannot apply
-    /// that staple without the PQ commit riding this frame, so the classical stream stalls
-    /// retriably "until the BIND lands" and a take-once bind that never lands stalls it
-    /// forever. Re-sending until the step advances heals that, exactly as `current_staple`
-    /// heals the classical stream.
+    /// One slot serves both flows because they are mutually exclusive: every A.3 and A.5
+    /// entry point gates on `pq_inflight`, so only one round is ever open. A.4 does NOT
+    /// gate on it and therefore runs CONCURRENTLY — hence its own slot below, and NOT a
+    /// third field for A.5.
+    pending_side_band: Option<RetainedFrame>,
+    /// The A.4 bootstrap's outbound frame (initiator's `KP'`, responder's `BootstrapBind`),
+    /// retained for re-send. Cleared at `pq_bootstrap_apply`.
     ///
-    /// Lifecycle: REPLACED when this side produces the round's next frame, CLEARED when
-    /// this side's part in the round completes (the `*_apply` receivers). An initiator's
-    /// terminal bind therefore lingers until the peer opens the next round — deliberate:
-    /// it is precisely the frame that must land, and duplicates are benign discards on the
-    /// receiver (see `pq_ratchet_apply`). Single slot: a round has one frame in flight, and
-    /// the turn plus `pq_inflight` — not slot occupancy — are what gate a new operation.
+    /// Separate from `pending_side_band` because A.4 is a concurrent flow, not an
+    /// alternative one: it is invisible to the `pq_inflight` guard, and
+    /// `pq_bootstrap_respond` parks its bind AND takes the turn — so the responder opening
+    /// an A.3 round (its move, legitimately) shared a slot with an unfinished A.4 and
+    /// evicted it. A BootstrapBind is irreplaceable: the peer's deferred PQ half is built
+    /// from it and nothing else can re-emit it, so eviction stranded establishment for
+    /// good. See `test_ratchet_round_does_not_evict_an_unfinished_bootstrap`.
+    pending_bootstrap: Option<RetainedFrame>,
+    /// The highest epoch at which a peer frame has opened, per header family — what the
+    /// peer has demonstrably APPLIED of our commits. Set by `observe_receipt`; read by
+    /// `hand_out` to retire a terminal frame whose `retire_at` it has reached.
     ///
-    /// Sealing happens at hand-out ([`pq_pending_outbound`]), not here: `seal_side_band`
-    /// draws a fresh random nonce per call and mutates nothing, so re-sealing the same
-    /// frame is safe and each re-send tracks the current PQ header epoch. A host that
-    /// chunks needs the opposite — a base that holds still — and asks for it with
-    /// [`SideBandSealing::Stable`], served from `pq_outbound_seal`.
-    pending_pq_outbound: Option<Vec<u8>>,
-    /// The `SideBandSealing::Stable` seal cache: `(frame, sealed)`.
-    ///
-    /// SELF-VALIDATING BY CONSTRUCTION — it stores the frame it sealed, and a hand-out
-    /// re-seals whenever that no longer matches the live `pending_pq_outbound`. The
-    /// alternative (a bare `Option<Vec<u8>>` invalidated at each set site) would be an
-    /// invariant a dozen call sites had to remember, and the failure would be silent and
-    /// bad: handing a chunking host the seal of a superseded frame. Comparing two short
-    /// frames costs nothing next to the AEAD it skips.
-    ///
-    /// Live-only, deliberately not archived: a restore restarts the chunking pass with a
-    /// fresh base, which a host must already tolerate (a lost pass demands the same).
-    ///
-    /// Epoch note: a cached seal keeps the epoch it was sealed at, so it ages where a
-    /// `Fresh` re-seal would not. For the PQ family that is near-moot — `seal_side_band`
-    /// seals under recv-PQ, which advances only when the PEER commits, and applying a peer
-    /// commit clears the retained frame anyway; the peer's `recv_pq_header_keys` window
-    /// covers the rest. The exception is the ONE frame taking the classical fallback, the
-    /// pre-A.4 `BOOTSTRAP_KP`: its key tracks the CLASSICAL epoch, which ordinary messaging
-    /// advances, so a long `Stable` pass over it could age past the peer's classical window.
-    /// `Fresh` (today's only caller) re-seals per hand-out and never meets this.
-    pq_outbound_seal: Option<(Vec<u8>, Vec<u8>)>,
+    /// Monotone by construction, so it is safe to compare against: evidence only accrues.
+    /// Rides the archive — losing it would strand a terminal frame in re-send forever,
+    /// which is exactly the state this exists to end.
+    peer_applied_classical: u64,
+    peer_applied_pq: u64,
     /// Whose move the PQ side-band is: the initiator owes the A.4 bootstrap; thereafter
     /// completing an operation passes the turn to the peer.
     pq_turn_mine: bool,
@@ -326,24 +416,6 @@ impl SessionInner {
         )
     }
 
-    /// Retain an initiator's side-band `frame` for re-send, seeding the
-    /// [`SideBandSealing::Stable`] cache with `sealed` — the very bytes the `*_begin` call
-    /// is about to return.
-    ///
-    /// The seed is what makes `begin`'s return and a subsequent `Stable` hand-out AGREE.
-    /// Without it the first peek re-seals (a fresh nonce), so a chunking host that sent
-    /// `begin`'s return and then peeked for the rest of the pass would cut pieces from two
-    /// different seals — which reassemble into nothing. `Fresh` hosts are unaffected: they
-    /// re-seal per send by definition, and the seeded cache is inert for them (and
-    /// self-validating, so it cannot go stale).
-    ///
-    /// Responder frames need no equivalent: `*_respond` hands nothing back, so its frame
-    /// only ever reaches the wire through a hand-out.
-    fn retain_side_band(&mut self, frame: Vec<u8>, sealed: &[u8]) {
-        self.pq_outbound_seal = Some((frame.clone(), sealed.to_vec()));
-        self.pending_pq_outbound = Some(frame);
-    }
-
     /// Register an exported PSK into every store this session's groups resolve from.
     fn register_psk(&self, psk_id: &ExternalPskId, psk: &PreSharedKey) {
         apq::register_psk_stores(&self.psk_stores, psk_id, psk);
@@ -356,6 +428,58 @@ impl SessionInner {
     /// referenced again — the send-PQ / recv-PQ watermarks keep both parties in lockstep).
     fn forget_psk(&self, psk_id: &ExternalPskId) {
         apq::forget_psk_stores(&self.psk_stores, psk_id);
+    }
+
+    fn slot_mut(&mut self, which: SideBandSlot) -> &mut Option<RetainedFrame> {
+        match which {
+            SideBandSlot::SideBand => &mut self.pending_side_band,
+            SideBandSlot::Bootstrap => &mut self.pending_bootstrap,
+        }
+    }
+
+    /// Seal `which` slot's retained frame for hand-out, filling its `Stable` cache on a
+    /// miss. `None` when the slot is empty (the quiescent case — nothing to re-send).
+    /// Drop `which`'s frame if the peer has demonstrably applied what it carries — a
+    /// terminal frame with a met stamp has nothing left to heal, and re-sending it forever
+    /// is the lingering this exists to end. Returns whether the slot is empty afterwards.
+    ///
+    /// Checked lazily, at the hand-out paths, rather than eagerly on receipt: that keeps
+    /// `observe_receipt` a plain monotone observation and lets the clearing ride whatever
+    /// persist its caller was already doing. BOTH hand-out paths must call it — a take that
+    /// skipped it would serve a spent frame in place of the live one.
+    fn retire_if_spent(&mut self, which: SideBandSlot) -> bool {
+        if let Some((family, epoch)) = self.slot_mut(which).as_ref().and_then(|r| r.retire_at) {
+            let applied = match family {
+                HeaderFamily::Classical => self.peer_applied_classical,
+                HeaderFamily::Pq => self.peer_applied_pq,
+            };
+            if applied >= epoch {
+                *self.slot_mut(which) = None;
+            }
+        }
+        self.slot_mut(which).is_none()
+    }
+
+    fn hand_out(&mut self, which: SideBandSlot, sealing: SideBandSealing) -> Option<Vec<u8>> {
+        if self.retire_if_spent(which) {
+            return None;
+        }
+        // Lift the frame out before sealing: `seal_side_band` borrows the whole inner, so
+        // it cannot run while a slot borrow is live.
+        let (frame, cached) = {
+            let retained = self.slot_mut(which).as_ref()?;
+            (retained.frame.clone(), retained.seal.clone())
+        };
+        if let (SideBandSealing::Stable, Some(sealed)) = (sealing, cached) {
+            return Some(sealed);
+        }
+        let sealed = self.seal_side_band(&frame).ok()?;
+        if matches!(sealing, SideBandSealing::Stable) {
+            if let Some(retained) = self.slot_mut(which) {
+                retained.seal = Some(sealed.clone());
+            }
+        }
+        Some(sealed)
     }
 
     /// Track `client`'s PSK stores so future `register_psk` calls reach any group half
@@ -616,8 +740,10 @@ fn build_session(
                 client_id: their_id,
             },
             pq_turn_mine: initiated,
-            pending_pq_outbound: None,
-            pq_outbound_seal: None,
+            pending_side_band: None,
+            pending_bootstrap: None,
+            peer_applied_classical: 0,
+            peer_applied_pq: 0,
             send_psk_ledger: VecDeque::new(),
             retired_send_psks: Vec::new(),
             last_cross_injected: None,

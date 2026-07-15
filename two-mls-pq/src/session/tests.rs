@@ -1,6 +1,23 @@
 use std::sync::Arc;
 
 use super::{SideBandSealing, TwoMlsPqSession};
+
+/// The one frame in flight, for the tests that legitimately expect exactly one.
+///
+/// Asserts at most one rather than quietly taking the first: A.4 has its own slot and runs
+/// concurrently with A.3/A.5, so two frames CAN be pending — a silent `.first()` here would
+/// hide exactly the case the second slot exists for. A test exercising concurrency reads
+/// `pq_pending_outbound` directly.
+fn peek_one(s: &Arc<TwoMlsPqSession>, sealing: SideBandSealing) -> Option<Vec<u8>> {
+    let frames = s.pq_pending_outbound(sealing);
+    assert!(
+        frames.len() <= 1,
+        "expected at most one retained frame, got {} — is this the concurrent A.4+A.3 case?",
+        frames.len()
+    );
+    frames.into_iter().next()
+}
+
 use crate::{
     assert_err, assert_ok, assert_some,
     test_utils::{establish_confirmed_sessions, establish_sessions, make_client, make_combiner_kp},
@@ -1093,11 +1110,18 @@ fn test_pq_ratchet_completes_after_principal_rotation() {
 
 /// Complete the A.4 bootstrap after establishment so both directions are full
 /// APQ — required before the deferred acceptor side can ratchet.
+/// Drive A.4 to completion the way a re-staple host does: through the retained PEEK, not
+/// `pq_take_pending_outbound`.
+///
+/// This matters more than it looks. The take empties the slot, so a take-driven helper
+/// cannot see anything that goes wrong with a RETAINED bootstrap frame — which is how the
+/// A.4/A.3 slot collision hid from the entire suite. Bob's bind stays retained after this
+/// returns and is retired by the receipt in Alice's first PQ-sealed frame.
 fn establish_full() -> (Arc<TwoMlsPqSession>, Arc<TwoMlsPqSession>) {
     let (alice, bob) = establish_confirmed_sessions();
     let kp = assert_ok!(alice.pq_bootstrap_begin(None));
     assert_ok!(bob.pq_bootstrap_respond(kp));
-    let bind = assert_some!(bob.pq_take_pending_outbound());
+    let bind = assert_some!(peek_one(&bob, SideBandSealing::Fresh));
     assert_ok!(alice.pq_bootstrap_apply(bind));
     (alice, bob)
 }
@@ -4956,9 +4980,9 @@ fn test_pq_pending_outbound_peek_is_repeatable_and_non_consuming() {
     assert_ok!(alice.pq_ratchet_begin());
 
     // Three peeks, three sealed frames — each independently openable by the peer.
-    let first = assert_some!(alice.pq_pending_outbound(SideBandSealing::Fresh));
-    let second = assert_some!(alice.pq_pending_outbound(SideBandSealing::Fresh));
-    assert!(alice.pq_pending_outbound(SideBandSealing::Fresh).is_some());
+    let first = assert_some!(peek_one(&alice, SideBandSealing::Fresh));
+    let second = assert_some!(peek_one(&alice, SideBandSealing::Fresh));
+    assert!(peek_one(&alice, SideBandSealing::Fresh).is_some());
 
     // Fresh seals draw a new nonce each time, so the sealed bytes differ even though the
     // frame does not. (Belt-and-braces on the seal: identical ciphertext under Fresh would
@@ -4978,14 +5002,14 @@ fn test_dropped_bind_heals_on_resend() {
     let (alice, bob) = establish_full();
     let ek = assert_ok!(alice.pq_ratchet_begin());
     assert_ok!(bob.pq_ratchet_respond(ek));
-    let ct = assert_some!(bob.pq_pending_outbound(SideBandSealing::Fresh));
+    let ct = assert_some!(peek_one(&bob, SideBandSealing::Fresh));
     assert_ok!(alice.pq_ratchet_bind(ct, b"payload".to_vec()));
 
     // The transport drops the bind: take a copy and throw it away.
-    let _lost = assert_some!(alice.pq_pending_outbound(SideBandSealing::Fresh));
+    let _lost = assert_some!(peek_one(&alice, SideBandSealing::Fresh));
 
     // Bob never saw it, so his side of the round is untouched and Alice can re-send.
-    let resent = assert_some!(alice.pq_pending_outbound(SideBandSealing::Fresh));
+    let resent = assert_some!(peek_one(&alice, SideBandSealing::Fresh));
     assert_eq!(
         assert_ok!(bob.pq_ratchet_apply(resent)),
         b"payload".to_vec()
@@ -5006,7 +5030,7 @@ fn test_duplicate_side_band_frames_are_discardable_not_routing_errors() {
     assert_err!(bob.pq_ratchet_respond(ek), TwoMlsPqError::DuplicateSideBand);
 
     // Duplicate CT: Alice already bound.
-    let ct = assert_some!(bob.pq_pending_outbound(SideBandSealing::Fresh));
+    let ct = assert_some!(peek_one(&bob, SideBandSealing::Fresh));
     assert_ok!(alice.pq_ratchet_bind(ct.clone(), b"x".to_vec()));
     assert_err!(
         alice.pq_ratchet_bind(ct, b"x".to_vec()),
@@ -5015,7 +5039,7 @@ fn test_duplicate_side_band_frames_are_discardable_not_routing_errors() {
 
     // Duplicate bind: Bob already applied. This is the common one — Alice re-sends her
     // terminal frame until Bob opens the next round.
-    let bind = assert_some!(alice.pq_pending_outbound(SideBandSealing::Fresh));
+    let bind = assert_some!(peek_one(&alice, SideBandSealing::Fresh));
     assert_ok!(bob.pq_ratchet_apply(bind.clone()));
     assert_err!(bob.pq_ratchet_apply(bind), TwoMlsPqError::DuplicateSideBand);
 }
@@ -5028,20 +5052,20 @@ fn test_side_band_falls_silent_for_the_receiver_after_the_round() {
     let (alice, bob) = establish_full();
     let ek = assert_ok!(alice.pq_ratchet_begin());
     assert_ok!(bob.pq_ratchet_respond(ek));
-    let ct = assert_some!(bob.pq_pending_outbound(SideBandSealing::Fresh));
+    let ct = assert_some!(peek_one(&bob, SideBandSealing::Fresh));
     assert_ok!(alice.pq_ratchet_bind(ct, b"x".to_vec()));
-    let bind = assert_some!(alice.pq_pending_outbound(SideBandSealing::Fresh));
+    let bind = assert_some!(peek_one(&alice, SideBandSealing::Fresh));
     assert_ok!(bob.pq_ratchet_apply(bind));
 
     // Bob applied: his round is over and he holds the turn — nothing left to re-send.
-    assert!(bob.pq_pending_outbound(SideBandSealing::Fresh).is_none());
+    assert!(peek_one(&bob, SideBandSealing::Fresh).is_none());
     assert!(bob.my_pq_turn());
 
     // Bob opening the next round replaces nothing (his slot is empty) and Alice's stale
     // terminal frame is retired by her own respond.
     let ek2 = assert_ok!(bob.pq_ratchet_begin());
     assert_ok!(alice.pq_ratchet_respond(ek2));
-    let ct2 = assert_some!(alice.pq_pending_outbound(SideBandSealing::Fresh));
+    let ct2 = assert_some!(peek_one(&alice, SideBandSealing::Fresh));
     // The frame Alice now offers is this round's CT, not last round's bind.
     assert_ok!(bob.pq_ratchet_bind(ct2, b"y".to_vec()));
 }
@@ -5055,15 +5079,15 @@ fn test_bootstrap_kp_is_retained_and_retired_on_apply() {
     assert_ok!(alice.pq_bootstrap_begin(None));
 
     // Dropped KP': re-send from the retained slot.
-    let _lost = assert_some!(alice.pq_pending_outbound(SideBandSealing::Fresh));
-    let resent = assert_some!(alice.pq_pending_outbound(SideBandSealing::Fresh));
+    let _lost = assert_some!(peek_one(&alice, SideBandSealing::Fresh));
+    let resent = assert_some!(peek_one(&alice, SideBandSealing::Fresh));
     assert_ok!(bob.pq_bootstrap_respond(resent));
 
-    let bind = assert_some!(bob.pq_pending_outbound(SideBandSealing::Fresh));
+    let bind = assert_some!(peek_one(&bob, SideBandSealing::Fresh));
     assert_ok!(alice.pq_bootstrap_apply(bind));
 
     // Both halves live: nothing left for the KP' to heal.
-    assert!(alice.pq_pending_outbound(SideBandSealing::Fresh).is_none());
+    assert!(peek_one(&alice, SideBandSealing::Fresh).is_none());
     assert!(alice.is_fully_established());
 }
 
@@ -5077,7 +5101,7 @@ fn test_retained_frame_survives_archive_round_trip() {
 
     let restored = round_trip(&alice);
 
-    let resent = assert_some!(restored.pq_pending_outbound(SideBandSealing::Fresh));
+    let resent = assert_some!(peek_one(&restored, SideBandSealing::Fresh));
     assert_ok!(bob.pq_ratchet_respond(resent));
 }
 
@@ -5089,15 +5113,15 @@ fn test_stable_sealing_holds_the_base_still_for_chunking() {
     let (alice, bob) = establish_full();
     assert_ok!(alice.pq_ratchet_begin());
 
-    let base = assert_some!(alice.pq_pending_outbound(SideBandSealing::Stable));
-    let again = assert_some!(alice.pq_pending_outbound(SideBandSealing::Stable));
+    let base = assert_some!(peek_one(&alice, SideBandSealing::Stable));
+    let again = assert_some!(peek_one(&alice, SideBandSealing::Stable));
     assert_eq!(base, again, "Stable must hand out identical bytes");
 
     // Reassembling halves cut from two separate hand-outs yields the original — the
     // property a chunking transport depends on.
     let mid = base.len() / 2;
-    let first_half = &assert_some!(alice.pq_pending_outbound(SideBandSealing::Stable))[..mid];
-    let second_half = &assert_some!(alice.pq_pending_outbound(SideBandSealing::Stable))[mid..];
+    let first_half = &assert_some!(peek_one(&alice, SideBandSealing::Stable))[..mid];
+    let second_half = &assert_some!(peek_one(&alice, SideBandSealing::Stable))[mid..];
     let reassembled: Vec<u8> = [first_half, second_half].concat();
     assert_eq!(reassembled, base);
 
@@ -5113,8 +5137,8 @@ fn test_fresh_sealing_differs_per_send_but_opens_the_same() {
     let (alice, bob) = establish_full();
     assert_ok!(alice.pq_ratchet_begin());
 
-    let a = assert_some!(alice.pq_pending_outbound(SideBandSealing::Fresh));
-    let b = assert_some!(alice.pq_pending_outbound(SideBandSealing::Fresh));
+    let a = assert_some!(peek_one(&alice, SideBandSealing::Fresh));
+    let b = assert_some!(peek_one(&alice, SideBandSealing::Fresh));
     assert_ne!(a, b, "Fresh must not repeat wire bytes");
 
     // Distinct bytes, same frame underneath: either copy drives the round.
@@ -5129,14 +5153,14 @@ fn test_fresh_sealing_differs_per_send_but_opens_the_same() {
 fn test_stable_seal_is_invalidated_when_the_frame_advances() {
     let (alice, bob) = establish_full();
     assert_ok!(alice.pq_ratchet_begin());
-    let ek_seal = assert_some!(alice.pq_pending_outbound(SideBandSealing::Stable));
+    let ek_seal = assert_some!(peek_one(&alice, SideBandSealing::Stable));
 
     // Drive the round on: Alice's retained frame becomes the bind.
     assert_ok!(bob.pq_ratchet_respond(ek_seal.clone()));
-    let ct = assert_some!(bob.pq_pending_outbound(SideBandSealing::Stable));
+    let ct = assert_some!(peek_one(&bob, SideBandSealing::Stable));
     assert_ok!(alice.pq_ratchet_bind(ct, b"payload".to_vec()));
 
-    let bind_seal = assert_some!(alice.pq_pending_outbound(SideBandSealing::Stable));
+    let bind_seal = assert_some!(peek_one(&alice, SideBandSealing::Stable));
     assert_ne!(
         bind_seal, ek_seal,
         "Stable must not serve a superseded frame"
@@ -5160,18 +5184,18 @@ fn test_begin_return_matches_the_stable_base() {
 
     // A.3
     let returned = assert_ok!(alice.pq_ratchet_begin());
-    let peeked = assert_some!(alice.pq_pending_outbound(SideBandSealing::Stable));
+    let peeked = assert_some!(peek_one(&alice, SideBandSealing::Stable));
     assert_eq!(returned, peeked, "A.3 begin disagrees with the Stable base");
     assert_ok!(bob.pq_ratchet_respond(returned));
 
     // A.5 — Bob holds the turn only after a full round, so drive one first.
-    let ct = assert_some!(bob.pq_pending_outbound(SideBandSealing::Stable));
+    let ct = assert_some!(peek_one(&bob, SideBandSealing::Stable));
     assert_ok!(alice.pq_ratchet_bind(ct, b"x".to_vec()));
-    let bind = assert_some!(alice.pq_pending_outbound(SideBandSealing::Stable));
+    let bind = assert_some!(peek_one(&alice, SideBandSealing::Stable));
     assert_ok!(bob.pq_ratchet_apply(bind));
 
     let returned = assert_ok!(bob.pq_rekey_begin(None));
-    let peeked = assert_some!(bob.pq_pending_outbound(SideBandSealing::Stable));
+    let peeked = assert_some!(peek_one(&bob, SideBandSealing::Stable));
     assert_eq!(returned, peeked, "A.5 begin disagrees with the Stable base");
 }
 
@@ -5182,7 +5206,159 @@ fn test_begin_return_matches_the_stable_base() {
 fn test_bootstrap_begin_return_matches_the_stable_base() {
     let (alice, bob) = establish_confirmed_sessions();
     let returned = assert_ok!(alice.pq_bootstrap_begin(None));
-    let peeked = assert_some!(alice.pq_pending_outbound(SideBandSealing::Stable));
+    let peeked = assert_some!(peek_one(&alice, SideBandSealing::Stable));
     assert_eq!(returned, peeked, "A.4 begin disagrees with the Stable base");
     assert_ok!(bob.pq_bootstrap_respond(returned));
+}
+
+// ===========================================================================
+// Concurrent-flow slot collision (A.4 vs A.3)
+// ===========================================================================
+
+/// A.4 and A.3 are separate flows, and A.4 is invisible to the `pq_inflight` guard that
+/// keeps A.3 and A.5 mutually exclusive — so nothing stops an A.3 round from evicting an
+/// in-flight A.4's frame out of the single retained slot. A BootstrapBind is
+/// irreplaceable: the peer's deferred PQ half is built from it and nothing else can
+/// re-emit it, so eviction strands establishment permanently.
+///
+/// This is a NORMAL flow, not a misbehaving one: `pq_bootstrap_respond` parks the bind AND
+/// takes the turn, so the responder opening a round is exactly what the protocol says is
+/// its move.
+#[test]
+fn test_ratchet_round_does_not_evict_an_unfinished_bootstrap() {
+    let (alice, bob) = establish_confirmed_sessions();
+    let kp = assert_ok!(alice.pq_bootstrap_begin(None));
+    assert_ok!(bob.pq_bootstrap_respond(kp));
+    // Bob answered A.4 and now holds the turn; Alice has NOT applied his bind yet.
+    assert!(bob.my_pq_turn());
+
+    // Bob opens an A.3 round. Legitimate — it is his move.
+    assert_ok!(bob.pq_ratchet_begin());
+
+    // BOTH are in flight now — the bootstrap bind AND the round Bob just opened. That is
+    // exactly what the second slot buys: they are concurrent flows, not alternatives.
+    let offered = bob.pq_pending_outbound(SideBandSealing::Fresh);
+    assert_eq!(
+        offered.len(),
+        2,
+        "expected the bootstrap bind and the A.3 EK to be in flight together"
+    );
+
+    // Alice can still finish A.4: the bind survived the round opened beside it.
+    // Bootstrap is handed out first.
+    assert_ok!(alice.pq_bootstrap_apply(offered[0].clone()));
+    assert!(alice.is_fully_established());
+
+    // And the round Bob opened is live in its own right — neither frame cost the other.
+    assert_ok!(alice.pq_ratchet_respond(offered[1].clone()));
+}
+
+// ===========================================================================
+// Terminal-frame retirement (the peer's header-key epoch as an application receipt)
+// ===========================================================================
+
+/// The A.3 bind is TERMINAL — the peer applies it, the turn flips, and nothing comes back
+/// for it — so under retention it would re-send forever, riding every message send.
+///
+/// Its receipt is already on the wire: the bind advances our send-classical epoch, the peer
+/// reaches that epoch only by APPLYING it, and the peer's next frame is sealed under our
+/// send group's key AT THE EPOCH IT APPLIED (`recv_header_keys`: "the peer seals frames to
+/// me under my send group (their recv group) as they last applied it"). So an ordinary
+/// message frame retires it — no new wire bytes, no protocol change.
+#[test]
+fn test_bind_retires_when_a_peer_message_proves_it_landed() {
+    let (alice, bob) = establish_full();
+    let ek = assert_ok!(alice.pq_ratchet_begin());
+    assert_ok!(bob.pq_ratchet_respond(ek));
+    let ct = assert_some!(peek_one(&bob, SideBandSealing::Fresh));
+    assert_ok!(alice.pq_ratchet_bind(ct, b"payload".to_vec()));
+    let bind = assert_some!(peek_one(&alice, SideBandSealing::Fresh));
+
+    assert_ok!(bob.pq_ratchet_apply(bind));
+    // Bob applied — but Alice has no evidence of it yet, so she rightly keeps re-sending
+    // the one frame that carries her PQ half.
+    assert!(
+        peek_one(&alice, SideBandSealing::Fresh).is_some(),
+        "the bind must keep re-sending until its landing is PROVEN, not merely true"
+    );
+
+    // Bob sends an ordinary message. Its header seal is the receipt.
+    assert_ok!(bob.prepare_to_encrypt(None));
+    let enc = assert_ok!(bob.encrypt(b"ordinary".to_vec()));
+    let _ = assert_ok!(alice.process_incoming(enc.cipher_text));
+
+    assert!(
+        peek_one(&alice, SideBandSealing::Fresh).is_none(),
+        "a peer message frame proves the bind landed; the side-band should fall silent"
+    );
+}
+
+/// A.5 is strictly PQ-only — it never touches the classical group — so a message frame
+/// cannot confirm its final Commit′. Only a peer SIDE-BAND frame can, which is the accepted
+/// cost of keeping the classical ratchet unblocked by a large ML-KEM updatePath.
+#[test]
+fn test_rekey_commit_retires_only_on_a_peer_side_band_frame() {
+    let (alice, bob) = establish_full();
+    // Bob holds the turn after the bootstrap, so he initiates the rekey.
+    assert!(bob.my_pq_turn());
+    let upd = assert_ok!(bob.pq_rekey_begin(None));
+    assert_ok!(alice.pq_rekey_respond(upd));
+    let commit = assert_some!(peek_one(&alice, SideBandSealing::Fresh));
+    assert_ok!(bob.pq_rekey_apply(commit));
+    let commit2 = assert_some!(peek_one(&bob, SideBandSealing::Fresh));
+    assert_ok!(alice.pq_rekey_apply(commit2));
+
+    // A classical message does NOT retire it: A.5 advanced no classical epoch, so a
+    // classical receipt says nothing about this frame.
+    assert_ok!(alice.prepare_to_encrypt(None));
+    let enc = assert_ok!(alice.encrypt(b"ordinary".to_vec()));
+    let _ = assert_ok!(bob.process_incoming(enc.cipher_text));
+    assert!(
+        peek_one(&bob, SideBandSealing::Fresh).is_some(),
+        "a classical frame cannot confirm a PQ-only commit"
+    );
+
+    // Alice opening the next PQ round does: her EK seals under her recv-PQ, an epoch she
+    // reached only by applying Bob's Commit'.
+    assert!(alice.my_pq_turn());
+    let ek = assert_ok!(alice.pq_ratchet_begin());
+
+    // Merely OPENING it is the whole receipt — Bob must NOT respond here. Responding would
+    // REPLACE the slot, and a replaced frame is indistinguishable from a retired one: this
+    // assertion would then pass with retirement disabled entirely, which is precisely what
+    // the negative control caught the first time it was written that way.
+    let _ = assert_ok!(bob.open_incoming(ek));
+
+    assert!(
+        peek_one(&bob, SideBandSealing::Fresh).is_none(),
+        "a PQ-sealed peer frame proves the Commit' landed; it should be retired"
+    );
+}
+
+/// A.4's BootstrapBind is terminal and PQ-only. Its receipt is the sharpest of the three:
+/// pre-A.4 the peer has no recv-PQ so its side-band frames seal CLASSICALLY, and the first
+/// PQ-sealed frame it sends is a key derivable only inside the group this very welcome
+/// carried — proof it joined.
+#[test]
+fn test_bootstrap_bind_retires_when_the_peer_proves_it_joined() {
+    let (alice, bob) = establish_full();
+
+    // Alice applied, but Bob has no evidence, so his bind is still in flight.
+    assert!(
+        !bob.pq_pending_outbound(SideBandSealing::Fresh).is_empty(),
+        "the bind must re-send until its landing is proven"
+    );
+
+    // Alice opens a round. Her EK is PQ-sealed, which she could only do having joined.
+    let ek = assert_ok!(alice.pq_ratchet_begin());
+    assert_ok!(bob.pq_ratchet_respond(ek));
+
+    // Retired: Bob offers this round's CT and nothing else.
+    let offered = bob.pq_pending_outbound(SideBandSealing::Fresh);
+    assert_eq!(
+        offered.len(),
+        1,
+        "the bootstrap bind should be retired, leaving only the live round's frame"
+    );
+    assert_ok!(alice.pq_ratchet_bind(offered[0].clone(), b"x".to_vec()));
 }

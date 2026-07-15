@@ -207,11 +207,38 @@ impl SessionInner {
     /// fails AEAD auth under every key and passes through. (This is a receiver convenience;
     /// the metadata-hiding property is a sender guarantee — every outbound frame is sealed
     /// — so accepting an opened frame here downgrades nothing an observer can see.)
-    pub(in crate::session) fn open_or_raw(&self, blob: Vec<u8>) -> Vec<u8> {
+    /// Open `blob` if a window key does, recording the receipt it carries, and fall back to
+    /// the blob unchanged (a host may hand us a frame it already took from
+    /// `open_incoming`, and the initiator's unsealed initial welcome passes through).
+    pub(in crate::session) fn open_or_raw(&mut self, blob: Vec<u8>) -> Vec<u8> {
         match self.try_open(&blob) {
-            Ok(Some(frame)) => frame,
+            Ok(Some(opened)) => {
+                self.observe_receipt(&opened);
+                opened.plaintext
+            }
             _ => blob,
         }
+    }
+
+    /// Record what an opened frame proves the peer has applied.
+    ///
+    /// The epoch of the key that opened it IS the receipt: we seal to the peer under OUR
+    /// recv group, so the peer seals to us under ITS recv group — which is our SEND group —
+    /// at the epoch it has actually applied. `recv_header_keys`' own doc says exactly this:
+    /// "the peer seals frames to me under my send group (their recv group) *as they last
+    /// applied it*". Unforgeable (that key is derivable only inside the group at that
+    /// epoch), and free — it already rides every frame.
+    ///
+    /// Monotone: old epochs are deliberately retained so a lagging peer still lands, so a
+    /// frame opening at an OLDER epoch is not evidence of regression — it simply does not
+    /// advance the watermark. Evidence only ever accrues, which is what makes comparing
+    /// against it safe.
+    pub(in crate::session) fn observe_receipt(&mut self, opened: &Opened) {
+        let watermark = match opened.family {
+            HeaderFamily::Classical => &mut self.peer_applied_classical,
+            HeaderFamily::Pq => &mut self.peer_applied_pq,
+        };
+        *watermark = (*watermark).max(opened.epoch);
     }
 
     /// Trial-decrypt an inbound blob against the header receive window, newest epoch
@@ -220,7 +247,7 @@ impl SessionInner {
     /// construction. Every candidate key is an honestly-derived secret, so trial
     /// decryption with a non-committing AEAD is safe here (no attacker-chosen keys, so no
     /// partitioning oracle).
-    pub(in crate::session) fn try_open(&self, blob: &[u8]) -> Result<Option<Vec<u8>>> {
+    pub(in crate::session) fn try_open(&self, blob: &[u8]) -> Result<Option<Opened>> {
         use mls_rs::CipherSuiteProvider;
         let cs = providers::header_aead_suite()?;
         let nonce_size = cs.aead_nonce_size();
@@ -232,11 +259,23 @@ impl SessionInner {
         // authenticates only under a classical-window key and a side-band frame only
         // under a PQ-window key (the pre-A.4 BOOTSTRAP_KP under classical), so trying
         // both windows resolves either without ambiguity. Newest epoch first in each.
-        let windows = [&self.recv_header_keys, &self.recv_header_keys_pq];
-        for keys in windows {
-            for key in keys.values().rev() {
+        //
+        // The epoch that opens it is the peer's application receipt (see
+        // `observe_receipt`), so iterate by KEY as well as value — the map is keyed by
+        // exactly the number the caller needs, and discarding it is what left terminal
+        // frames with no retirement rule.
+        let windows = [
+            (HeaderFamily::Classical, &self.recv_header_keys),
+            (HeaderFamily::Pq, &self.recv_header_keys_pq),
+        ];
+        for (family, keys) in windows {
+            for (&epoch, key) in keys.iter().rev() {
                 if let Ok(pt) = cs.aead_open(key, ct, None, nonce) {
-                    return Ok(Some(pt.to_vec()));
+                    return Ok(Some(Opened {
+                        plaintext: pt.to_vec(),
+                        family,
+                        epoch,
+                    }));
                 }
             }
         }
@@ -767,10 +806,14 @@ impl TwoMlsPqSession {
     /// tracking liveness should treat a run of `None`s on a live session as a reconnect
     /// signal.
     pub fn open_incoming(&self, blob: Vec<u8>) -> Result<Option<OpenedFrame>> {
-        let inner = self.lock();
-        let Some(frame) = inner.try_open(&blob)? else {
+        let mut inner = self.lock();
+        let Some(opened) = inner.try_open(&blob)? else {
             return Ok(None);
         };
+        // A host that opens here and re-delivers the plaintext would otherwise cost us the
+        // receipt: `open_or_raw` cannot re-derive it from an already-opened frame.
+        inner.observe_receipt(&opened);
+        let frame = opened.plaintext;
         let kind = frame
             .first()
             .copied()

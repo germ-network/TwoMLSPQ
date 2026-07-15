@@ -209,6 +209,15 @@ pub(crate) mod archive_wire {
         pub(in crate::session) rotating: Option<Vec<u8>>,
     }
 
+    /// A terminal frame's retirement stamp: the header family whose epoch retires it, and
+    /// that epoch. `family` is `0` classical / `1` PQ; `from_archive` rejects any other
+    /// value as `ArchiveInvalid`.
+    #[derive(MlsSize, MlsEncode, MlsDecode)]
+    pub(in crate::session) struct WireRetireAt {
+        pub(in crate::session) family: u8,
+        pub(in crate::session) epoch: u64,
+    }
+
     /// The persisted form of a `TwoMlsPqSession`. Everything a session needs to resume,
     /// self-contained (no restoring client is passed): the current signing identity,
     /// identity/turn state, both group snapshots, the cross-party PSK ledger, the
@@ -267,7 +276,19 @@ pub(crate) mod archive_wire {
         /// The Authentication Service state: both parties' credential sequences.
         pub(in crate::session) auth_mine: WirePartySequence,
         pub(in crate::session) auth_theirs: WirePartySequence,
-        pub(in crate::session) pending_pq_outbound: Option<Vec<u8>>,
+        /// The retained A.3/A.5 side-band frame (plaintext). Its `Stable` seal cache is
+        /// live-only and deliberately absent here — see `RetainedFrame`.
+        pub(in crate::session) pending_side_band: Option<Vec<u8>>,
+        /// The retained A.4 bootstrap frame. Its own slot because A.4 runs concurrently
+        /// with A.3/A.5 rather than as an alternative to it.
+        pub(in crate::session) pending_bootstrap: Option<Vec<u8>>,
+        /// The terminal-frame retirement stamps and the peer-applied watermarks they are
+        /// compared against. Without these a restore would strand a terminal frame in
+        /// re-send forever.
+        pub(in crate::session) side_band_retire_at: Option<WireRetireAt>,
+        pub(in crate::session) bootstrap_retire_at: Option<WireRetireAt>,
+        pub(in crate::session) peer_applied_classical: u64,
+        pub(in crate::session) peer_applied_pq: u64,
         pub(in crate::session) pq_inflight: Option<WirePqInflight>,
         /// The initiator's retained pre-establishment envelope state (v10): the peer
         /// key package pre-establishment frames are HPKE-sealed to, the host's
@@ -335,6 +356,42 @@ fn principal_from_wire(blob: archive_wire::SigningIdentityBlob) -> Result<Arc<Tw
 
 /// `PqInflight` → its wire form. The A.3 variants carry the round's KEM material; the
 /// A.5 markers carry only a discriminant (and an optional rotation ClientId).
+fn wire_retire_at((family, epoch): (HeaderFamily, u64)) -> archive_wire::WireRetireAt {
+    archive_wire::WireRetireAt {
+        family: match family {
+            HeaderFamily::Classical => 0,
+            HeaderFamily::Pq => 1,
+        },
+        epoch,
+    }
+}
+
+/// Rebuild a retained frame and its terminal-retirement stamp. The `Stable` seal cache is
+/// live-only, so a restore starts with none — a chunking pass restarts with a fresh base,
+/// which a host must already tolerate.
+fn retained_from_wire(
+    frame: Option<Vec<u8>>,
+    retire_at: Option<archive_wire::WireRetireAt>,
+) -> Result<Option<RetainedFrame>> {
+    let Some(frame) = frame else {
+        // A stamp with no frame to stamp is a corrupt or forged archive.
+        return match retire_at {
+            Some(_) => Err(TwoMlsPqError::ArchiveInvalid),
+            None => Ok(None),
+        };
+    };
+    let retained = RetainedFrame::unsealed(frame);
+    let Some(stamp) = retire_at else {
+        return Ok(Some(retained));
+    };
+    let family = match stamp.family {
+        0 => HeaderFamily::Classical,
+        1 => HeaderFamily::Pq,
+        _ => return Err(TwoMlsPqError::ArchiveInvalid),
+    };
+    Ok(Some(retained.retiring_at(family, stamp.epoch)))
+}
+
 fn wire_pq_inflight(inflight: &PqInflight) -> archive_wire::WirePqInflight {
     use archive_wire::{PqEphemeralBlob, SecretBlob, WirePqInflight};
     match inflight {
@@ -565,11 +622,18 @@ fn session_from_wire(wire: archive_wire::SessionArchive) -> Result<Arc<TwoMlsPqS
             my_state,
             their_state,
             pq_turn_mine: wire.pq_turn_mine,
-            pending_pq_outbound: wire.pending_pq_outbound,
-            // Live-only: a restore restarts any chunking pass with a fresh base (see the
-            // field's doc). The retained FRAME rides the archive above, so re-sending
-            // resumes either way — only the seal's stability is scoped to a process.
-            pq_outbound_seal: None,
+            // The seal cache is live-only, so a restore restarts any chunking pass with a
+            // fresh base — the frames themselves ride the archive, so re-sending resumes.
+            pending_side_band: retained_from_wire(
+                wire.pending_side_band,
+                wire.side_band_retire_at,
+            )?,
+            pending_bootstrap: retained_from_wire(
+                wire.pending_bootstrap,
+                wire.bootstrap_retire_at,
+            )?,
+            peer_applied_classical: wire.peer_applied_classical,
+            peer_applied_pq: wire.peer_applied_pq,
             send_psk_ledger: wire
                 .send_psk_ledger
                 .into_iter()
@@ -801,7 +865,20 @@ fn build_archive_wire(
             deferred_candidate: inner.deferred_candidate.clone(),
             auth_mine,
             auth_theirs,
-            pending_pq_outbound: inner.pending_pq_outbound.clone(),
+            pending_side_band: inner.pending_side_band.as_ref().map(|r| r.frame.clone()),
+            pending_bootstrap: inner.pending_bootstrap.as_ref().map(|r| r.frame.clone()),
+            side_band_retire_at: inner
+                .pending_side_band
+                .as_ref()
+                .and_then(|r| r.retire_at)
+                .map(wire_retire_at),
+            bootstrap_retire_at: inner
+                .pending_bootstrap
+                .as_ref()
+                .and_then(|r| r.retire_at)
+                .map(wire_retire_at),
+            peer_applied_classical: inner.peer_applied_classical,
+            peer_applied_pq: inner.peer_applied_pq,
             pq_inflight,
             initial_their_kp: inner.initial_their_kp.as_ref().map(wire_combiner_kp),
             initial_app_payload: inner.initial_app_payload.clone(),
