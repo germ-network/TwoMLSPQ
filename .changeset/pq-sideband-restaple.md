@@ -145,17 +145,35 @@ which `key_packages` already owned: a collision is a silent wire misclassificati
 compile error, and the only comment describing the space sat in the file a reader adding a
 session frame never opens.
 
-Tags are now RENUMBERED into contiguous bands — message path 0x01-0x03, A.1 establishment
-0x05-0x07, PQ side-band 0x09-0x17 in lifecycle order (bootstrap, ratchet, re-key). The
-side-band band is exactly what `pq_frame_kind` classifies, checked against the classifier
-across all 256 bytes. Allocation order had left the side-band non-contiguous and silently
-falsified five `0x05-0x11` range shorthands across the code and book; a range in prose
-should at least not be a lie. Extending the protocol is no longer "take the next unused odd
-value" — it is "take the next value in the right band, and renumber the bands below", which
-is cheap because nothing outside `frames.rs` names a tag by value.
+Tags are now RENUMBERED into bands, each packed from its start with its remaining room at
+the end:
 
-`frames::tests::TAG_SPACE` is the record, `tag_space_holds` enforces distinct, odd and
-dense-ascending, and the book's `wire-format.md` table is its prose half.
+| Band | Range | Used |
+|------|-------|------|
+| Message path | 0x01-0x03 | 2 / 2 — full, and closed by design: the message path has exactly one shape |
+| A.1 establishment | 0x05-0x0F | 2 / 6 — the hybrid nested envelope would land in the room |
+| PQ side-band | 0x11-0x2F | 8 / 16 — lifecycle order: bootstrap, ratchet, re-key |
+
+Allocation order had left the side-band non-contiguous and silently falsified five
+`0x05-0x11` range shorthands across the code and book; a range in prose should at least not
+be a lie. Extending the protocol is no longer "take the next unused odd value" — it is
+"append at the end of the right band, into the room it already reserves". Only a band that
+FILLS moves anything below it.
+
+The room is free in both directions that could have cost something. On the wire, header
+encryption seals every blob, so a tag is never observed and a sparse space fingerprints
+nothing. In the tests, `tag_space_holds` asserts density WITHIN a band and membership against
+that band's bounds, so room at a band's end is legal while appending past the end still
+fails. The reserve costs no enforcement — which is why the sizes are generous. They are
+reserves, not predictions: only the message path's fullness is a design claim.
+
+A band's reserved bytes are unallocated and MUST NOT classify, so the side-band's invariant
+is set equality against the registry (`side_band_band_matches_the_classifier`, over all 256
+bytes) rather than a range test — a reserved byte is *in* 0x11-0x2F, so "in range iff
+classified" would wave through a reserve that quietly started routing.
+
+`frames::tests::BANDS` is the record, and the book's `wire-format.md` table is its prose
+half.
 
 **This is a wire cut** (`BINDING_CONTRACT_VERSION` 17). Hosts classify via `pq_frame_kind`
 and never match raw bytes, so no host code changes; stale frames from older builds fail

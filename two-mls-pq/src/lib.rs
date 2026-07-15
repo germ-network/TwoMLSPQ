@@ -211,9 +211,11 @@ pub fn version() -> String {
 // uniffi's checksum. NOT caught by it, and the reason this bumps: `pq_take_pending_outbound`
 // now honours retirement (a spent frame is withdrawn once a peer receipt proves it landed)
 // where it previously served whatever sat in the slot. Wire: the tag space is RENUMBERED
-// into contiguous bands — message path 0x01-0x03, A.1 establishment 0x05-0x07 (envelope
-// 0x15->0x05, staple 0x13->0x07), PQ side-band 0x09-0x17 in lifecycle order (bootstrap
-// 0x09/0x0B/0x0D, ratchet 0x0F/0x11/0x13, re-key 0x15/0x17). Hosts classify via
+// into bands, each packed from its start with its room at the end — message path 0x01-0x03
+// (full, and closed by design), A.1 establishment 0x05-0x0F (envelope 0x15->0x05, staple
+// 0x13->0x07; the room is where a hybrid nested envelope would land), PQ side-band 0x11-0x2F
+// in lifecycle order (bootstrap 0x11/0x13/0x15, ratchet 0x17/0x19/0x1B, re-key 0x1D/0x1F).
+// A band's reserved bytes are unallocated and must not classify. Hosts classify via
 // `pq_frame_kind`, never raw bytes, so this is a wire cut only — stale frames from older
 // builds fail loudly. Archive layout versions are untouched (pre-release hard cut).
 const BINDING_CONTRACT_VERSION: u64 = 17;

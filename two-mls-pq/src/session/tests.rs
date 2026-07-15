@@ -4472,13 +4472,14 @@ fn test_process_incoming_bare_mls_and_unknown_tags_rejected() {
         alice_session.process_incoming(vec![0x00, 0x01, 0x02]),
         TwoMlsPqError::DecryptionFailed
     );
-    // A byte the space does not assign at all (0x19 — the first free odd value past the
-    // bands; see frames.rs) fails loudly too. This must stay an UNALLOCATED byte: it read
-    // 0x13 until the tag renumber, which is now the A.3 bind, and a side-band tag reaching
-    // process_incoming returns SessionNotReady — the host is meant to route those by
-    // `pq_frame_kind` — a different rejection than the one under test.
+    // A byte the space does not assign at all (0x31 — past every band; see frames.rs) fails
+    // loudly too. This must stay UNALLOCATED, and has now drifted twice: it read 0x13 until
+    // the tag renumber made that the A.3 bind, then 0x19 until banding made that the A.3
+    // ciphertext. A side-band tag reaching process_incoming returns SessionNotReady — the
+    // host is meant to route those by `pq_frame_kind` — which is a different rejection than
+    // the one under test, so the assertion would still pass while testing nothing.
     assert_err!(
-        alice_session.process_incoming(vec![0x19, 0x00]),
+        alice_session.process_incoming(vec![0x31, 0x00]),
         TwoMlsPqError::DecryptionFailed
     );
 }

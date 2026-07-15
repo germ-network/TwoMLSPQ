@@ -308,7 +308,7 @@ pub struct HpkeSealed {
 
 /// Leading tag byte of the §A.1 envelope blob (`[0x05][u32-LE kem_len][kem_output]
 /// [ciphertext]`) — the one frame kind that travels the invitation channel. Distinct from
-/// every message-path (0x00/0x01/0x03), side-band (0x09–0x17), and staple (0x07) tag so a
+/// every message-path (0x00/0x01/0x03), side-band (0x11–0x1F), and staple (0x07) tag so a
 /// host can classify the blob by its first byte; `open_incoming` / `process_incoming` never
 /// see it (an envelope reaching them fails loudly).
 ///

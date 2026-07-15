@@ -35,7 +35,7 @@ pub(in crate::session) fn rendezvous_secret(
 // protects (the classical and PQ ratchets run on independent, async cadences):
 //   * message-path frames (0x01/0x03) seal under the CLASSICAL half's exporter, keyed by
 //     the classical epoch — `header_key` / `recv_header_keys`;
-//   * PQ side-band frames (0x09–0x17) seal under the PQ half's exporter, keyed by
+//   * PQ side-band frames (0x11–0x1F) seal under the PQ half's exporter, keyed by
 //     `pq_epoch` — `header_key_pq` / `recv_header_keys_pq`.
 // The one exception is the pre-A.4 BOOTSTRAP_KP, whose recv-PQ group does not exist yet;
 // it falls back to the classical seal (see `SessionInner::seal_side_band`).
@@ -836,7 +836,7 @@ impl TwoMlsPqSession {
     /// the direction needs the reconnect path — surfaced before the app ciphertext is
     /// touched, and distinguishable from a transient `DecryptionFailed`.
     ///
-    /// PQ side-band frames (0x09–0x17) are **not** handled here — the host routes them to
+    /// PQ side-band frames (0x11–0x1F) are **not** handled here — the host routes them to
     /// the `pq_*` entry points by frame kind (`pq_frame_kind`). Passing one here returns
     /// `SessionNotReady` rather than attempting (and failing) MLS decryption. Anything
     /// else — including bare MLS ciphertext, which no longer occurs on the send path — is

@@ -42,7 +42,7 @@ a host may skip `open_incoming` for the message path. The initiator's initial we
 
 | Field | Where | What an observer learns |
 |---|---|---|
-| frame tag (`0x01`–`0x17`) | first byte of every tagged frame | frame kind: establishment vs. rotation vs. PQ side-band activity (bootstrap, ratchet, re-key) |
+| frame tag (`0x01`–`0x1F`) | first byte of every tagged frame | frame kind: establishment vs. rotation vs. PQ side-band activity (bootstrap, ratchet, re-key) |
 | `group_id` | every `MLSMessage` | a stable per-direction session identifier — links every message of a direction across epochs, undoing the per-epoch rendezvous rotation for anyone who stores ciphertexts |
 | `epoch` | every `MLSMessage` | commit cadence, message ordering, session age |
 | `content_type` | every PrivateMessage | application vs. proposal vs. commit |
@@ -237,13 +237,13 @@ HeaderKeyPQ(G, e) = exportSecret(label = "germ.network.twomlspq.headerKey.pq.v1"
 - **Message-path frames** (0x01 standalone welcomes and 0x03 message frames —
   `encrypt`'s output, welcome-or-commit staple included): seal under
   `HeaderKey(recv_group, current classical epoch)`.
-- **PQ side-band frames** (0x09–0x17): seal under `HeaderKeyPQ(recv_group,
+- **PQ side-band frames** (0x11–0x1F): seal under `HeaderKeyPQ(recv_group,
   current pq_epoch)` — the opposite PQ group at its `pq_epoch`. This covers every
   side-band frame however it reaches the host: those surfaced by
-  `pq_take_pending_outbound` (the responder's 0x11, 0x0B, 0x17, and both binds — 0x13 and
-  0x0D — which are initiator frames despite being surfaced rather than returned) **and
-  the initiator frames returned directly by `pq_ratchet_begin` (0x0F),
-  `pq_bootstrap_begin` (0x09), and `pq_rekey_begin` (0x15)** — the latter are easy
+  `pq_take_pending_outbound` (the responder's 0x19, 0x13, 0x1F, and both binds — 0x1B and
+  0x15 — which are initiator frames despite being surfaced rather than returned) **and
+  the initiator frames returned directly by `pq_ratchet_begin` (0x17),
+  `pq_bootstrap_begin` (0x11), and `pq_rekey_begin` (0x1D)** — the latter are easy
   to miss because they bypass `EncryptResult`; leaving them plaintext would
   fingerprint every PQ exchange by its first frame. No chicken-and-egg blocks it: each
   BIND commits the *initiator's* send-PQ but seals under the never-advanced receive-PQ
@@ -305,7 +305,7 @@ authenticates only under a classical key and a side-band frame only under a PQ k
 the inner tag; there is no ambiguity. Each trial is one ChaCha20-Poly1305 open — DoS
 cost is bounded and linear in the combined (small) window. On success it classifies
 the opened frame's leading tag into `OpenedFrameKind` (`Message` for 0x01/0x03,
-`PqSideBand { PqFrameKind }` for 0x09–0x17) and returns `OpenedFrame { kind, frame }`;
+`PqSideBand { PqFrameKind }` for 0x11–0x1F) and returns `OpenedFrame { kind, frame }`;
 the host routes `frame` by `kind`. On exhaustion it returns `Ok(None)` — the same
 "unknown, drop it" signal the reconnect path assigns, which trial decryption makes
 literal: an out-of-window frame and garbage are indistinguishable, by construction. An
@@ -379,7 +379,7 @@ byte, which header encryption hides. The wire boundary moved one step:
 - **`open_incoming(blob) -> Option<OpenedFrame { kind, frame }>`** — the session
   method: one trial-decrypt pass over the receive window, returning the plaintext
   frame plus its `kind` (`OpenedFrameKind::Message` for 0x01/0x03,
-  `PqSideBand { PqFrameKind }` for 0x09–0x17), or `None` if no window key opens it.
+  `PqSideBand { PqFrameKind }` for 0x11–0x1F), or `None` if no window key opens it.
   The host routes `frame` by `kind` to `process_incoming` / `pq_ratchet_*` /
   `pq_rekey_*` / `pq_bootstrap_*`; those entry points keep their plaintext-frame
   signatures (and additionally auto-open a sealed blob, per the receive rule).
