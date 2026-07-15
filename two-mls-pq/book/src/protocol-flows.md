@@ -105,7 +105,7 @@ sequenceDiagram
     Alice->>Alice: Creates an APQ group from Bob's APQ keyPackage = Alice's send group
     Alice->>Bob: One HPKE envelope [ app payload ∥ APQ Welcome (Alice's send group) ],<br/>sealed to the PQ EK in Bob's APQ keyPackage
 
-    Alice->>Bob: App messages in Alice's send group — each a fresh HPKE envelope to Bob's keyPackage (as the initial frame),<br/>re-stapling the APQ Welcome; any single one lets Bob join and read it. Once Alice joins Bob's send group she<br/>header-seals instead, still re-stapling the Welcome until her first commit supersedes it
+    Alice->>Bob: App messages in Alice's send group — each a fresh HPKE envelope to Bob's keyPackage (as the initial frame),<br/>re-stapling the APQ Welcome — any single one lets Bob join and read it. Once Alice joins Bob's send group she<br/>header-seals instead, still re-stapling the Welcome until her first commit supersedes it
 
     Note over Bob: Process Welcome
     Bob->>Bob: Processes the Welcome to produce a classical group
@@ -163,7 +163,7 @@ sequenceDiagram
     Bob-)Bob: Encapsulates to the EK → fresh shared secret S + ciphertext CT
     Bob-)Alice: CT, as a side-band frame
     Alice-)Alice: Decapsulates CT → S, imports S as a PSK → partial commit in her PQ group (pq epoch advances)
-    Alice-)Alice: Discards the DK and S — folded in; nothing waits holding it
+    Alice-)Alice: Discards the DK and S — folded in, so nothing waits holding it
     Alice-)Alice: (at her next classical COMMIT) classical commit imports a PSK from the PQ group<br/>(no update path, so no PQ ciphertext — staple-able)
     Alice-)Bob: Ordinary message frame, stapling an APQPrivateMessage: the PQ partial commit + the classical commit
     Bob-)Bob: Applies both halves from the staple, then discards S
@@ -289,7 +289,7 @@ sequenceDiagram
     Alice->>Alice: [ASG-cl] Add(Bob KP) + PSK=apq_psk + Commit → ASG-cl epoch 1 (PQ-seeded)
 
     Alice->>Bob: One HPKE envelope [ app payload ∥ APQ Welcome = { Welcome' [ASG-PQ], Welcome(PSK) [ASG-cl] } ],<br/>sealed to the PQ EK in Bob's KP'
-    Alice->>Bob: App messages [ASG-cl] — each re-wrapped in a fresh HPKE envelope to Bob's KP' (as the initial frame above),<br/>re-stapling the APQ Welcome; any single one is a complete establishment vector (Bob can join and read it),<br/>so the initial frame need not survive. Alice has no receiving group to header-seal against until she joins BSG-cl;<br/>after that she header-seals, re-stapling the Welcome until her first commit
+    Alice->>Bob: App messages [ASG-cl] — each re-wrapped in a fresh HPKE envelope to Bob's KP' (as the initial frame above),<br/>re-stapling the APQ Welcome — any single one is a complete establishment vector (Bob can join and read it),<br/>so the initial frame need not survive. Alice has no receiving group to header-seal against until she joins BSG-cl —<br/>after that she header-seals, re-stapling the Welcome until her first commit
 
     Note over Bob: Join Alice's send group (both halves)
     Bob->>Bob: Process Welcome' → join ASG-PQ, then Welcome(PSK) → join ASG-cl
@@ -339,7 +339,7 @@ sequenceDiagram
     Alice-)Alice: Decapsulate CT → S
 
     Alice-)Alice: [ASG-PQ] PSK=S + Commit' (no updatePath — PARTIAL, so it stays small) → pq_epoch++<br/>(psk_id carries the 0x52 injected-secret domain byte)
-    Alice-)Alice: Discard DK and S — the secret is folded in; nothing waits holding it
+    Alice-)Alice: Discard DK and S — the secret is folded in, so nothing waits holding it
 
     Note over Alice,Bob: The APQ pair is now half-committed: PQ has moved, classical is OWED.<br/>The attestation (t_epoch, pq_epoch) is now a RESERVATION on the next classical commit.<br/>Alice keeps sending at her current classical epoch, so nothing stalls — and nothing<br/>is held but the PQ commit's bytes, since apq_psk is not exported yet.
 
