@@ -430,6 +430,76 @@ impl SessionInner {
         apq::forget_psk_stores(&self.psk_stores, psk_id);
     }
 
+    /// The bind both A.3 and A.4 close their round with: inject `s` into our send-PQ with a
+    /// pathless commit, chain the exported `apq_psk` into our classical half, and staple
+    /// `app`. Returns the three sections the caller frames.
+    ///
+    /// The rounds differ ONLY in where `s` comes from — A.3 decapsulates it from the peer's
+    /// CT, A.4 exports it from the group it just joined — so everything from here down is
+    /// shared. That is the point: A.4's bind is not *like* A.3's, it IS A.3's.
+    ///
+    /// A -02 FULL commit: both halves carry the AppDataUpdate attesting the absolute
+    /// post-commit epochs of both groups, computed before either commit.
+    fn bind_with_secret(&mut self, s: &[u8], app: &[u8]) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+        let stores = self.psk_stores.clone();
+        let send = self
+            .send_group
+            .as_mut()
+            .ok_or(TwoMlsPqError::SessionNotReady)?;
+        let send_pq = send.pq.as_mut().ok_or(TwoMlsPqError::SessionNotReady)?;
+        let attestation = ApqInfoUpdate {
+            t_epoch: send.classical.current_epoch() + 1,
+            pq_epoch: send_pq.current_epoch() + 1,
+        };
+        let (pq_commit, apq_psk) =
+            apq::pq_ratchet::inject_and_commit(send_pq, s, &stores, attestation)?;
+        let cl_builder = send
+            .classical
+            .commit_builder()
+            .custom_proposal(attestation.to_custom_proposal()?);
+        let cl_out = apq_psk
+            .add_to_commit(cl_builder)?
+            .build()
+            .map_err(|_| TwoMlsPqError::Mls)?;
+        send.classical
+            .apply_pending_commit()
+            .map_err(|_| TwoMlsPqError::Mls)?;
+        // A bare PSK commit (the queued peer proposal is not cached — it is re-applied only
+        // at the routine fold), so the roster is unchanged; assert it.
+        apq::ensure_two_party(&send.classical)?;
+        // The commit consumed the one-shot apq PSK; drop it from every store it was
+        // registered into (the session registry plus the group-captured handles).
+        send.forget_psk(apq_psk.storage_id());
+        apq::forget_psk_stores(&stores, apq_psk.storage_id());
+        let cl_commit = cl_out
+            .commit_message
+            .to_bytes()
+            .map_err(|_| TwoMlsPqError::Mls)?;
+        let app_ct = send
+            .classical
+            .encrypt_application_message(app, vec![])
+            .map_err(|_| TwoMlsPqError::Mls)?
+            .to_bytes()
+            .map_err(|_| TwoMlsPqError::Mls)?;
+        // This commit advanced our send-group epoch, so any queued or offered peer proposal
+        // (an Update bound to the prior send epoch) is now stale and cannot be committed —
+        // drop it. The peer re-proposes at the new epoch once it observes this staple (the
+        // receiver freely drops; the proposer re-sends).
+        self.queued_proposal = None;
+        self.offered_proposal = None;
+        // Our send group advanced: record the new epoch's PSK in the session ledger.
+        self.remember_send_psk()?;
+        // The classical commit becomes the staple subsequent message frames re-send — if the
+        // BIND frame itself is lost, the classical stream still heals. (A message frame can
+        // overtake the BIND; the peer then lacks the APQ-PSK and the staple fails retriably
+        // until the BIND lands.)
+        self.current_staple = cl_commit.clone();
+        // The commit publishes new keys; tag the staple with the (already-bumped) push seq
+        // for `depends_on_seq`.
+        self.current_staple_seq = self.state_seq;
+        Ok((pq_commit, cl_commit, app_ct))
+    }
+
     fn slot_mut(&mut self, which: SideBandSlot) -> &mut Option<RetainedFrame> {
         match which {
             SideBandSlot::SideBand => &mut self.pending_side_band,

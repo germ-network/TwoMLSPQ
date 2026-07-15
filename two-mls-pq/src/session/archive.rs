@@ -198,6 +198,8 @@ pub(crate) mod archive_wire {
     /// - `1` `Responding`     — `secret` set; `ephemeral`/`rotating` absent.
     /// - `2` `RekeyInitiated` — `rotating` optional; no KEM payload.
     /// - `3` `RekeyResponded` — no payload.
+    /// - `4` `BootstrapInitiated` — no payload (the welcome is self-sufficient).
+    /// - `5` `BootstrapResponded` — no payload.
     ///
     /// `from_archive` rejects any other `kind`, or a payload that does not match `kind`,
     /// as `ArchiveInvalid`.
@@ -422,6 +424,18 @@ fn wire_pq_inflight(inflight: &PqInflight) -> archive_wire::WirePqInflight {
             secret: None,
             rotating: None,
         },
+        PqInflight::BootstrapInitiated => WirePqInflight {
+            kind: 4,
+            ephemeral: None,
+            secret: None,
+            rotating: None,
+        },
+        PqInflight::BootstrapResponded => WirePqInflight {
+            kind: 5,
+            ephemeral: None,
+            secret: None,
+            rotating: None,
+        },
     }
 }
 
@@ -458,6 +472,18 @@ fn pq_inflight_from_wire(wire: archive_wire::WirePqInflight) -> Result<PqInfligh
             secret: None,
             rotating: None,
         } => Ok(PqInflight::RekeyResponded),
+        WirePqInflight {
+            kind: 4,
+            ephemeral: None,
+            secret: None,
+            rotating: None,
+        } => Ok(PqInflight::BootstrapInitiated),
+        WirePqInflight {
+            kind: 5,
+            ephemeral: None,
+            secret: None,
+            rotating: None,
+        } => Ok(PqInflight::BootstrapResponded),
         _ => Err(TwoMlsPqError::ArchiveInvalid),
     }
 }

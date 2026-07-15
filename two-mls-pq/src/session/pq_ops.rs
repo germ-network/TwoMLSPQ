@@ -8,9 +8,20 @@
 use super::*;
 
 /// PQ ratchet round state carried between the messages of one exchange.
+///
+/// Every side-band round registers here, and every `*_begin` gates on it being empty — that
+/// single-occupancy IS the mutual exclusion between A.3, A.4 and A.5. A.4 was long absent
+/// from it, which is exactly why a ratchet round could open during a bootstrap and evict its
+/// irreplaceable frame; being a well-formed round now, it takes its place.
 pub(in crate::session) enum PqInflight {
     /// Initiator holds the ephemeral (decapsulation key) until it receives the ciphertext.
     Initiating(apq::pq_ratchet::PqEphemeral),
+    /// A.4 initiator awaiting the responder's `Welcome'`. Carries nothing: the welcome is
+    /// self-sufficient, and the secret this round injects is exported from the group it
+    /// carries rather than held across the round.
+    BootstrapInitiated,
+    /// A.4 responder awaiting the initiator's bind — the frame that proves it joined.
+    BootstrapResponded,
     /// Responder holds the shared secret until it receives the stapled bind. `Zeroizing` wipes the
     /// secret from memory on drop, whether it is consumed by the bind or abandoned.
     Responding(Zeroizing<Vec<u8>>),
@@ -170,64 +181,7 @@ impl TwoMlsPqSession {
                 &eph,
                 &ct,
             )?);
-            let stores = inner.psk_stores.clone();
-            let send = inner
-                .send_group
-                .as_mut()
-                .ok_or(TwoMlsPqError::SessionNotReady)?;
-            let send_pq = send.pq.as_mut().ok_or(TwoMlsPqError::SessionNotReady)?;
-            // The bind is a -02 FULL commit: both halves carry the AppDataUpdate attesting
-            // the absolute post-commit epochs of both groups, computed before either commit.
-            let attestation = ApqInfoUpdate {
-                t_epoch: send.classical.current_epoch() + 1,
-                pq_epoch: send_pq.current_epoch() + 1,
-            };
-            let (pq_commit, apq_psk) =
-                apq::pq_ratchet::inject_and_commit(send_pq, &s, &stores, attestation)?;
-            let cl_builder = send
-                .classical
-                .commit_builder()
-                .custom_proposal(attestation.to_custom_proposal()?);
-            let cl_out = apq_psk
-                .add_to_commit(cl_builder)?
-                .build()
-                .map_err(|_| TwoMlsPqError::Mls)?;
-            send.classical
-                .apply_pending_commit()
-                .map_err(|_| TwoMlsPqError::Mls)?;
-            // The bind is a bare PSK commit (the queued peer proposal is not cached — it is
-            // re-applied only at the routine fold), so the roster is unchanged; assert it.
-            apq::ensure_two_party(&send.classical)?;
-            // The bind consumed the one-shot apq PSK; drop it from every store it was
-            // registered into (the session registry plus the group-captured handles).
-            send.forget_psk(apq_psk.storage_id());
-            apq::forget_psk_stores(&stores, apq_psk.storage_id());
-            let cl_commit = cl_out
-                .commit_message
-                .to_bytes()
-                .map_err(|_| TwoMlsPqError::Mls)?;
-            let app_ct = send
-                .classical
-                .encrypt_application_message(&app, vec![])
-                .map_err(|_| TwoMlsPqError::Mls)?
-                .to_bytes()
-                .map_err(|_| TwoMlsPqError::Mls)?;
-            // This commit advanced our send-group epoch, so any queued or offered peer
-            // proposal (an Update bound to the prior send epoch) is now stale and cannot be
-            // committed — drop it. The peer re-proposes at the new epoch once it observes
-            // this bind's staple (the receiver freely drops; the proposer re-sends).
-            inner.queued_proposal = None;
-            inner.offered_proposal = None;
-            // Our send group advanced: record the new epoch's PSK in the session ledger.
-            inner.remember_send_psk()?;
-            // The bind's classical commit becomes the staple subsequent message frames
-            // re-send — if the BIND frame itself is lost, the classical stream still heals.
-            // (A message frame can overtake the BIND; the peer then lacks the APQ-PSK and the
-            // staple fails retriably until the BIND lands — same as today's ordering.)
-            inner.current_staple = cl_commit.clone();
-            // The A.3 bind commit publishes new keys; tag the staple with the (already-bumped)
-            // push seq for `depends_on_seq`.
-            inner.current_staple_seq = inner.state_seq;
+            let (pq_commit, cl_commit, app_ct) = inner.bind_with_secret(&s, &app)?;
             // Our operation is complete once the peer applies; the turn passes.
             inner.pq_turn_mine = false;
             // TERMINAL: the round ends here for us — the peer applies and the turn flips,
@@ -1020,7 +974,7 @@ impl TwoMlsPqSession {
                 // secrecy reaches ASG-cl at the next A.3 ratchet; until then ASG-cl keeps
                 // the PQ-derived security chained in at establishment.
                 send.set_pq(pq_group, client.combiner());
-                encode_bootstrap_bind(pq_welcome)
+                encode_bootstrap_welcome(pq_welcome)
             };
             inner.pq_turn_mine = true;
             // TERMINAL: nothing comes back for it. PQ-only, so it is retired by the peer's
@@ -1052,7 +1006,7 @@ impl TwoMlsPqSession {
         let pq_welcome = {
             let mut inner = self.lock();
             let bind_msg = inner.open_or_raw(bind_msg);
-            let pq_welcome = decode_bootstrap_bind(&bind_msg)?;
+            let pq_welcome = decode_bootstrap_welcome(&bind_msg)?;
             // Validate the peer's PQ welcome suite before joining — an early, clear
             // CipherSuiteMismatch rather than a late opaque mls-rs error (matches the
             // establishment welcome path).

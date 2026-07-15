@@ -33,8 +33,23 @@ pub(crate) const PQ_BIND_TAG: u8 = 0x09;
 /// send-group PQ half.
 pub(crate) const PQ_BOOTSTRAP_KP_TAG: u8 = 0x0B;
 
-/// A.4 bootstrap reply: the new PQ group's welcome (PQ-groups-only; no classical commit).
-pub(crate) const PQ_BOOTSTRAP_BIND_TAG: u8 = 0x0D;
+/// A.4 bootstrap reply: the new PQ group's welcome. PQ-groups-only — no classical commit
+/// rides here; the initiator's bind (0x15) is what reaches a classical group.
+pub(crate) const PQ_BOOTSTRAP_WELCOME_TAG: u8 = 0x0D;
+
+/// A.4 bootstrap bind — the round's terminal frame, and structurally A.3's bind (0x09):
+/// `[pq partial-commit][classical commit][app]`. The initiator sends it after joining the
+/// welcomed group, and it differs from A.3's only in where the injected secret came from —
+/// an exporter off the newly joined group rather than a KEM exchange. That secret is
+/// derivable only from INSIDE that group, so a bind that applies at all proves the
+/// initiator joined: A.4's receipt is a side effect of entropy it had to chain anyway.
+///
+/// Allocated at 0x17, after `key_packages::INITIAL_ENVELOPE_TAG` (0x15) — the tag space is
+/// odd bytes 0x03..=0x17 and is ALLOCATION-order, not spec-order (§A.1's 0x13 is
+/// numerically first but was allocated last), so a new flow appends rather than slotting in
+/// beside its siblings. NB the space is not all declared here: the envelope tag lives in
+/// `key_packages`, which is why `rejects_non_side_band_tags` asserts against it.
+pub(crate) const PQ_BOOTSTRAP_BIND_TAG: u8 = 0x17;
 
 // A.5 rekey (architecture-diagrams §A.5), cryptokit only — updatePath commits run on the
 // PQ groups alone so the classical ratchet is never blocked behind a large ML-KEM
@@ -78,6 +93,9 @@ pub enum PqFrameKind {
     /// 0x0B — A.4 bootstrap: this side's PQ key package.
     BootstrapKeyPackage,
     /// 0x0D — A.4 bootstrap: the reply (the new PQ group's welcome).
+    BootstrapWelcome,
+    /// 0x15 — A.4 bootstrap: the initiator's terminal bind
+    /// (`[pq partial-commit][classical commit][app]`), which also confirms the welcome.
     BootstrapBind,
     /// 0x0F — A.5 rekey: the initiator's Upd' proposal.
     RekeyUpdate,
@@ -128,6 +146,7 @@ pub fn pq_frame_kind(tag: u8) -> Option<PqFrameKind> {
         PQ_CT_TAG => PqFrameKind::RatchetCiphertext,
         PQ_BIND_TAG => PqFrameKind::RatchetBind,
         PQ_BOOTSTRAP_KP_TAG => PqFrameKind::BootstrapKeyPackage,
+        PQ_BOOTSTRAP_WELCOME_TAG => PqFrameKind::BootstrapWelcome,
         PQ_BOOTSTRAP_BIND_TAG => PqFrameKind::BootstrapBind,
         PQ_REKEY_UPD_TAG => PqFrameKind::RekeyUpdate,
         PQ_REKEY_COMMIT_TAG => PqFrameKind::RekeyCommit,
@@ -210,21 +229,47 @@ pub(crate) fn encode_pq_bind(
     out
 }
 
-/// Encode the A.4 bootstrap reply: `[0x0D][pq_welcome…]`. PQ-groups-only per the spec —
-/// no classical commit rides along; ASG-PQ binds into ASG-cl at the next A.3 ratchet.
-pub(crate) fn encode_bootstrap_bind(pq_welcome: Vec<u8>) -> Vec<u8> {
+/// Encode the A.4 bootstrap reply: `[0x0D][pq_welcome…]`. PQ-groups-only per the spec — no
+/// classical commit rides along; the initiator's bind (0x15) carries the classical half.
+pub(crate) fn encode_bootstrap_welcome(pq_welcome: Vec<u8>) -> Vec<u8> {
     let mut out = Vec::with_capacity(1 + pq_welcome.len());
-    out.push(PQ_BOOTSTRAP_BIND_TAG);
+    out.push(PQ_BOOTSTRAP_WELCOME_TAG);
     out.extend_from_slice(&pq_welcome);
     out
 }
 
-pub(crate) fn decode_bootstrap_bind(bytes: &[u8]) -> Result<Vec<u8>> {
+pub(crate) fn decode_bootstrap_welcome(bytes: &[u8]) -> Result<Vec<u8>> {
+    let (&tag, rest) = bytes.split_first().ok_or(TwoMlsPqError::Mls)?;
+    if tag != PQ_BOOTSTRAP_WELCOME_TAG {
+        return Err(TwoMlsPqError::Mls);
+    }
+    Ok(rest.to_vec())
+}
+
+/// Encode the A.4 bootstrap bind: `[0x15][pq_commit][classical_commit][app]` — A.3's bind
+/// shape (`encode_pq_bind`) under its own tag, so the two rounds' terminal frames cannot be
+/// confused at the door.
+pub(crate) fn encode_bootstrap_bind(
+    pq_commit: Vec<u8>,
+    classical_commit: Vec<u8>,
+    app: Vec<u8>,
+) -> Vec<u8> {
+    let mut out =
+        Vec::with_capacity(1 + 4 + pq_commit.len() + 4 + classical_commit.len() + 4 + app.len());
+    out.push(PQ_BOOTSTRAP_BIND_TAG);
+    push_section(&mut out, &pq_commit);
+    push_section(&mut out, &classical_commit);
+    push_section(&mut out, &app);
+    out
+}
+
+pub(crate) fn decode_bootstrap_bind(bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
     let (&tag, rest) = bytes.split_first().ok_or(TwoMlsPqError::Mls)?;
     if tag != PQ_BOOTSTRAP_BIND_TAG {
         return Err(TwoMlsPqError::Mls);
     }
-    Ok(rest.to_vec())
+    let [pq_commit, classical_commit, app] = read_sections::<3>(rest)?;
+    Ok((pq_commit, classical_commit, app))
 }
 
 pub(crate) fn decode_pq_bind(bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
@@ -353,8 +398,8 @@ mod pq_frame_kind_tests {
     fn rejects_non_side_band_tags() {
         // Bare-MLS first byte, the APQWelcome and message-frame tags, gaps/evens between
         // side-band tags, the pre-establishment staple tag (0x13 — envelope-interior
-        // only), and the envelope tag (0x15 — invitation channel only) are not
-        // side-band frames.
+        // only), the envelope tag (0x15 — invitation channel only), and the first
+        // unallocated byte past the block (0x19) are not side-band frames.
         for tag in [
             0x00,
             APQ_TAG,
@@ -363,6 +408,7 @@ mod pq_frame_kind_tests {
             0x12,
             PRE_ESTABLISHMENT_APP_TAG,
             crate::key_packages::INITIAL_ENVELOPE_TAG,
+            0x19,
             0xFF,
         ] {
             assert_eq!(
