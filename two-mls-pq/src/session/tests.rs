@@ -5362,3 +5362,73 @@ fn test_bootstrap_bind_retires_when_the_peer_proves_it_joined() {
     );
     assert_ok!(alice.pq_ratchet_bind(offered[0].clone(), b"x".to_vec()));
 }
+
+/// Two frames in flight is BOUNDED and TRANSIENT, not a steady state — and the window
+/// closes on evidence, not on a timer.
+///
+/// It exists only across the A.4 gap, because A.4's confirmation can only ride a PQ-sealed
+/// peer frame and the peer holds no turn after applying: the only thing that can prove the
+/// bind landed is the first A.3 round, which the turn holder must open. So the bootstrap
+/// necessarily overlaps that round. (Gating the round on A.4 resolving instead deadlocks:
+/// the turn holder waits for evidence only the peer can send, and the peer will not
+/// initiate out of turn.)
+#[test]
+fn test_two_in_flight_is_transient_and_closes_on_evidence() {
+    let (alice, bob) = establish_full();
+    // Bob answered A.4 and holds the turn, so the next round is his to open — while his
+    // own bind is still unconfirmed.
+    assert!(bob.my_pq_turn());
+    assert_ok!(bob.pq_ratchet_begin());
+    assert_eq!(
+        bob.pq_pending_outbound(SideBandSealing::Fresh).len(),
+        2,
+        "the bootstrap and the round it overlaps are both in flight"
+    );
+
+    // One round trip closes it: Alice applied the bind, so her CT is PQ-sealed — a key
+    // derivable only inside the group that bind carried.
+    let offered = bob.pq_pending_outbound(SideBandSealing::Fresh);
+    assert_ok!(alice.pq_ratchet_respond(offered[1].clone()));
+    let ct = assert_some!(peek_one(&alice, SideBandSealing::Fresh));
+    assert_ok!(bob.pq_ratchet_bind(ct, b"x".to_vec()));
+
+    assert_eq!(
+        bob.pq_pending_outbound(SideBandSealing::Fresh).len(),
+        1,
+        "the bootstrap retired on the receipt; only the live round remains"
+    );
+}
+
+/// The other half: if the peer did NOT get the bind, the overlap PERSISTS — correctly.
+///
+/// The seal family reports it for free. Without its recv-PQ the peer cannot seal under the
+/// PQ family, so `seal_side_band` falls back to classical; that frame advances no PQ
+/// watermark, so the bind is not retired and keeps re-sending alongside the round. The
+/// evidence is the absence of evidence, and it needs no special case.
+#[test]
+fn test_unconfirmed_bootstrap_keeps_re_sending_alongside_the_round() {
+    let (alice, bob) = establish_confirmed_sessions();
+    let kp = assert_ok!(alice.pq_bootstrap_begin(None));
+    assert_ok!(bob.pq_bootstrap_respond(kp));
+    // Alice never applies Bob's bind — the transport dropped it.
+    assert_ok!(bob.pq_ratchet_begin());
+    let offered = bob.pq_pending_outbound(SideBandSealing::Fresh);
+    assert_eq!(offered.len(), 2);
+
+    // Alice answers the round. Having never joined, she seals CLASSICALLY.
+    assert_ok!(alice.pq_ratchet_respond(offered[1].clone()));
+    // Alice is holding two herself, and rightly so: she never applied Bob's bind, so her
+    // own KP' is still unretired beside this round's CT. A.4 is unfinished on BOTH sides,
+    // and both sides keep re-sending their half of it.
+    let from_alice = alice.pq_pending_outbound(SideBandSealing::Fresh);
+    assert_eq!(from_alice.len(), 2, "alice's KP' is unconfirmed too");
+    assert_ok!(bob.pq_ratchet_bind(from_alice[1].clone(), b"x".to_vec()));
+
+    // And Bob's bind is still in flight — exactly right, it never landed. Nothing had to
+    // detect that: Alice simply could not produce the PQ-sealed frame that would retire it.
+    assert_eq!(
+        bob.pq_pending_outbound(SideBandSealing::Fresh).len(),
+        2,
+        "an unconfirmed bootstrap must keep re-sending until it lands"
+    );
+}
