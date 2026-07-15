@@ -307,10 +307,15 @@ pub struct HpkeSealed {
 }
 
 /// Leading tag byte of the §A.1 envelope blob (`[0x15][u32-LE kem_len][kem_output]
-/// [ciphertext]`) — the one frame kind that travels the invitation channel. Distinct
-/// from every message-path (0x00/0x01/0x03), side-band (0x05–0x11), and staple (0x13)
+/// [ciphertext]`) — the one frame kind that travels the invitation channel. Distinct from
+/// every message-path (0x00/0x01/0x03), side-band (0x05–0x11 and 0x17), and staple (0x13)
 /// tag so a host can classify the blob by its first byte; `open_incoming` /
 /// `process_incoming` never see it (an envelope reaching them fails loudly).
+///
+/// This byte is allocated out of the shared tag space but declared here rather than in
+/// `session::frames`, because an envelope is not a session frame. `frames::tests::TAG_SPACE`
+/// is where the whole space is visible at once and where the distinctness this doc claims is
+/// actually enforced — asserting it in prose is how 0x15 got claimed twice once already.
 pub const INITIAL_ENVELOPE_TAG: u8 = 0x15;
 
 /// [`INITIAL_ENVELOPE_TAG`] for hosts that parse the outer frame themselves —

@@ -43,10 +43,14 @@ Three flows run beside the message path on their own tagged frames (see
 the session initiator owes the bootstrap; completing an operation passes the turn to
 the peer (`my_pq_turn()`), and only one operation may be in flight at a time.
 
-- **Bootstrap** (`0x0B`/`0x0D`) — stands up Group_B's deferred PQ half off the
+- **Bootstrap** (`0x0B`/`0x0D`/`0x17`) — stands up Group_B's deferred PQ half off the
   critical path: Alice sends her PQ key package; Bob creates Group_B.pq around it and
-  returns its Welcome. Both send groups are then complete APQ groups
-  (`is_fully_established()`).
+  returns its Welcome; Alice joins and binds. Both send groups are then complete APQ
+  groups (`is_fully_established()`). The bind is structurally the PQ ratchet's (below),
+  differing only in where its injected secret comes from — an exporter off the newly
+  joined group rather than a KEM exchange — and it doubles as the round's receipt: that
+  secret is derivable only from inside Group_B.pq, so a bind that applies at all proves
+  Alice joined.
 - **PQ ratchet** (`0x05`/`0x07`/`0x09`) — injects fresh ML-KEM
   entropy into a send group's PQ half via a pathless PSK commit and re-binds the
   exported APQ-PSK into the classical half in the same round.

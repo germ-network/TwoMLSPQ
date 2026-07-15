@@ -6,6 +6,28 @@
 
 use super::*;
 
+// ── The tag space ───────────────────────────────────────────────────────────────────
+// Every wire blob is discriminated by its first byte, so these values are ONE global
+// space — but they are declared in three places, because each tag lives with the thing it
+// tags: `APQ_TAG` (0x01) in the `apq` crate, `INITIAL_ENVELOPE_TAG` (0x15) in
+// `key_packages` (it rides the invitation channel and is not a session frame), and the
+// rest here. Ownership is local; allocation is global. That split is the hazard: a
+// collision is a silent wire misclassification rather than a compile error, and the file
+// you read when adding a session frame is not the file that knows about 0x15.
+//
+// Two invariants hold across all three sites; `tests::tag_space_holds` enforces both.
+//   * DISTINCT — see above.
+//   * ODD — an MLSMessage begins with ProtocolVersion 0x0001 (big-endian), so its first
+//     byte is always 0x00. Reserving the entire even space is what lets a tagged frame and
+//     a bare MLS message be told apart from byte 0 alone, and what makes the message
+//     frame's staple slot self-discriminating (welcome 0x01 vs. commit 0x00) with no
+//     discriminator byte of its own.
+//
+// Values are in ALLOCATION order, not spec order (§A.1's 0x13 is numerically first but was
+// allocated last), so a new flow appends rather than slotting in beside its siblings. To
+// add one: take the next unused odd byte, add a row to `tests::TAG_SPACE`, and update the
+// book's `wire-format.md` table — the prose registry, which must agree.
+
 // APQWelcome wire format (0x01) + encode/decode live in the `apq` crate (imported above).
 // The APQWelcome appears both as a standalone frame (invitation channel, and optional
 // standalone delivery of the acceptor's return welcome) and as the message frame's staple
@@ -34,7 +56,7 @@ pub(crate) const PQ_BIND_TAG: u8 = 0x09;
 pub(crate) const PQ_BOOTSTRAP_KP_TAG: u8 = 0x0B;
 
 /// A.4 bootstrap reply: the new PQ group's welcome. PQ-groups-only — no classical commit
-/// rides here; the initiator's bind (0x15) is what reaches a classical group.
+/// rides here; the initiator's bind (0x17) is what reaches a classical group.
 pub(crate) const PQ_BOOTSTRAP_WELCOME_TAG: u8 = 0x0D;
 
 /// A.4 bootstrap bind — the round's terminal frame, and structurally A.3's bind (0x09):
@@ -44,11 +66,9 @@ pub(crate) const PQ_BOOTSTRAP_WELCOME_TAG: u8 = 0x0D;
 /// derivable only from INSIDE that group, so a bind that applies at all proves the
 /// initiator joined: A.4's receipt is a side effect of entropy it had to chain anyway.
 ///
-/// Allocated at 0x17, after `key_packages::INITIAL_ENVELOPE_TAG` (0x15) — the tag space is
-/// odd bytes 0x03..=0x17 and is ALLOCATION-order, not spec-order (§A.1's 0x13 is
-/// numerically first but was allocated last), so a new flow appends rather than slotting in
-/// beside its siblings. NB the space is not all declared here: the envelope tag lives in
-/// `key_packages`, which is why `rejects_non_side_band_tags` asserts against it.
+/// Allocated at 0x17 — the next unused odd byte past `key_packages::INITIAL_ENVELOPE_TAG`
+/// (0x15). See the tag-space note at the top of this file for why "next unused" spans three
+/// declaration sites.
 pub(crate) const PQ_BOOTSTRAP_BIND_TAG: u8 = 0x17;
 
 // A.5 rekey (architecture-diagrams §A.5), cryptokit only — updatePath commits run on the
@@ -230,7 +250,7 @@ pub(crate) fn encode_pq_bind(
 }
 
 /// Encode the A.4 bootstrap reply: `[0x0D][pq_welcome…]`. PQ-groups-only per the spec — no
-/// classical commit rides along; the initiator's bind (0x15) carries the classical half.
+/// classical commit rides along; the initiator's bind (0x17) carries the classical half.
 pub(crate) fn encode_bootstrap_welcome(pq_welcome: Vec<u8>) -> Vec<u8> {
     let mut out = Vec::with_capacity(1 + pq_welcome.len());
     out.push(PQ_BOOTSTRAP_WELCOME_TAG);
@@ -415,6 +435,52 @@ mod pq_frame_kind_tests {
                 pq_frame_kind(tag),
                 None,
                 "tag {tag:#x} must not classify as side-band"
+            );
+        }
+    }
+
+    /// Every allocated tag byte and the constant that owns it — the allocation record for a
+    /// space declared across three sites (see the note at the top of this file). Ownership
+    /// stays local; this is the one place the whole space is visible at once.
+    ///
+    /// A row here is not decoration: `tag_space_holds` is what turns a duplicate byte from a
+    /// wire bug found in review into a failing build. Add a row when you add a tag, and keep
+    /// the book's `wire-format.md` table in step.
+    const TAG_SPACE: &[(u8, &str)] = &[
+        (APQ_TAG, "apq::APQ_TAG"),
+        (MESSAGE_FRAME_TAG, "MESSAGE_FRAME_TAG"),
+        (PQ_EK_TAG, "PQ_EK_TAG"),
+        (PQ_CT_TAG, "PQ_CT_TAG"),
+        (PQ_BIND_TAG, "PQ_BIND_TAG"),
+        (PQ_BOOTSTRAP_KP_TAG, "PQ_BOOTSTRAP_KP_TAG"),
+        (PQ_BOOTSTRAP_WELCOME_TAG, "PQ_BOOTSTRAP_WELCOME_TAG"),
+        (PQ_REKEY_UPD_TAG, "PQ_REKEY_UPD_TAG"),
+        (PQ_REKEY_COMMIT_TAG, "PQ_REKEY_COMMIT_TAG"),
+        (PRE_ESTABLISHMENT_APP_TAG, "PRE_ESTABLISHMENT_APP_TAG"),
+        (
+            crate::key_packages::INITIAL_ENVELOPE_TAG,
+            "key_packages::INITIAL_ENVELOPE_TAG",
+        ),
+        (PQ_BOOTSTRAP_BIND_TAG, "PQ_BOOTSTRAP_BIND_TAG"),
+    ];
+
+    #[test]
+    fn tag_space_holds() {
+        for (tag, name) in TAG_SPACE {
+            // An MLSMessage's first byte is always 0x00 (ProtocolVersion 0x0001, BE). The
+            // even space is reserved so byte 0 alone separates a tagged frame from bare MLS
+            // — and so the staple slot can self-discriminate welcome 0x01 vs. commit 0x00.
+            assert_eq!(tag % 2, 1, "{name} ({tag:#04x}) must be odd");
+
+            let dupes: Vec<_> = TAG_SPACE
+                .iter()
+                .filter(|(other, _)| other == tag)
+                .map(|(_, n)| *n)
+                .collect();
+            assert_eq!(
+                dupes.len(),
+                1,
+                "{tag:#04x} is allocated more than once: {dupes:?}"
             );
         }
     }

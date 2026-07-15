@@ -10,9 +10,20 @@ Every outbound blob is a tagged frame — there are no bare MLS messages on the 
 | `PQ_CT_TAG` | `0x07` | PQ ratchet: ML-KEM ciphertext |
 | `PQ_BIND_TAG` | `0x09` | PQ ratchet bind: PQ partial commit + classical commit + app |
 | `PQ_BOOTSTRAP_KP_TAG` | `0x0B` | Bootstrap: PQ key package for the deferred send-group half |
-| `PQ_BOOTSTRAP_BIND_TAG` | `0x0D` | Bootstrap: the new PQ group's Welcome (PQ-groups-only; no classical commit) |
+| `PQ_BOOTSTRAP_WELCOME_TAG` | `0x0D` | Bootstrap: the new PQ group's Welcome (PQ-groups-only; no classical commit) |
 | `PQ_REKEY_UPD_TAG` | `0x0F` | PQ re-key: initiator's `Upd'` proposal |
 | `PQ_REKEY_COMMIT_TAG` | `0x11` | PQ re-key: `[Commit'][counter-Upd'-or-empty]` |
+| `PRE_ESTABLISHMENT_APP_TAG` | `0x13` | §A.1 app staple, envelope-interior only: `[0x13][BSG-cl PrivateMessage]` |
+| `INITIAL_ENVELOPE_TAG` | `0x15` | §A.1 envelope — the one frame on the invitation channel. Declared in `key_packages` |
+| `PQ_BOOTSTRAP_BIND_TAG` | `0x17` | Bootstrap bind: PQ partial commit + classical commit + app — A.3's bind shape |
+
+The table is the prose half of the registry; `frames::tests::TAG_SPACE` is the executable
+half, and the two must agree. The space is **allocation-ordered, not spec-ordered** (§A.1's
+`0x13` is numerically first but was allocated last), and it spans **three declaration
+sites**, because each tag lives with the thing it tags: `APQ_TAG` in the `apq` crate,
+`INITIAL_ENVELOPE_TAG` in `key_packages` (an envelope is not a session frame), and the rest
+in `session::frames`. Ownership is local; allocation is global — which is exactly how `0x15`
+once got claimed twice, by a reader of `frames.rs` for whom the envelope tag was invisible.
 
 Each multi-section frame uses a `u32`-LE length prefix per embedded field. Hosts
 classify PQ side-band frames via the exported `pq_frame_kind` (never by matching raw
@@ -103,8 +114,14 @@ a leaf that cannot support them is rejected rather than silently degraded.
 The tag values are part of the on-wire protocol; pre-release, a renumber is allowed
 (this format renumbered the PQ side-band from `0x0B–0x17` and deleted the retired
 `0x07` reservation along with the old `BUNDLED`/`PARTIAL`/`STAPLED_WELCOME` frames —
-stale frames from older builds fail loudly in the decoders). When adding a message
-type, pick an unused **odd** value, add matching `encode_*`/`decode_*` helpers
-following the `u32`-LE length-prefix pattern, and extend `pq_frame_kind` if it is a
-side-band frame — hosts dispatch on the classifier, so a frame kind that never
-reaches it is invisible to them.
+stale frames from older builds fail loudly in the decoders; `0x17` has since been
+re-allocated to the bootstrap bind out of that freed range). When adding a message type,
+pick an unused **odd** value, **add a row to `frames::tests::TAG_SPACE`** and to the table
+above, add matching `encode_*`/`decode_*` helpers following the `u32`-LE length-prefix
+pattern, and extend `pq_frame_kind` if it is a side-band frame — hosts dispatch on the
+classifier, so a frame kind that never reaches it is invisible to them.
+
+"Unused" is the step worth being deliberate about: the space has three declaration sites,
+so the registry — not a read of `frames.rs` — is what tells you a byte is free.
+`tag_space_holds` enforces both invariants (distinct, odd) and names the colliding
+constants when it fires.
