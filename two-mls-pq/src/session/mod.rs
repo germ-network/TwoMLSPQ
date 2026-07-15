@@ -100,15 +100,6 @@ pub(in crate::session) struct Opened {
     pub(in crate::session) epoch: u64,
 }
 
-/// Which retained slot a hand-out is reading. Two, because A.4 runs CONCURRENTLY with
-/// A.3/A.5 rather than as an alternative to them — see the field docs on
-/// [`SessionInner::pending_bootstrap`].
-#[derive(Clone, Copy)]
-pub(in crate::session) enum SideBandSlot {
-    SideBand,
-    Bootstrap,
-}
-
 impl RetainedFrame {
     /// Retain `frame`, seeding the `Stable` cache with `sealed` — the bytes a `*_begin` is
     /// about to return to the caller.
@@ -227,17 +218,6 @@ struct SessionInner {
     /// gate on it and therefore runs CONCURRENTLY — hence its own slot below, and NOT a
     /// third field for A.5.
     pending_side_band: Option<RetainedFrame>,
-    /// The A.4 bootstrap's outbound frame (initiator's `KP'`, responder's `BootstrapBind`),
-    /// retained for re-send. Cleared at `pq_bootstrap_apply`.
-    ///
-    /// Separate from `pending_side_band` because A.4 is a concurrent flow, not an
-    /// alternative one: it is invisible to the `pq_inflight` guard, and
-    /// `pq_bootstrap_respond` parks its bind AND takes the turn — so the responder opening
-    /// an A.3 round (its move, legitimately) shared a slot with an unfinished A.4 and
-    /// evicted it. A BootstrapBind is irreplaceable: the peer's deferred PQ half is built
-    /// from it and nothing else can re-emit it, so eviction stranded establishment for
-    /// good. See `test_ratchet_round_does_not_evict_an_unfinished_bootstrap`.
-    pending_bootstrap: Option<RetainedFrame>,
     /// The highest epoch at which a peer frame has opened, per header family — what the
     /// peer has demonstrably APPLIED of our commits. Set by `observe_receipt`; read by
     /// `hand_out` to retire a terminal frame whose `retire_at` it has reached.
@@ -500,11 +480,79 @@ impl SessionInner {
         Ok((pq_commit, cl_commit, app_ct))
     }
 
-    fn slot_mut(&mut self, which: SideBandSlot) -> &mut Option<RetainedFrame> {
-        match which {
-            SideBandSlot::SideBand => &mut self.pending_side_band,
-            SideBandSlot::Bootstrap => &mut self.pending_bootstrap,
+    /// The apply both A.3 and A.4 close their round with: apply the peer's pathless PQ
+    /// commit to our recv-PQ with the injected secret `s`, apply the classical commit, verify
+    /// the -02 FULL attestation across both halves, and return the stapled app message.
+    ///
+    /// As with `bind_with_secret`, the rounds differ only in where `s` came from: A.3 held it
+    /// from encapsulating, A.4 re-derives it by exporting from its own copy of the group it
+    /// created. Everything below is identical.
+    fn apply_bind(
+        &mut self,
+        s: &[u8],
+        stores: &[InMemoryPreSharedKeyStorage],
+        pq_commit: &[u8],
+        cl_commit: &[u8],
+        app_ct: &[u8],
+    ) -> Result<Vec<u8>> {
+        let recv = self
+            .recv_group
+            .as_mut()
+            .ok_or(TwoMlsPqError::SessionNotReady)?;
+        let recv_pq = recv.pq.as_mut().ok_or(TwoMlsPqError::SessionNotReady)?;
+        let (apq_psk, pq_attestation) =
+            apq::pq_ratchet::apply_injected_commit(recv_pq, s, pq_commit, stores)?;
+        let cl = MlsMessage::from_bytes(cl_commit).map_err(|_| TwoMlsPqError::Mls)?;
+        let cl_attestation = match recv
+            .classical
+            .process_incoming_message(cl)
+            .map_err(|_| TwoMlsPqError::Mls)?
+        {
+            ReceivedMessage::Commit(desc) => {
+                commit_attestation(&desc)?.ok_or(TwoMlsPqError::ApqInfoMismatch)?
+            }
+            _ => return Err(TwoMlsPqError::ApqInfoMismatch),
+        };
+        // -02 FULL verification: both halves carried the AppDataUpdate, the two copies
+        // agree, and they attest the actual post-apply epochs of both groups.
+        //
+        // Verify/apply boundary: per-half AppDataUpdate validity (correct proposal type,
+        // committer-sent, and new-epoch == pre-commit context.epoch + 1) is enforced
+        // PRE-apply by the MlsRules filter (see `apq::rules`), so a structurally bad
+        // attestation is rejected before either group state moves. What remains here — the
+        // CROSS-half agreement and the match against the actual post-apply epochs — is
+        // necessarily post-apply, because comparing the two halves' epochs requires both
+        // commits to have been applied (mls-rs `process_incoming_message` validates and
+        // applies atomically; there is no inspect-without-apply short of a fork change).
+        // That residual check still gates every observable effect: it runs BEFORE the
+        // stapled app message is decrypted (line below), BEFORE the one-shot apq PSK is
+        // forgotten, and BEFORE the turn passes — so on a bad attestation from our sole
+        // counterparty no plaintext is released and no turn/PSK state is confirmed. The
+        // only thing an attestation forgery can force is a self-inflicted epoch advance
+        // that then errors out, which is within the two-party DoS threat model.
+        if cl_attestation != pq_attestation
+            || pq_attestation.pq_epoch != recv_pq.current_epoch()
+            || cl_attestation.t_epoch != recv.classical.current_epoch()
+        {
+            return Err(TwoMlsPqError::ApqInfoMismatch);
         }
+        // Peer commits (the PQ partial above is checked inside `apply_injected_commit`)
+        // must never change the two-party shape.
+        apq::ensure_two_party(&recv.classical)?;
+        // The bind consumed the one-shot apq PSK; drop it from every store it was
+        // registered into (the session registry plus the group-captured handles).
+        recv.forget_psk(apq_psk.storage_id());
+        apq::forget_psk_stores(stores, apq_psk.storage_id());
+        let app = MlsMessage::from_bytes(app_ct).map_err(|_| TwoMlsPqError::Mls)?;
+        let out = match recv
+            .classical
+            .process_incoming_message(app)
+            .map_err(|_| TwoMlsPqError::Mls)?
+        {
+            ReceivedMessage::ApplicationMessage(m) => Ok(m.data().to_vec()),
+            _ => Err(TwoMlsPqError::DecryptionFailed),
+        };
+        out
     }
 
     /// Seal `which` slot's retained frame for hand-out, filling its `Stable` cache on a
@@ -517,27 +565,27 @@ impl SessionInner {
     /// `observe_receipt` a plain monotone observation and lets the clearing ride whatever
     /// persist its caller was already doing. BOTH hand-out paths must call it — a take that
     /// skipped it would serve a spent frame in place of the live one.
-    fn retire_if_spent(&mut self, which: SideBandSlot) -> bool {
-        if let Some((family, epoch)) = self.slot_mut(which).as_ref().and_then(|r| r.retire_at) {
+    fn retire_if_spent(&mut self) -> bool {
+        if let Some((family, epoch)) = self.pending_side_band.as_ref().and_then(|r| r.retire_at) {
             let applied = match family {
                 HeaderFamily::Classical => self.peer_applied_classical,
                 HeaderFamily::Pq => self.peer_applied_pq,
             };
             if applied >= epoch {
-                *self.slot_mut(which) = None;
+                self.pending_side_band = None;
             }
         }
-        self.slot_mut(which).is_none()
+        self.pending_side_band.is_none()
     }
 
-    fn hand_out(&mut self, which: SideBandSlot, sealing: SideBandSealing) -> Option<Vec<u8>> {
-        if self.retire_if_spent(which) {
+    fn hand_out(&mut self, sealing: SideBandSealing) -> Option<Vec<u8>> {
+        if self.retire_if_spent() {
             return None;
         }
         // Lift the frame out before sealing: `seal_side_band` borrows the whole inner, so
         // it cannot run while a slot borrow is live.
         let (frame, cached) = {
-            let retained = self.slot_mut(which).as_ref()?;
+            let retained = self.pending_side_band.as_ref()?;
             (retained.frame.clone(), retained.seal.clone())
         };
         if let (SideBandSealing::Stable, Some(sealed)) = (sealing, cached) {
@@ -545,7 +593,7 @@ impl SessionInner {
         }
         let sealed = self.seal_side_band(&frame).ok()?;
         if matches!(sealing, SideBandSealing::Stable) {
-            if let Some(retained) = self.slot_mut(which) {
+            if let Some(retained) = self.pending_side_band.as_mut() {
                 retained.seal = Some(sealed.clone());
             }
         }
@@ -811,7 +859,6 @@ fn build_session(
             },
             pq_turn_mine: initiated,
             pending_side_band: None,
-            pending_bootstrap: None,
             peer_applied_classical: 0,
             peer_applied_pq: 0,
             send_psk_ledger: VecDeque::new(),

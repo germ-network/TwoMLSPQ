@@ -58,19 +58,53 @@ that any single received frame heals the peer.
 Hosts that keep using `pq_take_pending_outbound` are unaffected: initiator frames
 are still returned as before, and taking still consumes.
 
-## Two slots, because A.4 is concurrent
+## A.4 is a well-formed round now, so one slot suffices
 
-A.3 and A.5 are mutually exclusive — every entry point gates on `pq_inflight`, so one
-round is open at a time and one slot serves both. A.4 does NOT gate on it and runs
-alongside them, so it gets its own: `pq_bootstrap_respond` parks its bind AND takes the
-turn, so the responder opening an A.3 round (its move, legitimately) shared the slot with
-an unfinished A.4 and evicted it. A BootstrapBind is irreplaceable — the peer's deferred
-PQ half is built from it and nothing else can re-emit it — so eviction stranded
-establishment for good, in a normal flow.
+Retention exposed that A.4 could be evicted: it was the only flow absent from
+`pq_inflight`, so a ratchet round could open beside a bootstrap and replace its frame —
+and a bootstrap frame is irreplaceable, so establishment stranded for good. Reachable in a
+NORMAL flow, because `pq_bootstrap_respond` took the turn at its own send: the responder
+was expected to open the next round while its own welcome was still unconfirmed.
 
-`pq_pending_outbound` therefore returns a LIST: zero, one, or two frames, since a
-bootstrap can be in flight while a ratchet round is open. Send them all; they are
-independent. Bootstrap comes first, but the receiver's two doors are order-independent.
+The cause was A.4's two-leg shape. A.3 and A.5 end with the initiator finalising, which is
+what lets the turn pass on a receipt; A.4 stopped at KP' → Welcome, so it had no finalising
+leg and handed the turn over early to compensate. It now has one:
+
+**KP' → Welcome' → Bind.** The initiator joins the welcomed group, exports the cross-party
+secret from its birth epoch, injects it into its own send-PQ with a pathless commit, and
+chains the exported apq_psk into its classical half — `encode_bootstrap_bind`
+(`[pq_commit][classical_commit][app]`, tag 0x17), which is A.3's bind under its own tag.
+The only difference from A.3 is where the secret comes from: a group exporter rather than a
+KEM exchange.
+
+Three things fall out:
+
+- **The receipt is free.** The secret is derivable only from INSIDE the welcomed group, so a
+  bind that applies at all proves the initiator joined. The responder re-derives it from its
+  own copy — same group, epoch and domain — so it never goes on the wire. An ack frame would
+  have proved the same thing and done no work.
+- **The turn passes on the same rule as everything else** — the initiator relinquishes at its
+  terminal send, the responder takes it on applying. The responder never holds the turn while
+  its welcome is unconfirmed, so the collision cannot form.
+- **A.4 registers in `pq_inflight`**, joining the single-occupancy that already kept A.3 and
+  A.5 apart. So `pq_pending_outbound` returns at most one frame, and the second slot the
+  first cut of this change added is gone.
+
+`pq_bootstrap_apply` now means the RESPONDER's leg-4 apply and returns the stapled app, as
+`pq_ratchet_apply` does; the initiator's join-and-bind is `pq_bootstrap_bind`. Tag 0x0D is
+renamed `PQ_BOOTSTRAP_WELCOME` — it has always carried a welcome, and the bind name goes to
+the frame that earns it.
+
+Two consequences worth knowing:
+
+- **A.4 is no longer PQ-groups-only.** Its bind carries a classical commit, so it advances
+  the initiator's epochs (1/1 → 2/2) where the old bootstrap advanced nothing. Post-A.4
+  state is therefore asymmetric: the responder's send-PQ is born at A.4 and does not move
+  until its own next bind. Classical never blocks on PQ — this defers freshness, not
+  liveness.
+- **A.4's terminal frame gets the FAST receipt.** Its classical commit means an ordinary peer
+  message frame retires it, where the old PQ-only bootstrap could only be confirmed by a peer
+  side-band frame.
 
 ## Terminal frames retire on the peer's application receipt
 

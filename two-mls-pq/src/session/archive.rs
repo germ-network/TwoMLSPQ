@@ -281,14 +281,10 @@ pub(crate) mod archive_wire {
         /// The retained A.3/A.5 side-band frame (plaintext). Its `Stable` seal cache is
         /// live-only and deliberately absent here — see `RetainedFrame`.
         pub(in crate::session) pending_side_band: Option<Vec<u8>>,
-        /// The retained A.4 bootstrap frame. Its own slot because A.4 runs concurrently
-        /// with A.3/A.5 rather than as an alternative to it.
-        pub(in crate::session) pending_bootstrap: Option<Vec<u8>>,
         /// The terminal-frame retirement stamps and the peer-applied watermarks they are
         /// compared against. Without these a restore would strand a terminal frame in
         /// re-send forever.
         pub(in crate::session) side_band_retire_at: Option<WireRetireAt>,
-        pub(in crate::session) bootstrap_retire_at: Option<WireRetireAt>,
         pub(in crate::session) peer_applied_classical: u64,
         pub(in crate::session) peer_applied_pq: u64,
         pub(in crate::session) pq_inflight: Option<WirePqInflight>,
@@ -654,10 +650,6 @@ fn session_from_wire(wire: archive_wire::SessionArchive) -> Result<Arc<TwoMlsPqS
                 wire.pending_side_band,
                 wire.side_band_retire_at,
             )?,
-            pending_bootstrap: retained_from_wire(
-                wire.pending_bootstrap,
-                wire.bootstrap_retire_at,
-            )?,
             peer_applied_classical: wire.peer_applied_classical,
             peer_applied_pq: wire.peer_applied_pq,
             send_psk_ledger: wire
@@ -892,14 +884,8 @@ fn build_archive_wire(
             auth_mine,
             auth_theirs,
             pending_side_band: inner.pending_side_band.as_ref().map(|r| r.frame.clone()),
-            pending_bootstrap: inner.pending_bootstrap.as_ref().map(|r| r.frame.clone()),
             side_band_retire_at: inner
                 .pending_side_band
-                .as_ref()
-                .and_then(|r| r.retire_at)
-                .map(wire_retire_at),
-            bootstrap_retire_at: inner
-                .pending_bootstrap
                 .as_ref()
                 .and_then(|r| r.retire_at)
                 .map(wire_retire_at),
