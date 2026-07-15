@@ -317,6 +317,15 @@ fn apq_epochs(group: &CombinerGroup) -> crate::ApqEpochs {
 }
 
 impl SessionInner {
+    /// Both PQ halves live — i.e. A.4 has completed on this side. The inner-lock twin of
+    /// [`TwoMlsPqSession::is_fully_established`], for guards that already hold the lock.
+    fn pq_halves_live(&self) -> bool {
+        matches!(
+            (&self.send_group, &self.recv_group),
+            (Some(s), Some(r)) if s.pq.is_some() && r.pq.is_some()
+        )
+    }
+
     /// Retain an initiator's side-band `frame` for re-send, seeding the
     /// [`SideBandSealing::Stable`] cache with `sealed` — the very bytes the `*_begin` call
     /// is about to return.
@@ -1191,11 +1200,7 @@ impl TwoMlsPqSession {
 
     /// True once both directions' PQ halves are live (post-A.4 bootstrap).
     pub fn is_fully_established(&self) -> bool {
-        let inner = self.lock();
-        matches!(
-            (&inner.send_group, &inner.recv_group),
-            (Some(s), Some(r)) if s.pq.is_some() && r.pq.is_some()
-        )
+        self.lock().pq_halves_live()
     }
 
     /// The send group's APQ epoch pair (PQ side-band, classical message group).
