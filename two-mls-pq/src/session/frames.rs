@@ -85,6 +85,38 @@ pub enum PqFrameKind {
     RekeyCommit,
 }
 
+/// How [`TwoMlsPqSession::pq_pending_outbound`] seals the retained frame it hands out.
+///
+/// The frame is retained as PLAINTEXT and sealed per hand-out, so the host chooses whether
+/// repeated hand-outs of one frame carry the same wire bytes. The choice is the host's
+/// because only the host knows how it transmits: the trade is unlinkability against a
+/// stable base, and neither is safer in general.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum SideBandSealing {
+    /// Seal afresh on every hand-out — a new random nonce, so repeated sends of one
+    /// retained frame are distinct on the wire and a passive observer cannot correlate
+    /// them (a stalled round would otherwise repeat byte-identical ciphertext).
+    ///
+    /// Correct for a host that transmits the frame WHOLE. Sealing is a small AEAD over a
+    /// short frame, so the per-send cost is noise.
+    Fresh,
+    /// Seal once and hand out identical bytes for as long as the retained frame is
+    /// unchanged.
+    ///
+    /// Required by a host that CHUNKS: chunks are cut from the sealed bytes, and pieces cut
+    /// from two different seals never reassemble — the base must hold still across a pass.
+    /// The cost is exactly the correlation `Fresh` avoids: repeated sends are
+    /// byte-identical, marking a re-send to anyone watching.
+    ///
+    /// Stability is scoped to the FRAME, not to time: the moment the round advances and
+    /// this side produces its next frame, the next hand-out is a fresh seal of the new
+    /// frame — which is what a chunking host wants (an in-flight pass for a superseded
+    /// frame is worthless). The cached seal is live-only and does not ride the archive, so
+    /// a restore restarts the pass with a new base; a host must be able to re-chunk anyway,
+    /// since that is what a lost pass demands.
+    Stable,
+}
+
 /// Classify a PQ side-band frame by its leading tag byte (`message[0]`). Returns `None` for
 /// any byte that is not one of the seven side-band tags — the host treats that as a malformed
 /// side-band frame. Single source of truth for the wire tags: the host dispatches on the

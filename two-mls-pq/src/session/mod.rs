@@ -132,8 +132,27 @@ struct SessionInner {
     ///
     /// Sealing happens at hand-out ([`pq_pending_outbound`]), not here: `seal_side_band`
     /// draws a fresh random nonce per call and mutates nothing, so re-sealing the same
-    /// frame is safe and each re-send tracks the current PQ header epoch.
+    /// frame is safe and each re-send tracks the current PQ header epoch. A host that
+    /// chunks needs the opposite — a base that holds still — and asks for it with
+    /// [`SideBandSealing::Stable`], served from `pq_outbound_seal`.
     pending_pq_outbound: Option<Vec<u8>>,
+    /// The `SideBandSealing::Stable` seal cache: `(frame, sealed)`.
+    ///
+    /// SELF-VALIDATING BY CONSTRUCTION — it stores the frame it sealed, and a hand-out
+    /// re-seals whenever that no longer matches the live `pending_pq_outbound`. The
+    /// alternative (a bare `Option<Vec<u8>>` invalidated at each set site) would be an
+    /// invariant a dozen call sites had to remember, and the failure would be silent and
+    /// bad: handing a chunking host the seal of a superseded frame. Comparing two short
+    /// frames costs nothing next to the AEAD it skips.
+    ///
+    /// Live-only, deliberately not archived: a restore restarts the chunking pass with a
+    /// fresh base, which a host must already tolerate (a lost pass demands the same).
+    ///
+    /// Epoch note: the seal is under the RECV-PQ header key, which advances only when the
+    /// PEER commits — and applying a peer commit clears this side's retained frame anyway,
+    /// so a cached seal cannot outlive its own epoch by the ordinary flow. Were one to,
+    /// the peer's `recv_pq_header_keys` window still opens recent epochs.
+    pq_outbound_seal: Option<(Vec<u8>, Vec<u8>)>,
     /// Whose move the PQ side-band is: the initiator owes the A.4 bootstrap; thereafter
     /// completing an operation passes the turn to the peer.
     pq_turn_mine: bool,
@@ -269,7 +288,7 @@ pub struct TwoMlsPqSession {
 mod frames;
 pub use frames::fuzz_decode_message_frame;
 use frames::*;
-pub use frames::{pq_frame_kind, OpenedFrame, OpenedFrameKind, PqFrameKind};
+pub use frames::{pq_frame_kind, OpenedFrame, OpenedFrameKind, PqFrameKind, SideBandSealing};
 
 mod messaging;
 use messaging::*;
@@ -567,6 +586,7 @@ fn build_session(
             },
             pq_turn_mine: initiated,
             pending_pq_outbound: None,
+            pq_outbound_seal: None,
             send_psk_ledger: VecDeque::new(),
             retired_send_psks: Vec::new(),
             last_cross_injected: None,

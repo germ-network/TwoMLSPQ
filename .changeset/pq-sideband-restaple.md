@@ -24,11 +24,24 @@ frame and cleared when its part in the round completes. This mirrors
 `current_staple`, which has always re-sent the classical commit on every frame so
 that any single received frame heals the peer.
 
-- **New `pq_pending_outbound()`** — the frame, sealed fresh, without consuming it.
+- **New `pq_pending_outbound(sealing)`** — the frame, sealed, without consuming it.
   Prefer it over `pq_take_pending_outbound` (retained, and still correct for hosts
-  driving a strict request/response). A pure read: no `state_seq` bump, nothing to
-  persist. Each call re-seals under the current PQ header epoch with a fresh random
-  nonce, so a frame retained across a ratchet still opens.
+  driving a strict request/response). Advances no protocol state: no `state_seq`
+  bump, nothing to persist. The seal is under the current PQ header epoch, so a
+  frame retained across a ratchet still opens.
+- **New `SideBandSealing`** — the frame is retained as plaintext and sealed per
+  hand-out, so how repeated hand-outs look on the wire is the host's call, and only
+  the host can make it. `Fresh` re-seals every time: repeated sends of one retained
+  frame are distinct, so a passive observer cannot correlate the re-sends of a
+  stalled round. `Stable` seals once and repeats the bytes while the frame is
+  unchanged, which a host that CHUNKS requires — chunks are cut from the sealed
+  bytes, and pieces cut from two different seals never reassemble. The trade is
+  exactly the correlation `Fresh` avoids, and neither is safer in general.
+  Stability is scoped to the frame: when the round advances, the next hand-out seals
+  the new frame (the cache stores what it sealed and re-seals on a mismatch, so no
+  set site has to remember to invalidate it). The cache is live-only, so a restore
+  restarts a chunking pass with a fresh base — which a host must tolerate anyway,
+  since a lost pass demands the same.
 - **New `DuplicateSideBand` error** — the PQ analogue of `DuplicateWelcome`.
   Re-sending makes duplicates steady-state traffic: an initiator's terminal frame
   has no inbound of its own to retire it, so it re-sends until the peer opens the

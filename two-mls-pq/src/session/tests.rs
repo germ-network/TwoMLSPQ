@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use super::TwoMlsPqSession;
+use super::{SideBandSealing, TwoMlsPqSession};
 use crate::{
     assert_err, assert_ok, assert_some,
     test_utils::{establish_confirmed_sessions, establish_sessions, make_client, make_combiner_kp},
@@ -4956,13 +4956,13 @@ fn test_pq_pending_outbound_peek_is_repeatable_and_non_consuming() {
     assert_ok!(alice.pq_ratchet_begin());
 
     // Three peeks, three sealed frames — each independently openable by the peer.
-    let first = assert_some!(alice.pq_pending_outbound());
-    let second = assert_some!(alice.pq_pending_outbound());
-    assert!(alice.pq_pending_outbound().is_some());
+    let first = assert_some!(alice.pq_pending_outbound(SideBandSealing::Fresh));
+    let second = assert_some!(alice.pq_pending_outbound(SideBandSealing::Fresh));
+    assert!(alice.pq_pending_outbound(SideBandSealing::Fresh).is_some());
 
-    // Each seal draws a fresh random nonce, so the sealed bytes differ even though the
-    // frame does not. (Belt-and-braces on the seal: identical ciphertext would mean a
-    // reused nonce.)
+    // Fresh seals draw a new nonce each time, so the sealed bytes differ even though the
+    // frame does not. (Belt-and-braces on the seal: identical ciphertext under Fresh would
+    // mean a reused nonce.)
     assert_ne!(first, second);
 
     // And the peer opens the SECOND copy — a re-send is a real frame, not a stub.
@@ -4978,14 +4978,14 @@ fn test_dropped_bind_heals_on_resend() {
     let (alice, bob) = establish_full();
     let ek = assert_ok!(alice.pq_ratchet_begin());
     assert_ok!(bob.pq_ratchet_respond(ek));
-    let ct = assert_some!(bob.pq_pending_outbound());
+    let ct = assert_some!(bob.pq_pending_outbound(SideBandSealing::Fresh));
     assert_ok!(alice.pq_ratchet_bind(ct, b"payload".to_vec()));
 
     // The transport drops the bind: take a copy and throw it away.
-    let _lost = assert_some!(alice.pq_pending_outbound());
+    let _lost = assert_some!(alice.pq_pending_outbound(SideBandSealing::Fresh));
 
     // Bob never saw it, so his side of the round is untouched and Alice can re-send.
-    let resent = assert_some!(alice.pq_pending_outbound());
+    let resent = assert_some!(alice.pq_pending_outbound(SideBandSealing::Fresh));
     assert_eq!(
         assert_ok!(bob.pq_ratchet_apply(resent)),
         b"payload".to_vec()
@@ -5006,7 +5006,7 @@ fn test_duplicate_side_band_frames_are_discardable_not_routing_errors() {
     assert_err!(bob.pq_ratchet_respond(ek), TwoMlsPqError::DuplicateSideBand);
 
     // Duplicate CT: Alice already bound.
-    let ct = assert_some!(bob.pq_pending_outbound());
+    let ct = assert_some!(bob.pq_pending_outbound(SideBandSealing::Fresh));
     assert_ok!(alice.pq_ratchet_bind(ct.clone(), b"x".to_vec()));
     assert_err!(
         alice.pq_ratchet_bind(ct, b"x".to_vec()),
@@ -5015,7 +5015,7 @@ fn test_duplicate_side_band_frames_are_discardable_not_routing_errors() {
 
     // Duplicate bind: Bob already applied. This is the common one — Alice re-sends her
     // terminal frame until Bob opens the next round.
-    let bind = assert_some!(alice.pq_pending_outbound());
+    let bind = assert_some!(alice.pq_pending_outbound(SideBandSealing::Fresh));
     assert_ok!(bob.pq_ratchet_apply(bind.clone()));
     assert_err!(bob.pq_ratchet_apply(bind), TwoMlsPqError::DuplicateSideBand);
 }
@@ -5028,20 +5028,20 @@ fn test_side_band_falls_silent_for_the_receiver_after_the_round() {
     let (alice, bob) = establish_full();
     let ek = assert_ok!(alice.pq_ratchet_begin());
     assert_ok!(bob.pq_ratchet_respond(ek));
-    let ct = assert_some!(bob.pq_pending_outbound());
+    let ct = assert_some!(bob.pq_pending_outbound(SideBandSealing::Fresh));
     assert_ok!(alice.pq_ratchet_bind(ct, b"x".to_vec()));
-    let bind = assert_some!(alice.pq_pending_outbound());
+    let bind = assert_some!(alice.pq_pending_outbound(SideBandSealing::Fresh));
     assert_ok!(bob.pq_ratchet_apply(bind));
 
     // Bob applied: his round is over and he holds the turn — nothing left to re-send.
-    assert!(bob.pq_pending_outbound().is_none());
+    assert!(bob.pq_pending_outbound(SideBandSealing::Fresh).is_none());
     assert!(bob.my_pq_turn());
 
     // Bob opening the next round replaces nothing (his slot is empty) and Alice's stale
     // terminal frame is retired by her own respond.
     let ek2 = assert_ok!(bob.pq_ratchet_begin());
     assert_ok!(alice.pq_ratchet_respond(ek2));
-    let ct2 = assert_some!(alice.pq_pending_outbound());
+    let ct2 = assert_some!(alice.pq_pending_outbound(SideBandSealing::Fresh));
     // The frame Alice now offers is this round's CT, not last round's bind.
     assert_ok!(bob.pq_ratchet_bind(ct2, b"y".to_vec()));
 }
@@ -5055,15 +5055,15 @@ fn test_bootstrap_kp_is_retained_and_retired_on_apply() {
     assert_ok!(alice.pq_bootstrap_begin(None));
 
     // Dropped KP': re-send from the retained slot.
-    let _lost = assert_some!(alice.pq_pending_outbound());
-    let resent = assert_some!(alice.pq_pending_outbound());
+    let _lost = assert_some!(alice.pq_pending_outbound(SideBandSealing::Fresh));
+    let resent = assert_some!(alice.pq_pending_outbound(SideBandSealing::Fresh));
     assert_ok!(bob.pq_bootstrap_respond(resent));
 
-    let bind = assert_some!(bob.pq_pending_outbound());
+    let bind = assert_some!(bob.pq_pending_outbound(SideBandSealing::Fresh));
     assert_ok!(alice.pq_bootstrap_apply(bind));
 
     // Both halves live: nothing left for the KP' to heal.
-    assert!(alice.pq_pending_outbound().is_none());
+    assert!(alice.pq_pending_outbound(SideBandSealing::Fresh).is_none());
     assert!(alice.is_fully_established());
 }
 
@@ -5077,6 +5077,74 @@ fn test_retained_frame_survives_archive_round_trip() {
 
     let restored = round_trip(&alice);
 
-    let resent = assert_some!(restored.pq_pending_outbound());
+    let resent = assert_some!(restored.pq_pending_outbound(SideBandSealing::Fresh));
     assert_ok!(bob.pq_ratchet_respond(resent));
+}
+
+/// The reason `Stable` exists: a chunking host cuts pieces out of the sealed bytes, so the
+/// base must not move under it. Two hand-outs of an unchanged frame must be byte-identical
+/// — otherwise chunk 1 of seal A and chunk 2 of seal B reassemble into garbage.
+#[test]
+fn test_stable_sealing_holds_the_base_still_for_chunking() {
+    let (alice, bob) = establish_full();
+    assert_ok!(alice.pq_ratchet_begin());
+
+    let base = assert_some!(alice.pq_pending_outbound(SideBandSealing::Stable));
+    let again = assert_some!(alice.pq_pending_outbound(SideBandSealing::Stable));
+    assert_eq!(base, again, "Stable must hand out identical bytes");
+
+    // Reassembling halves cut from two separate hand-outs yields the original — the
+    // property a chunking transport depends on.
+    let mid = base.len() / 2;
+    let first_half = &assert_some!(alice.pq_pending_outbound(SideBandSealing::Stable))[..mid];
+    let second_half = &assert_some!(alice.pq_pending_outbound(SideBandSealing::Stable))[mid..];
+    let reassembled: Vec<u8> = [first_half, second_half].concat();
+    assert_eq!(reassembled, base);
+
+    // And the reassembly is a real frame, not just equal bytes.
+    assert_ok!(bob.pq_ratchet_respond(reassembled));
+}
+
+/// `Fresh` is the opposite contract, and it is what an en-bloc host wants: repeated sends
+/// of one retained frame must not repeat byte-identical ciphertext, which would let a
+/// passive observer correlate the re-sends of a stalled round.
+#[test]
+fn test_fresh_sealing_differs_per_send_but_opens_the_same() {
+    let (alice, bob) = establish_full();
+    assert_ok!(alice.pq_ratchet_begin());
+
+    let a = assert_some!(alice.pq_pending_outbound(SideBandSealing::Fresh));
+    let b = assert_some!(alice.pq_pending_outbound(SideBandSealing::Fresh));
+    assert_ne!(a, b, "Fresh must not repeat wire bytes");
+
+    // Distinct bytes, same frame underneath: either copy drives the round.
+    assert_ok!(bob.pq_ratchet_respond(b));
+}
+
+/// Stability is scoped to the FRAME, not to time. When the round advances, the next
+/// `Stable` hand-out must reflect the NEW frame — a chunking pass for a superseded frame
+/// is worthless, and serving the stale seal would be the silent failure the cache's
+/// self-validation exists to prevent.
+#[test]
+fn test_stable_seal_is_invalidated_when_the_frame_advances() {
+    let (alice, bob) = establish_full();
+    assert_ok!(alice.pq_ratchet_begin());
+    let ek_seal = assert_some!(alice.pq_pending_outbound(SideBandSealing::Stable));
+
+    // Drive the round on: Alice's retained frame becomes the bind.
+    assert_ok!(bob.pq_ratchet_respond(ek_seal.clone()));
+    let ct = assert_some!(bob.pq_pending_outbound(SideBandSealing::Stable));
+    assert_ok!(alice.pq_ratchet_bind(ct, b"payload".to_vec()));
+
+    let bind_seal = assert_some!(alice.pq_pending_outbound(SideBandSealing::Stable));
+    assert_ne!(
+        bind_seal, ek_seal,
+        "Stable must not serve a superseded frame"
+    );
+
+    // The new base is the bind, and it is live.
+    assert_eq!(
+        assert_ok!(bob.pq_ratchet_apply(bind_seal)),
+        b"payload".to_vec()
+    );
 }

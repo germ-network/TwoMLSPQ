@@ -781,23 +781,45 @@ impl TwoMlsPqSession {
         self.lock().pq_turn_mine
     }
 
-    /// The current round's outbound side-band frame, sealed fresh, WITHOUT consuming it —
-    /// the side-band analogue of re-stapling `current_staple` onto every message frame.
-    /// `None` when the side-band is quiescent (no round in flight), which is what lets a
-    /// host send a bare message.
+    /// The current round's outbound side-band frame, sealed, WITHOUT consuming it — the
+    /// side-band analogue of re-stapling `current_staple` onto every message frame. `None`
+    /// when the side-band is quiescent (no round in flight), which is what lets a host send
+    /// a bare message.
     ///
     /// Call it on every send for as long as it returns `Some`: a side-band frame is the
     /// only carrier of its PQ half, so re-sending is how a dropped one heals (see
     /// [`SessionInner::pending_pq_outbound`]). Duplicates are benign discards on the
     /// receiver, so over-sending is safe where under-sending stalls the ratchet.
     ///
-    /// A pure read: the frame stays, no `state_seq` bump, nothing to persist. Each call
-    /// re-seals under the CURRENT PQ header epoch with a fresh random nonce, so a frame
-    /// retained across a PQ ratchet still opens for the peer.
-    pub fn pq_pending_outbound(&self) -> Option<Vec<u8>> {
-        let inner = self.lock();
-        let frame = inner.pending_pq_outbound.as_ref()?;
-        inner.seal_side_band(frame).ok()
+    /// `sealing` picks the wire behaviour, and only the host can: [`SideBandSealing::Fresh`]
+    /// makes every send distinct (a stalled round does not repeat identifiable bytes);
+    /// [`SideBandSealing::Stable`] holds the base still so a host can CHUNK it. See
+    /// [`SideBandSealing`] for the trade.
+    ///
+    /// Advances no protocol state either way: the frame stays, no `state_seq` bump, nothing
+    /// to persist. (`Stable` fills a live-only seal cache — invisible to the archive and to
+    /// the peer.) The seal is under the CURRENT PQ header epoch, so a frame retained across
+    /// a PQ ratchet still opens for the peer.
+    pub fn pq_pending_outbound(&self, sealing: SideBandSealing) -> Option<Vec<u8>> {
+        let mut inner = self.lock();
+        let frame = inner.pending_pq_outbound.clone()?;
+        match sealing {
+            SideBandSealing::Fresh => inner.seal_side_band(&frame).ok(),
+            SideBandSealing::Stable => {
+                // Serve the cache only if it sealed the frame we are actually holding —
+                // the frame moves on every step of the round, and a chunking host handed
+                // the seal of a superseded frame would emit a pass that reassembles into
+                // a stale one.
+                if let Some((sealed_frame, sealed)) = &inner.pq_outbound_seal {
+                    if *sealed_frame == frame {
+                        return Some(sealed.clone());
+                    }
+                }
+                let sealed = inner.seal_side_band(&frame).ok()?;
+                inner.pq_outbound_seal = Some((frame, sealed.clone()));
+                Some(sealed)
+            }
+        }
     }
 
     /// Consume the current round's side-band frame.

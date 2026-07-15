@@ -566,6 +566,10 @@ fn session_from_wire(wire: archive_wire::SessionArchive) -> Result<Arc<TwoMlsPqS
             their_state,
             pq_turn_mine: wire.pq_turn_mine,
             pending_pq_outbound: wire.pending_pq_outbound,
+            // Live-only: a restore restarts any chunking pass with a fresh base (see the
+            // field's doc). The retained FRAME rides the archive above, so re-sending
+            // resumes either way — only the seal's stability is scoped to a process.
+            pq_outbound_seal: None,
             send_psk_ledger: wire
                 .send_psk_ledger
                 .into_iter()
