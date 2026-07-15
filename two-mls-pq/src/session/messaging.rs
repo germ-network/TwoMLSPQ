@@ -35,7 +35,7 @@ pub(in crate::session) fn rendezvous_secret(
 // protects (the classical and PQ ratchets run on independent, async cadences):
 //   * message-path frames (0x01/0x03) seal under the CLASSICAL half's exporter, keyed by
 //     the classical epoch — `header_key` / `recv_header_keys`;
-//   * PQ side-band frames (0x05–0x11 and 0x17) seal under the PQ half's exporter, keyed by
+//   * PQ side-band frames (0x09–0x17) seal under the PQ half's exporter, keyed by
 //     `pq_epoch` — `header_key_pq` / `recv_header_keys_pq`.
 // The one exception is the pre-A.4 BOOTSTRAP_KP, whose recv-PQ group does not exist yet;
 // it falls back to the classical seal (see `SessionInner::seal_side_band`).
@@ -715,7 +715,7 @@ impl TwoMlsPqSession {
     /// one. Pre-establishment (initiated side, no recv group — the marker is the empty
     /// staged-proposal slot a `prepare_pre_establishment` left), the output is instead
     /// a fresh §A.1 envelope HPKE-sealed to the peer's KP′, carrying the establishment
-    /// sections plus this app message as its `[0x13]` staple — any single frame lets
+    /// sections plus this app message as its `[0x07]` staple — any single frame lets
     /// the invitation holder join and read it. `pending_outbound` is NOT consumed on
     /// either path — the frame itself carries the welcome; the standalone copy stays
     /// available for hosts that also deliver it separately (processing is idempotent).
@@ -836,7 +836,7 @@ impl TwoMlsPqSession {
     /// the direction needs the reconnect path — surfaced before the app ciphertext is
     /// touched, and distinguishable from a transient `DecryptionFailed`.
     ///
-    /// PQ side-band frames (0x05–0x11 and 0x17) are **not** handled here — the host routes them to
+    /// PQ side-band frames (0x09–0x17) are **not** handled here — the host routes them to
     /// the `pq_*` entry points by frame kind (`pq_frame_kind`). Passing one here returns
     /// `SessionNotReady` rather than attempting (and failing) MLS decryption. Anything
     /// else — including bare MLS ciphertext, which no longer occurs on the send path — is
@@ -1139,7 +1139,7 @@ impl TwoMlsPqSession {
             }));
         }
 
-        // Pre-establishment app staple ([0x13][BSG-cl PrivateMessage]): the peer's app
+        // Pre-establishment app staple ([0x07][BSG-cl PrivateMessage]): the peer's app
         // message extracted from a §A.1 envelope's `stapled_message` section (see
         // `InitialFrame`). The ciphertext rides the peer's send group — OUR recv group
         // — so it only decrypts after the join the same envelope's welcome produced;

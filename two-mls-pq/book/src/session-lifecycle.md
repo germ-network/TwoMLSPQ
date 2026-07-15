@@ -43,7 +43,7 @@ Three flows run beside the message path on their own tagged frames (see
 the session initiator owes the bootstrap; completing an operation passes the turn to
 the peer (`my_pq_turn()`), and only one operation may be in flight at a time.
 
-- **Bootstrap** (`0x0B`/`0x0D`/`0x17`) — stands up Group_B's deferred PQ half off the
+- **Bootstrap** (`0x09`/`0x0B`/`0x0D`) — stands up Group_B's deferred PQ half off the
   critical path: Alice sends her PQ key package; Bob creates Group_B.pq around it and
   returns its Welcome; Alice joins and binds. Both send groups are then complete APQ
   groups (`is_fully_established()`). The bind is structurally the PQ ratchet's (below),
@@ -51,10 +51,10 @@ the peer (`my_pq_turn()`), and only one operation may be in flight at a time.
   joined group rather than a KEM exchange — and it doubles as the round's receipt: that
   secret is derivable only from inside Group_B.pq, so a bind that applies at all proves
   Alice joined.
-- **PQ ratchet** (`0x05`/`0x07`/`0x09`) — injects fresh ML-KEM
+- **PQ ratchet** (`0x0F`/`0x11`/`0x13`) — injects fresh ML-KEM
   entropy into a send group's PQ half via a pathless PSK commit and re-binds the
   exported APQ-PSK into the classical half in the same round.
-- **PQ re-key** (`0x0F`/`0x11`) — updatePath commits run on the two send groups'
+- **PQ re-key** (`0x15`/`0x17`) — updatePath commits run on the two send groups'
   PQ halves **alone**, so the classical ratchet is never blocked behind a large
   ML-KEM updatePath: the initiator proposes `Upd'(self)` into the PQ half of the
   peer's send group (`pq_rekey_begin`), the responder commits it and counter-proposes

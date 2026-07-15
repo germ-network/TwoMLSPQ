@@ -73,7 +73,7 @@ leg and handed the turn over early to compensate. It now has one:
 **KP' → Welcome' → Bind.** The initiator joins the welcomed group, exports the cross-party
 secret from its birth epoch, injects it into its own send-PQ with a pathless commit, and
 chains the exported apq_psk into its classical half — `encode_bootstrap_bind`
-(`[pq_commit][classical_commit][app]`, tag 0x17), which is A.3's bind under its own tag.
+(`[pq_commit][classical_commit][app]`), which is A.3's bind under its own tag.
 The only difference from A.3 is where the secret comes from: a group exporter rather than a
 KEM exchange.
 
@@ -91,9 +91,9 @@ Three things fall out:
   first cut of this change added is gone.
 
 `pq_bootstrap_apply` now means the RESPONDER's leg-4 apply and returns the stapled app, as
-`pq_ratchet_apply` does; the initiator's join-and-bind is `pq_bootstrap_bind`. Tag 0x0D is
-renamed `PQ_BOOTSTRAP_WELCOME` — it has always carried a welcome, and the bind name goes to
-the frame that earns it.
+`pq_ratchet_apply` does; the initiator's join-and-bind is `pq_bootstrap_bind`. The old
+`PQ_BOOTSTRAP_BIND` tag is renamed `PQ_BOOTSTRAP_WELCOME` — it has always carried a welcome,
+and the bind name goes to the frame that earns it.
 
 Two consequences worth knowing:
 
@@ -133,3 +133,30 @@ Consequences worth knowing:
   could leak processing outcome.
 - **Monotone**: old epochs are retained so a lagging peer still lands, so a frame opening at
   an older epoch is not evidence of regression — evidence only accrues.
+
+## The tag space is banded, and the bands are enforced
+
+Adding A.4's bind exposed that the tag space had no single record. The bytes are one global
+first-byte discriminator space, but they are declared in three places — `apq::APQ_TAG`, the
+envelope tag in `key_packages`, and the rest in `session::frames` — because each tag lives
+with the thing it tags. Ownership is local; allocation is global, so "take the next unused
+odd value" was not answerable from any one file. The new bind was duly allocated at 0x15,
+which `key_packages` already owned: a collision is a silent wire misclassification, not a
+compile error, and the only comment describing the space sat in the file a reader adding a
+session frame never opens.
+
+Tags are now RENUMBERED into contiguous bands — message path 0x01-0x03, A.1 establishment
+0x05-0x07, PQ side-band 0x09-0x17 in lifecycle order (bootstrap, ratchet, re-key). The
+side-band band is exactly what `pq_frame_kind` classifies, checked against the classifier
+across all 256 bytes. Allocation order had left the side-band non-contiguous and silently
+falsified five `0x05-0x11` range shorthands across the code and book; a range in prose
+should at least not be a lie. Extending the protocol is no longer "take the next unused odd
+value" — it is "take the next value in the right band, and renumber the bands below", which
+is cheap because nothing outside `frames.rs` names a tag by value.
+
+`frames::tests::TAG_SPACE` is the record, `tag_space_holds` enforces distinct, odd and
+dense-ascending, and the book's `wire-format.md` table is its prose half.
+
+**This is a wire cut** (`BINDING_CONTRACT_VERSION` 17). Hosts classify via `pq_frame_kind`
+and never match raw bytes, so no host code changes; stale frames from older builds fail
+loudly in the decoders, as they already did across the previous renumber.

@@ -4472,10 +4472,13 @@ fn test_process_incoming_bare_mls_and_unknown_tags_rejected() {
         alice_session.process_incoming(vec![0x00, 0x01, 0x02]),
         TwoMlsPqError::DecryptionFailed
     );
-    // The retired pre-rework tags (BUNDLED 0x03 is now the message frame, but the
-    // old STAPLED_WELCOME value 0x09 is now PQ BIND and 0x13 is unassigned).
+    // A byte the space does not assign at all (0x19 — the first free odd value past the
+    // bands; see frames.rs) fails loudly too. This must stay an UNALLOCATED byte: it read
+    // 0x13 until the tag renumber, which is now the A.3 bind, and a side-band tag reaching
+    // process_incoming returns SessionNotReady — the host is meant to route those by
+    // `pq_frame_kind` — a different rejection than the one under test.
     assert_err!(
-        alice_session.process_incoming(vec![0x13, 0x00]),
+        alice_session.process_incoming(vec![0x19, 0x00]),
         TwoMlsPqError::DecryptionFailed
     );
 }

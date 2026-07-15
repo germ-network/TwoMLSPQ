@@ -202,7 +202,21 @@ pub fn version() -> String {
 // accumulated ladders carried no compatibility value — history stays in git): ALL
 // persisted sessions and invitations regenerate. The v15 key-package wire cut
 // (COMBINER_KEY_PACKAGE_VERSION 3, a published artifact, not an archive) is untouched.
-const BINDING_CONTRACT_VERSION: u64 = 16;
+// v17 (2026-07-15, A.4's third leg + tag banding): A.4 is a well-formed three-leg round —
+// KP' -> Welcome' -> BIND — so the bootstrap ends on a receipt rather than a silent turn
+// flip, and it registers in the single side-band slot alongside A.3/A.5 (a bootstrap and a
+// ratchet can no longer be in flight at once). New `pq_bootstrap_bind`; `EncryptOutput`
+// gained an optional `side_band` frame and `encrypt` a `SideBandSealing` parameter (Fresh
+// re-seals per hand-out, Stable holds the base still for chunking) — both caught by
+// uniffi's checksum. NOT caught by it, and the reason this bumps: `pq_take_pending_outbound`
+// now honours retirement (a spent frame is withdrawn once a peer receipt proves it landed)
+// where it previously served whatever sat in the slot. Wire: the tag space is RENUMBERED
+// into contiguous bands — message path 0x01-0x03, A.1 establishment 0x05-0x07 (envelope
+// 0x15->0x05, staple 0x13->0x07), PQ side-band 0x09-0x17 in lifecycle order (bootstrap
+// 0x09/0x0B/0x0D, ratchet 0x0F/0x11/0x13, re-key 0x15/0x17). Hosts classify via
+// `pq_frame_kind`, never raw bytes, so this is a wire cut only — stale frames from older
+// builds fail loudly. Archive layout versions are untouched (pre-release hard cut).
+const BINDING_CONTRACT_VERSION: u64 = 17;
 
 /// See `BINDING_CONTRACT_VERSION`. Exported so the Swift layer can verify the
 /// binding it was generated with matches the binary it loaded.

@@ -9,24 +9,37 @@ use super::*;
 // ── The tag space ───────────────────────────────────────────────────────────────────
 // Every wire blob is discriminated by its first byte, so these values are ONE global
 // space — but they are declared in three places, because each tag lives with the thing it
-// tags: `APQ_TAG` (0x01) in the `apq` crate, `INITIAL_ENVELOPE_TAG` (0x15) in
+// tags: `APQ_TAG` (0x01) in the `apq` crate, `INITIAL_ENVELOPE_TAG` (0x05) in
 // `key_packages` (it rides the invitation channel and is not a session frame), and the
 // rest here. Ownership is local; allocation is global. That split is the hazard: a
 // collision is a silent wire misclassification rather than a compile error, and the file
-// you read when adding a session frame is not the file that knows about 0x15.
+// you read when adding a session frame is not the file that declares the envelope tag.
 //
-// Two invariants hold across all three sites; `tests::tag_space_holds` enforces both.
-//   * DISTINCT — see above.
+// The invariants below hold across all three sites; `tests::tag_space_holds` enforces them.
+//   * DISTINCT — see above. This is not hypothetical: 0x15 was once claimed by both the
+//     envelope tag and a new side-band frame, because the space had no single record.
 //   * ODD — an MLSMessage begins with ProtocolVersion 0x0001 (big-endian), so its first
 //     byte is always 0x00. Reserving the entire even space is what lets a tagged frame and
 //     a bare MLS message be told apart from byte 0 alone, and what makes the message
 //     frame's staple slot self-discriminating (welcome 0x01 vs. commit 0x00) with no
 //     discriminator byte of its own.
 //
-// Values are in ALLOCATION order, not spec order (§A.1's 0x13 is numerically first but was
-// allocated last), so a new flow appends rather than slotting in beside its siblings. To
-// add one: take the next unused odd byte, add a row to `tests::TAG_SPACE`, and update the
-// book's `wire-format.md` table — the prose registry, which must agree.
+// The space is BANDED, and each band is contiguous:
+//   0x01–0x03  message path      — APQWelcome, message frame
+//   0x05–0x07  A.1 establishment — envelope (invitation channel), pre-establishment staple
+//   0x09–0x17  PQ side-band      — exactly the tags `pq_frame_kind` classifies, in
+//                                  lifecycle order: bootstrap, then ratchet, then re-key
+//
+// Banding is what makes "0x09–0x17 is the side-band" a claim that stays true, and it was
+// bought by a renumber: the tags were allocation-ordered, so appending the A.4 bind at 0x17
+// left the side-band non-contiguous and silently falsified five "0x05–0x11" range shorthands
+// across the code and book. Prefer `pq_frame_kind` to a range test regardless — but a range
+// written in prose should at least not be a lie.
+//
+// To add a flow: put it at the end of its band and RENUMBER the bands below it (pre-release,
+// this is free — stale frames from older builds fail loudly in the decoders), rather than
+// appending past 0x17 and re-breaking contiguity. Then update `tests::TAG_SPACE`, the book's
+// `wire-format.md` table, and `BINDING_CONTRACT_VERSION`.
 
 // APQWelcome wire format (0x01) + encode/decode live in the `apq` crate (imported above).
 // The APQWelcome appears both as a standalone frame (invitation channel, and optional
@@ -44,52 +57,58 @@ use super::*;
 // the stapled Upd for app approval.
 pub(crate) const MESSAGE_FRAME_TAG: u8 = 0x03;
 
-// PQ ratchet (architecture-diagrams PR #2 §A.3), cryptokit only:
-// 0x05 carries the initiator's ML-KEM encapsulation key, 0x07 the responder's ciphertext,
-// 0x09 the bind = [pq partial-commit][classical commit][app], all length-prefixed.
-pub(crate) const PQ_EK_TAG: u8 = 0x05;
-pub(crate) const PQ_CT_TAG: u8 = 0x07;
-pub(crate) const PQ_BIND_TAG: u8 = 0x09;
+// ── Band: A.1 establishment (0x05–0x07) ─────────────────────────────────────────────
+// 0x05 is `key_packages::INITIAL_ENVELOPE_TAG` — declared there, not here, because an
+// envelope is not a session frame. It heads this band; the staple below completes it.
 
-/// A.4 bootstrap: this side's PQ key package, sent so the peer can stand up its deferred
-/// send-group PQ half.
-pub(crate) const PQ_BOOTSTRAP_KP_TAG: u8 = 0x0B;
-
-/// A.4 bootstrap reply: the new PQ group's welcome. PQ-groups-only — no classical commit
-/// rides here; the initiator's bind (0x17) is what reaches a classical group.
-pub(crate) const PQ_BOOTSTRAP_WELCOME_TAG: u8 = 0x0D;
-
-/// A.4 bootstrap bind — the round's terminal frame, and structurally A.3's bind (0x09):
-/// `[pq partial-commit][classical commit][app]`. The initiator sends it after joining the
-/// welcomed group, and it differs from A.3's only in where the injected secret came from —
-/// an exporter off the newly joined group rather than a KEM exchange. That secret is
-/// derivable only from INSIDE that group, so a bind that applies at all proves the
-/// initiator joined: A.4's receipt is a side effect of entropy it had to chain anyway.
-///
-/// Allocated at 0x17 — the next unused odd byte past `key_packages::INITIAL_ENVELOPE_TAG`
-/// (0x15). See the tag-space note at the top of this file for why "next unused" spans three
-/// declaration sites.
-pub(crate) const PQ_BOOTSTRAP_BIND_TAG: u8 = 0x17;
-
-// A.5 rekey (architecture-diagrams §A.5), cryptokit only — updatePath commits run on the
-// PQ groups alone so the classical ratchet is never blocked behind a large ML-KEM
-// updatePath. 0x0F carries the initiator's Upd' proposal for the responder's send-PQ;
-// 0x11 = [Commit'][counter-Upd'-or-empty], length-prefixed — the responder's reply
-// carries its counter-proposal, the initiator's final commit an empty slot. Each Commit'
-// cross-injects a PSK exported from the opposite PQ send group; the bumped pq_epoch
-// reconciles into APQInfo at the next A.3 bind (no AppDataUpdate rides these commits).
-pub(crate) const PQ_REKEY_UPD_TAG: u8 = 0x0F;
-pub(crate) const PQ_REKEY_COMMIT_TAG: u8 = 0x11;
-
-/// §A.1 pre-establishment app staple: `[0x13][BSG-cl PrivateMessage]` — the initiator's
+/// §A.1 pre-establishment app staple: `[0x07][BSG-cl PrivateMessage]` — the initiator's
 /// app message riding a §A.1 envelope's `stapled_message` section before its recv group
 /// exists (the 0x03 message frame is structurally unavailable then: its proposal section
 /// is mandatory and there is no recv group to propose into). Travels ONLY inside the
 /// HPKE envelope on the invitation channel — never header-sealed, so it is deliberately
 /// NOT an `opened_frame_kind`; the host hands it to `process_incoming` after the join.
-pub(crate) const PRE_ESTABLISHMENT_APP_TAG: u8 = 0x13;
+pub(crate) const PRE_ESTABLISHMENT_APP_TAG: u8 = 0x07;
 
-/// Encode a pre-establishment app staple: `[0x13][app message bytes]`.
+// ── Band: PQ side-band (0x09–0x17) ──────────────────────────────────────────────────
+// Exactly the tags `pq_frame_kind` classifies, ordered by lifecycle: a session bootstraps
+// its deferred PQ half once (A.4), then ratchets it repeatedly (A.3), and re-keys it
+// occasionally (A.5). Note the section numbers do NOT follow that order — the spec numbers
+// are historical; renumbering them is a separate, deferred change.
+
+/// A.4 bootstrap: this side's PQ key package, sent so the peer can stand up its deferred
+/// send-group PQ half.
+pub(crate) const PQ_BOOTSTRAP_KP_TAG: u8 = 0x09;
+
+/// A.4 bootstrap reply: the new PQ group's welcome. PQ-groups-only — no classical commit
+/// rides here; the initiator's bind (0x0D) is what reaches a classical group.
+pub(crate) const PQ_BOOTSTRAP_WELCOME_TAG: u8 = 0x0B;
+
+/// A.4 bootstrap bind — the round's terminal frame, and structurally A.3's bind (0x13):
+/// `[pq partial-commit][classical commit][app]`. The initiator sends it after joining the
+/// welcomed group, and it differs from A.3's only in where the injected secret came from —
+/// an exporter off the newly joined group rather than a KEM exchange. That secret is
+/// derivable only from INSIDE that group, so a bind that applies at all proves the
+/// initiator joined: A.4's receipt is a side effect of entropy it had to chain anyway.
+pub(crate) const PQ_BOOTSTRAP_BIND_TAG: u8 = 0x0D;
+
+// PQ ratchet (architecture-diagrams PR #2 §A.3), cryptokit only:
+// 0x0F carries the initiator's ML-KEM encapsulation key, 0x11 the responder's ciphertext,
+// 0x13 the bind = [pq partial-commit][classical commit][app], all length-prefixed.
+pub(crate) const PQ_EK_TAG: u8 = 0x0F;
+pub(crate) const PQ_CT_TAG: u8 = 0x11;
+pub(crate) const PQ_BIND_TAG: u8 = 0x13;
+
+// A.5 rekey (architecture-diagrams §A.5), cryptokit only — updatePath commits run on the
+// PQ groups alone so the classical ratchet is never blocked behind a large ML-KEM
+// updatePath. 0x15 carries the initiator's Upd' proposal for the responder's send-PQ;
+// 0x17 = [Commit'][counter-Upd'-or-empty], length-prefixed — the responder's reply
+// carries its counter-proposal, the initiator's final commit an empty slot. Each Commit'
+// cross-injects a PSK exported from the opposite PQ send group; the bumped pq_epoch
+// reconciles into APQInfo at the next A.3 bind (no AppDataUpdate rides these commits).
+pub(crate) const PQ_REKEY_UPD_TAG: u8 = 0x15;
+pub(crate) const PQ_REKEY_COMMIT_TAG: u8 = 0x17;
+
+/// Encode a pre-establishment app staple: `[0x07][app message bytes]`.
 pub(crate) fn encode_pre_establishment_app(app: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(1 + app.len());
     out.push(PRE_ESTABLISHMENT_APP_TAG);
@@ -97,7 +116,7 @@ pub(crate) fn encode_pre_establishment_app(app: &[u8]) -> Vec<u8> {
     out
 }
 
-/// The seven PQ side-band frame kinds the host routes through `TwoMlsPqSession::ingest`
+/// The eight PQ side-band frame kinds the host routes through `TwoMlsPqSession::ingest`
 /// (the `begin`/`ingest`/`advance` surface in the AbstractTwoMLS adapter). Exported so the
 /// host classifies a frame from THIS binary via [`pq_frame_kind`] instead of hardcoding the
 /// tag bytes: the tags stay defined once, above, and a renumber can no longer drift out of
@@ -250,7 +269,7 @@ pub(crate) fn encode_pq_bind(
 }
 
 /// Encode the A.4 bootstrap reply: `[0x0D][pq_welcome…]`. PQ-groups-only per the spec — no
-/// classical commit rides along; the initiator's bind (0x17) carries the classical half.
+/// classical commit rides along; the initiator's bind (0x0D) carries the classical half.
 pub(crate) fn encode_bootstrap_welcome(pq_welcome: Vec<u8>) -> Vec<u8> {
     let mut out = Vec::with_capacity(1 + pq_welcome.len());
     out.push(PQ_BOOTSTRAP_WELCOME_TAG);
@@ -416,16 +435,17 @@ mod pq_frame_kind_tests {
 
     #[test]
     fn rejects_non_side_band_tags() {
-        // Bare-MLS first byte, the APQWelcome and message-frame tags, gaps/evens between
-        // side-band tags, the pre-establishment staple tag (0x13 — envelope-interior
-        // only), the envelope tag (0x15 — invitation channel only), and the first
-        // unallocated byte past the block (0x19) are not side-band frames.
+        // Bare-MLS first byte, the APQWelcome and message-frame tags, evens inside the
+        // side-band band, the pre-establishment staple tag (0x07 — envelope-interior only),
+        // the envelope tag (0x05 — invitation channel only), and the first unallocated byte
+        // past the band (0x19) are not side-band frames.
         for tag in [
             0x00,
             APQ_TAG,
             MESSAGE_FRAME_TAG,
             0x0A,
             0x12,
+            0x0E,
             PRE_ESTABLISHMENT_APP_TAG,
             crate::key_packages::INITIAL_ENVELOPE_TAG,
             0x19,
@@ -447,26 +467,29 @@ mod pq_frame_kind_tests {
     /// wire bug found in review into a failing build. Add a row when you add a tag, and keep
     /// the book's `wire-format.md` table in step.
     const TAG_SPACE: &[(u8, &str)] = &[
+        // Message path (0x01–0x03)
         (APQ_TAG, "apq::APQ_TAG"),
         (MESSAGE_FRAME_TAG, "MESSAGE_FRAME_TAG"),
-        (PQ_EK_TAG, "PQ_EK_TAG"),
-        (PQ_CT_TAG, "PQ_CT_TAG"),
-        (PQ_BIND_TAG, "PQ_BIND_TAG"),
-        (PQ_BOOTSTRAP_KP_TAG, "PQ_BOOTSTRAP_KP_TAG"),
-        (PQ_BOOTSTRAP_WELCOME_TAG, "PQ_BOOTSTRAP_WELCOME_TAG"),
-        (PQ_REKEY_UPD_TAG, "PQ_REKEY_UPD_TAG"),
-        (PQ_REKEY_COMMIT_TAG, "PQ_REKEY_COMMIT_TAG"),
-        (PRE_ESTABLISHMENT_APP_TAG, "PRE_ESTABLISHMENT_APP_TAG"),
+        // A.1 establishment (0x05–0x07)
         (
             crate::key_packages::INITIAL_ENVELOPE_TAG,
             "key_packages::INITIAL_ENVELOPE_TAG",
         ),
+        (PRE_ESTABLISHMENT_APP_TAG, "PRE_ESTABLISHMENT_APP_TAG"),
+        // PQ side-band (0x09–0x17), lifecycle order
+        (PQ_BOOTSTRAP_KP_TAG, "PQ_BOOTSTRAP_KP_TAG"),
+        (PQ_BOOTSTRAP_WELCOME_TAG, "PQ_BOOTSTRAP_WELCOME_TAG"),
         (PQ_BOOTSTRAP_BIND_TAG, "PQ_BOOTSTRAP_BIND_TAG"),
+        (PQ_EK_TAG, "PQ_EK_TAG"),
+        (PQ_CT_TAG, "PQ_CT_TAG"),
+        (PQ_BIND_TAG, "PQ_BIND_TAG"),
+        (PQ_REKEY_UPD_TAG, "PQ_REKEY_UPD_TAG"),
+        (PQ_REKEY_COMMIT_TAG, "PQ_REKEY_COMMIT_TAG"),
     ];
 
     #[test]
     fn tag_space_holds() {
-        for (tag, name) in TAG_SPACE {
+        for (i, (tag, name)) in TAG_SPACE.iter().enumerate() {
             // An MLSMessage's first byte is always 0x00 (ProtocolVersion 0x0001, BE). The
             // even space is reserved so byte 0 alone separates a tagged frame from bare MLS
             // — and so the staple slot can self-discriminate welcome 0x01 vs. commit 0x00.
@@ -481,6 +504,32 @@ mod pq_frame_kind_tests {
                 dupes.len(),
                 1,
                 "{tag:#04x} is allocated more than once: {dupes:?}"
+            );
+
+            // Dense and ascending: the odd bytes are allocated with no holes, which is what
+            // keeps each band contiguous and its range shorthand honest. A new flow goes at
+            // the end of its band and renumbers the bands below — appending past the last
+            // tag would pass the checks above and still break the bands.
+            let expected = 0x01 + 2 * i as u8;
+            assert_eq!(
+                *tag, expected,
+                "{name} is at {tag:#04x} but position {i} in the space is {expected:#04x} — \
+                 the odd space must be dense and ascending"
+            );
+        }
+    }
+
+    /// The side-band band and the classifier must be the same set — checked exhaustively
+    /// over all 256 bytes, so neither a gap inside the band nor a stray `pq_frame_kind` arm
+    /// outside it can survive. This is what licenses "0x09–0x17 is the side-band" in prose.
+    #[test]
+    fn side_band_band_matches_the_classifier() {
+        for tag in 0x00..=0xFFu8 {
+            let in_band = (0x09..=0x17).contains(&tag) && tag % 2 == 1;
+            assert_eq!(
+                pq_frame_kind(tag).is_some(),
+                in_band,
+                "{tag:#04x}: classifier and the 0x09–0x17 band disagree"
             );
         }
     }
