@@ -4942,3 +4942,141 @@ fn test_welcome_with_pq_half_binding_rejected() {
     ));
     assert_eq!(assert_ok!(bob_session.app_binding()), Some(binding));
 }
+
+// ===========================================================================
+// Side-band re-staple (retention + non-consuming peek)
+// ===========================================================================
+
+/// The property the whole model rests on: a round's frame is RETAINED, so a host can
+/// re-send it on every message frame the way `current_staple` already rides the classical
+/// stream. Peeking must therefore be repeatable and must not consume.
+#[test]
+fn test_pq_pending_outbound_peek_is_repeatable_and_non_consuming() {
+    let (alice, bob) = establish_full();
+    assert_ok!(alice.pq_ratchet_begin());
+
+    // Three peeks, three sealed frames — each independently openable by the peer.
+    let first = assert_some!(alice.pq_pending_outbound());
+    let second = assert_some!(alice.pq_pending_outbound());
+    assert!(alice.pq_pending_outbound().is_some());
+
+    // Each seal draws a fresh random nonce, so the sealed bytes differ even though the
+    // frame does not. (Belt-and-braces on the seal: identical ciphertext would mean a
+    // reused nonce.)
+    assert_ne!(first, second);
+
+    // And the peer opens the SECOND copy — a re-send is a real frame, not a stub.
+    assert_ok!(bob.pq_ratchet_respond(second));
+}
+
+/// The bug this closes, stated as the crate's own comment does: the A.3 bind's classical
+/// commit re-staples, but the peer cannot apply that staple without the PQ commit riding
+/// the bind frame — so the classical stream stalls "until the BIND lands". Under take-once
+/// a dropped bind never lands and the session wedges forever. Retention heals it.
+#[test]
+fn test_dropped_bind_heals_on_resend() {
+    let (alice, bob) = establish_full();
+    let ek = assert_ok!(alice.pq_ratchet_begin());
+    assert_ok!(bob.pq_ratchet_respond(ek));
+    let ct = assert_some!(bob.pq_pending_outbound());
+    assert_ok!(alice.pq_ratchet_bind(ct, b"payload".to_vec()));
+
+    // The transport drops the bind: take a copy and throw it away.
+    let _lost = assert_some!(alice.pq_pending_outbound());
+
+    // Bob never saw it, so his side of the round is untouched and Alice can re-send.
+    let resent = assert_some!(alice.pq_pending_outbound());
+    assert_eq!(
+        assert_ok!(bob.pq_ratchet_apply(resent)),
+        b"payload".to_vec()
+    );
+}
+
+/// Re-staple makes duplicates steady-state traffic, not an edge case: the initiator's
+/// terminal bind has no inbound of its own to retire it, so it re-sends until the peer
+/// opens the next round. Every receiver must read such a frame as a discardable duplicate
+/// — distinctly from `SessionNotReady`, which a host is entitled to read as "wrong door".
+#[test]
+fn test_duplicate_side_band_frames_are_discardable_not_routing_errors() {
+    let (alice, bob) = establish_full();
+
+    // Duplicate EK: Bob already responded.
+    let ek = assert_ok!(alice.pq_ratchet_begin());
+    assert_ok!(bob.pq_ratchet_respond(ek.clone()));
+    assert_err!(bob.pq_ratchet_respond(ek), TwoMlsPqError::DuplicateSideBand);
+
+    // Duplicate CT: Alice already bound.
+    let ct = assert_some!(bob.pq_pending_outbound());
+    assert_ok!(alice.pq_ratchet_bind(ct.clone(), b"x".to_vec()));
+    assert_err!(
+        alice.pq_ratchet_bind(ct, b"x".to_vec()),
+        TwoMlsPqError::DuplicateSideBand
+    );
+
+    // Duplicate bind: Bob already applied. This is the common one — Alice re-sends her
+    // terminal frame until Bob opens the next round.
+    let bind = assert_some!(alice.pq_pending_outbound());
+    assert_ok!(bob.pq_ratchet_apply(bind.clone()));
+    assert_err!(bob.pq_ratchet_apply(bind), TwoMlsPqError::DuplicateSideBand);
+}
+
+/// Silent when quiescent — what lets a host send a bare message. Bob's part in the round
+/// ends when he applies the bind, so his retained CT goes; Alice's terminal bind lingers
+/// (deliberately — it is the frame that must land) until the next round replaces it.
+#[test]
+fn test_side_band_falls_silent_for_the_receiver_after_the_round() {
+    let (alice, bob) = establish_full();
+    let ek = assert_ok!(alice.pq_ratchet_begin());
+    assert_ok!(bob.pq_ratchet_respond(ek));
+    let ct = assert_some!(bob.pq_pending_outbound());
+    assert_ok!(alice.pq_ratchet_bind(ct, b"x".to_vec()));
+    let bind = assert_some!(alice.pq_pending_outbound());
+    assert_ok!(bob.pq_ratchet_apply(bind));
+
+    // Bob applied: his round is over and he holds the turn — nothing left to re-send.
+    assert!(bob.pq_pending_outbound().is_none());
+    assert!(bob.my_pq_turn());
+
+    // Bob opening the next round replaces nothing (his slot is empty) and Alice's stale
+    // terminal frame is retired by her own respond.
+    let ek2 = assert_ok!(bob.pq_ratchet_begin());
+    assert_ok!(alice.pq_ratchet_respond(ek2));
+    let ct2 = assert_some!(alice.pq_pending_outbound());
+    // The frame Alice now offers is this round's CT, not last round's bind.
+    assert_ok!(bob.pq_ratchet_bind(ct2, b"y".to_vec()));
+}
+
+/// A.4 is the worst frame to strand — without it the session never reaches full
+/// establishment — so the KP' must be retained and re-sendable too, and retired once
+/// both halves are live.
+#[test]
+fn test_bootstrap_kp_is_retained_and_retired_on_apply() {
+    let (alice, bob) = establish_confirmed_sessions();
+    assert_ok!(alice.pq_bootstrap_begin(None));
+
+    // Dropped KP': re-send from the retained slot.
+    let _lost = assert_some!(alice.pq_pending_outbound());
+    let resent = assert_some!(alice.pq_pending_outbound());
+    assert_ok!(bob.pq_bootstrap_respond(resent));
+
+    let bind = assert_some!(bob.pq_pending_outbound());
+    assert_ok!(alice.pq_bootstrap_apply(bind));
+
+    // Both halves live: nothing left for the KP' to heal.
+    assert!(alice.pq_pending_outbound().is_none());
+    assert!(alice.is_fully_established());
+}
+
+/// Retention rides the archive: a session restored mid-round must still be able to
+/// re-send. (`pending_pq_outbound` was already serialized; this pins that the new
+/// hand-out path reads it back.)
+#[test]
+fn test_retained_frame_survives_archive_round_trip() {
+    let (alice, bob) = establish_full();
+    assert_ok!(alice.pq_ratchet_begin());
+
+    let restored = round_trip(&alice);
+
+    let resent = assert_some!(restored.pq_pending_outbound());
+    assert_ok!(bob.pq_ratchet_respond(resent));
+}

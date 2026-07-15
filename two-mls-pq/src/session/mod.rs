@@ -111,8 +111,28 @@ struct SessionInner {
     state_seq: u64,
     my_state: PrincipalState,
     their_state: PrincipalState,
-    /// Responder-side side-band frame awaiting pickup by `pq_take_pending_outbound`.
-    /// Single slot: responder operations refuse to start while a frame is waiting.
+    /// The current round's outbound side-band frame, UNSEALED and RETAINED for re-send —
+    /// the side-band analogue of [`current_staple`](Self::current_staple), and set by both
+    /// roles (initiator `*_begin`/`pq_ratchet_bind`, responder `*_respond`).
+    ///
+    /// Retained rather than handed out once: a side-band frame is the only carrier of its
+    /// PQ half, so a lost one has no other way to reach the peer. The A.3 bind is the sharp
+    /// case — its classical commit re-staples on message frames, but the peer cannot apply
+    /// that staple without the PQ commit riding this frame, so the classical stream stalls
+    /// retriably "until the BIND lands" and a take-once bind that never lands stalls it
+    /// forever. Re-sending until the step advances heals that, exactly as `current_staple`
+    /// heals the classical stream.
+    ///
+    /// Lifecycle: REPLACED when this side produces the round's next frame, CLEARED when
+    /// this side's part in the round completes (the `*_apply` receivers). An initiator's
+    /// terminal bind therefore lingers until the peer opens the next round — deliberate:
+    /// it is precisely the frame that must land, and duplicates are benign discards on the
+    /// receiver (see `pq_ratchet_apply`). Single slot: a round has one frame in flight, and
+    /// the turn plus `pq_inflight` — not slot occupancy — are what gate a new operation.
+    ///
+    /// Sealing happens at hand-out ([`pq_pending_outbound`]), not here: `seal_side_band`
+    /// draws a fresh random nonce per call and mutates nothing, so re-sealing the same
+    /// frame is safe and each re-send tracks the current PQ header epoch.
     pending_pq_outbound: Option<Vec<u8>>,
     /// Whose move the PQ side-band is: the initiator owes the A.4 bootstrap; thereafter
     /// completing an operation passes the turn to the peer.

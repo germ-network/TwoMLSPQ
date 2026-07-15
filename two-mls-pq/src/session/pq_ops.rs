@@ -70,6 +70,10 @@ impl TwoMlsPqSession {
             msg.extend_from_slice(&eph.encapsulation_key());
             let sealed = inner.seal_side_band(&msg)?;
             inner.pq_inflight = Some(PqInflight::Initiating(eph));
+            // Retain for re-send as well as returning it: the EK is this round's only
+            // carrier, and losing it strands the round — `pq_inflight` blocks a re-begin
+            // and nothing else can re-emit the ephemeral's public half.
+            inner.pending_pq_outbound = Some(msg);
             Ok(sealed)
         })
     }
@@ -88,8 +92,20 @@ impl TwoMlsPqSession {
             if tag != PQ_EK_TAG {
                 return Err(TwoMlsPqError::Mls);
             }
-            if inner.pq_inflight.is_some() || inner.pending_pq_outbound.is_some() {
-                return Err(TwoMlsPqError::SessionNotReady);
+            // `pq_inflight` alone gates a double-respond (a first one parks `Responding`).
+            // Slot occupancy no longer means busy: since frames are retained for re-send,
+            // our own last frame is still parked here — a duplicate EK re-sent by the peer
+            // must be discardable, not an error, and a NEW round's EK legitimately replaces
+            // the terminal frame of the round before it.
+            match inner.pq_inflight {
+                // We already answered this round's EK; the peer is re-sending it until our
+                // CT lands. Nothing to do — and nothing done: this is above the choke point.
+                Some(PqInflight::Responding(_)) => return Err(TwoMlsPqError::DuplicateSideBand),
+                // Any other in-flight state is a genuinely ill-timed EK (e.g. a turn
+                // collision, both sides opening a round at once) — the host's problem to
+                // resolve, not a frame to silently drop.
+                Some(_) => return Err(TwoMlsPqError::SessionNotReady),
+                None => {}
             }
             ek.to_vec()
         };
@@ -98,6 +114,7 @@ impl TwoMlsPqSession {
             inner.pq_inflight = Some(PqInflight::Responding(Zeroizing::new(s)));
             let mut msg = vec![PQ_CT_TAG];
             msg.extend_from_slice(&ct);
+            // Replaces the previous round's terminal frame, if any.
             inner.pending_pq_outbound = Some(msg);
             Ok(())
         })
@@ -120,9 +137,9 @@ impl TwoMlsPqSession {
             if tag != PQ_CT_TAG {
                 return Err(TwoMlsPqError::Mls);
             }
-            if inner.pending_pq_outbound.is_some() {
-                return Err(TwoMlsPqError::SessionNotReady);
-            }
+            // No slot check: our own EK is parked here for re-send, and binding is exactly
+            // what should replace it. The `Initiating` check below is the real gate.
+            //
             // Staple-stacking guard: a prepared-but-unsent classical commit is sitting in
             // `current_staple` waiting for its `encrypt`. The bind commit below would replace
             // it, and a displaced commit never rides a frame again — the peer would hit the
@@ -131,8 +148,12 @@ impl TwoMlsPqSession {
                 return Err(TwoMlsPqError::SessionNotReady);
             }
             // Only an initiator holding the A.3 ephemeral can bind the ciphertext.
-            if !matches!(inner.pq_inflight, Some(PqInflight::Initiating(_))) {
-                return Err(TwoMlsPqError::SessionNotReady);
+            match inner.pq_inflight {
+                Some(PqInflight::Initiating(_)) => {}
+                // We already bound: the ephemeral was consumed and the turn passed, so this
+                // is the peer re-sending its CT until our bind lands. Discard.
+                None if !inner.pq_turn_mine => return Err(TwoMlsPqError::DuplicateSideBand),
+                _ => return Err(TwoMlsPqError::SessionNotReady),
             }
             ct.to_vec()
         };
@@ -231,8 +252,15 @@ impl TwoMlsPqSession {
             let inner = self.lock();
             let bind_msg = inner.open_or_raw(bind_msg);
             let decoded = decode_pq_bind(&bind_msg)?;
-            if !matches!(inner.pq_inflight, Some(PqInflight::Responding(_))) {
-                return Err(TwoMlsPqError::SessionNotReady);
+            match inner.pq_inflight {
+                Some(PqInflight::Responding(_)) => {}
+                // The commonest duplicate there is: we applied this bind, which passed us
+                // the turn, and the initiator keeps re-sending it until it opens the next
+                // round (its terminal frame has no inbound of its own to retire it). The
+                // held secret is long gone, so re-applying is impossible as well as
+                // unnecessary — discard.
+                None if inner.pq_turn_mine => return Err(TwoMlsPqError::DuplicateSideBand),
+                _ => return Err(TwoMlsPqError::SessionNotReady),
             }
             decoded
         };
@@ -301,6 +329,10 @@ impl TwoMlsPqSession {
             };
             // We finished receiving this operation; the next one is ours to start.
             inner.pq_turn_mine = true;
+            // Our part in the round is over: drop the retained CT so the side-band falls
+            // silent until we open the next round. The peer's bind landed, which is the
+            // only acknowledgement its CT needed.
+            inner.pending_pq_outbound = None;
             out
         })
     }
@@ -324,10 +356,9 @@ impl TwoMlsPqSession {
         // guards a handoff that only matters once we mutate, and it needs the moved id.)
         {
             let inner = self.lock();
-            if !inner.pq_turn_mine
-                || inner.pending_pq_outbound.is_some()
-                || inner.pq_inflight.is_some()
-            {
+            // Turn + inflight, not slot occupancy: holding the turn already means the last
+            // round completed, and its terminal frame may still be parked for re-send.
+            if !inner.pq_turn_mine || inner.pq_inflight.is_some() {
                 return Err(TwoMlsPqError::SessionNotReady);
             }
             if inner
@@ -376,6 +407,8 @@ impl TwoMlsPqSession {
             msg.extend_from_slice(&proposal.to_bytes().map_err(|_| TwoMlsPqError::Mls)?);
             let sealed = inner.seal_side_band(&msg)?;
             inner.pq_inflight = Some(PqInflight::RekeyInitiated { rotating });
+            // Retain for re-send (see `pq_ratchet_begin`): a lost Upd' strands the rekey.
+            inner.pending_pq_outbound = Some(msg);
             Ok(sealed)
         })
     }
@@ -403,7 +436,9 @@ impl TwoMlsPqSession {
             }
             let proposal_msg =
                 MlsMessage::from_bytes(proposal_bytes).map_err(|_| TwoMlsPqError::Mls)?;
-            if inner.pending_pq_outbound.is_some() || inner.pq_inflight.is_some() {
+            // Inflight only (see `pq_ratchet_respond`): the slot may hold our own retained
+            // frame from the previous round.
+            if inner.pq_inflight.is_some() {
                 return Err(TwoMlsPqError::SessionNotReady);
             }
             proposal_msg
@@ -721,6 +756,9 @@ impl TwoMlsPqSession {
                     }
                     // We finished receiving this operation; the next one is ours to start.
                     inner.pq_turn_mine = true;
+                    // Our part in the rekey is over (see `pq_ratchet_apply`): drop the
+                    // retained Commit' so the side-band falls silent until the next round.
+                    inner.pending_pq_outbound = None;
                     Ok(false)
                 }
                 // Unreachable: the guard at the top of this function admits only the two
@@ -743,9 +781,31 @@ impl TwoMlsPqSession {
         self.lock().pq_turn_mine
     }
 
-    /// Consume the side-band frame parked by the responder-side operations
-    /// (`pq_ratchet_respond` / `pq_ratchet_bind` / `pq_bootstrap_respond`). Single slot,
-    /// single delivery: those operations refuse to start while a frame is waiting.
+    /// The current round's outbound side-band frame, sealed fresh, WITHOUT consuming it —
+    /// the side-band analogue of re-stapling `current_staple` onto every message frame.
+    /// `None` when the side-band is quiescent (no round in flight), which is what lets a
+    /// host send a bare message.
+    ///
+    /// Call it on every send for as long as it returns `Some`: a side-band frame is the
+    /// only carrier of its PQ half, so re-sending is how a dropped one heals (see
+    /// [`SessionInner::pending_pq_outbound`]). Duplicates are benign discards on the
+    /// receiver, so over-sending is safe where under-sending stalls the ratchet.
+    ///
+    /// A pure read: the frame stays, no `state_seq` bump, nothing to persist. Each call
+    /// re-seals under the CURRENT PQ header epoch with a fresh random nonce, so a frame
+    /// retained across a PQ ratchet still opens for the peer.
+    pub fn pq_pending_outbound(&self) -> Option<Vec<u8>> {
+        let inner = self.lock();
+        let frame = inner.pending_pq_outbound.as_ref()?;
+        inner.seal_side_band(frame).ok()
+    }
+
+    /// Consume the current round's side-band frame.
+    ///
+    /// Prefer [`Self::pq_pending_outbound`]: taking leaves the round's only carrier of its
+    /// PQ half nowhere to be re-sent from, so a dropped frame stalls the ratchet with no
+    /// way to heal. Retained for hosts that drive the side-band as a strict
+    /// request/response and accept that.
     pub fn pq_take_pending_outbound(&self) -> Option<Vec<u8>> {
         let mut inner = self.lock();
         let frame = inner.pending_pq_outbound.take()?;
@@ -807,7 +867,12 @@ impl TwoMlsPqSession {
             // Side-band frame. Pre-A.4 our recv-PQ (Group_B.pq) is the group the bootstrap
             // is creating, so `seal_side_band` falls back to the classical seal for exactly
             // this frame; the peer opens it from its classical window.
-            inner.seal_side_band(&msg)
+            let sealed = inner.seal_side_band(&msg)?;
+            // Retain for re-send (see `pq_ratchet_begin`). A lost KP' is the worst of the
+            // three to strand: without A.4 the session never reaches full establishment,
+            // and this frame is what the peer's deferred send-PQ half is built around.
+            inner.pending_pq_outbound = Some(msg);
+            Ok(sealed)
         })
     }
 
@@ -829,9 +894,10 @@ impl TwoMlsPqSession {
             if tag != PQ_BOOTSTRAP_KP_TAG {
                 return Err(TwoMlsPqError::Mls);
             }
-            if inner.pending_pq_outbound.is_some() {
-                return Err(TwoMlsPqError::SessionNotReady);
-            }
+            // No slot check (see `pq_ratchet_respond`). The "our send-PQ is already up"
+            // guard below is what makes a re-sent KP' idempotent — it is reached before any
+            // group is built, so a duplicate is refused without touching state.
+            //
             // Validate the peer's PQ key package suite before building a group around it — an
             // early, clear CipherSuiteMismatch rather than a late opaque mls-rs error.
             check_key_package_suite(kp, inner.suite.pq)?;
@@ -843,13 +909,16 @@ impl TwoMlsPqSession {
             }
             // Our send-PQ half must not already be up (checked last, matching the original body
             // order); the guard-first position prevents a full-Checkpoint push on a replay.
+            // An already-up half means we answered this KP' — the peer is re-sending until
+            // our bootstrap frame lands. Discard rather than report not-ready: it reaches
+            // here before any group is built, so it is a true no-op.
             if inner
                 .send_group
                 .as_ref()
                 .map(|g| g.pq.is_some())
                 .unwrap_or(false)
             {
-                return Err(TwoMlsPqError::SessionNotReady);
+                return Err(TwoMlsPqError::DuplicateSideBand);
             }
             kp.to_vec()
         };
@@ -962,6 +1031,9 @@ impl TwoMlsPqSession {
                 recv.set_pq(pq, client.combiner());
             }
             inner.pq_turn_mine = false;
+            // A.4 is complete on our side: drop the retained KP'. Both halves are live now,
+            // so nothing is left for it to heal.
+            inner.pending_pq_outbound = None;
             Ok(())
         })
     }

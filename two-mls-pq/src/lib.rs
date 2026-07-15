@@ -529,6 +529,19 @@ pub enum TwoMlsPqError {
     ArchiveInvalid,
     #[error("welcome already consumed for this remote")]
     DuplicateWelcome,
+    /// A side-band frame for a step this side has already taken — the PQ analogue of
+    /// `DuplicateWelcome`. Expected traffic, not a fault: the sender retains the round's
+    /// frame and re-sends it until the step advances (see
+    /// `SessionInner::pending_pq_outbound`), so the tail of every round is a frame the
+    /// receiver has already applied. The app should discard it.
+    ///
+    /// Distinct from `SessionNotReady`, which a host must be free to read as a ROUTING
+    /// signal (a frame offered at the wrong door), and from `Mls`, a frame that never
+    /// parsed. Raised only where the state proves the step is done; a merely ill-timed
+    /// frame still reports `SessionNotReady`. Like every side-band guard it is checked
+    /// before the persist choke point, so a duplicate is a true no-op.
+    #[error("side-band frame already applied")]
+    DuplicateSideBand,
     /// A single-use (not last-resort) invitation whose key package has already been consumed
     /// by an accepted session. Distinct from `DuplicateWelcome` (a per-remote replay guard):
     /// a spent invitation rejects *every* further `receive`, from any remote. The app should
