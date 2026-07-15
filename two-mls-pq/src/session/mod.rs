@@ -148,10 +148,14 @@ struct SessionInner {
     /// Live-only, deliberately not archived: a restore restarts the chunking pass with a
     /// fresh base, which a host must already tolerate (a lost pass demands the same).
     ///
-    /// Epoch note: the seal is under the RECV-PQ header key, which advances only when the
-    /// PEER commits — and applying a peer commit clears this side's retained frame anyway,
-    /// so a cached seal cannot outlive its own epoch by the ordinary flow. Were one to,
-    /// the peer's `recv_pq_header_keys` window still opens recent epochs.
+    /// Epoch note: a cached seal keeps the epoch it was sealed at, so it ages where a
+    /// `Fresh` re-seal would not. For the PQ family that is near-moot — `seal_side_band`
+    /// seals under recv-PQ, which advances only when the PEER commits, and applying a peer
+    /// commit clears the retained frame anyway; the peer's `recv_pq_header_keys` window
+    /// covers the rest. The exception is the ONE frame taking the classical fallback, the
+    /// pre-A.4 `BOOTSTRAP_KP`: its key tracks the CLASSICAL epoch, which ordinary messaging
+    /// advances, so a long `Stable` pass over it could age past the peer's classical window.
+    /// `Fresh` (today's only caller) re-seals per hand-out and never meets this.
     pq_outbound_seal: Option<(Vec<u8>, Vec<u8>)>,
     /// Whose move the PQ side-band is: the initiator owes the A.4 bootstrap; thereafter
     /// completing an operation passes the turn to the peer.
@@ -313,6 +317,24 @@ fn apq_epochs(group: &CombinerGroup) -> crate::ApqEpochs {
 }
 
 impl SessionInner {
+    /// Retain an initiator's side-band `frame` for re-send, seeding the
+    /// [`SideBandSealing::Stable`] cache with `sealed` — the very bytes the `*_begin` call
+    /// is about to return.
+    ///
+    /// The seed is what makes `begin`'s return and a subsequent `Stable` hand-out AGREE.
+    /// Without it the first peek re-seals (a fresh nonce), so a chunking host that sent
+    /// `begin`'s return and then peeked for the rest of the pass would cut pieces from two
+    /// different seals — which reassemble into nothing. `Fresh` hosts are unaffected: they
+    /// re-seal per send by definition, and the seeded cache is inert for them (and
+    /// self-validating, so it cannot go stale).
+    ///
+    /// Responder frames need no equivalent: `*_respond` hands nothing back, so its frame
+    /// only ever reaches the wire through a hand-out.
+    fn retain_side_band(&mut self, frame: Vec<u8>, sealed: &[u8]) {
+        self.pq_outbound_seal = Some((frame.clone(), sealed.to_vec()));
+        self.pending_pq_outbound = Some(frame);
+    }
+
     /// Register an exported PSK into every store this session's groups resolve from.
     fn register_psk(&self, psk_id: &ExternalPskId, psk: &PreSharedKey) {
         apq::register_psk_stores(&self.psk_stores, psk_id, psk);

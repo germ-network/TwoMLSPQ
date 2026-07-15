@@ -72,8 +72,9 @@ impl TwoMlsPqSession {
             inner.pq_inflight = Some(PqInflight::Initiating(eph));
             // Retain for re-send as well as returning it: the EK is this round's only
             // carrier, and losing it strands the round — `pq_inflight` blocks a re-begin
-            // and nothing else can re-emit the ephemeral's public half.
-            inner.pending_pq_outbound = Some(msg);
+            // and nothing else can re-emit the ephemeral's public half. Seeding the seal
+            // cache keeps a Stable hand-out byte-identical to what we return here.
+            inner.retain_side_band(msg, &sealed);
             Ok(sealed)
         })
     }
@@ -408,7 +409,7 @@ impl TwoMlsPqSession {
             let sealed = inner.seal_side_band(&msg)?;
             inner.pq_inflight = Some(PqInflight::RekeyInitiated { rotating });
             // Retain for re-send (see `pq_ratchet_begin`): a lost Upd' strands the rekey.
-            inner.pending_pq_outbound = Some(msg);
+            inner.retain_side_band(msg, &sealed);
             Ok(sealed)
         })
     }
@@ -798,8 +799,18 @@ impl TwoMlsPqSession {
     ///
     /// Advances no protocol state either way: the frame stays, no `state_seq` bump, nothing
     /// to persist. (`Stable` fills a live-only seal cache — invisible to the archive and to
-    /// the peer.) The seal is under the CURRENT PQ header epoch, so a frame retained across
-    /// a PQ ratchet still opens for the peer.
+    /// the peer.)
+    ///
+    /// Epochs: `Fresh` seals at the epoch CURRENT to each call, so a frame retained across a
+    /// ratchet keeps opening for the peer. `Stable` cannot, by construction — the bytes hold
+    /// still, so the cached seal keeps the epoch it was first sealed at and the peer opens it
+    /// from its retained header-key window. That is roomy for the PQ family (`seal_side_band`
+    /// seals under recv-PQ, which advances only when the PEER commits — and applying a peer
+    /// commit clears this side's retained frame anyway). It is tighter for the one frame that
+    /// takes `seal_side_band`'s classical fallback, the pre-A.4 `BOOTSTRAP_KP`, whose key
+    /// tracks the CLASSICAL epoch that ordinary messaging advances: a `Stable` pass over that
+    /// frame wants to finish inside the peer's classical header window. `Fresh` has no such
+    /// constraint.
     pub fn pq_pending_outbound(&self, sealing: SideBandSealing) -> Option<Vec<u8>> {
         let mut inner = self.lock();
         let frame = inner.pending_pq_outbound.clone()?;
@@ -835,6 +846,10 @@ impl TwoMlsPqSession {
         // so its recv-PQ group exists); the classical fallback in `seal_side_band` is
         // never hit here.
         let out = inner.seal_side_band(&frame).ok();
+        // The frame is gone, so its cached seal has nothing left to describe. Dropping it is
+        // hygiene rather than correctness — a hand-out re-seals on a frame mismatch anyway —
+        // but it keeps the cache from outliving the frame it sealed.
+        inner.pq_outbound_seal = None;
         // The take advanced state — persist Core (a side-band frame changes no group).
         // Keyed on the take, like `pending_outbound`: an (unreachable) seal failure still
         // consumed the parked frame.
@@ -893,7 +908,7 @@ impl TwoMlsPqSession {
             // Retain for re-send (see `pq_ratchet_begin`). A lost KP' is the worst of the
             // three to strand: without A.4 the session never reaches full establishment,
             // and this frame is what the peer's deferred send-PQ half is built around.
-            inner.pending_pq_outbound = Some(msg);
+            inner.retain_side_band(msg, &sealed);
             Ok(sealed)
         })
     }

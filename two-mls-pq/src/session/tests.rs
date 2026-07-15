@@ -5148,3 +5148,41 @@ fn test_stable_seal_is_invalidated_when_the_frame_advances() {
         b"payload".to_vec()
     );
 }
+
+/// `*_begin` both RETURNS a sealed frame and retains it, so the two must not disagree: a
+/// chunking host that sent the return and then peeked for the rest of the pass would cut
+/// pieces from two different seals, which reassemble into nothing. Seeding the seal cache
+/// at `begin` is what keeps them identical — this pins it for all three initiator entry
+/// points, since each seals and retains independently.
+#[test]
+fn test_begin_return_matches_the_stable_base() {
+    let (alice, bob) = establish_full();
+
+    // A.3
+    let returned = assert_ok!(alice.pq_ratchet_begin());
+    let peeked = assert_some!(alice.pq_pending_outbound(SideBandSealing::Stable));
+    assert_eq!(returned, peeked, "A.3 begin disagrees with the Stable base");
+    assert_ok!(bob.pq_ratchet_respond(returned));
+
+    // A.5 — Bob holds the turn only after a full round, so drive one first.
+    let ct = assert_some!(bob.pq_pending_outbound(SideBandSealing::Stable));
+    assert_ok!(alice.pq_ratchet_bind(ct, b"x".to_vec()));
+    let bind = assert_some!(alice.pq_pending_outbound(SideBandSealing::Stable));
+    assert_ok!(bob.pq_ratchet_apply(bind));
+
+    let returned = assert_ok!(bob.pq_rekey_begin(None));
+    let peeked = assert_some!(bob.pq_pending_outbound(SideBandSealing::Stable));
+    assert_eq!(returned, peeked, "A.5 begin disagrees with the Stable base");
+}
+
+/// The A.4 half of `test_begin_return_matches_the_stable_base`: its KP' is minted
+/// pre-establishment and is the one frame sealed classically, so it takes a different path
+/// through `seal_side_band` and is worth pinning separately.
+#[test]
+fn test_bootstrap_begin_return_matches_the_stable_base() {
+    let (alice, bob) = establish_confirmed_sessions();
+    let returned = assert_ok!(alice.pq_bootstrap_begin(None));
+    let peeked = assert_some!(alice.pq_pending_outbound(SideBandSealing::Stable));
+    assert_eq!(returned, peeked, "A.4 begin disagrees with the Stable base");
+    assert_ok!(bob.pq_bootstrap_respond(returned));
+}
