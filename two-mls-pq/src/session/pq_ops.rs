@@ -401,14 +401,8 @@ impl TwoMlsPqSession {
             let cross_psk = if inner.last_cross_injected_pq == Some(recv_pq_epoch) {
                 None
             } else {
-                let recv_pq = inner
-                    .recv_group
-                    .as_mut()
-                    .and_then(|g| g.pq.as_mut())
-                    .ok_or(TwoMlsPqError::SessionNotReady)?;
-                let exported = export_psk(recv_pq, PskDomain::CrossParty)?;
+                let exported = inner.export_cross_from_recv_pq()?;
                 inner.register_psk(exported.storage_id(), exported.psk());
-                inner.last_cross_injected_pq = Some(recv_pq_epoch);
                 Some(exported)
             };
             // Snapshot of the peer's canonical history for the announced-id check below,
@@ -562,14 +556,8 @@ impl TwoMlsPqSession {
                     .ok_or(TwoMlsPqError::SessionNotReady)?
                     .current_epoch();
                 if inner.last_send_pq_exported != Some(send_pq_epoch) {
-                    let send_pq = inner
-                        .send_group
-                        .as_mut()
-                        .and_then(|g| g.pq.as_mut())
-                        .ok_or(TwoMlsPqError::SessionNotReady)?;
-                    let exported = export_psk(send_pq, PskDomain::CrossParty)?;
+                    let exported = inner.export_cross_from_send_pq()?;
                     inner.register_psk(exported.storage_id(), exported.psk());
-                    inner.last_send_pq_exported = Some(send_pq_epoch);
                     Some(exported.storage_id().clone())
                 } else {
                     None
@@ -629,26 +617,7 @@ impl TwoMlsPqSession {
             // [BSG-PQ]") — derivable only having applied the Commit', which is what makes
             // the ack a receipt. The responder re-derives the same value from its own
             // send-PQ as it applies our staple, so it never goes on the wire.
-            let (s, new_epoch) = {
-                let recv_pq = inner
-                    .recv_group
-                    .as_mut()
-                    .and_then(|g| g.pq.as_mut())
-                    .ok_or(TwoMlsPqError::SessionNotReady)?;
-                let epoch = recv_pq.current_epoch();
-                (
-                    Zeroizing::new(
-                        export_psk(recv_pq, PskDomain::CrossParty)?
-                            .psk()
-                            .as_ref()
-                            .to_vec(),
-                    ),
-                    epoch,
-                )
-            };
-            // The exporter leaf is consumed on first export — record that this epoch's is
-            // spent, so a later respond at this same epoch skips re-deriving it.
-            inner.last_cross_injected_pq = Some(new_epoch);
+            let s = Zeroizing::new(inner.export_cross_from_recv_pq()?.psk().as_ref().to_vec());
             // As A.3 and A.4, whose `commit_pq_and_owe_bind` this shares: commit the PQ
             // half, owe the classical one, park NOTHING. The ack rides our next classical
             // COMMIT as an APQPrivateMessage staple, and the staple's re-send until
@@ -1024,26 +993,7 @@ impl TwoMlsPqSession {
             // birth epoch of the group we just joined. Derivable only from inside it, and
             // the peer re-derives the same value from its own copy (same group, epoch and
             // domain), so it never goes on the wire.
-            let (s, birth_epoch) = {
-                let recv_pq = inner
-                    .recv_group
-                    .as_mut()
-                    .and_then(|g| g.pq.as_mut())
-                    .ok_or(TwoMlsPqError::SessionNotReady)?;
-                let epoch = recv_pq.current_epoch();
-                (
-                    Zeroizing::new(
-                        export_psk(recv_pq, PskDomain::CrossParty)?
-                            .psk()
-                            .raw_value()
-                            .to_vec(),
-                    ),
-                    epoch,
-                )
-            };
-            // The exporter leaf is consumed on first export, so record that we have spent
-            // this epoch's — a later A.5 must not try to re-export it.
-            inner.last_cross_injected_pq = Some(birth_epoch);
+            let s = Zeroizing::new(inner.export_cross_from_recv_pq()?.psk().as_ref().to_vec());
 
             // As A.3 (`pq_ratchet_bind`), which this shares `commit_pq_and_owe_bind` with:
             // commit the PQ half, owe the classical one, park NOTHING in `pending_side_band`.

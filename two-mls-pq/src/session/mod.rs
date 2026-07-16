@@ -20,7 +20,7 @@ use apq::{
     create_bound_classical_send_group, create_combiner_send_group, create_group_with_member,
     decode_apq_welcome, encode_apq_welcome, export_psk, forget_psk,
     join_combiner_group_from_halves, join_group_from_welcome, register_psk, sender_client_id,
-    GroupCreation, PskDomain, APQ_TAG,
+    ExportedPsk, GroupCreation, PskDomain, APQ_TAG,
 };
 
 use crate::key_package_store::CombinerGroup;
@@ -103,6 +103,18 @@ struct OwedBind {
 struct LeafChanges {
     new_sender: Option<ClientId>,
     canonicalized_own: Option<Vec<u8>>,
+}
+
+/// What a staple's classical commit is, relative to our recv group's epoch. The single home
+/// of the re-staple ordering discipline (`staple_epoch_action`), so the two staple forms — a
+/// plain commit and a bind's `APQPrivateMessage` — cannot drift on how repeats and gaps are
+/// handled.
+enum StapleAction {
+    /// Older than our epoch: already applied off an earlier frame. The staple rides every
+    /// frame precisely so repeats are cheap skips.
+    Skip,
+    /// Exactly our next epoch: this frame's commit is live and its arm must apply it.
+    Apply,
 }
 
 /// No frame here is ever terminal: every side-band frame is answered by its round's next
@@ -451,6 +463,43 @@ impl SessionInner {
         apq::forget_psk_stores(&self.psk_stores, psk_id);
     }
 
+    /// Export the cross-party TwoMLS-PSK from our recv-PQ mirror at its current epoch and
+    /// stamp `last_cross_injected_pq` to that epoch — the two are ONE step everywhere they
+    /// appear, because the export spends a one-shot exporter leaf and the watermark is what
+    /// stops a later same-epoch export re-consuming the (now gone) leaf and failing opaquely.
+    /// The caller decides what to do with the result: take its raw value as the injected
+    /// secret S, or `register_psk` it for the peer's commit to resolve.
+    fn export_cross_from_recv_pq(&mut self) -> Result<ExportedPsk> {
+        let (exported, epoch) = {
+            let recv_pq = self
+                .recv_group
+                .as_mut()
+                .and_then(|g| g.pq.as_mut())
+                .ok_or(TwoMlsPqError::SessionNotReady)?;
+            let epoch = recv_pq.current_epoch();
+            (export_psk(recv_pq, PskDomain::CrossParty)?, epoch)
+        };
+        self.last_cross_injected_pq = Some(epoch);
+        Ok(exported)
+    }
+
+    /// The send-PQ twin of [`SessionInner::export_cross_from_recv_pq`], stamping
+    /// `last_send_pq_exported`. Used where WE are the party whose send-PQ the round rekeyed
+    /// (A.4's/A.5's responder re-deriving S, A.5's initiator pre-registering for the peer).
+    fn export_cross_from_send_pq(&mut self) -> Result<ExportedPsk> {
+        let (exported, epoch) = {
+            let send_pq = self
+                .send_group
+                .as_mut()
+                .and_then(|g| g.pq.as_mut())
+                .ok_or(TwoMlsPqError::SessionNotReady)?;
+            let epoch = send_pq.current_epoch();
+            (export_psk(send_pq, PskDomain::CrossParty)?, epoch)
+        };
+        self.last_send_pq_exported = Some(epoch);
+        Ok(exported)
+    }
+
     /// The trigger half of the bind both A.3 and A.4 close their round with: inject `s` into
     /// our send-PQ with a pathless commit, and OWE the classical half.
     ///
@@ -564,6 +613,26 @@ impl SessionInner {
         Ok(Some((owed.pq_commit, apq_psk, attestation)))
     }
 
+    /// Classify a staple's classical commit against our recv group's epoch — the one place
+    /// the re-staple ordering lives, called by BOTH staple arms so a change to how repeats or
+    /// gaps are handled can never land in one and not the other. `Greater` (a commit we never
+    /// saw sits between) is reconnect territory, surfaced as `EpochDesync` before the app
+    /// ciphertext is touched.
+    fn staple_epoch_action(&self, commit: &MlsMessage) -> Result<StapleAction> {
+        let commit_epoch = commit.epoch().ok_or(TwoMlsPqError::DecryptionFailed)?;
+        let current = self
+            .recv_group
+            .as_ref()
+            .ok_or(TwoMlsPqError::SessionNotEstablished)?
+            .classical
+            .current_epoch();
+        match commit_epoch.cmp(&current) {
+            std::cmp::Ordering::Less => Ok(StapleAction::Skip),
+            std::cmp::Ordering::Equal => Ok(StapleAction::Apply),
+            std::cmp::Ordering::Greater => Err(TwoMlsPqError::EpochDesync),
+        }
+    }
+
     /// The apply both A.3 and A.4 close their round with: apply the peer's pathless PQ commit
     /// to our recv-PQ with the injected secret `s`, apply the classical commit, and verify the
     /// -02 FULL attestation across both halves. Returns the leaf-identity changes the classical
@@ -573,6 +642,12 @@ impl SessionInner {
     /// frame of its own. It therefore does NOT touch the app message: that is the enclosing
     /// message frame's own section, which the ordinary path decrypts once this returns — the
     /// same order as before, since the classical commit has applied by then.
+    ///
+    /// `inject_send_psks` runs INSIDE this method (not at the call site, as the plain
+    /// commit-staple arm does it): the deliberate difference is that this is a self-contained
+    /// method whose one caller latches a failure of it as an irrecoverable bind-apply, so
+    /// keeping the precondition inside the latched region is what makes an inject failure land
+    /// there rather than escape unlatched.
     ///
     /// As with `commit_pq_and_owe_bind`, the rounds differ only in where `s` came from: A.3
     /// held it from encapsulating, A.4 re-derives it by exporting from its own copy of the

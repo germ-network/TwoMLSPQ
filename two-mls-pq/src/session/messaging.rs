@@ -1042,27 +1042,15 @@ impl TwoMlsPqSession {
                 // supplies.
                 //
                 // The peer re-staples this on every frame until its next commit supersedes
-                // it, so a repeat is the common case, not an anomaly: like the plain commit
-                // staple below, order on the classical half's epoch — an already-applied
-                // bind is an idempotent skip, the current epoch's is this round's close,
-                // and one from a future epoch is the same unbridgeable desync a plain
-                // staple would be.
+                // it, so a repeat is the common case, not an anomaly: the epoch ordering (a
+                // repeat skips, a gap desyncs) is `staple_epoch_action`, shared with the
+                // plain commit arm below so the two cannot drift.
                 let (t_message, pq_message) = apq::decode_apq_private_message(&staple)?;
-                let commit_epoch = MlsMessage::from_bytes(&t_message)
-                    .map_err(|_| TwoMlsPqError::DecryptionFailed)?
-                    .epoch()
-                    .ok_or(TwoMlsPqError::DecryptionFailed)?;
-                let current_epoch = inner
-                    .recv_group
-                    .as_ref()
-                    .ok_or(TwoMlsPqError::SessionNotEstablished)?
-                    .classical
-                    .current_epoch();
-                match commit_epoch.cmp(&current_epoch) {
-                    // Already applied off an earlier frame — the staple rides every frame
-                    // precisely so repeats are cheap skips.
-                    std::cmp::Ordering::Less => {}
-                    std::cmp::Ordering::Equal => {
+                let t_msg = MlsMessage::from_bytes(&t_message)
+                    .map_err(|_| TwoMlsPqError::DecryptionFailed)?;
+                match inner.staple_epoch_action(&t_msg)? {
+                    StapleAction::Skip => {}
+                    StapleAction::Apply => {
                         let stores = inner.psk_stores.clone();
                         // Where S comes from is the one thing the three rounds do not
                         // share. A.3's responder has held it since `encapsulate`; A.4's and
@@ -1074,25 +1062,9 @@ impl TwoMlsPqSession {
                         let s = match inner.pq_inflight.take() {
                             Some(PqInflight::Responding(s)) => s,
                             Some(PqInflight::BootstrapResponded)
-                            | Some(PqInflight::RekeyResponded) => {
-                                let send_pq = inner
-                                    .send_group
-                                    .as_mut()
-                                    .and_then(|g| g.pq.as_mut())
-                                    .ok_or(TwoMlsPqError::SessionNotReady)?;
-                                let epoch = send_pq.current_epoch();
-                                let s = Zeroizing::new(
-                                    export_psk(send_pq, PskDomain::CrossParty)?
-                                        .psk()
-                                        .as_ref()
-                                        .to_vec(),
-                                );
-                                // The exporter leaf is spent on first export. Record it, or
-                                // the next A.5 re-exports the same leaf and fails with an
-                                // opaque `Mls`.
-                                inner.last_send_pq_exported = Some(epoch);
-                                s
-                            }
+                            | Some(PqInflight::RekeyResponded) => Zeroizing::new(
+                                inner.export_cross_from_send_pq()?.psk().as_ref().to_vec(),
+                            ),
                             // A current-epoch bind we are not the responder of — an
                             // ill-timed or forged staple; restore what we took.
                             other => {
@@ -1140,25 +1112,15 @@ impl TwoMlsPqSession {
                         // falls silent until the next round's begin replaces the slot.
                         inner.pending_side_band = None;
                     }
-                    // Ahead of us: a commit we never saw sits between — reconnect
-                    // territory, surfaced before the app ciphertext is touched.
-                    std::cmp::Ordering::Greater => return Err(TwoMlsPqError::EpochDesync),
                 }
             } else {
                 let commit_msg =
                     MlsMessage::from_bytes(&staple).map_err(|_| TwoMlsPqError::DecryptionFailed)?;
-                let commit_epoch = commit_msg.epoch().ok_or(TwoMlsPqError::DecryptionFailed)?;
-                let current_epoch = inner
-                    .recv_group
-                    .as_ref()
-                    .ok_or(TwoMlsPqError::SessionNotEstablished)?
-                    .classical
-                    .current_epoch();
-                match commit_epoch.cmp(&current_epoch) {
+                match inner.staple_epoch_action(&commit_msg)? {
                     // Already applied off an earlier frame — the staple rides every
                     // frame precisely so repeats are cheap skips.
-                    std::cmp::Ordering::Less => {}
-                    std::cmp::Ordering::Equal => {
+                    StapleAction::Skip => {}
+                    StapleAction::Apply => {
                         // The commit may bind the cross-party TwoMLS-PSK of our send
                         // group — possibly at an epoch we've since moved past (their
                         // frame can cross one of our commits). Live-inject the
@@ -1226,13 +1188,6 @@ impl TwoMlsPqSession {
                         if new_own != prior_own {
                             canonicalized_own = Some(new_own);
                         }
-                    }
-                    std::cmp::Ordering::Greater => {
-                        // The peer is more than one commit ahead of us: the bridging
-                        // commit no longer rides any frame (only the latest staples).
-                        // Not transient — surface the desync before touching the app
-                        // ciphertext so the host can route to reconnect.
-                        return Err(TwoMlsPqError::EpochDesync);
                     }
                 }
             }
