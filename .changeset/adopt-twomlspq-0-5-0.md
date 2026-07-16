@@ -27,7 +27,32 @@ group; turn alternation covers the other. `ingest(.rekeyCommit)` reports
 **New failure surface**: `.bindApplyFailed` (peer bind staple failed after its secret was
 consumed — receiving is poisoned, sending unaffected; poll the new `isReceiveBroken` to
 decide urgency by role) and `.bindDischargeFailed` (our own owed bind failed mid-commit —
-permanently broken; route to re-establishment). Both map to `.reconnect`.
+permanently broken; route to re-establishment, disposition `.reconnect`).
+`.bindApplyFailed` maps to `.retryLater`, NOT `.reconnect` — custody: frames refused in
+the poisoned window were never consumed and WILL decrypt after the restore, so an exit
+that acks them on a session-recovery path would destroy recoverable messages. Spool them;
+`isReceiveBroken` carries the session-level recovery signal.
+
+**`PQInbound.owesBind`** is TRUE on every closing-leg ingest: our send-PQ committed
+eagerly and the classical half is OWED — it discharges only inside our next classical
+COMMIT. The host must eventually drive a committing send; an idle session never
+discharges, the peer re-sends forever (each a `.duplicateSideBand` discard), and the turn
+never flips. The flag is transient (the crate exports no owed-bind query yet — upstream
+ask), so act on it or record it.
+
+**Persisted state (contract 16 → 19)**: wire tags were renumbered, so an in-flight
+v0.4.x frame fails to classify — a loud discard, never a misparse; retention means live
+peers re-send. Archives follow the crate's pre-release hard cut: a v0.4.1 blob fails
+closed as `ArchiveInvalid` (`.discardArtifact`) and regenerates — availability loss only.
+
+**App adoption worklist (verified against germDM feat/pq)**: `PQSideBandDriverTests`
+reads the removed `plaintext` (compile error) and `#require`s third frames that are now
+nil; its `bootstrap()` helper asserts the turn flips at the closing leg (it now flips at
+the discharge); `PQSideBandDriver`'s "reply == nil means complete" contract is false on
+closing legs (use `owesBind`); `FrameExit.classify`'s inner `default` routes
+`.duplicateSideBand` into the garbage-frame bucket the reconnect heuristic reads — give
+it the `.duplicate` exit; and the driver must adopt `pendingSideBand(sealing:)` for the
+re-staple ruling.
 
 **Driving note (v19 evidence-gating)**: a classical commit no longer requires an approved
 proposal — a round also commits when it owes a bind and holds a peer offer built against

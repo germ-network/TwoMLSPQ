@@ -64,8 +64,18 @@ extension AbstractTwoMLS {
 	/// distinct on the wire, so a stalled round's re-sends cannot be correlated.
 	/// `.stable` seals once and repeats the bytes while the frame is unchanged,
 	/// which CHUNKING requires: chunks cut from two different seals never
-	/// reassemble. The trade is exactly the correlation `.fresh` avoids; neither
-	/// is safer in general.
+	/// reassemble.
+	///
+	/// The correlation-vs-chunking trade is even, but `.stable` also carries a
+	/// LIVENESS bound `.fresh` does not: the cached seal keeps the epoch it was
+	/// first sealed at. That is roomy for PQ-sealed frames (the key advances
+	/// only when the peer commits), but the one frame sealed under the
+	/// CLASSICAL fallback key — the pre-A.4 `BOOTSTRAP_KP`, whose epoch
+	/// ordinary messaging advances — must complete its `.stable` pass inside
+	/// the peer's classical header window, or the reassembled frame opens for
+	/// no key and re-handing the same bytes never heals. A chunking transport
+	/// should pause classical sends across a `.stable` pass over the KP', or
+	/// use `.fresh` for it and chunk only steady-state frames.
 	public enum SideBandSealing: Sendable, Equatable {
 		case fresh
 		case stable
@@ -74,25 +84,43 @@ extension AbstractTwoMLS {
 	/// A received-and-applied PQ message and its effects.
 	public struct PQInbound: Sendable {
 		public let kind: PQOperationKind
+		/// The round's TARGET group — the one this operation exists to move.
+		/// NOTE this can under-describe a closing leg: `.rekeyCommit` reports
+		/// `.theirs` (the peer's group was re-keyed) even though applying it
+		/// ALSO partial-commits our own send-PQ eagerly (the ACK's PQ half).
+		/// `newEpochs` and `owesBind` carry that; do not dispatch own-group
+		/// work off this field alone.
 		public let advancedGroup: SendGroupRole
 		/// This side's SEND group epoch pair after the apply (nil when nothing
-		/// moved). NOTE: when `advancedGroup == .theirs` the group that advanced
-		/// is the peer's — this field still reports our own send group's pair,
-		/// which is unchanged by such an apply. It answers "what are MY epochs
-		/// now", not "what did the advanced group move to".
+		/// of ours moved). It answers "what are MY epochs now", not "what did
+		/// the advanced group move to" — and on a closing leg our own pq half
+		/// HAS moved even when `advancedGroup == .theirs` (see above).
 		public let newEpochs: APQEpochs?
 		public let rotatedCredential: ClientID?  // A.4/A.5 principal handoff
+		/// TRUE on every closing leg (`.bootstrapWelcome`, `.ratchetCiphertext`,
+		/// `.rekeyCommit` ingests): our send-PQ committed eagerly and the
+		/// classical half is now OWED — it discharges only inside our next
+		/// classical COMMIT (v19: which a current-epoch peer offer licenses).
+		/// The host MUST eventually drive a committing send; an idle session
+		/// never discharges, the peer re-sends its last frame forever (each one
+		/// a `.duplicateSideBand` discard), and the turn never flips. This flag
+		/// is the moment to arrange that send. It is transient — nothing
+		/// re-exposes it after a restore (the crate offers no owed-bind query
+		/// yet), so act on it or record it.
+		public let owesBind: Bool
 
 		public init(
 			kind: PQOperationKind,
 			advancedGroup: SendGroupRole,
 			newEpochs: APQEpochs?,
-			rotatedCredential: ClientID?
+			rotatedCredential: ClientID?,
+			owesBind: Bool = false
 		) {
 			self.kind = kind
 			self.advancedGroup = advancedGroup
 			self.newEpochs = newEpochs
 			self.rotatedCredential = rotatedCredential
+			self.owesBind = owesBind
 		}
 	}
 
@@ -129,12 +157,14 @@ extension AbstractTwoMLS {
 		func begin(_ kind: PQOperationKind, rotating: ClientID?) throws -> PQOutbound
 
 		/// Hand out the reply a responding `ingest` parked (CT after an EK,
-		/// Welcome' after a KP', Commit' after an Upd'), CONSUMING it. Returns
-		/// nil when nothing is parked — including after every closing leg, whose
-		/// bind rides the next classical commit as the message-frame staple
-		/// rather than parking here. Correct for strict request/response
-		/// drivers; a re-staple driver should prefer `pendingSideBand(sealing:)`.
-		func advance(after inbound: PQInbound) throws -> PQOutbound?
+		/// Welcome' after a KP', Commit' after an Upd'), CONSUMING it — the
+		/// retained copy included, so a re-staple driver should prefer
+		/// `pendingSideBand(sealing:)`. Returns nil when nothing is parked —
+		/// which is every closing leg: the bind rides the next classical commit
+		/// as the message-frame staple rather than parking here (`inbound
+		/// .owesBind` is the explicit signal). Cannot fail; the take is a pure
+		/// read-and-clear.
+		func advance(after inbound: PQInbound) -> PQOutbound?
 
 		/// The retained side-band frame, sealed, WITHOUT consuming it — the
 		/// re-send path (v18 retention). Safe to call on every send; advances no

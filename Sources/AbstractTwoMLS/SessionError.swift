@@ -70,11 +70,19 @@ extension AbstractTwoMLS {
 			case epochDesync
 			/// A peer bind staple failed to apply AFTER the round's secret was
 			/// consumed: receiving is poisoned (every further processIncoming
-			/// refuses; the peer re-staples the same unappliable bind), while
-			/// SENDING is unaffected. Not reachable from an honest peer. Healed
-			/// by restoring the last persisted state — poll `isReceiveBroken`
-			/// to decide urgency by role (receive-critical: now; send-mostly:
-			/// deferred).
+			/// refuses with this code; the peer re-staples the same unappliable
+			/// bind), while SENDING is unaffected. Not reachable from an honest
+			/// peer. Healed by restoring the last persisted state — poll
+			/// `isReceiveBroken` to decide urgency by role (receive-critical:
+			/// now; send-mostly: deferred).
+			///
+			/// Disposition is `.retryLater`, NOT `.reconnect`, and the
+			/// difference is custody: frames refused in the poisoned window were
+			/// never consumed and WILL decrypt after the restore, so a host that
+			/// acks-and-drops them on a session-recovery exit destroys messages
+			/// the documented heal would have delivered. Spool them; the
+			/// session-level recovery is `isReceiveBroken`'s job, not the
+			/// frame's.
 			case bindApplyFailed
 			/// Our own owed bind failed mid-commit after its reservation was
 			/// consumed: the exporter leaf is spent, no retry can rebuild the
@@ -147,8 +155,12 @@ extension AbstractTwoMLS {
 				case .staleFrame, .duplicateWelcome, .duplicateSideBand,
 					.unopenableFrame, .malformedFrame:
 					return .discardFrame
-				case .epochDesync, .bindApplyFailed, .bindDischargeFailed:
+				case .epochDesync, .bindDischargeFailed:
 					return .reconnect
+				case .bindApplyFailed:
+					// Custody: the poisoned window's frames are recoverable
+					// after the restore — never let an exit ack them away.
+					return .retryLater
 				case .credentialRejected:
 					return .approveAndReprocess
 				case .invitationSpent, .archiveInvalid:

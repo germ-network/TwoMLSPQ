@@ -12,7 +12,8 @@
 //  are thin adapter types in the `AbstractTwoMLS` namespace rather than
 //  extensions on the generated classes. The generated module stays pristine.
 //
-//  Status (TwoMLSPQ v0.4.0 binding, contract 16):
+//  Status (TwoMLSPQ v0.5.0 binding, contract 19 — see the ladder above
+//  `expectedBindingContract` for the v17/v18/v19 deltas):
 //   - `PQSession`, the six result adapters, `PQClient`, and `PQInvitation` are wired:
 //     routing (`shouldListenOn`/`sendRendezvous`), the true APQ epoch pair on encrypt
 //     results, A.5 rekey (`begin(.rekey)`); principal rotation — `receive(newClientId:)`
@@ -138,6 +139,12 @@ import TwoMLSPQ
 //     applied our previous commit). Host-visible: didCommit can be true with NO
 //     queueProposal, and committedRemoteClientId is nil on such a round (a proposal-less
 //     commit canonicalizes nothing of the peer's).
+//     PERSISTED STATE (both rungs, stated per the ladder's own rule): wire tags were
+//     renumbered, so an in-flight v0.4.x frame fails to classify under v0.5.0 — a loud
+//     unopenable/misrouted discard, never a misparse; retention means live peers re-send.
+//     Session/invitation archives follow the crate's pre-release hard cut: a v0.4.1 blob
+//     fails CLOSED as ArchiveInvalid (.discardArtifact) and the session/invitation must be
+//     regenerated — availability loss only, no stale-PQ splice.
 private let expectedBindingContract: UInt64 = 19
 
 enum TwoMLSPQBindingContract {
@@ -573,7 +580,7 @@ extension AbstractTwoMLS {
 
 		public func advance(
 			after inbound: PQInbound
-		) throws(AbstractTwoMLS.SessionError) -> PQOutbound? {
+		) -> PQOutbound? {
 			base.pqTakePendingOutbound().map {
 				PQOutbound(kind: inbound.kind, payload: $0)
 			}
@@ -585,8 +592,10 @@ extension AbstractTwoMLS {
 			return try mapPQErrors(.ingest) {
 			// Frames leave the peer sealed (header encryption, contract v7): the leading
 			// tag is no longer in the clear, so classify by removing the outer seal and
-			// reading the routing `kind` rather than switching on `message.first`. The
-			// pq_* receivers open the seal transparently, so hand them the sealed blob.
+			// reading the routing `kind` rather than switching on `message.first`. Hand
+			// the receivers the OPENED frame — the binding documents them as taking it,
+			// and passing the sealed blob (which they also tolerate) re-runs the whole
+			// trial-decrypt window per frame for nothing.
 			guard let opened = try base.openIncoming(blob: message) else {
 				// No header key opened it (M2a). One alone may be a stranger's
 				// garbage or a reconnect-gap frame; treat a RUN of these on a live
@@ -611,7 +620,7 @@ extension AbstractTwoMLS {
 			case .bootstrapKeyPackage:
 				// A.4 leg 1 (we respond): stand up our send group's deferred PQ
 				// half around the initiator's KP'; the Welcome' parks for `advance`.
-				try base.pqBootstrapRespond(kpMsg: message)
+				try base.pqBootstrapRespond(kpMsg: opened.frame)
 				return PQInbound(
 					kind: .finishBootstrap, advancedGroup: .ours,
 					newEpochs: epochs, rotatedCredential: nil)
@@ -621,13 +630,13 @@ extension AbstractTwoMLS {
 				// rides our next classical commit as the staple. `epochs` now reads
 				// pq+1 with classical unchanged; the pair evens out when the bind
 				// lands.
-				try base.pqBootstrapBind(welcomeMsg: message)
+				try base.pqBootstrapBind(welcomeMsg: opened.frame)
 				return PQInbound(
 					kind: .finishBootstrap, advancedGroup: .ours,
-					newEpochs: epochs, rotatedCredential: nil)
+					newEpochs: epochs, rotatedCredential: nil, owesBind: true)
 			case .ratchetEphemeralKey:
 				// A.3 (we respond): seal a fresh secret to the EK; the CT parks.
-				try base.pqRatchetRespond(ekMsg: message)
+				try base.pqRatchetRespond(ekMsg: opened.frame)
 				return PQInbound(
 					kind: .ratchet, advancedGroup: .theirs,
 					newEpochs: nil, rotatedCredential: nil)
@@ -635,10 +644,10 @@ extension AbstractTwoMLS {
 				// A.3 (we initiated): open the sealed secret, commit our send-PQ,
 				// OWE the classical half. The round's app message travels on the
 				// committing round's own message frame — there is no app to pass.
-				try base.pqRatchetBind(ctMsg: message)
+				try base.pqRatchetBind(ctMsg: opened.frame)
 				return PQInbound(
 					kind: .ratchet, advancedGroup: .ours,
-					newEpochs: epochs, rotatedCredential: nil)
+					newEpochs: epochs, rotatedCredential: nil, owesBind: true)
 			case .rekeyUpdate:
 				// A.5 (we respond): commit the initiator's Upd' on our send-PQ —
 				// the round's ONE updatePath commit, which also catches our own
@@ -646,7 +655,7 @@ extension AbstractTwoMLS {
 				// announces the initiator's (already Phase 8-rotated) agent id in
 				// the Upd' — by the time this returns, the initiator's leaf in our
 				// send-PQ has moved to that agent's key.
-				let rotated = try base.pqRekeyRespond(updMsg: message)
+				let rotated = try base.pqRekeyRespond(updMsg: opened.frame)
 				return PQInbound(
 					kind: .rekey, advancedGroup: .ours,
 					newEpochs: epochs, rotatedCredential: rotated?.bytes)
@@ -656,10 +665,10 @@ extension AbstractTwoMLS {
 				// brings our own group's round next. Our stapled ACK (the round's
 				// closing bind) is owed internally and rides our next classical
 				// commit; nothing parks for `advance`.
-				try base.pqRekeyApply(msg: message)
+				try base.pqRekeyApply(msg: opened.frame)
 				return PQInbound(
 					kind: .rekey, advancedGroup: .theirs,
-					newEpochs: epochs, rotatedCredential: nil)
+					newEpochs: epochs, rotatedCredential: nil, owesBind: true)
 			}
 			}
 		}
@@ -669,10 +678,22 @@ extension AbstractTwoMLS {
 		/// available until the peer's answer proves it landed, so a driver may
 		/// hand this out on every send. `.fresh` re-seals per call (re-sends are
 		/// unlinkable on the wire); `.stable` repeats the bytes while the frame
-		/// is unchanged, which chunking requires. Advances no protocol state:
-		/// nothing to persist.
+		/// is unchanged, which chunking requires — but see the liveness bound on
+		/// `SideBandSealing`: a `.stable` pass over the pre-A.4 `BOOTSTRAP_KP`
+		/// must finish inside the peer's classical header window. Advances no
+		/// protocol state: nothing to persist. Returns nil while a bind is OWED
+		/// — an owed bind is not a side-band frame (it rides the next classical
+		/// commit); see `PQInbound.owesBind`.
 		public func pendingSideBand(sealing: SideBandSealing) -> Data? {
-			base.pqPendingOutbound(sealing: sealing == .fresh ? .fresh : .stable)
+			// Exhaustive, not `== .fresh ? :` — a future sealing mode must fail
+			// compilation here rather than silently lower to `.stable` (the
+			// same tripwire convention as the error map and PersistedSlot).
+			let ffi: TwoMLSPQ.SideBandSealing
+			switch sealing {
+			case .fresh: ffi = .fresh
+			case .stable: ffi = .stable
+			}
+			return base.pqPendingOutbound(sealing: ffi)
 		}
 
 		/// Whether receiving is poisoned: a peer bind staple failed to apply

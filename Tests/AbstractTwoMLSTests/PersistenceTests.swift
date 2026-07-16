@@ -301,7 +301,7 @@ struct PersistenceContractTests {
 		try restored.installSink(RecordingSink())
 		let restoredPQ = restored as any AbstractTwoMLS.PQRatchetingSession
 
-		let reply = try #require(try restoredPQ.advance(after: inbound))
+		let reply = try #require(restoredPQ.advance(after: inbound))
 		_ = try localPQ.ingest(reply.payload)
 		#expect(localPQ.isFullyEstablished)
 		#expect(restoredPQ.isFullyEstablished)

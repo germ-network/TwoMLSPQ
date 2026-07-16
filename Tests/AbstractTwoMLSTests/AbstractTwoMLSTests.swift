@@ -208,13 +208,13 @@ struct LifecycleTests {
 		#expect(peek1 != peek2)
 		#expect(try localBase.openIncoming(blob: peek1)?.kind == .pqSideBand(kind: .bootstrapWelcome))
 
-		let reply = try #require(try remoteSession.advance(after: inbound))
+		let reply = try #require(remoteSession.advance(after: inbound))
 		#expect(reply.kind == .finishBootstrap)
 		// The responder's reply is the new PQ group's Welcome' (v18: the bind is no
 		// longer a side-band frame kind — it rides the message-frame staple).
 		#expect(try localBase.openIncoming(blob: reply.payload)?.kind == .pqSideBand(kind: .bootstrapWelcome))
 		// The consuming take hands the frame out exactly once — retention included.
-		#expect(try remoteSession.advance(after: inbound) == nil)
+		#expect(remoteSession.advance(after: inbound) == nil)
 		#expect(remoteSession.pendingSideBand(sealing: .fresh) == nil)
 
 		let localClassicalBeforeBind = localBase.epochs().classicalEpoch
@@ -272,11 +272,11 @@ struct LifecycleTests {
 
 		// Local's parked reply is its Commit' — the round's ONE updatePath commit
 		// (v18: the counter-Upd' is gone; one A.5 round re-keys one group).
-		let rekeyReply = try #require(try localSession.advance(after: rekeyInbound1))
+		let rekeyReply = try #require(localSession.advance(after: rekeyInbound1))
 		#expect(rekeyReply.kind == .rekey)
 		// Rekey Commit' frame — classify by opening the seal (wire tag sealed, v7).
 		#expect(try remoteBase.openIncoming(blob: rekeyReply.payload)?.kind == .pqSideBand(kind: .rekeyCommit))
-		#expect(try localSession.advance(after: rekeyInbound1) == nil)
+		#expect(localSession.advance(after: rekeyInbound1) == nil)
 
 		// Remote applies local's Commit' to its recv mirror, and the closing ACK's
 		// PQ half commits EAGERLY on remote's own send-PQ (a pathless partial —
@@ -286,7 +286,7 @@ struct LifecycleTests {
 		let rekeyInbound2 = try remoteSession.ingest(rekeyReply.payload)
 		#expect(rekeyInbound2.kind == .rekey)
 		#expect(remoteBase.epochs().pqEpoch == 2)
-		#expect(try remoteSession.advance(after: rekeyInbound2) == nil)
+		#expect(remoteSession.advance(after: rekeyInbound2) == nil)
 
 		// Remote's next committing round staples the ACK; local applies it and the
 		// turn passes back to local.
