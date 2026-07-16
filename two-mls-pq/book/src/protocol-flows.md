@@ -35,8 +35,8 @@ In its place we have two PQ operations:
 1. A PQ ratchet
     1. Takes the following steps:
         1. The initiator (Alice) sends a PQ EK, as a dedicated side-band frame
-        2. The respondent (Bob) replies with a fresh secret (S) encapsulated to the EK, as a dedicated side-band frame
-        3. On receipt of S, Alice imports it as a PSK into her PQ group as a partial commit and binds it to her classical group, advancing both halves' epochs
+        2. The respondent (Bob) picks a fresh random secret (S) and *seals* it to the EK — under a key bound to the KEM shared secret **and** a repeatable export of Alice's PQ group at its current epoch — returning `[enc][sealed S]` as a dedicated side-band frame. (Sealing a random S rather than using the KEM output directly is what lets Alice *open* it: ML-KEM decapsulation returns garbage, not an error, for a ciphertext answering a different ephemeral, so only the AEAD tag over S can reject a stale or misdirected ciphertext before it is injected. S is then hybrid-secure — it holds if either ML-KEM or the epoch secret does.)
+        3. Alice opens S (an explicit receipt; a stale ciphertext fails here with her ephemeral and PQ leaf intact), imports it as a PSK into her PQ group as a partial commit, and binds it to her classical group, advancing both halves' epochs
             1. The corresponding classical commit imports a PSK from the PQ group, as the draft’s FULL commit would
             2. Since the PQ commit doesn’t have an update path, it is only encrypted with the previous group secret and not any PQ ciphertexts, so we can staple it to outgoing messages alongside the classical commit
             3. Alice can then discard the corresponding DK and S.
@@ -47,16 +47,13 @@ In its place we have two PQ operations:
     
     We still need to regularly re-key the PQ group, on cadence, and to hand the PQ leaves to a credential the classical ratchet has already canonicalized (credential changes are proposed and approved in the classical ratchet — see the TwoMLS AS note below; the PQ re-key only catches the PQ leaves up):
     
-    1. The initiator (Alice) sends a proposal to update her leafNode in the PQ half of the respondent’s (Bob’s) send group
-    2. On receipt, Bob makes a full commit in his send group, sends the commit and a corresponding proposal to Alice.
-        1. Like in TwoMLS, each of these full commits injects a PSK from the opposite send group.
-    3. On receipt of Bob’s PQ commit and proposal, Alice commit’s Bob’s proposal and returns it.
-    4. On receipt of Alice’s commit, Bob is now the initiator
+    1. The initiator (Alice) sends a proposal to update her leafNode in the PQ half of the respondent’s (Bob’s) send group — the proposal replaces the *proposer’s* leaf
+    2. On receipt, Bob makes a full commit in his send group — the one large updatePath commit of the round, which also replaces the *committer’s* leaf (this is where Bob’s own leaf catches up to a rotated credential)
+        1. Like in TwoMLS, this full commit injects a PSK from the opposite send group.
+    3. On receipt of Bob’s PQ commit, Alice applies it and acks: a pathless partial commit on her own send group importing a secret exported from the just-rekeyed group, bound to her classical group exactly as the PQ ratchet’s bind is — it rides her next classical commit as the staple. Deriving the secret requires having applied Bob’s commit, so an ack that applies at all is the receipt.
+    4. On receipt of the stapled ack, Bob is now the initiator
     
-    These commits happen in isolation on the PQ group, otherwise we block the classical ratchet on transmitting the PQ full commits. 
-    
-
-(we could take an extra step to separately export a secret to the classical, but that mucks with the timing as the classical ratchet does block the binding of the PQ ratchet. Cleaner to have - perform 1.5 exchanges, then you can resume the PQ ratchet).
+    One round re-keys ONE group; the turn alternation brings the other group’s round next. The large updatePath commit happens in isolation on the PQ group, otherwise we block the classical ratchet on transmitting it — only the small pathless ack rides the classical staple.
 
 1. Session establishment
     1. Bob posts an APQ keyPackage
@@ -68,9 +65,72 @@ Now we have two independent state machines.
 
 1. Classical Ratchet
     1. The classical ratchet proceeds exactly as in TwoMLS, exchanging rounds of AppMessage + Proposal + Commit, all stapled together
-    2. A sender commits to its send group only when it folds a peer proposal its app has approved (`queue_proposal`); until then each frame re-staples the latest commit, and app messages keep flowing in the current epoch
-    3. Such a commit also re-injects a cross-party PSK exported from the sender's receive group (the TwoMLS binding), but only when that group has **advanced** since the sender last bound it — i.e. when the peer has produced new entropy to entangle with (a peer commit or a PQ ratchet). Re-binding an unadvanced peer epoch would add nothing, so a commit with no new peer entropy carries no cross-party PSK (it still folds the peer's Update and refreshes the sender's own leaf via the updatePath). This is what keeps the two send groups entangled with each other's *current* state, rather than re-stating a binding already in force.
+    2. A sender commits to its send group only when it is **licensed** to (see Evidence-gating below), and only when it has something to commit: a peer proposal its app has approved (`queue_proposal`), or an owed PQ bind to discharge. Until then each frame re-staples the latest commit, and app messages keep flowing in the current epoch
+    3. Such a commit also re-injects a cross-party PSK exported from the sender's receive group (the TwoMLS binding), but only when that group has **advanced** since the sender last bound it — i.e. when the peer has produced new entropy to entangle with (a peer commit or a PQ ratchet). Re-binding an unadvanced peer epoch would add nothing, so a commit with no new peer entropy carries no cross-party PSK (it still refreshes the sender's own leaf via the updatePath, and folds the peer's Update if it carries one). This is what keeps the two send groups entangled with each other's *current* state, rather than re-stating a binding already in force.
     4. Credential rotation rides this same ratchet (the TwoMLS AS): staged candidate credentials travel in the stapled Update proposals, the peer's approval of a proposal is the authorization, and the peer's commit canonicalizes the winner — the PQ leaves only catch up later (A.4/A.5)
+
+### Evidence-gating: at most one commit outstanding, per direction
+
+A sender may only commit **once the peer has demonstrably applied its previous commit**. Each
+send group is a single-writer channel — only its owner ever commits in it — so this is a
+per-direction rule, and it is the invariant two other properties silently rest on:
+
+- **Any single frame heals the peer.** Every frame re-staples the sender's latest commit, which
+  bridges a peer that is *at most one* commit behind. A sender that could commit twice while the
+  peer was away would produce a staple nothing bridges — an unrecoverable `EpochDesync` in
+  ordinary lossy messaging, rather than the reconnect-only edge it is.
+- **A bind's staple provably survives until applied.** A bind's PQ half exists on the wire only
+  as the current staple (§A.3–A.5); a superseded staple never re-sends, and by then `owed_bind`
+  is consumed and the PQ exporter leaf is spent. If a sender could commit past an unapplied bind,
+  the peer's recv-PQ mirror would permanently lose an epoch the sender's send-PQ has advanced
+  past — and no classical reconnect repairs a PQ group.
+
+**The evidence is the peer's stapled proposal, and it is in-protocol.** The peer builds its
+`Upd(self)` in *its recv group*, which **is** our send group, so the proposal is bound to our
+send group's epoch: an offer bound to our current epoch could only have been produced by a party
+that had applied our commits through it. Our own commit invalidates any offer still in flight
+(it was built for the prior epoch), and the peer re-proposes at the new epoch on its next frame —
+so the license is re-earned exactly once per round trip. (The peer's *commit* proves the same
+fact, but any frame carrying their commit also carries their proposal at our epoch — the frame is
+`[staple][proposal][app]`, all sections mandatory — so proposal-evidence strictly contains
+commit-evidence, and it also arrives on the frames where they don't commit.)
+
+**The license is not approval, but it is authenticated.** It accrues at receive, independent of
+`queue_proposal`: an offer the app never approves, is slow to approve, or whose credential the AS
+would refuse still licenses the discharge — approval is the app's to withhold (it is the AS
+authorization step, and folding stays gated on it), but the license is not the app's to stall, so
+a bug or delay in approving a remote proposal can never block a bind's classical commit. What the
+license does require is that the offer *validate* against our send group (the same
+`validate_offered_update` a fold runs, applied here unconditionally): the epoch field of raw
+proposal bytes is unsigned, so trusting it would let a malicious peer splice a higher epoch and
+forge the license into discharging a bind the peer has not applied. A valid offer proves exactly
+our current send epoch, and the watermark is stamped to that.
+
+This was implicit for as long as folding an approved proposal was the *only* way to commit: the
+fold IS the evidence, since `validate_offered_update` runs the offer through mls-rs against the
+live send group and a stale-epoch offer is refused there. Committing without a fold (to discharge
+an owed bind) needs the same license, so the watermark is now tracked explicitly rather than
+inferred from the fold.
+
+**Where each ratchet advances.** TwoMLS is a state machine advanced by sending and processing
+messages: the PQ ratchet advances when a PQ step is processed, but the classical ratchet advances
+only at `prepare_to_encrypt` — the host's own next send. So the library never commits classically
+behind the app: a PQ trigger leaves an *owed* bind, and the discharge (fold or licensed
+proposal-less commit) rides whatever round the host starts. There is deliberately no third reason
+to commit — no commit on cadence merely because the license is present — since every commit of
+ours invalidates the peer's in-flight offer, and committing every licensed round would churn
+offers inside the window the peer's app has to approve them. A host that wants leaf-refresh PCS
+faster than its PQ cadence should run the PQ ratchet faster; the bind carries both PCS sources.
+
+> **Why the proposal and not the PSK.** The peer's commit that cross-injects a PSK exported from
+> our send group at epoch *E* is also proof it applied *E* — it cannot export from a mirror it has
+> not advanced. It is not used as the license because it rides **commits only**, and both
+> directions would then gate on each other: two sides that commit concurrently (neither having
+> seen the other's) each hold an unapplied commit and neither can produce the evidence that would
+> release the other. The proposal rides **every frame**, commit or not, so the license cannot
+> deadlock. (The injection remains a useful *check*, and the header-key application receipt —
+> deleted with the retirement machinery — was the weaker version of the same idea: it proved
+> transport-window position where the proposal proves MLS state incorporation.)
 
 Independently, we have an exchange of large PQ key messages, carried as dedicated side-band frames alongside the classical ratchet. The state flip-flops when each direction has finished receiving a message from the other.
 
@@ -264,12 +324,16 @@ FULL commit and does not use that pair. Our three operations, by name:
   Commit' (cheap — no per-member PQ ciphertexts) plus the classical commit
   importing the re-exported `apq_psk`, carried together as the -02 `APQPrivateMessage`
   the message frame staples. Introduces PQ Post-Compromise Security.
-- **PQ re-key** (A.5) — updatePath Commit's in the PQ groups alone (the
-  expensive leaf rotation), with no classical commit; run rarely, off the
-  classical ratchet's critical path.
+- **PQ re-key** (A.5) — ONE updatePath Commit' in the PQ group alone (the
+  expensive leaf rotation, run rarely, off the classical ratchet's critical
+  path), answered by the initiator's ack — which is structurally the A.3 bind:
+  a path-less partial Commit' plus its classical partner, stapled as one
+  `APQPrivateMessage`. One round re-keys one group; the turn alternation
+  covers the other.
 
-What -02 calls a FULL commit is, here, the bind (A.3) plus the re-key (A.5),
-decomposed — our extension to the draft.
+What -02 calls a FULL commit is, here, the bind — which closes every round
+(A.3, A.4 and A.5 alike); the re-key's standalone updatePath Commit' is our
+extension to the draft.
 
 ### A.1 Session establishment (granular)
 
@@ -457,24 +521,31 @@ exports it from her recv mirror to build the bind, and Bob exports it from his s
 apply it. A later A.5 re-key must not re-export that epoch from either. (Both watermarks are
 load-bearing; omitting the responder's makes the next re-key fail on a consumed leaf.)
 
-### A.5 PQ re-key (granular) — PQ-group updatePath commits, isolated from classical
+### A.5 PQ re-key (granular) — the one updatePath commit, isolated from classical
 
 > **Note on -02 conformance.** Draft -02 defines no *standalone* PQ-group commit:
 > every PQ commit is one half of a simultaneous **FULL commit** (PQ + paired
 > classical) with synchronized epoch bookkeeping. Germ's PQ re-key deliberately
-> commits in the PQ groups **alone** (so the classical ratchet is not blocked on
-> large PQ updatePaths), which is an extension beyond -02. A standalone re-key
-> therefore carries no `AppDataUpdate` — attesting one half's epoch while the
-> other stands still is exactly what the proposal cannot express, and rule 7
-> rejects an attestation smuggled into one. The bumped `pq_epoch` is reconciled
-> into the classical half at the next PQ ratchet bind (A.3), which re-exports
-> `apq_psk` and attests the pair. The cross-injected `PSK(from …-PQ)` below is
-> the TwoMLS PQ-to-PQ export between send groups, distinct from `apq_psk`.
-> Like the classical ratchet (§Classical Ratchet), this cross-injection is
-> event-driven: a re-key binds the opposite PQ send group only when it has
-> advanced since the last binding, so a re-key that follows another with no
-> intervening PQ commit from the peer carries no cross-party PSK (the leaf
-> rotation still happens via the updatePath).
+> runs its one large updatePath commit in the PQ group **alone** (so the
+> classical ratchet is not blocked on large ML-KEM updatePaths), which is an
+> extension beyond -02 — but the round *ends* conformantly: the initiator's ack
+> is an ordinary bind (a -02 FULL commit pair riding the message-frame staple as
+> an `APQPrivateMessage`), whose `AppDataUpdate` reconciles the bumped
+> `pq_epoch` in-round. The cross-injected `PSK(from …-PQ)` below is the TwoMLS
+> PQ-to-PQ export between send groups, distinct from `apq_psk`. Like the
+> classical ratchet (§Classical Ratchet), this cross-injection is event-driven:
+> a re-key binds the opposite PQ send group only when it has advanced since the
+> last binding, so a re-key that follows another with no intervening PQ commit
+> from the peer carries no cross-party PSK (the leaf rotation still happens via
+> the updatePath).
+>
+> **The round is `X → Y → bind`, like A.3 and A.4.** The proposal replaces the
+> *proposer's* leaf (this is where the initiator's credential handoff rides);
+> the full commit replaces the *committer's* leaf (this is where the responder's
+> own leaf catches up to an already-canonical credential); the pathless ack
+> signals receipt through the classical channel. One round re-keys ONE group —
+> the turn alternation brings the other group's round next, at the same bytes
+> per group as the old two-in-one shape, and no large frame is ever terminal.
 
 ```mermaid
 sequenceDiagram
@@ -482,16 +553,17 @@ sequenceDiagram
     participant Alice
     participant Bob
 
-    Note over Alice,Bob: Run on cadence, or to carry a credential the classical ratchet (A.2) has already<br/>canonicalized onto the PQ leaves (catch-up). PQ updatePath commits,<br/>run in isolation on the PQ groups so the classical ratchet is not blocked.<br/>Each commit cross-injects a PSK from the opposite send group's PQ half (TwoMLS-style).
+    Note over Alice,Bob: Run on cadence, or to carry a credential the classical ratchet (A.2) has already<br/>canonicalized onto the PQ leaves (catch-up). The one updatePath commit runs<br/>in isolation on the PQ group so the classical ratchet is not blocked.
 
     Alice-)Bob: Upd'(Alice) proposal to update Alice's leaf in [BSG-PQ], side-band frame
     Bob-)Bob: Export PSK from [ASG-PQ]
     Bob-)Bob: [BSG-PQ] Commit'(Upd'(Alice)) with updatePath + PSK(from ASG-PQ) → pq_epoch++
-    Bob-)Alice: Commit' [BSG-PQ] + corresponding Upd'(Bob) proposal for [ASG-PQ], side-band frame
+    Note over Bob: The updatePath also replaces Bob's own leaf — his credential<br/>catch-up channel when a rotation has been canonicalized.
+    Bob-)Alice: Commit' [BSG-PQ], side-band frame — re-sent until the ack answers it
     Alice-)Alice: Apply Commit' to [BSG-PQ]
-    Alice-)Alice: Export PSK from [BSG-PQ]
-    Alice-)Alice: [ASG-PQ] Commit'(Upd'(Bob)) with updatePath + PSK(from BSG-PQ) → pq_epoch++
-    Alice-)Bob: Commit' [ASG-PQ], side-band frame
-    Bob-)Bob: Apply Commit' to [ASG-PQ]
-    Note over Alice,Bob: Bumped pq_epoch is bound into the classical half at the next PQ ratchet bind (A.3).<br/>Bob is now the initiator.
+    Alice-)Alice: Export S from [BSG-PQ] at its NEW epoch — deriving S proves the apply
+    Alice-)Alice: [ASG-PQ] pathless partial commit importing S → pq_epoch++, classical half OWED
+    Alice-)Bob: Ack rides Alice's next classical COMMIT as the APQPrivateMessage staple
+    Bob-)Bob: Re-derives S from [BSG-PQ], applies both halves from the staple
+    Note over Alice,Bob: The ack is a conformant FULL commit — its attestation reconciles the bumped<br/>pq_epoch in-round. Bob is now the initiator, and the next A.5 re-keys [ASG-PQ].
 ```

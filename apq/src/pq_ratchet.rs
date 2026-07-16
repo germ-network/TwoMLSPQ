@@ -2,10 +2,17 @@
 //! the PQ group via a *pathless* PSK commit, then re-exported into the classical group, so the
 //! whole bind is cheap and staple-able to an app message — no per-round PQ updatePath.
 //!
-//! The initiator sends an encapsulation key (EK), the responder encapsulates a fresh shared
-//! secret S and returns the ciphertext, and the initiator decapsulates. Both sides then inject S
-//! as a PSK into the PQ group (a commit with no updatePath) and re-export the `apq_psk` from the
-//! resulting epoch to bind into the classical group.
+//! The initiator sends an encapsulation key (EK); the responder picks a fresh random secret S
+//! and SEALS it to the EK under a key bound to both the KEM shared secret and an epoch-derived
+//! PSK ([`seal_injected_secret`]); the initiator opens it ([`open_injected_secret`]). Both
+//! sides then inject S as a PSK into the PQ group (a commit with no updatePath) and re-export
+//! the `apq_psk` from the resulting epoch to bind into the classical group.
+//!
+//! Sealing a random S rather than using the raw KEM output is what makes the open a receipt:
+//! ML-KEM decapsulation returns a garbage secret (implicit rejection), not an error, for a
+//! ciphertext that answers a different ephemeral, so a bare `decapsulate` cannot tell a stale
+//! or misdirected ciphertext from a good one — it would inject the garbage and strand the
+//! round. The AEAD tag over the sealed S fails explicitly instead, before anything is spent.
 //!
 //! Provider-agnostic: the KEM steps are generic over [`KemType`]; the caller supplies its
 //! provider's ML-KEM (e.g. CryptoKit's `MlKem768Kem`, aws-lc's `MlKemKem`). Both sides must
@@ -15,7 +22,7 @@ use mls_rs::client_builder::MlsConfig;
 use mls_rs::crypto::{HpkePublicKey, HpkeSecretKey};
 use mls_rs::psk::{ExternalPskId, PreSharedKey};
 use mls_rs::storage_provider::in_memory::InMemoryPreSharedKeyStorage;
-use mls_rs::{Group, MlsMessage};
+use mls_rs::{CipherSuiteProvider, Group, MlsMessage};
 use mls_rs_crypto_traits::KemType;
 use zeroize::Zeroizing;
 
@@ -73,6 +80,105 @@ pub fn decapsulate<K: KemType>(kem: &K, eph: &PqEphemeral, ct: &[u8]) -> Result<
         .map_err(|_| CombinerError::Mls)
 }
 
+/// The injected secret is 32 bytes of fresh randomness, chosen by the responder and SEALED
+/// to the initiator rather than being the KEM shared secret itself.
+pub const INJECTED_SECRET_LEN: usize = 32;
+
+/// KDF `info` separating the CT-seal AEAD key from every other derivation off this suite.
+const CT_SEAL_KEY_INFO: &[u8] = b"germ.network.twomlspq.a3.ctSeal.key.v1";
+
+/// Derive the AEAD key that seals the round's secret, from the KEM shared secret and the
+/// epoch-bound PSK. Both must be right, so the key is wrong (and the AEAD open below fails
+/// EXPLICITLY, unlike ML-KEM's implicit rejection) whenever the ciphertext answers a
+/// different ephemeral (garbage `kem_ss`) OR a different group epoch (wrong `psk`). That
+/// dual dependency is also the hybrid: the secret stays confidential if EITHER ML-KEM holds
+/// or the group's epoch secret does.
+fn ct_seal_key<C: CipherSuiteProvider>(
+    suite: &C,
+    kem_ss: &[u8],
+    psk: &[u8],
+) -> Result<Zeroizing<Vec<u8>>> {
+    // Extract order follows HPKE's PSK key schedule: salt = KEM shared secret, ikm = PSK.
+    let prk = suite
+        .kdf_extract(kem_ss, psk)
+        .map_err(|_| CombinerError::Mls)?;
+    let key = suite
+        .kdf_expand(&prk, CT_SEAL_KEY_INFO, suite.aead_key_size())
+        .map_err(|_| CombinerError::Mls)?;
+    Ok(key)
+}
+
+/// `[u32-LE enc_len][enc][sealed]` — the responder's wire ciphertext: the KEM encapsulation
+/// and the AEAD-sealed secret. Length-prefixed so the split does not assume the KEM's
+/// ciphertext size.
+fn encode_ct(enc: &[u8], sealed: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + enc.len() + sealed.len());
+    out.extend_from_slice(&(enc.len() as u32).to_le_bytes());
+    out.extend_from_slice(enc);
+    out.extend_from_slice(sealed);
+    out
+}
+
+fn decode_ct(wire: &[u8]) -> Result<(&[u8], &[u8])> {
+    let (len_bytes, rest) = wire.split_at_checked(4).ok_or(CombinerError::Mls)?;
+    let enc_len =
+        u32::from_le_bytes(len_bytes.try_into().map_err(|_| CombinerError::Mls)?) as usize;
+    rest.split_at_checked(enc_len).ok_or(CombinerError::Mls)
+}
+
+/// Responder — encapsulate to the initiator's EK, then SEAL a fresh random secret `S` under a
+/// key bound to both the KEM shared secret and the epoch-derived `psk`. Returns `(S, wire_ct)`
+/// where `wire_ct` is `[enc][sealed S]`; the responder holds `S` to apply the initiator's
+/// bind later, and the initiator recovers the identical `S` via [`open_injected_secret`].
+///
+/// Sealing a random secret (rather than exporting the KEM output as `S`) is what gives the
+/// bind an explicit receipt: the AEAD tag over `S` fails to open under the wrong key, so a
+/// stale or misdirected ciphertext is rejected before any secret is injected — see
+/// [`open_injected_secret`].
+pub fn seal_injected_secret<K: KemType, C: CipherSuiteProvider>(
+    kem: &K,
+    suite: &C,
+    ek_bytes: &[u8],
+    psk: &[u8],
+) -> Result<(Zeroizing<Vec<u8>>, Vec<u8>)> {
+    let ek = HpkePublicKey::from(ek_bytes.to_vec());
+    let res = kem.encap(&ek).map_err(|_| CombinerError::Mls)?;
+    let key = ct_seal_key(suite, &res.shared_secret, psk)?;
+    let mut s = Zeroizing::new(vec![0u8; INJECTED_SECRET_LEN]);
+    suite.random_bytes(&mut s).map_err(|_| CombinerError::Mls)?;
+    // Single use per key (the key is unique per round through `kem_ss`), so a zero nonce is
+    // sound; empty AAD, because the key already binds the ephemeral and the epoch.
+    let nonce = vec![0u8; suite.aead_nonce_size()];
+    let sealed = suite
+        .aead_seal(&key, &s, None, &nonce)
+        .map_err(|_| CombinerError::Mls)?;
+    Ok((s, encode_ct(&res.enc, &sealed)))
+}
+
+/// Initiator step 2 — decapsulate with the held DK and OPEN the sealed secret. A ciphertext
+/// answering a different ephemeral (garbage `kem_ss`) or built against a different group
+/// epoch (wrong `psk`) yields the wrong AEAD key, so the open fails EXPLICITLY here — the
+/// caller rejects it with the round's ephemeral and PQ leaf untouched, where ML-KEM's own
+/// implicit rejection would have handed back a garbage secret to inject.
+pub fn open_injected_secret<K: KemType, C: CipherSuiteProvider>(
+    kem: &K,
+    suite: &C,
+    eph: &PqEphemeral,
+    wire_ct: &[u8],
+    psk: &[u8],
+) -> Result<Zeroizing<Vec<u8>>> {
+    let (enc, sealed) = decode_ct(wire_ct)?;
+    let kem_ss = kem
+        .decap(enc, &eph.dk, &eph.ek)
+        .map_err(|_| CombinerError::Mls)?;
+    let key = ct_seal_key(suite, &kem_ss, psk)?;
+    let nonce = vec![0u8; suite.aead_nonce_size()];
+    let s = suite
+        .aead_open(&key, sealed, None, &nonce)
+        .map_err(|_| CombinerError::Mls)?;
+    Ok(s)
+}
+
 /// PSK id for the injected secret S at the PQ group's current epoch. The trailing domain byte
 /// (see `group::PSK_DOMAIN_INJECTED`) keeps it disjoint from any exported `apq_psk` id, which is
 /// derived from the *next* epoch and carries no domain byte.
@@ -114,17 +220,26 @@ impl Drop for InjectedSecret<'_> {
 }
 
 /// Initiator (committer) — inject S into `pq_group` via a pathless PSK commit carrying the
-/// -02 `AppDataUpdate` epoch attestation, apply it, and re-export the `apq_psk` from the
-/// new PQ epoch (registered for the classical bind). The injected secret S stays an
-/// *external* PSK (it is externally-sourced KEM entropy, not an exporter-derived value);
-/// the re-exported `apq_psk` is an application PSK.
-/// Returns `(pq_commit_bytes, apq_psk)`.
+/// -02 `AppDataUpdate` epoch attestation, and apply it. The injected secret S stays an
+/// *external* PSK (it is externally-sourced KEM entropy, not an exporter-derived value).
+/// Returns the commit bytes.
+///
+/// This deliberately does NOT export the `apq_psk`. The classical bind that consumes it
+/// rides the next classical COMMIT, which the caller does not control and which may be a
+/// while off — and the export is the one step that must not happen early: `export_psk`
+/// SPENDS the exporter leaf, irreversibly, so exporting here would mean holding live key
+/// material (and archiving it) across an unbounded wait. Call [`export_apq_psk`] when the
+/// classical half is actually ready to commit.
+///
+/// S itself is folded in and wiped HERE. It is the secret we must not hold, and this commit
+/// is what discharges it — which is why the PQ half moves at the trigger while the classical
+/// half waits.
 pub fn inject_and_commit<Cfg: MlsConfig>(
     pq_group: &mut Group<Cfg>,
     s: &[u8],
     stores: &[InMemoryPreSharedKeyStorage],
     attestation: ApqInfoUpdate,
-) -> Result<(Vec<u8>, ExportedPsk)> {
+) -> Result<Vec<u8>> {
     let secret = InjectedSecret::register(pq_group, s, stores);
     let out = pq_group
         .commit_builder()
@@ -137,15 +252,30 @@ pub fn inject_and_commit<Cfg: MlsConfig>(
         .apply_pending_commit()
         .map_err(|_| CombinerError::Mls)?;
     crate::group::ensure_two_party(pq_group)?;
-    // S is now folded into the new epoch; wipe it from the stores before re-exporting.
+    // S is now folded into the new epoch; wipe it from the stores.
     drop(secret);
-    let apq_psk = export_psk(pq_group, PskDomain::Apq)?;
-    crate::group::register_psk_stores(stores, apq_psk.storage_id(), apq_psk.psk());
     let bytes = out
         .commit_message
         .to_bytes()
         .map_err(|_| CombinerError::Mls)?;
-    Ok((bytes, apq_psk))
+    Ok(bytes)
+}
+
+/// Export the `apq_psk` from the PQ group's CURRENT epoch and register it for the classical
+/// bind — the deferred second half of [`inject_and_commit`].
+///
+/// The epoch this exports from is the one the caller's attestation reserved: no further PQ
+/// commit may land while a bind is owed, precisely so this export lands on the attested
+/// epoch and the responder — re-exporting the same value from its own mirror as it applies
+/// the commit — derives an identical PSK. The exporter leaf is spent once per (group, epoch,
+/// component), so call this exactly once per owed bind.
+pub fn export_apq_psk<Cfg: MlsConfig>(
+    pq_group: &mut Group<Cfg>,
+    stores: &[InMemoryPreSharedKeyStorage],
+) -> Result<ExportedPsk> {
+    let apq_psk = export_psk(pq_group, PskDomain::Apq)?;
+    crate::group::register_psk_stores(stores, apq_psk.storage_id(), apq_psk.psk());
+    Ok(apq_psk)
 }
 
 /// Responder (applier) — register S (held since `encapsulate`), apply the initiator's pathless PQ
@@ -300,13 +430,12 @@ mod tests {
             t_epoch: cl_epoch_before + 1,
             pq_epoch: pq_epoch_before + 1,
         };
-        let (pq_commit, apq_psk) = inject_and_commit(
-            asg.pq.as_mut().unwrap(),
-            &s_alice,
-            &[alice.pq().secret_store(), alice.classical().secret_store()],
-            attestation,
-        )
-        .unwrap();
+        let a_stores = [alice.pq().secret_store(), alice.classical().secret_store()];
+        let pq_commit =
+            inject_and_commit(asg.pq.as_mut().unwrap(), &s_alice, &a_stores, attestation).unwrap();
+        // The export is now a separate step — a session defers it until its classical half is
+        // ready to commit. Nothing here waits, so do both back to back.
+        let apq_psk = export_apq_psk(asg.pq.as_mut().unwrap(), &a_stores).unwrap();
         let cl_out = apq_psk
             .add_to_commit(asg.classical.commit_builder())
             .unwrap()
@@ -441,7 +570,7 @@ mod tests {
             t_epoch: asg.classical.current_epoch() + 1,
             pq_epoch: asg.pq.as_ref().unwrap().current_epoch() + 1,
         };
-        let (pq_commit, _) =
+        let pq_commit =
             inject_and_commit(asg.pq.as_mut().unwrap(), &s_alice2, &a_stores, good).unwrap();
         let _ = (s_bob, s_bob2);
         let b_stores = [bob.pq().secret_store(), bob.classical().secret_store()];

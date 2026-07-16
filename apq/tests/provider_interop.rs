@@ -246,13 +246,14 @@ mod cryptokit_interop {
             t_epoch: a_send.classical.current_epoch() + 1,
             pq_epoch: a_send.pq.as_ref().unwrap().current_epoch() + 1,
         };
-        let (pq_commit, apq_psk) = pq_ratchet::inject_and_commit(
+        let pq_commit = pq_ratchet::inject_and_commit(
             a_send.pq.as_mut().unwrap(),
             &s_alice,
             &a_stores,
             attestation,
         )
         .unwrap();
+        let apq_psk = pq_ratchet::export_apq_psk(a_send.pq.as_mut().unwrap(), &a_stores).unwrap();
         let cl_out = apq_psk
             .add_to_commit(a_send.classical.commit_builder())
             .unwrap()

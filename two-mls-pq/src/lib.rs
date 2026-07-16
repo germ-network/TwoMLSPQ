@@ -202,7 +202,84 @@ pub fn version() -> String {
 // accumulated ladders carried no compatibility value — history stays in git): ALL
 // persisted sessions and invitations regenerate. The v15 key-package wire cut
 // (COMBINER_KEY_PACKAGE_VERSION 3, a published artifact, not an archive) is untouched.
-const BINDING_CONTRACT_VERSION: u64 = 16;
+// v18 (2026-07-15, every round ends in a stapled bind; 17 was burned by an interim build
+// of this same work and is skipped):
+// - Side-band frames are RETAINED for re-send (a frame lost in transport stalled its round
+//   with no way to heal): new `pq_pending_outbound(sealing: SideBandSealing)` peeks the
+//   sealed frame without consuming it (`Fresh` re-seals per hand-out, `Stable` holds the
+//   base still for chunking); new `DuplicateSideBand` error classifies a re-sent frame for
+//   a step already taken as a discardable duplicate. A.4 is a well-formed three-leg round
+//   (KP' -> Welcome' -> bind) registered in the single side-band slot alongside A.3/A.5.
+// - A BIND IS THE STAPLE, not a frame. A.3's and A.4's closing leg commits the PQ half
+//   pathlessly and OWES the classical half, which rides the binder's next classical COMMIT
+//   as the message-frame staple in draft-02 §7 `APQPrivateMessage` form — re-sent until
+//   superseded, so a lost bind heals by the staple's own machinery. `pq_ratchet_bind` /
+//   `pq_bootstrap_bind` LOSE their `app` parameter (the app travels on the committing
+//   round's own message frame); `pq_ratchet_apply` / `pq_bootstrap_apply` are DELETED (the
+//   bind arrives via `process_incoming`) — all caught by uniffi's checksum. NOT caught by
+//   it, and the reason this bumps: the staple slot gained a third form, `[0x05]`
+//   APQPrivateMessage alongside `[0x00]` commit and `[0x01]` APQWelcome.
+// - A.5 takes the same shape: Upd' (proposal — replaces the proposer's leaf, and carries
+//   the initiator's credential handoff) -> Commit' (the round's one updatePath commit —
+//   replaces the committer's leaf, now also the responder's own-leaf credential catch-up)
+//   -> a stapled ACK (pathless partial commit; a conformant FULL commit pair whose
+//   attestation reconciles the bumped pq_epoch in-round). The counter-Upd' is gone:
+//   `PQ_REKEY_COMMIT` carries one payload, `pq_rekey_apply` is initiator-only and returns
+//   `Result<()>`, and one A.5 round re-keys ONE group — the turn alternation brings the
+//   other group's round next.
+// - Retirement does not exist: every large frame is answered by a bind and every round's
+//   terminal leg is a staple, so retained frames clear on the ordinary round-complete rule
+//   and nothing re-sends forever. (An interim build withdrew spent frames on a peer
+//   application receipt; the receipt machinery is gone because nothing needs it.)
+// - Wire: `PQ_BIND` and `PQ_BOOTSTRAP_BIND` are deleted with their `PqFrameKind` variants
+//   (a bind is not a side-band frame), the message-path band GROWS to admit
+//   `apq::APQ_PRIVATE_MESSAGE_TAG`, and every band below shifts — message path 0x01-0x05
+//   (FULL: welcome 0x01, message frame 0x03, private-message staple form 0x05), A.1
+//   establishment 0x07-0x11 (envelope 0x05->0x07, pre-establishment staple 0x07->0x09),
+//   PQ side-band 0x13-0x31 in lifecycle order (bootstrap 0x13/0x15, ratchet 0x17/0x19,
+//   re-key 0x1B/0x1D). A band's reserved bytes are unallocated and must not classify.
+//   Hosts classify via `pq_frame_kind`, never raw bytes, so this is a wire cut only —
+//   stale frames from older builds fail loudly. Archive layout versions are untouched
+//   (pre-release hard cut; blobs from interim builds fail to decode and regenerate).
+// v19 (2026-07-15, evidence-gating): a classical commit no longer requires an app-approved
+// proposal. Rule 3 makes an owed PQ bind wait for a classical COMMIT, so while folding was
+// the only way to commit, an app that received offers and never approved them stranded every
+// PQ round at 2/1 forever — PQ liveness must not depend on approval policy. A round now
+// commits when it folds an approved Upd (unchanged) OR when it owes a bind and is LICENSED:
+// the peer's stapled Upd is built in its recv group — which IS our send group — so an offer
+// bound to our current epoch proves the peer applied our previous commit. That license is
+// what has always thrown the "at most one commit outstanding per direction" rule (a fold IS
+// the evidence, since a stale-epoch offer is refused against the live send group); it is now
+// tracked explicitly (`peer_applied_send_epoch`, archived) because a proposal-less commit has
+// no fold to infer it from. The tracker is stamped only from an offer that passes that same
+// validation — the raw epoch field is unsigned, so a spliced high-epoch offer cannot advance
+// it. Committing past an unapplied commit would break single-frame
+// healing AND supersede the only staple a bind's PQ half ever rides. Cadence-driven empty
+// commits are deliberately NOT offered: our commit invalidates the peer's in-flight offer, so
+// committing every licensed round would starve rotation for any host that deliberates.
+// Host-visible: `did_commit` can be true with no `queue_proposal`, and
+// `committed_remote_client_id` is now `None` on such a round — it reports what the commit
+// CANONICALIZED, and a proposal-less commit canonicalizes nothing of the peer's. Archive
+// layout gained a field (pre-release hard cut: old blobs fail to decode and regenerate).
+// The book's Protocol Flows chapter states the property under "Evidence-gating".
+// Also in v19: the two irrecoverable-failure paths a bind's owed state creates are now
+// surfaced, not silent (neither is reachable from an honest flow — both take an internal
+// MLS failure). `BindDischargeFailed` (fatal): the classical commit discharging a bind
+// failed after the reservation was consumed and the exporter leaf spent — the round cannot
+// be rebuilt, so it wears its own error, not the retriable one it would otherwise, and the
+// host re-establishes. `BindApplyFailed` + `pq_receive_broken()`: applying a peer's bind
+// staple failed after the round's secret was consumed, so RECEIVING is broken (every frame
+// re-staples the same unappliable bind) while SENDING still works — in-memory only, so
+// restoring the last persisted state heals it, and queryable so a host sets its own
+// severity by role. Both variants appended to `TwoMlsPqError` (ordinals stable).
+// Also in v19 (WIRE): the A.3 ciphertext (0x19) is no longer a bare ML-KEM ciphertext. The
+// responder now picks a random injected secret and SEALS it to the initiator's EK under a
+// key bound to the KEM shared secret AND a repeatable epoch export of the inject-group
+// (`[u32 enc_len][enc][sealed]`). The initiator OPENS it before injecting — so a stale or
+// misdirected ciphertext, which ML-KEM's implicit rejection would decapsulate to garbage and
+// strand the round on, fails the AEAD tag explicitly and is rejected with the ephemeral and
+// PQ leaf intact. Bonus: S is hybrid-secure (holds if either ML-KEM or the epoch secret does).
+const BINDING_CONTRACT_VERSION: u64 = 19;
 
 /// See `BINDING_CONTRACT_VERSION`. Exported so the Swift layer can verify the
 /// binding it was generated with matches the binary it loaded.
@@ -278,6 +355,9 @@ pub struct RendezvousId {
 pub struct PrepareEncryptResult {
     pub proposal_message: Vec<u8>,
     pub proposal_hash: Vec<u8>,
+    /// The peer credential this round's commit CANONICALIZED, or `None` when it
+    /// canonicalized none — including on a committing round that folded nothing (a bind
+    /// discharging on its own; see `did_commit`). Not a synonym for `did_commit`.
     pub committed_remote_client_id: Option<ClientId>,
     pub did_commit: bool,
 }
@@ -529,6 +609,19 @@ pub enum TwoMlsPqError {
     ArchiveInvalid,
     #[error("welcome already consumed for this remote")]
     DuplicateWelcome,
+    /// A side-band frame for a step this side has already taken — the PQ analogue of
+    /// `DuplicateWelcome`. Expected traffic, not a fault: the sender retains the round's
+    /// frame and re-sends it until the step advances (see
+    /// `SessionInner::pending_pq_outbound`), so the tail of every round is a frame the
+    /// receiver has already applied. The app should discard it.
+    ///
+    /// Distinct from `SessionNotReady`, which a host must be free to read as a ROUTING
+    /// signal (a frame offered at the wrong door), and from `Mls`, a frame that never
+    /// parsed. Raised only where the state proves the step is done; a merely ill-timed
+    /// frame still reports `SessionNotReady`. Like every side-band guard it is checked
+    /// before the persist choke point, so a duplicate is a true no-op.
+    #[error("side-band frame already applied")]
+    DuplicateSideBand,
     /// A single-use (not last-resort) invitation whose key package has already been consumed
     /// by an accepted session. Distinct from `DuplicateWelcome` (a per-remote replay guard):
     /// a spent invitation rejects *every* further `receive`, from any remote. The app should
@@ -604,12 +697,35 @@ pub enum TwoMlsPqError {
     /// On `TwoMlsPqInvitation::receive` this is raised before any invitation state is
     /// claimed, so the invitation stays fully reusable for the genuine welcome.
     //
+    #[error("AppBinding missing, unexpected, or inconsistent")]
+    AppBindingMismatch,
+    /// FATAL: the classical commit that was discharging an owed bind failed AFTER the
+    /// reservation was consumed. The PQ round cannot be rebuilt — the exporter leaf is
+    /// spent and `owed_bind` is gone — and the failed state persists, so no retry
+    /// recovers it: the peer waits in its responded state forever and this session's PQ
+    /// binding is permanently broken. Not reachable from any honest flow (it takes an
+    /// internal MLS failure mid-commit); surfaced loudly, as its own variant, precisely
+    /// so a host never mistakes it for the retriable error it would otherwise wear.
+    /// Route to re-establishment.
+    #[error("bind discharge failed after the reservation was consumed; re-establish")]
+    BindDischargeFailed,
+    /// Receiving on this session is broken: applying a peer's bind staple failed after
+    /// the round's secret was consumed, so the staple — which the peer re-sends on every
+    /// frame until its next commit, which evidence-gating now forbids it — can never
+    /// apply, and every inbound frame carrying it fails before its app message is
+    /// touched. SENDING still works. Unlike [`Self::BindDischargeFailed`] this is
+    /// in-memory only (inbound processing persists on success), so restoring from the
+    /// last persisted state recovers the round. Not reachable from an honest peer; how
+    /// critical it is depends on what the session is for, which is why it is queryable
+    /// (`pq_receive_broken`) rather than only thrown.
+    ///
+    //
     // Deliberately the LAST variant: uniffi numbers error cases by position, so appending
     // keeps every prior variant's ordinal stable. Keep appending future variants here (the
     // contract bump already forces binding/binary pairing, but there is no reason to
     // renumber the survivors).
-    #[error("AppBinding missing, unexpected, or inconsistent")]
-    AppBindingMismatch,
+    #[error("bind apply failed with the round secret consumed; receive is broken until restore")]
+    BindApplyFailed,
 }
 
 /// SHA-256 over `bytes` — the single hashing primitive behind every digest this

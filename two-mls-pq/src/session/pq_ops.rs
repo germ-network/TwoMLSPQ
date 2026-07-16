@@ -8,17 +8,30 @@
 use super::*;
 
 /// PQ ratchet round state carried between the messages of one exchange.
+///
+/// Every side-band round registers here, and every `*_begin` gates on it being empty — that
+/// single-occupancy IS the mutual exclusion between A.3, A.4 and A.5. A.4 was long absent
+/// from it, which is exactly why a ratchet round could open during a bootstrap and evict its
+/// irreplaceable frame; being a well-formed round now, it takes its place.
 pub(in crate::session) enum PqInflight {
     /// Initiator holds the ephemeral (decapsulation key) until it receives the ciphertext.
     Initiating(apq::pq_ratchet::PqEphemeral),
+    /// A.4 initiator awaiting the responder's `Welcome'`. Carries nothing: the welcome is
+    /// self-sufficient, and the secret this round injects is exported from the group it
+    /// carries rather than held across the round.
+    BootstrapInitiated,
+    /// A.4 responder awaiting the initiator's bind — the frame that proves it joined.
+    BootstrapResponded,
     /// Responder holds the shared secret until it receives the stapled bind. `Zeroizing` wipes the
     /// secret from memory on drop, whether it is consumed by the bind or abandoned.
     Responding(Zeroizing<Vec<u8>>),
-    /// A.5 initiator awaiting the responder's Commit' (+ counter-Upd'). `rotating`
-    /// carries the credential-handoff ClientId from `pq_rekey_begin` so the final
-    /// commit also hands our own send-PQ leaf to the new principal's signing key.
-    RekeyInitiated { rotating: Option<ClientId> },
-    /// A.5 responder awaiting the initiator's final Commit'.
+    /// A.5 initiator awaiting the responder's Commit'. Carries nothing: the round's
+    /// credential handoff already rode the leg-1 Upd' (the proposal replaces the
+    /// proposer's leaf), and the leg-3 ack is a pathless partial commit that touches
+    /// no leaf.
+    RekeyInitiated,
+    /// A.5 responder awaiting the initiator's ack — a stapled bind, which arrives via
+    /// `process_incoming` like A.3's and A.4's.
     RekeyResponded,
 }
 
@@ -43,7 +56,7 @@ pub(in crate::session) fn require_peer_update(
 #[uniffi::export]
 impl TwoMlsPqSession {
     /// Initiator step 1 — generate an ML-KEM ephemeral and return the encapsulation-key message
-    /// (tag 0x05). The decapsulation key is held until the ciphertext arrives.
+    /// (tag 0x17). The decapsulation key is held until the ciphertext arrives.
     pub fn pq_ratchet_begin(&self) -> Result<Vec<u8>> {
         // Guard-first (pre-lock, OUTSIDE `mutate_and_persist`): a call that fails a precondition
         // mutates nothing. Rejecting it here — rather than inside the closure — keeps the persist
@@ -70,12 +83,19 @@ impl TwoMlsPqSession {
             msg.extend_from_slice(&eph.encapsulation_key());
             let sealed = inner.seal_side_band(&msg)?;
             inner.pq_inflight = Some(PqInflight::Initiating(eph));
+            // Retain for re-send as well as returning it: the EK is this round's only
+            // carrier, and losing it strands the round — `pq_inflight` blocks a re-begin
+            // and nothing else can re-emit the ephemeral's public half. Seeding the seal
+            // cache keeps a Stable hand-out byte-identical to what we return here.
+            inner.pending_side_band = Some(RetainedFrame::seeded(msg, &sealed));
             Ok(sealed)
         })
     }
 
-    /// Responder — encapsulate a fresh secret to the initiator's EK, hold it, and return the
-    /// ciphertext message (tag 0x07).
+    /// Responder — SEAL a fresh secret to the initiator's EK (bound to our current PQ epoch),
+    /// hold it, and return the ciphertext message (tag 0x19). The secret is random and sealed
+    /// rather than the KEM output itself, so the initiator's open is an explicit receipt (see
+    /// `apq::pq_ratchet::seal_injected_secret`).
     pub fn pq_ratchet_respond(&self, ek_msg: Vec<u8>) -> Result<()> {
         // Guard-first (see `pq_ratchet_begin`): validate the frame and check the turn/slot
         // state before the persist choke point, so a replayed or ill-timed EK frame can't force
@@ -88,41 +108,69 @@ impl TwoMlsPqSession {
             if tag != PQ_EK_TAG {
                 return Err(TwoMlsPqError::Mls);
             }
-            if inner.pq_inflight.is_some() || inner.pending_pq_outbound.is_some() {
-                return Err(TwoMlsPqError::SessionNotReady);
+            // `pq_inflight` alone gates a double-respond (a first one parks `Responding`).
+            // Slot occupancy is deliberately not a gate: frames are retained for re-send,
+            // so occupancy is round progress, not "busy" — and a duplicate EK re-sent by
+            // the peer must be discardable, not an error.
+            match inner.pq_inflight {
+                // We already answered this round's EK; the peer is re-sending it until our
+                // CT lands. Nothing to do — and nothing done: this is above the choke point.
+                Some(PqInflight::Responding(_)) => return Err(TwoMlsPqError::DuplicateSideBand),
+                // Any other in-flight state is a genuinely ill-timed EK (e.g. a turn
+                // collision, both sides opening a round at once) — the host's problem to
+                // resolve, not a frame to silently drop.
+                Some(_) => return Err(TwoMlsPqError::SessionNotReady),
+                None => {}
             }
             ek.to_vec()
         };
         self.mutate_and_persist(crate::BlobKind::Checkpoint, |inner| {
-            let (s, ct) = apq::pq_ratchet::encapsulate(&providers::pq_kem()?, &ek)?;
-            inner.pq_inflight = Some(PqInflight::Responding(Zeroizing::new(s)));
+            // The PSK binds the round to the group the secret is injected into — the
+            // initiator's send-PQ, which we mirror as our recv-PQ — at its current epoch.
+            let psk = {
+                let recv_pq = inner
+                    .recv_group
+                    .as_ref()
+                    .and_then(|g| g.pq.as_ref())
+                    .ok_or(TwoMlsPqError::SessionNotReady)?;
+                ct_seal_psk(recv_pq)?
+            };
+            let (s, ct) = apq::pq_ratchet::seal_injected_secret(
+                &providers::pq_kem()?,
+                &providers::header_aead_suite()?,
+                &ek,
+                &psk,
+            )?;
+            inner.pq_inflight = Some(PqInflight::Responding(s));
             let mut msg = vec![PQ_CT_TAG];
             msg.extend_from_slice(&ct);
-            inner.pending_pq_outbound = Some(msg);
+            // Parked for re-send until the initiator's stapled bind answers it.
+            inner.pending_side_band = Some(RetainedFrame::unsealed(msg));
             Ok(())
         })
     }
 
-    /// Initiator step 2 — decapsulate S, inject it into the send group's PQ half via a pathless
-    /// commit, bind the exported apq_psk into the classical half, and staple an app message.
-    /// Returns the bind frame (tag 0x09).
-    pub fn pq_ratchet_bind(&self, ct_msg: Vec<u8>, app: Vec<u8>) -> Result<()> {
+    /// Initiator step 2 — decapsulate S and inject it into the send group's PQ half via a
+    /// pathless commit, OWING the classical half: the bind rides our next classical COMMIT
+    /// as an `APQPrivateMessage` staple (see `discharge_owed_bind`), which is also where
+    /// the round's app message travels — an ordinary message frame's own section.
+    pub fn pq_ratchet_bind(&self, ct_msg: Vec<u8>) -> Result<()> {
         // Guard-first (see `pq_ratchet_begin`): validate the frame and every turn/slot/staple
-        // precondition before the persist choke point. The `pq_inflight` state is checked here
-        // as a pure read; the closure below still `take`s it (guaranteed `Initiating`). A
-        // displaced or ill-timed CT frame is then a no-op that neither bumps the seq nor pushes
-        // a Checkpoint — and, crucially, never reaches the `take` that would consume a held
-        // ephemeral or the `remember_send_psk` that mutates.
-        let ct = {
+        // precondition — AND open the sealed secret — before the persist choke point. The open
+        // is a PURE read (decapsulate and the exporter mutate nothing), so a displaced,
+        // stale, or misdirected CT is a no-op that neither bumps the seq nor pushes a
+        // Checkpoint, and never reaches the closure's `take` of the held ephemeral. The
+        // opened secret is what the closure commits.
+        let s = {
             let inner = self.lock();
             let ct_msg = inner.open_or_raw(ct_msg);
-            let (&tag, ct) = ct_msg.split_first().ok_or(TwoMlsPqError::Mls)?;
+            let (&tag, wire_ct) = ct_msg.split_first().ok_or(TwoMlsPqError::Mls)?;
             if tag != PQ_CT_TAG {
                 return Err(TwoMlsPqError::Mls);
             }
-            if inner.pending_pq_outbound.is_some() {
-                return Err(TwoMlsPqError::SessionNotReady);
-            }
+            // No slot check: our own EK is parked here for re-send, and binding is exactly
+            // what should replace it. The `Initiating` check below is the real gate.
+            //
             // Staple-stacking guard: a prepared-but-unsent classical commit is sitting in
             // `current_staple` waiting for its `encrypt`. The bind commit below would replace
             // it, and a displaced commit never rides a frame again — the peer would hit the
@@ -130,183 +178,97 @@ impl TwoMlsPqSession {
             if inner.pending_proposal_hash.is_some() {
                 return Err(TwoMlsPqError::SessionNotReady);
             }
-            // Only an initiator holding the A.3 ephemeral can bind the ciphertext.
-            if !matches!(inner.pq_inflight, Some(PqInflight::Initiating(_))) {
+            // Rule 2: at most one owed bind. A second `inject_and_commit` would advance
+            // `pq_epoch` out from under the epoch the outstanding bind's attestation already
+            // reserved, and the peer rejects a stale attestation pre-apply — with our PQ leaf
+            // spent and unrebuildable. The turn does not cover this, because we deliberately
+            // keep it while a bind is owed (see below), so the check has to be its own.
+            //
+            // Retriable, and self-clearing: our next classical commit discharges the owed bind
+            // and this bind proceeds.
+            if inner.owed_bind.is_some() {
                 return Err(TwoMlsPqError::SessionNotReady);
             }
-            ct.to_vec()
+            // Only an initiator holding the A.3 ephemeral can bind the ciphertext.
+            let eph = match &inner.pq_inflight {
+                Some(PqInflight::Initiating(eph)) => eph,
+                // We already bound: the ephemeral was consumed and the turn passed, so this
+                // is the peer re-sending its CT until our bind lands. Discard.
+                None if !inner.pq_turn_mine => return Err(TwoMlsPqError::DuplicateSideBand),
+                _ => return Err(TwoMlsPqError::SessionNotReady),
+            };
+            // OPEN the sealed secret. The PSK binds the group the secret is injected into
+            // (our send-PQ) at its current epoch; the AEAD key binds that AND the KEM shared
+            // secret, so a CT answering a DIFFERENT ephemeral (a stale round's, re-sent
+            // across the bundling window) or a different epoch fails the open EXPLICITLY —
+            // rejected here, ephemeral and PQ leaf intact, where a bare `decapsulate` would
+            // have handed back ML-KEM's implicit-rejection garbage to inject and strand the
+            // round on an unshared secret.
+            let psk = {
+                let send_pq = inner
+                    .send_group
+                    .as_ref()
+                    .and_then(|g| g.pq.as_ref())
+                    .ok_or(TwoMlsPqError::SessionNotReady)?;
+                ct_seal_psk(send_pq)?
+            };
+            apq::pq_ratchet::open_injected_secret(
+                &providers::pq_kem()?,
+                &providers::header_aead_suite()?,
+                eph,
+                wire_ct,
+                &psk,
+            )?
         };
         self.mutate_and_persist(crate::BlobKind::Checkpoint, |inner| {
             // Capture the departing epoch's PSK before the classical bind commit below.
             inner.remember_send_psk()?;
-            let eph = match inner.pq_inflight.take() {
-                Some(PqInflight::Initiating(eph)) => eph,
-                _ => return Err(TwoMlsPqError::SessionNotReady),
-            };
-            let s = Zeroizing::new(apq::pq_ratchet::decapsulate(
-                &providers::pq_kem()?,
-                &eph,
-                &ct,
-            )?);
-            let stores = inner.psk_stores.clone();
-            let send = inner
-                .send_group
-                .as_mut()
-                .ok_or(TwoMlsPqError::SessionNotReady)?;
-            let send_pq = send.pq.as_mut().ok_or(TwoMlsPqError::SessionNotReady)?;
-            // The bind is a -02 FULL commit: both halves carry the AppDataUpdate attesting
-            // the absolute post-commit epochs of both groups, computed before either commit.
-            let attestation = ApqInfoUpdate {
-                t_epoch: send.classical.current_epoch() + 1,
-                pq_epoch: send_pq.current_epoch() + 1,
-            };
-            let (pq_commit, apq_psk) =
-                apq::pq_ratchet::inject_and_commit(send_pq, &s, &stores, attestation)?;
-            let cl_builder = send
-                .classical
-                .commit_builder()
-                .custom_proposal(attestation.to_custom_proposal()?);
-            let cl_out = apq_psk
-                .add_to_commit(cl_builder)?
-                .build()
-                .map_err(|_| TwoMlsPqError::Mls)?;
-            send.classical
-                .apply_pending_commit()
-                .map_err(|_| TwoMlsPqError::Mls)?;
-            // The bind is a bare PSK commit (the queued peer proposal is not cached — it is
-            // re-applied only at the routine fold), so the roster is unchanged; assert it.
-            apq::ensure_two_party(&send.classical)?;
-            // The bind consumed the one-shot apq PSK; drop it from every store it was
-            // registered into (the session registry plus the group-captured handles).
-            send.forget_psk(apq_psk.storage_id());
-            apq::forget_psk_stores(&stores, apq_psk.storage_id());
-            let cl_commit = cl_out
-                .commit_message
-                .to_bytes()
-                .map_err(|_| TwoMlsPqError::Mls)?;
-            let app_ct = send
-                .classical
-                .encrypt_application_message(&app, vec![])
-                .map_err(|_| TwoMlsPqError::Mls)?
-                .to_bytes()
-                .map_err(|_| TwoMlsPqError::Mls)?;
-            // This commit advanced our send-group epoch, so any queued or offered peer
-            // proposal (an Update bound to the prior send epoch) is now stale and cannot be
-            // committed — drop it. The peer re-proposes at the new epoch once it observes
-            // this bind's staple (the receiver freely drops; the proposer re-sends).
-            inner.queued_proposal = None;
-            inner.offered_proposal = None;
-            // Our send group advanced: record the new epoch's PSK in the session ledger.
-            inner.remember_send_psk()?;
-            // The bind's classical commit becomes the staple subsequent message frames
-            // re-send — if the BIND frame itself is lost, the classical stream still heals.
-            // (A message frame can overtake the BIND; the peer then lacks the APQ-PSK and the
-            // staple fails retriably until the BIND lands — same as today's ordering.)
-            inner.current_staple = cl_commit.clone();
-            // The A.3 bind commit publishes new keys; tag the staple with the (already-bumped)
-            // push seq for `depends_on_seq`.
-            inner.current_staple_seq = inner.state_seq;
-            // Our operation is complete once the peer applies; the turn passes.
-            inner.pq_turn_mine = false;
-            inner.pending_pq_outbound = Some(encode_pq_bind(pq_commit, cl_commit, app_ct));
-            // The bind committed classically in our send group — capture the new
-            // epoch's listen address — and advanced our send-PQ's pq_epoch — capture its
-            // new header key.
-            inner.record_listen_rendezvous()?;
+            // The ephemeral's only use — the open above — is done; discard it. Defensive
+            // re-check of the state the guard read, which nothing races under sequential
+            // driving.
+            match inner.pq_inflight.take() {
+                Some(PqInflight::Initiating(_)) => {}
+                other => {
+                    inner.pq_inflight = other;
+                    return Err(TwoMlsPqError::SessionNotReady);
+                }
+            }
+            // Commit the PQ half and OWE the classical one. NOTHING is parked in
+            // `pending_side_band` here — deliberately. The two commits ride our next classical
+            // COMMIT as an APQPrivateMessage in the STAPLE (`discharge_owed_bind`), which is
+            // the message path, and the staple's own re-send until superseded is what heals a
+            // lost one. Parking a bind frame here instead would put it on the side-band wire,
+            // persist it under side-band retention rather than staple semantics, and contend
+            // for the slot with the next round's EK below.
+            inner.commit_pq_and_owe_bind(&s)?;
+            // Our EK is spent — the CT we just consumed answered it. Clearing is this side's
+            // ordinary "my part is done" (the round's next outbound is the staple, not a
+            // side-band frame); leaving it would re-send a frame the peer's round is past,
+            // which the peer must then decide to ignore.
+            inner.pending_side_band = None;
+            // The turn does NOT pass here. It passes at discharge, when the bind actually
+            // reaches the wire — which is what lets us open the next round while this one's
+            // classical half is owed and bundle its EK into the same EncryptResult as the
+            // bind. Both land before the peer takes a turn, so that saves a round trip.
+            //
+            // The two rounds are then in flight together, but on DIFFERENT paths: this round's
+            // bind in the staple, the next round's EK in `pending_side_band`. They never
+            // contend.
+            //
+            // Rule 2 — no second PQ commit while a bind is owed — is therefore NOT enforced by
+            // the turn here, and must be explicit: see the `owed_bind` check above, which is
+            // what keeps `pq_epoch` from moving out from under the reservation this trigger
+            // just made.
+            //
+            // Our send-PQ's pq_epoch advanced — capture its new header key. NOT the listen
+            // address: that tracks the CLASSICAL epoch, which has deliberately not moved.
             inner.record_pq_header_key()?;
             Ok(())
         })
     }
 
-    /// Responder — apply the stapled bind: register the held secret, apply the PQ partial commit
-    /// and classical commit on the recv group, and return the decrypted app message.
-    pub fn pq_ratchet_apply(&self, bind_msg: Vec<u8>) -> Result<Vec<u8>> {
-        // Guard-first (see `pq_ratchet_begin`): decode the frame and confirm we hold the
-        // responder secret before the persist choke point, so a stray or ill-timed bind is a
-        // no-op that neither `take`s the held secret nor pushes a Checkpoint. Frame validation
-        // comes first, so a stranger's unparseable blob is rejected at the frame layer (`Mls`)
-        // before any KEM/turn state is consulted; the closure still `take`s the (now guaranteed
-        // `Responding`) inflight state.
-        let (pq_commit, cl_commit, app_ct) = {
-            let inner = self.lock();
-            let bind_msg = inner.open_or_raw(bind_msg);
-            let decoded = decode_pq_bind(&bind_msg)?;
-            if !matches!(inner.pq_inflight, Some(PqInflight::Responding(_))) {
-                return Err(TwoMlsPqError::SessionNotReady);
-            }
-            decoded
-        };
-        self.mutate_and_persist(crate::BlobKind::Checkpoint, |inner| {
-            let s = match inner.pq_inflight.take() {
-                Some(PqInflight::Responding(s)) => s,
-                _ => return Err(TwoMlsPqError::SessionNotReady),
-            };
-            let stores = inner.psk_stores.clone();
-            let recv = inner
-                .recv_group
-                .as_mut()
-                .ok_or(TwoMlsPqError::SessionNotReady)?;
-            let recv_pq = recv.pq.as_mut().ok_or(TwoMlsPqError::SessionNotReady)?;
-            let (apq_psk, pq_attestation) =
-                apq::pq_ratchet::apply_injected_commit(recv_pq, &s, &pq_commit, &stores)?;
-            let cl = MlsMessage::from_bytes(&cl_commit).map_err(|_| TwoMlsPqError::Mls)?;
-            let cl_attestation = match recv
-                .classical
-                .process_incoming_message(cl)
-                .map_err(|_| TwoMlsPqError::Mls)?
-            {
-                ReceivedMessage::Commit(desc) => {
-                    commit_attestation(&desc)?.ok_or(TwoMlsPqError::ApqInfoMismatch)?
-                }
-                _ => return Err(TwoMlsPqError::ApqInfoMismatch),
-            };
-            // -02 FULL verification: both halves carried the AppDataUpdate, the two copies
-            // agree, and they attest the actual post-apply epochs of both groups.
-            //
-            // Verify/apply boundary: per-half AppDataUpdate validity (correct proposal type,
-            // committer-sent, and new-epoch == pre-commit context.epoch + 1) is enforced
-            // PRE-apply by the MlsRules filter (see `apq::rules`), so a structurally bad
-            // attestation is rejected before either group state moves. What remains here — the
-            // CROSS-half agreement and the match against the actual post-apply epochs — is
-            // necessarily post-apply, because comparing the two halves' epochs requires both
-            // commits to have been applied (mls-rs `process_incoming_message` validates and
-            // applies atomically; there is no inspect-without-apply short of a fork change).
-            // That residual check still gates every observable effect: it runs BEFORE the
-            // stapled app message is decrypted (line below), BEFORE the one-shot apq PSK is
-            // forgotten, and BEFORE the turn passes — so on a bad attestation from our sole
-            // counterparty no plaintext is released and no turn/PSK state is confirmed. The
-            // only thing an attestation forgery can force is a self-inflicted epoch advance
-            // that then errors out, which is within the two-party DoS threat model.
-            if cl_attestation != pq_attestation
-                || pq_attestation.pq_epoch != recv_pq.current_epoch()
-                || cl_attestation.t_epoch != recv.classical.current_epoch()
-            {
-                return Err(TwoMlsPqError::ApqInfoMismatch);
-            }
-            // Peer commits (the PQ partial above is checked inside `apply_injected_commit`)
-            // must never change the two-party shape.
-            apq::ensure_two_party(&recv.classical)?;
-            // The bind consumed the one-shot apq PSK; drop it from every store it was
-            // registered into (the session registry plus the group-captured handles).
-            recv.forget_psk(apq_psk.storage_id());
-            apq::forget_psk_stores(&stores, apq_psk.storage_id());
-            let app = MlsMessage::from_bytes(&app_ct).map_err(|_| TwoMlsPqError::Mls)?;
-            let out = match recv
-                .classical
-                .process_incoming_message(app)
-                .map_err(|_| TwoMlsPqError::Mls)?
-            {
-                ReceivedMessage::ApplicationMessage(m) => Ok(m.data().to_vec()),
-                _ => Err(TwoMlsPqError::DecryptionFailed),
-            };
-            // We finished receiving this operation; the next one is ours to start.
-            inner.pq_turn_mine = true;
-            out
-        })
-    }
-
     /// A.5 initiator — propose Upd'(self) into the peer's send-PQ (our recv mirror) and
-    /// return the 0x0F frame. Requires both PQ halves live (post-A.4 only), the turn, and
+    /// return the Upd' frame (tag 0x1B). Requires both PQ halves live (post-A.4 only), the turn, and
     /// no other side-band operation in flight. Proposal only: no epochs move until the
     /// responder commits.
     ///
@@ -324,10 +286,9 @@ impl TwoMlsPqSession {
         // guards a handoff that only matters once we mutate, and it needs the moved id.)
         {
             let inner = self.lock();
-            if !inner.pq_turn_mine
-                || inner.pending_pq_outbound.is_some()
-                || inner.pq_inflight.is_some()
-            {
+            // Turn + inflight are the gates; the slot is not consulted (occupancy is round
+            // progress under retention, never "busy").
+            if !inner.pq_turn_mine || inner.pq_inflight.is_some() {
                 return Err(TwoMlsPqError::SessionNotReady);
             }
             if inner
@@ -375,15 +336,28 @@ impl TwoMlsPqSession {
             let mut msg = vec![PQ_REKEY_UPD_TAG];
             msg.extend_from_slice(&proposal.to_bytes().map_err(|_| TwoMlsPqError::Mls)?);
             let sealed = inner.seal_side_band(&msg)?;
-            inner.pq_inflight = Some(PqInflight::RekeyInitiated { rotating });
+            inner.pq_inflight = Some(PqInflight::RekeyInitiated);
+            // Retain for re-send (see `pq_ratchet_begin`): a lost Upd' strands the rekey.
+            inner.pending_side_band = Some(RetainedFrame::seeded(msg, &sealed));
             Ok(sealed)
         })
     }
 
     /// A.5 responder — commit the initiator's Upd' on our own send-PQ with an updatePath
     /// and a PSK exported from our recv-PQ mirror (the initiator derives the same PSK from
-    /// its send-PQ), then park the `[Commit'][counter-Upd'(self)]` frame (0x11) for pickup
-    /// via `pq_take_pending_outbound`.
+    /// its send-PQ), then park the Commit' frame for re-send via `pq_pending_outbound`.
+    /// The initiator answers it with the round's ack — a pathless partial commit that
+    /// rides its next classical COMMIT as the staple — so this frame is never terminal.
+    ///
+    /// The round's two leaf replacements both happen here: the folded Upd' replaces the
+    /// PROPOSER's (initiator's) leaf, and the commit's updatePath replaces the COMMITTER's
+    /// (our own). That makes this commit the A.5 credential channel for both parties:
+    /// the initiator's handoff rides its Upd' (see `pq_rekey_begin`), and our own leaf
+    /// catches up to the session's canonical identity whenever it lags — the PQ analogue
+    /// of `prepare_ratchet_commit`'s classical own-leaf catch-up, validated by the AS's
+    /// catch-up rule (a leaf may only move to an ALREADY-canonical identity). Each party's
+    /// send-PQ leaf therefore hands off when it RESPONDS, and the turn alternation is what
+    /// brings that round around.
     ///
     /// Returns the ClientId the initiator announced in the Upd's authenticated_data when
     /// this rekey carries an A.5 credential handoff (see `pq_rekey_begin`), else `None`.
@@ -403,7 +377,9 @@ impl TwoMlsPqSession {
             }
             let proposal_msg =
                 MlsMessage::from_bytes(proposal_bytes).map_err(|_| TwoMlsPqError::Mls)?;
-            if inner.pending_pq_outbound.is_some() || inner.pq_inflight.is_some() {
+            // Inflight only (see `pq_ratchet_respond`): the slot may hold our own retained
+            // frame from the previous round.
+            if inner.pq_inflight.is_some() {
                 return Err(TwoMlsPqError::SessionNotReady);
             }
             proposal_msg
@@ -425,19 +401,16 @@ impl TwoMlsPqSession {
             let cross_psk = if inner.last_cross_injected_pq == Some(recv_pq_epoch) {
                 None
             } else {
-                let recv_pq = inner
-                    .recv_group
-                    .as_mut()
-                    .and_then(|g| g.pq.as_mut())
-                    .ok_or(TwoMlsPqError::SessionNotReady)?;
-                let exported = export_psk(recv_pq, PskDomain::CrossParty)?;
+                let exported = inner.export_cross_from_recv_pq()?;
                 inner.register_psk(exported.storage_id(), exported.psk());
-                inner.last_cross_injected_pq = Some(recv_pq_epoch);
                 Some(exported)
             };
-            // Snapshot of the peer's canonical history for the announced-id check below
-            // (taken before the group borrow).
+            // Snapshot of the peer's canonical history for the announced-id check below,
+            // and our own identity/keys for the committer catch-up (both taken before the
+            // group borrow).
             let canonical_theirs = inner.with_auth(|core| core.theirs.to_parts().0);
+            let current_id = inner.client.client_id();
+            let (my_signer, my_public) = inner.client.combiner().pq_signature_keypair();
             let rotated;
             let commit_bytes = {
                 let send_pq = inner
@@ -466,12 +439,32 @@ impl TwoMlsPqSession {
                         return Err(TwoMlsPqError::CredentialRejected);
                     }
                 }
-                let builder = send_pq.commit_builder();
-                let builder = match &cross_psk {
-                    Some(psk) => psk.add_to_commit(builder)?,
-                    None => builder,
+                // Own-leaf catch-up: this commit's updatePath replaces OUR leaf — the
+                // committer replacement that is this round's other half. When the leaf
+                // still signs as a principal the session has rotated past (Phase 8 swapped
+                // `self.client`; the PQ leaves lag until their next updatePath), move it to
+                // the current identity here. The peer's AS validates the catch-up when it
+                // applies this Commit' (canonical-only), so a commit racing ahead of our
+                // classical rotation staple is refused retriably, exactly like the
+                // initiator-side handoff.
+                let my_leaf = sender_client_id(send_pq, my_index)?;
+                let handoff = if my_leaf != current_id.bytes {
+                    let identity = SigningIdentity::new(
+                        BasicCredential::new(current_id.bytes.clone()).into_credential(),
+                        my_public,
+                    );
+                    Some((my_signer, identity))
+                } else {
+                    None
                 };
-                let out = builder.build().map_err(|_| TwoMlsPqError::Mls)?;
+                let mut builder = send_pq.commit_builder();
+                if let Some(psk) = &cross_psk {
+                    builder = psk.add_to_commit(builder)?;
+                }
+                if let Some((signer, identity)) = handoff {
+                    builder = builder.set_new_signing_identity(signer, identity);
+                }
+                let out = builder.build().map_err(map_credential_err)?;
                 send_pq
                     .apply_pending_commit()
                     .map_err(|_| TwoMlsPqError::Mls)?;
@@ -488,58 +481,72 @@ impl TwoMlsPqSession {
             if let Some(psk) = &cross_psk {
                 inner.forget_psk(psk.storage_id());
             }
-            // Counter-Upd'(self) for the initiator's send-PQ (our recv mirror).
-            let counter = {
-                let recv_pq = inner
-                    .recv_group
-                    .as_mut()
-                    .and_then(|g| g.pq.as_mut())
-                    .ok_or(TwoMlsPqError::SessionNotReady)?;
-                recv_pq
-                    .propose_update(Vec::new())
-                    .map_err(|_| TwoMlsPqError::Mls)?
-                    .to_bytes()
-                    .map_err(|_| TwoMlsPqError::Mls)?
-            };
             inner.pq_inflight = Some(PqInflight::RekeyResponded);
-            inner.pending_pq_outbound = Some(encode_pq_rekey_commit(commit_bytes, counter));
+            // REPLACES our previous frame; the initiator's stapled ack answers it, and the
+            // staple arm's clear is what empties the slot — no retirement stamp (this is a
+            // middle leg now, not a terminal one).
+            inner.pending_side_band = Some(RetainedFrame::unsealed(encode_pq_rekey_commit(
+                commit_bytes,
+            )));
             // Our send-PQ's pq_epoch advanced (updatePath commit) — capture its new key.
             inner.record_pq_header_key()?;
             Ok(rotated)
         })
     }
 
-    /// Apply an A.5 rekey Commit' (0x11). As the initiator mid-operation (frame carries
-    /// the counter-Upd'), apply the peer's commit to our recv mirror, commit the
-    /// counter-Upd' on our own send-PQ with the freshly-exported cross-PSK, park the
-    /// final 0x11, and return `true` (pick it up via `pq_take_pending_outbound`). As the
-    /// responder (empty counter slot), apply the final commit, take the turn, and return
-    /// `false` — the operation is complete.
-    pub fn pq_rekey_apply(&self, msg: Vec<u8>) -> Result<bool> {
-        // Guard-first (see `pq_ratchet_begin`): reject an unsolicited commit before the persist
-        // choke point (a pure read of the inflight state) and decode the frame here. The closure
-        // still `take`s the (now guaranteed rekey) inflight state below.
-        let (commit_bytes, counter_bytes) = {
+    /// A.5 initiator, leg 3 — apply the responder's Commit' to our recv mirror, then CLOSE
+    /// the round with the ack: export the cross-party secret from the mirror's NEW
+    /// (post-Commit') epoch, inject it into our own send-PQ with a pathless partial
+    /// commit, and OWE the classical half. The ack rides our next classical COMMIT as an
+    /// `APQPrivateMessage` staple — this IS A.3's and A.4's bind (`commit_pq_and_owe_bind`),
+    /// differing only in where S comes from, and it is what answers the round's one large
+    /// frame: S is derivable only by a party that has applied the Commit', so a bind that
+    /// applies at all is the receipt. The responder receives it via `process_incoming`
+    /// (the staple arm), never here — the turn passes at discharge, and the peer takes it
+    /// on applying the staple.
+    pub fn pq_rekey_apply(&self, msg: Vec<u8>) -> Result<()> {
+        // Guard-first (see `pq_ratchet_begin`): decode the frame and check every turn/slot/
+        // staple precondition before the persist choke point, so a replayed or ill-timed
+        // Commit' is a no-op. The closure still `take`s the (now guaranteed `RekeyInitiated`)
+        // inflight state below.
+        let commit_bytes = {
             let inner = self.lock();
             let msg = inner.open_or_raw(msg);
-            let decoded = decode_pq_rekey_commit(&msg)?;
-            if !matches!(
-                inner.pq_inflight,
-                Some(PqInflight::RekeyInitiated { .. }) | Some(PqInflight::RekeyResponded)
-            ) {
+            let commit_bytes = decode_pq_rekey_commit(&msg)?;
+            // Staple-stacking guard, as the other two binds have (see `pq_ratchet_bind`): a
+            // prepared-but-unsent classical commit sits in `current_staple` waiting for its
+            // `encrypt`, and the ack's commit below would displace it. Retriable: apply
+            // after the round's `encrypt`.
+            if inner.pending_proposal_hash.is_some() {
                 return Err(TwoMlsPqError::SessionNotReady);
             }
-            decoded
+            // Rule 2, as the other two binds (see `pq_ratchet_bind`): at most one owed bind.
+            // Retriable — our next classical commit discharges the outstanding one.
+            if inner.owed_bind.is_some() {
+                return Err(TwoMlsPqError::SessionNotReady);
+            }
+            // Only the initiator of THIS rekey may close it.
+            match inner.pq_inflight {
+                Some(PqInflight::RekeyInitiated) => {}
+                // We already acked: the round closed for us and the turn passed at (or
+                // awaits) discharge, so this is the peer re-sending its Commit' until our
+                // stapled ack lands. Discard.
+                None if !inner.pq_turn_mine => return Err(TwoMlsPqError::DuplicateSideBand),
+                _ => return Err(TwoMlsPqError::SessionNotReady),
+            }
+            commit_bytes
         };
         self.mutate_and_persist(crate::BlobKind::Checkpoint, |inner| {
             let commit_msg =
                 MlsMessage::from_bytes(&commit_bytes).map_err(|_| TwoMlsPqError::Mls)?;
-            let client = inner.client.clone();
-            // Both roles pre-register their own send-PQ cross-party PSK so the peer's commit
-            // (which cross-injects from its recv-PQ mirror = our send-PQ) can resolve it. Export
-            // it at most once per send-PQ epoch (`last_send_pq_exported`): the value stays in the
-            // store, and re-exporting a consumed leaf across two re-keys without our send-PQ
-            // advancing would fail. (The send-PQ analogue of the classical `send_psk_ledger`.)
+            // Pre-register our own send-PQ cross-party PSK so the peer's Commit' (which
+            // cross-injects from its recv-PQ mirror = our send-PQ) can resolve it. Export
+            // it at most once per send-PQ epoch (`last_send_pq_exported`): the value stays
+            // in the store, and re-exporting a consumed leaf across two re-keys without our
+            // send-PQ advancing would fail. (The send-PQ analogue of the classical
+            // `send_psk_ledger`.) When the export is skipped (watermark already at this
+            // epoch) the peer's commit skips referencing it too — the lockstep invariant —
+            // so there is nothing new to forget.
             let pre_registered_send_pq: Option<ExternalPskId> = {
                 let inner: &mut SessionInner = &mut *inner;
                 let send_pq_epoch = inner
@@ -549,188 +556,84 @@ impl TwoMlsPqSession {
                     .ok_or(TwoMlsPqError::SessionNotReady)?
                     .current_epoch();
                 if inner.last_send_pq_exported != Some(send_pq_epoch) {
-                    let send_pq = inner
-                        .send_group
-                        .as_mut()
-                        .and_then(|g| g.pq.as_mut())
-                        .ok_or(TwoMlsPqError::SessionNotReady)?;
-                    let exported = export_psk(send_pq, PskDomain::CrossParty)?;
+                    let exported = inner.export_cross_from_send_pq()?;
                     inner.register_psk(exported.storage_id(), exported.psk());
-                    inner.last_send_pq_exported = Some(send_pq_epoch);
-                    // Held so we can drop it once the peer's commit (below) has resolved it —
-                    // it is consumed within this same call. When the export is skipped
-                    // (watermark already at this epoch) the peer's commit skips referencing it
-                    // too, so there is nothing new to forget.
                     Some(exported.storage_id().clone())
                 } else {
                     None
                 }
             };
-            match inner.pq_inflight.take() {
-                Some(PqInflight::RekeyInitiated { rotating }) => {
-                    if counter_bytes.is_empty() {
-                        return Err(TwoMlsPqError::SessionNotReady);
-                    }
-                    let counter_msg =
-                        MlsMessage::from_bytes(&counter_bytes).map_err(|_| TwoMlsPqError::Mls)?;
-                    // Apply the responder's Commit' to our recv mirror, then export the
-                    // cross-PSK from its NEW epoch (§A.5: "Export PSK from [BSG-PQ]").
-                    let exported = {
-                        let inner: &mut SessionInner = &mut *inner;
-                        let recv_pq = inner
-                            .recv_group
-                            .as_mut()
-                            .and_then(|g| g.pq.as_mut())
-                            .ok_or(TwoMlsPqError::SessionNotReady)?;
-                        match recv_pq
-                            .process_incoming_message(commit_msg)
-                            .map_err(|_| TwoMlsPqError::Mls)?
-                        {
-                            // A.5 commits are PQ-group-only and carry no AppDataUpdate —
-                            // the bumped pq_epoch reconciles at the next A.3 bind. An
-                            // attestation smuggled in here is rejected.
-                            ReceivedMessage::Commit(desc) => {
-                                if commit_attestation(&desc)?.is_some() {
-                                    return Err(TwoMlsPqError::ApqInfoMismatch);
-                                }
-                            }
-                            _ => return Err(TwoMlsPqError::Mls),
-                        }
-                        // A peer commit must never change the two-party shape.
-                        apq::ensure_two_party(&*recv_pq)?;
-                        let recv_pq_epoch = recv_pq.current_epoch();
-                        // The apply just advanced recv-PQ, so this is a fresh epoch — inject and
-                        // bump the watermark (a later respond at this epoch skips). Guarded by
-                        // the watermark for symmetry with the classical / respond paths.
-                        if inner.last_cross_injected_pq == Some(recv_pq_epoch) {
-                            None
-                        } else {
-                            let exported = export_psk(recv_pq, PskDomain::CrossParty)?;
-                            inner.last_cross_injected_pq = Some(recv_pq_epoch);
-                            Some(exported)
-                        }
-                    };
-                    if let Some(psk) = &exported {
-                        inner.register_psk(psk.storage_id(), psk.psk());
-                    }
-                    // The responder's Commit' we just applied to our recv-PQ mirror consumed the
-                    // send-PQ cross-PSK we pre-registered above; drop it from the store.
-                    if let Some(id) = &pre_registered_send_pq {
-                        inner.forget_psk(id);
-                    }
-                    // Commit the counter-Upd' on our own send-PQ. If this rekey carries a
-                    // credential handoff, the commit's updatePath also moves OUR committer
-                    // leaf to the new principal's signing key (the Upd' in `pq_rekey_begin`
-                    // covered our leaf in the peer's send-PQ; this covers the other group).
-                    let handoff = match &rotating {
-                        Some(new_id) => {
-                            // The session client must not have changed mid-operation.
-                            if client.client_id() != *new_id {
-                                return Err(TwoMlsPqError::SessionNotReady);
-                            }
-                            Some(client.combiner().pq_signature_keypair())
-                        }
-                        None => None,
-                    };
-                    let commit2 = {
-                        let send_pq = inner
-                            .send_group
-                            .as_mut()
-                            .and_then(|g| g.pq.as_mut())
-                            .ok_or(TwoMlsPqError::SessionNotReady)?;
-                        let my_index = send_pq.current_member_index();
-                        match send_pq
-                            .process_incoming_message(counter_msg)
-                            .map_err(map_credential_err)?
-                        {
-                            // The counter slot may only carry the peer's own-leaf Update.
-                            ReceivedMessage::Proposal(desc) => {
-                                require_peer_update(&desc, my_index)?
-                            }
-                            _ => return Err(TwoMlsPqError::Mls),
-                        }
-                        let handoff = match handoff {
-                            Some((new_signer, new_public)) => {
-                                // Catch-up: the moved leaf carries the canonical credential.
-                                let identity = SigningIdentity::new(
-                                    BasicCredential::new(client.client_id().bytes.clone())
-                                        .into_credential(),
-                                    new_public,
-                                );
-                                Some((new_signer, identity))
-                            }
-                            None => None,
-                        };
-                        let mut builder = send_pq.commit_builder();
-                        if let Some(psk) = &exported {
-                            builder = psk.add_to_commit(builder)?;
-                        }
-                        if let Some((new_signer, identity)) = handoff {
-                            builder = builder.set_new_signing_identity(new_signer, identity);
-                        }
-                        let out = builder.build().map_err(|_| TwoMlsPqError::Mls)?;
-                        send_pq
-                            .apply_pending_commit()
-                            .map_err(|_| TwoMlsPqError::Mls)?;
-                        // The commit folded the peer-supplied counter proposal: reject a
-                        // roster change (only an Update is legitimate there).
-                        apq::ensure_two_party(send_pq)?;
-                        out.commit_message
-                            .to_bytes()
-                            .map_err(|_| TwoMlsPqError::Mls)?
-                    };
-                    // Our counter commit above consumed the recv-PQ cross-PSK we exported and
-                    // registered for it; drop it now the commit is applied.
-                    if let Some(psk) = &exported {
-                        inner.forget_psk(psk.storage_id());
-                    }
-                    // Our operation completes once the peer applies; the turn passes.
-                    inner.pq_turn_mine = false;
-                    inner.pending_pq_outbound = Some(encode_pq_rekey_commit(commit2, Vec::new()));
-                    // Our send-PQ's pq_epoch advanced (the counter-Upd' commit) — capture it.
-                    inner.record_pq_header_key()?;
-                    Ok(true)
-                }
-                Some(PqInflight::RekeyResponded) => {
-                    if !counter_bytes.is_empty() {
-                        return Err(TwoMlsPqError::SessionNotReady);
-                    }
-                    let recv_pq = inner
-                        .recv_group
-                        .as_mut()
-                        .and_then(|g| g.pq.as_mut())
-                        .ok_or(TwoMlsPqError::SessionNotReady)?;
-                    match recv_pq
-                        .process_incoming_message(commit_msg)
-                        .map_err(|_| TwoMlsPqError::Mls)?
-                    {
-                        // Like the responder's Commit' above: A.5 carries no AppDataUpdate.
-                        ReceivedMessage::Commit(desc) => {
-                            if commit_attestation(&desc)?.is_some() {
-                                return Err(TwoMlsPqError::ApqInfoMismatch);
-                            }
-                        }
-                        _ => return Err(TwoMlsPqError::Mls),
-                    }
-                    // A peer commit must never change the two-party shape.
-                    apq::ensure_two_party(recv_pq)?;
-                    // The initiator's final Commit' we just applied consumed the send-PQ
-                    // cross-PSK we pre-registered above; drop it from the store.
-                    if let Some(id) = &pre_registered_send_pq {
-                        inner.forget_psk(id);
-                    }
-                    // We finished receiving this operation; the next one is ours to start.
-                    inner.pq_turn_mine = true;
-                    Ok(false)
-                }
-                // Unreachable: the guard at the top of this function admits only the two
-                // rekey states. Kept (with the state restored) purely as exhaustiveness
-                // defense should the guard and this match ever drift apart.
-                other => {
-                    inner.pq_inflight = other;
-                    Err(TwoMlsPqError::SessionNotReady)
-                }
+            // Exhaustiveness defense should the guard at the top of this function and this
+            // body ever drift apart — a pure READ, never a take: the inflight state has to
+            // survive every fallible step below (see the clear after the apply).
+            if !matches!(inner.pq_inflight, Some(PqInflight::RekeyInitiated)) {
+                return Err(TwoMlsPqError::SessionNotReady);
             }
+            // Apply the responder's Commit' to our recv mirror. It may carry the
+            // responder's own-leaf credential catch-up (see `pq_rekey_respond`), which the
+            // AS validates against its canonical sequence — hence `map_credential_err`.
+            {
+                let recv_pq = inner
+                    .recv_group
+                    .as_mut()
+                    .and_then(|g| g.pq.as_mut())
+                    .ok_or(TwoMlsPqError::SessionNotReady)?;
+                match recv_pq
+                    .process_incoming_message(commit_msg)
+                    .map_err(map_credential_err)?
+                {
+                    // The responder's Commit' is PQ-group-only and carries no
+                    // AppDataUpdate — reconciliation is OUR ack's job (a FULL commit,
+                    // below). An attestation smuggled in here is rejected.
+                    ReceivedMessage::Commit(desc) => {
+                        if commit_attestation(&desc)?.is_some() {
+                            return Err(TwoMlsPqError::ApqInfoMismatch);
+                        }
+                    }
+                    _ => return Err(TwoMlsPqError::Mls),
+                }
+                // A peer commit must never change the two-party shape.
+                apq::ensure_two_party(&*recv_pq)?;
+            }
+            // The Commit' has APPLIED: the round's inbound leg is complete, so the inflight
+            // state goes now — deliberately not before it.
+            //
+            // Everything above is fallible, and the credential catch-up this Commit' may
+            // carry is refused RETRIABLY by design (see `pq_rekey_respond`: the AS admits
+            // only an already-canonical identity, so a Commit' racing ahead of our classical
+            // rotation staple is rejected until that staple lands). Clearing the state
+            // first would make that retry unreachable: the responder re-sends its Commit'
+            // as designed, but our guard — seeing no round in flight and still holding the
+            // turn, which passes only at a discharge that never happened — would answer
+            // SessionNotReady forever, deadlocking both sides for good (the closure's
+            // mutations persist even on Err).
+            inner.pq_inflight = None;
+            // The Commit' we just applied consumed the send-PQ cross-PSK we pre-registered
+            // above; drop it from the store.
+            if let Some(id) = &pre_registered_send_pq {
+                inner.forget_psk(id);
+            }
+            // S: the cross-party secret off the mirror's NEW epoch (§A.5: "Export PSK from
+            // [BSG-PQ]") — derivable only having applied the Commit', which is what makes
+            // the ack a receipt. The responder re-derives the same value from its own
+            // send-PQ as it applies our staple, so it never goes on the wire.
+            let s = Zeroizing::new(inner.export_cross_from_recv_pq()?.psk().as_ref().to_vec());
+            // As A.3 and A.4, whose `commit_pq_and_owe_bind` this shares: commit the PQ
+            // half, owe the classical one, park NOTHING. The ack rides our next classical
+            // COMMIT as an APQPrivateMessage staple, and the staple's re-send until
+            // superseded heals a lost one.
+            inner.commit_pq_and_owe_bind(&s)?;
+            // Our Upd' is spent — the Commit' we just applied answered it (the ordinary
+            // "my part is done" clear; the ack travels the staple, not this slot).
+            inner.pending_side_band = None;
+            // The turn passes at DISCHARGE, not here — see `discharge_owed_bind`. Rule 2 is
+            // checked explicitly at the bind entry points instead.
+            //
+            // Our send-PQ's pq_epoch advanced (the ack's pathless commit) — capture its
+            // header key. NOT the listen address: that tracks the CLASSICAL epoch, which
+            // has deliberately not moved.
+            inner.record_pq_header_key()?;
+            Ok(())
         })
     }
 }
@@ -743,16 +646,68 @@ impl TwoMlsPqSession {
         self.lock().pq_turn_mine
     }
 
-    /// Consume the side-band frame parked by the responder-side operations
-    /// (`pq_ratchet_respond` / `pq_ratchet_bind` / `pq_bootstrap_respond`). Single slot,
-    /// single delivery: those operations refuse to start while a frame is waiting.
+    /// Whether receiving is broken: a peer bind staple failed to apply after the round's
+    /// secret was consumed, so `process_incoming` now refuses every frame with
+    /// [`TwoMlsPqError::BindApplyFailed`] (the peer re-staples the same unappliable bind
+    /// forever). SENDING is unaffected. Not reachable from an honest peer, and healed by
+    /// restoring the last persisted state — how urgent that is depends on what the session
+    /// is for (a receive-critical role treats it as fatal; a send-mostly role can defer),
+    /// which is why this is a query rather than only an error a host trips over.
+    pub fn pq_receive_broken(&self) -> bool {
+        self.lock().bind_apply_broken
+    }
+
+    /// The current round's outbound side-band frame, sealed, WITHOUT consuming it — the
+    /// side-band analogue of re-stapling `current_staple` onto every message frame. `None`
+    /// when the side-band is quiescent, which is what lets a host send a bare message.
+    ///
+    /// One frame at most: every side-band round registers in `pq_inflight`, and every
+    /// `*_begin` gates on it, so A.3, A.4 and A.5 are mutually exclusive. (A.4 was once
+    /// absent from that, which let a ratchet round open beside a bootstrap and evict it —
+    /// the reason A.4 is now a well-formed round.)
+    ///
+    /// Call it on every send for as long as it returns anything: a side-band frame is the
+    /// only carrier of its PQ half, so re-sending is how a dropped one heals (see
+    /// [`SessionInner::pending_side_band`]). Duplicates are benign discards on the
+    /// receiver, so over-sending is safe where under-sending stalls the ratchet.
+    ///
+    /// `sealing` picks the wire behaviour, and only the host can: [`SideBandSealing::Fresh`]
+    /// makes every send distinct (a stalled round does not repeat identifiable bytes);
+    /// [`SideBandSealing::Stable`] holds the base still so a host can CHUNK it. See
+    /// [`SideBandSealing`] for the trade.
+    ///
+    /// Advances no protocol state either way: the frame stays, no `state_seq` bump, nothing
+    /// to persist. (`Stable` fills a live-only seal cache — invisible to the archive and to
+    /// the peer.)
+    ///
+    /// Epochs: `Fresh` seals at the epoch CURRENT to each call, so a frame retained across a
+    /// ratchet keeps opening for the peer. `Stable` cannot, by construction — the bytes hold
+    /// still, so the cached seal keeps the epoch it was first sealed at and the peer opens it
+    /// from its retained header-key window. That is roomy for the PQ family (`seal_side_band`
+    /// seals under recv-PQ, which advances only when the PEER commits — and applying a peer
+    /// commit clears this side's retained frame anyway). It is tighter for the one frame that
+    /// takes `seal_side_band`'s classical fallback, the pre-A.4 `BOOTSTRAP_KP`, whose key
+    /// tracks the CLASSICAL epoch that ordinary messaging advances: a `Stable` pass over that
+    /// frame wants to finish inside the peer's classical header window. `Fresh` has no such
+    /// constraint.
+    pub fn pq_pending_outbound(&self, sealing: SideBandSealing) -> Option<Vec<u8>> {
+        let mut inner = self.lock();
+        inner.hand_out(sealing)
+    }
+
+    /// Consume the current round's side-band frame.
+    ///
+    /// Prefer [`Self::pq_pending_outbound`]: taking leaves the round's only carrier of its
+    /// PQ half nowhere to be re-sent from, so a dropped frame stalls the ratchet with no
+    /// way to heal. Retained for hosts that drive the side-band as a strict
+    /// request/response and accept that.
     pub fn pq_take_pending_outbound(&self) -> Option<Vec<u8>> {
         let mut inner = self.lock();
-        let frame = inner.pending_pq_outbound.take()?;
+        let retained = inner.pending_side_band.take()?;
         // Side-band frames seal under the PQ family (the responder is post-establishment,
         // so its recv-PQ group exists); the classical fallback in `seal_side_band` is
         // never hit here.
-        let out = inner.seal_side_band(&frame).ok();
+        let out = inner.seal_side_band(&retained.frame).ok();
         // The take advanced state — persist Core (a side-band frame changes no group).
         // Keyed on the take, like `pending_outbound`: an (unreachable) seal failure still
         // consumed the parked frame.
@@ -769,9 +724,9 @@ impl TwoMlsPqSession {
         out
     }
 
-    /// A.4 initiator — emit this side's PQ key package (tag 0x0B) so the peer can stand
+    /// A.4 initiator — emit this side's PQ key package (tag 0x13) so the peer can stand
     /// up its deferred send-group PQ half. The key package's private material is retained
-    /// in this client, so the returned welcome can be joined by `pq_bootstrap_apply`.
+    /// in this client, so the returned welcome can be joined by `pq_bootstrap_bind`.
     ///
     /// `rotating` must name the session's CURRENT principal (like `pq_rekey_begin`); the KP'
     /// below is generated by that client, so the new leaf carries its credential without
@@ -807,12 +762,21 @@ impl TwoMlsPqSession {
             // Side-band frame. Pre-A.4 our recv-PQ (Group_B.pq) is the group the bootstrap
             // is creating, so `seal_side_band` falls back to the classical seal for exactly
             // this frame; the peer opens it from its classical window.
-            inner.seal_side_band(&msg)
+            let sealed = inner.seal_side_band(&msg)?;
+            // Retain for re-send (see `pq_ratchet_begin`). A lost KP' is the worst of the
+            // three to strand: without A.4 the session never reaches full establishment,
+            // and this frame is what the peer's deferred send-PQ half is built around.
+            inner.pending_side_band = Some(RetainedFrame::seeded(msg, &sealed));
+            // Register the round. This is what stops A.3/A.5 opening beside a bootstrap —
+            // every `*_begin` gates on `pq_inflight` being empty, and A.4's absence from it
+            // is precisely why a ratchet round could evict this frame.
+            inner.pq_inflight = Some(PqInflight::BootstrapInitiated);
+            Ok(sealed)
         })
     }
 
     /// A.4 responder — stand up the deferred send-group PQ half around the peer's key
-    /// package and return the bootstrap frame (tag 0x0D) carrying its Welcome.
+    /// package and return the bootstrap frame (tag 0x15) carrying its Welcome.
     /// PQ-groups-only: no classical commit rides here — the new half's APQ-PSK reaches
     /// the classical group at the next A.3 bind. Taking this turn makes the next
     /// operation ours.
@@ -829,9 +793,10 @@ impl TwoMlsPqSession {
             if tag != PQ_BOOTSTRAP_KP_TAG {
                 return Err(TwoMlsPqError::Mls);
             }
-            if inner.pending_pq_outbound.is_some() {
-                return Err(TwoMlsPqError::SessionNotReady);
-            }
+            // No slot check (see `pq_ratchet_respond`). The "our send-PQ is already up"
+            // guard below is what makes a re-sent KP' idempotent — it is reached before any
+            // group is built, so a duplicate is refused without touching state.
+            //
             // Validate the peer's PQ key package suite before building a group around it — an
             // early, clear CipherSuiteMismatch rather than a late opaque mls-rs error.
             check_key_package_suite(kp, inner.suite.pq)?;
@@ -843,13 +808,16 @@ impl TwoMlsPqSession {
             }
             // Our send-PQ half must not already be up (checked last, matching the original body
             // order); the guard-first position prevents a full-Checkpoint push on a replay.
+            // An already-up half means we answered this KP' — the peer is re-sending until
+            // our bootstrap frame lands. Discard rather than report not-ready: it reaches
+            // here before any group is built, so it is a true no-op.
             if inner
                 .send_group
                 .as_ref()
                 .map(|g| g.pq.is_some())
                 .unwrap_or(false)
             {
-                return Err(TwoMlsPqError::SessionNotReady);
+                return Err(TwoMlsPqError::DuplicateSideBand);
             }
             kp.to_vec()
         };
@@ -893,10 +861,18 @@ impl TwoMlsPqSession {
                 // secrecy reaches ASG-cl at the next A.3 ratchet; until then ASG-cl keeps
                 // the PQ-derived security chained in at establishment.
                 send.set_pq(pq_group, client.combiner());
-                encode_bootstrap_bind(pq_welcome)
+                encode_bootstrap_welcome(pq_welcome)
             };
-            inner.pq_turn_mine = true;
-            inner.pending_pq_outbound = Some(frame);
+            // The turn is NOT taken here. A.4 has a leg to apply now, so it passes on the
+            // same rule A.3 and A.5 follow: we take it applying the stapled bind (the
+            // staple arm in `process_incoming`), by which point the bind has proved this
+            // welcome landed. Taking it at our own send is what left us opening a ratchet
+            // round beside an unconfirmed bootstrap — the collision this leg exists to
+            // remove.
+            inner.pq_inflight = Some(PqInflight::BootstrapResponded);
+            // Parked for re-send until the initiator's stapled bind answers it (the staple
+            // arm clears the slot as it applies).
+            inner.pending_side_band = Some(RetainedFrame::unsealed(frame));
             // Our send-PQ half now exists (Group_B.pq) — capture its header key so we can
             // open side-band frames the peer seals to it.
             inner.record_pq_header_key()?;
@@ -904,30 +880,82 @@ impl TwoMlsPqSession {
         })
     }
 
-    /// A.4 initiator completion — join the peer's new PQ group (our key package's
-    /// private material is retained in this client) and register its APQ-PSK.
-    /// PQ-groups-only, like the responder side: no classical commit is applied here.
-    /// The turn passes to the peer.
-    pub fn pq_bootstrap_apply(&self, bind_msg: Vec<u8>) -> Result<()> {
+    /// A.4 initiator, leg 3 — join the peer's new PQ group (our key package's private
+    /// material is retained in this client), then CLOSE the round with a bind: export the
+    /// cross-party secret from the group we just joined, inject it into our own send-PQ with
+    /// a pathless commit, and chain the exported apq_psk into our classical half.
+    ///
+    /// This is A.3's bind (`bind_with_secret`) — the only difference is where the secret
+    /// comes from: an exporter off the joined group rather than a KEM decapsulation. Two
+    /// things fall out of that, and they are the reason the leg exists:
+    ///
+    /// - **The receipt is free.** The secret is derivable only from INSIDE the welcomed
+    ///   group, so a bind that applies at all proves we joined. The peer re-derives it
+    ///   rather than receiving it, so nothing about it goes on the wire.
+    /// - **A.4 becomes a well-formed round** (initiator → responder → initiator, as A.3 and
+    ///   A.5 are), so the usual rule applies unchanged: we relinquish at this terminal send
+    ///   and the peer takes the turn on applying it. Before this leg existed the peer took
+    ///   the turn at its own send, and would open a ratchet round beside a bootstrap it had
+    ///   no confirmation of.
+    pub fn pq_bootstrap_bind(&self, welcome_msg: Vec<u8>) -> Result<()> {
         // Guard-first (see `pq_ratchet_begin`): confirm our recv-PQ half is not already up and
         // validate the welcome suite before the persist choke point, so a replayed or malformed
-        // bootstrap bind is a no-op rather than a full-Checkpoint push.
+        // welcome is a no-op rather than a full-Checkpoint push.
         let pq_welcome = {
             let inner = self.lock();
-            let bind_msg = inner.open_or_raw(bind_msg);
-            let pq_welcome = decode_bootstrap_bind(&bind_msg)?;
+            let welcome_msg = inner.open_or_raw(welcome_msg);
+            let pq_welcome = decode_bootstrap_welcome(&welcome_msg)?;
             // Validate the peer's PQ welcome suite before joining — an early, clear
             // CipherSuiteMismatch rather than a late opaque mls-rs error (matches the
             // establishment welcome path).
             check_welcome_suite(&pq_welcome, inner.suite.pq)?;
-            // Our recv-PQ half must not already be up (checked last, matching the original body
-            // order); the guard-first position prevents a full-Checkpoint push on a replay.
+            // An already-up recv-PQ means we joined and bound already — the peer is
+            // re-sending its welcome until our stapled bind lands. Discard: re-staple makes
+            // this steady-state, and it is reached before anything is touched.
+            //
+            // Checked BEFORE the `BootstrapInitiated` gate, not after: joining sets recv-PQ
+            // and clears `pq_inflight` to `None` in one closure, so a post-bind re-send is
+            // always {recv-PQ up, inflight None} — behind the inflight gate it would answer
+            // the retriable `SessionNotReady`, inviting the host to retry a round that is
+            // over, and the duplicate arm would be dead.
             if inner
                 .recv_group
                 .as_ref()
                 .map(|g| g.pq.is_some())
                 .unwrap_or(false)
             {
+                return Err(TwoMlsPqError::DuplicateSideBand);
+            }
+            // Only the initiator of THIS bootstrap may close it — a welcome with no bootstrap
+            // in flight (and recv-PQ still down, per the discard above) is genuinely
+            // ill-timed, not a duplicate.
+            if !matches!(inner.pq_inflight, Some(PqInflight::BootstrapInitiated)) {
+                return Err(TwoMlsPqError::SessionNotReady);
+            }
+            // Staple-stacking guard, as `pq_ratchet_bind` has: a prepared-but-unsent classical
+            // commit is sitting in `current_staple` waiting for its `encrypt`, and the bind
+            // commit below would replace it. A displaced commit never rides a frame again, so
+            // the peer hits the epoch-ahead desync with zero loss on the wire. Retriable: bind
+            // after `encrypt`.
+            //
+            // A.4 shares `bind_with_secret` with A.3, so it always had A.3's hazard — in a
+            // sharper form. A.3's trigger is a CT the host asked for; A.4's is an INBOUND
+            // welcome, so a host that prepares a round and then receives it before its
+            // `encrypt` arrives here without having done anything wrong, and the ordering is
+            // not its to control.
+            //
+            // Ordered after the duplicate check, where A.3 puts its guard first: a re-sent
+            // welcome for a round we already closed is a discard whatever our staple state is,
+            // and answering it with a retriable SessionNotReady would invite the host to retry
+            // a round that is over.
+            if inner.pending_proposal_hash.is_some() {
+                return Err(TwoMlsPqError::SessionNotReady);
+            }
+            // Rule 2, as `pq_ratchet_bind` (see there): at most one owed bind. A second
+            // `inject_and_commit` would move `pq_epoch` out from under the outstanding bind's
+            // reserved attestation, which the peer rejects pre-apply with our PQ leaf already
+            // spent. Retriable — our next classical commit discharges the owed bind.
+            if inner.owed_bind.is_some() {
                 return Err(TwoMlsPqError::SessionNotReady);
             }
             pq_welcome
@@ -961,7 +989,30 @@ impl TwoMlsPqSession {
                 verify_pq_half_unbound(&pq)?;
                 recv.set_pq(pq, client.combiner());
             }
-            inner.pq_turn_mine = false;
+            // The receipt, and the entropy, in one step: the cross-party secret off the
+            // birth epoch of the group we just joined. Derivable only from inside it, and
+            // the peer re-derives the same value from its own copy (same group, epoch and
+            // domain), so it never goes on the wire.
+            let s = Zeroizing::new(inner.export_cross_from_recv_pq()?.psk().as_ref().to_vec());
+
+            // As A.3 (`pq_ratchet_bind`), which this shares `commit_pq_and_owe_bind` with:
+            // commit the PQ half, owe the classical one, park NOTHING in `pending_side_band`.
+            // The two commits ride our next classical COMMIT as an APQPrivateMessage staple —
+            // the message path — and the staple's re-send until superseded heals a lost one.
+            inner.commit_pq_and_owe_bind(&s)?;
+            // A.4's round is over for us as far as the slot is concerned; the owed bind is
+            // tracked by `owed_bind`, not here.
+            inner.pq_inflight = None;
+            // Our KP' is spent — the welcome we just joined answered it (see
+            // `pq_ratchet_bind` for the rule). A KP' re-sent past this point is worse than
+            // wasteful: the peer's send-PQ half is up, so it reads as a re-bootstrap attempt.
+            inner.pending_side_band = None;
+            // The turn passes at DISCHARGE, not here — see `discharge_owed_bind`. Rule 2 is
+            // checked explicitly at the bind entry points instead.
+            //
+            // Our send-PQ's pq_epoch advanced — capture its header key. NOT the listen
+            // address: that tracks the CLASSICAL epoch, which has deliberately not moved.
+            inner.record_pq_header_key()?;
             Ok(())
         })
     }
