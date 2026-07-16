@@ -122,12 +122,12 @@ Sending is two-phase so CommProtocol can bind a per-round proposal hash:
   the truth (the signal is lost if the same frame's app message fails).
 - `None` — a welcome that changed nothing to announce (a re-delivery already joined
   from, or a first join under the peer's expected identity), or a message for an
-  unknown epoch (a reconnect condition — not recovered in-library; see
+  unknown epoch (re-establish the session — not recovered in-library; see
   Planned Features).
 
 A stapled commit *ahead* of the receive group's next epoch fails with `EpochDesync`
 before the app ciphertext is touched: the peer advanced more than one commit past us
-and the bridging commit no longer rides any frame — reconnect territory,
+and the bridging commit no longer rides any frame — re-establish territory,
 distinguishable from a transient `DecryptionFailed` (e.g. a message frame that
 overtook its A.3 BIND, which succeeds on retry once the BIND lands).
 

@@ -30,8 +30,8 @@ reusable layer: an `MlsRules` filter every client is built with
    credential is the member's opaque ClientId, and it may change only per the TwoMLS
    Authentication Service (below).
 5. **Commit epoch must equal the receiver's current epoch.** Ahead is `EpochDesync`
-   (reconnect territory); behind is an idempotent skip (the staple re-rides every
-   frame).
+   (re-establish territory — unrecoverable in-library); behind is an idempotent skip
+   (the staple re-rides every frame).
 6. **Establishment binds identities.** A combiner key package's two halves must name
    one ClientId; the welcome's creator leaf must equal the key package's identity at
    `receive`/`accept`; an A.4 bootstrap key package must name the established peer.

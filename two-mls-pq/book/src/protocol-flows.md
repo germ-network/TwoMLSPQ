@@ -78,7 +78,7 @@ per-direction rule, and it is the invariant two other properties silently rest o
 - **Any single frame heals the peer.** Every frame re-staples the sender's latest commit, which
   bridges a peer that is *at most one* commit behind. A sender that could commit twice while the
   peer was away would produce a staple nothing bridges — an unrecoverable `EpochDesync` in
-  ordinary lossy messaging, rather than the reconnect-only edge it is.
+  ordinary lossy messaging, rather than the re-establish-only edge it is.
 - **A bind's staple provably survives until applied.** A bind's PQ half exists on the wire only
   as the current staple (§A.3–A.5); a superseded staple never re-sends, and by then `owed_bind`
   is consumed and the PQ exporter leaf is spent. If a sender could commit past an unapplied bind,

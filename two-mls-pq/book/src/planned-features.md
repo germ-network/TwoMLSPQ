@@ -1,10 +1,14 @@
 # Planned Features
 
-**Reconnect (`EpochDesync` recovery) is not planned.** When a stapled commit
-arrives ahead of the receive group, `process_incoming` surfaces `EpochDesync`
-and the session is not recovered in-library — how to proceed (typically
-re-establishing a fresh session) is the host's decision. The epoch-history
-window previously sketched here for in-library recovery has been dropped.
+**In-library `EpochDesync` recovery is not planned — there is no "reconnect"
+at this layer.** When a stapled commit arrives ahead of the receive group,
+`process_incoming` surfaces `EpochDesync` and the session is not recovered
+in-library: recovery is OUT-OF-SESSION — the host re-establishes a fresh
+session (restore cannot heal it; the persisted state is desynced too). The
+epoch-history window once sketched here for in-library recovery has been
+dropped, and the vocabulary with it: "reconnect" survives in these docs only
+when naming the CLASSICAL TwoMLS rejoin mechanism, which has no PQ
+counterpart.
 
 Session persistence (push-based — `ArchiveSink` / `install_sink` / `restore`),
 transport routing (`should_listen_on`, `send_rendezvous`, `forwarded`), the always-staple

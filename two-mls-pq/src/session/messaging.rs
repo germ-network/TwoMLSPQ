@@ -888,7 +888,7 @@ impl TwoMlsPqSession {
     /// Remove the header seal from an inbound rendezvous-channel blob, returning the
     /// plaintext frame and its routing kind, or `None` if no key in the header receive
     /// window opens it (an out-of-window or garbage blob — indistinguishable by
-    /// construction, the same "unknown, drop it" signal the reconnect path assigns).
+    /// construction, and dropping it is all this layer can do).
     ///
     /// This is the single entry point for frames that arrive on a rendezvous address. The
     /// host dispatches on `OpenedFrame.kind`: `Message` → `process_incoming(frame)`;
@@ -901,8 +901,8 @@ impl TwoMlsPqSession {
     /// Observability: an opened frame whose leading tag is unrecognized is
     /// `DecryptionFailed`, but a blob no window key opens is a silent `None`. Desyncs that
     /// mls-rs would once have surfaced loudly can therefore read as `None` here; a host
-    /// tracking liveness should treat a run of `None`s on a live session as a reconnect
-    /// signal.
+    /// tracking liveness should treat a run of `None`s on a live session as a signal to
+    /// re-establish the session (recovery is out-of-session; none exists at this layer).
     pub fn open_incoming(&self, blob: Vec<u8>) -> Result<Option<OpenedFrame>> {
         let inner = self.lock();
         let Some(frame) = inner.try_open(&blob)? else {
@@ -927,8 +927,8 @@ impl TwoMlsPqSession {
     ///
     /// A commit staple *ahead* of the recv group's next epoch is `EpochDesync`: the
     /// bridging commit no longer rides any frame (only the sender's latest staples), so
-    /// the direction needs the reconnect path — surfaced before the app ciphertext is
-    /// touched, and distinguishable from a transient `DecryptionFailed`.
+    /// the direction needs out-of-session re-establishment — surfaced before the app
+    /// ciphertext is touched, and distinguishable from a transient `DecryptionFailed`.
     ///
     /// PQ side-band frames (0x13–0x1D) are **not** handled here — the host routes them to
     /// the `pq_*` entry points by frame kind (`pq_frame_kind`). Passing one here returns
