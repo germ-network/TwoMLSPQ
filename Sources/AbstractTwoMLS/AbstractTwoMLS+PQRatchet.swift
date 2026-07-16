@@ -5,7 +5,7 @@
 //  Created by Mark @ Germ on 6/23/26.
 //
 //  The PQ side-band state machine for the AbstractTwoMLS family, aligned with
-//  docs/08-twoMLSPQ-APQ.md Appendix A.
+//  the TwoMLSPQ book's Protocol Flows chapter, Appendix A.
 //
 //  PQ messages are whole `Data` here; chunking and reassembly are the
 //  transport's job, below this layer.
@@ -59,6 +59,18 @@ extension AbstractTwoMLS {
 		}
 	}
 
+	/// How a retained side-band frame is sealed per hand-out (v18 retention).
+	/// `.fresh` re-seals every time — repeated sends of one retained frame are
+	/// distinct on the wire, so a stalled round's re-sends cannot be correlated.
+	/// `.stable` seals once and repeats the bytes while the frame is unchanged,
+	/// which CHUNKING requires: chunks cut from two different seals never
+	/// reassemble. The trade is exactly the correlation `.fresh` avoids; neither
+	/// is safer in general.
+	public enum SideBandSealing: Sendable, Equatable {
+		case fresh
+		case stable
+	}
+
 	/// A received-and-applied PQ message and its effects.
 	public struct PQInbound: Sendable {
 		public let kind: PQOperationKind
@@ -70,25 +82,17 @@ extension AbstractTwoMLS {
 		/// now", not "what did the advanced group move to".
 		public let newEpochs: APQEpochs?
 		public let rotatedCredential: ClientID?  // A.4/A.5 principal handoff
-		/// The app message stapled onto an A.3 bind, decrypted while applying it.
-		/// Always nil through this backend today: `ingest` applies binds with an
-		/// empty payload and `begin(.ratchet)` offers no way to supply one — the
-		/// crate supports the stapled A.3 app message, but the wrapper does not
-		/// yet expose sending it (deliberate follow-up).
-		public let plaintext: Data?
 
 		public init(
 			kind: PQOperationKind,
 			advancedGroup: SendGroupRole,
 			newEpochs: APQEpochs?,
-			rotatedCredential: ClientID?,
-			plaintext: Data? = nil
+			rotatedCredential: ClientID?
 		) {
 			self.kind = kind
 			self.advancedGroup = advancedGroup
 			self.newEpochs = newEpochs
 			self.rotatedCredential = rotatedCredential
-			self.plaintext = plaintext
 		}
 	}
 
@@ -124,10 +128,24 @@ extension AbstractTwoMLS {
 		/// new credential for the A.4/A.5 handoff.
 		func begin(_ kind: PQOperationKind, rotating: ClientID?) throws -> PQOutbound
 
-		/// Drive the next step once the peer's reply has been ingested (e.g.
-		/// produce the stapled bind commit after receiving CT in A.3). Returns
-		/// nil when the operation is complete and the turn has flipped.
+		/// Hand out the reply a responding `ingest` parked (CT after an EK,
+		/// Welcome' after a KP', Commit' after an Upd'), CONSUMING it. Returns
+		/// nil when nothing is parked — including after every closing leg, whose
+		/// bind rides the next classical commit as the message-frame staple
+		/// rather than parking here. Correct for strict request/response
+		/// drivers; a re-staple driver should prefer `pendingSideBand(sealing:)`.
 		func advance(after inbound: PQInbound) throws -> PQOutbound?
+
+		/// The retained side-band frame, sealed, WITHOUT consuming it — the
+		/// re-send path (v18 retention). Safe to call on every send; advances no
+		/// protocol state.
+		func pendingSideBand(sealing: SideBandSealing) -> Data?
+
+		/// Whether receiving is poisoned by a peer bind staple that failed after
+		/// its round's secret was consumed (`.bindApplyFailed` on every further
+		/// receive; sending unaffected; healed by restoring the last persisted
+		/// state). A query so the host can decide urgency by role.
+		var isReceiveBroken: Bool { get }
 
 		// --- Responder (peer holds the turn) ---
 		/// Apply a whole received PQ message.

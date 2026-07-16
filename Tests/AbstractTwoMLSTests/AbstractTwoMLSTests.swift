@@ -186,8 +186,9 @@ struct LifecycleTests {
 		let inbound = try remoteSession.ingest(kp.payload)
 		#expect(inbound.kind == .finishBootstrap)
 		// Responding stands the PQ half up immediately: new PQ group at epoch 1. The
-		// classical epoch is untouched — A.4 is PQ-groups-only; the APQ-PSK binds into
-		// the classical half at the next A.3 ratchet.
+		// classical epoch is untouched — the responder's half of A.4 is PQ-groups-only;
+		// the initiator's closing bind is what reaches a classical group, and it rides
+		// the initiator's next classical commit as the message-frame staple (v18).
 		#expect(remoteBase.isFullyEstablished())
 		#expect(remoteBase.epochs().pqEpoch == 1)
 		#expect(remoteBase.epochs().classicalEpoch == remoteClassicalBefore)
@@ -200,25 +201,47 @@ struct LifecycleTests {
 				== remoteListenBeforeBootstrap.rendezvousByEpoch.count)
 		#expect(!remoteListenAfterBootstrap.sendGroup.pq.bytes.isEmpty)
 
+		// The retention peek (v18) serves the parked reply WITHOUT consuming it:
+		// two fresh hand-outs are DIFFERENT ciphertexts of the same retained frame.
+		let peek1 = try #require(remoteSession.pendingSideBand(sealing: .fresh))
+		let peek2 = try #require(remoteSession.pendingSideBand(sealing: .fresh))
+		#expect(peek1 != peek2)
+		#expect(try localBase.openIncoming(blob: peek1)?.kind == .pqSideBand(kind: .bootstrapWelcome))
+
 		let reply = try #require(try remoteSession.advance(after: inbound))
 		#expect(reply.kind == .finishBootstrap)
-		// Bootstrap bind frame tag (PQ welcome only — A.4 is PQ-groups-only).
-		#expect(try localBase.openIncoming(blob: reply.payload)?.kind == .pqSideBand(kind: .bootstrapBind))
-		// The parked reply is handed out exactly once.
+		// The responder's reply is the new PQ group's Welcome' (v18: the bind is no
+		// longer a side-band frame kind — it rides the message-frame staple).
+		#expect(try localBase.openIncoming(blob: reply.payload)?.kind == .pqSideBand(kind: .bootstrapWelcome))
+		// The consuming take hands the frame out exactly once — retention included.
 		#expect(try remoteSession.advance(after: inbound) == nil)
+		#expect(remoteSession.pendingSideBand(sealing: .fresh) == nil)
 
+		let localClassicalBeforeBind = localBase.epochs().classicalEpoch
 		let localInbound = try localSession.ingest(reply.payload)
 		#expect(localInbound.kind == .finishBootstrap)
 		#expect(localBase.isFullyEstablished())
-		// Local's recv mirror gained the PQ group id, and the turn passed to remote.
+		// Local's recv mirror gained the PQ group id. Local still HOLDS the turn:
+		// the initiator relinquishes at its terminal send — the committing round
+		// that staples the bind — not at the trigger.
 		#expect(try #require(localBase.receiveGroupId()).pq.bytes.isEmpty == false)
+		#expect(localBase.myPqTurn())
+		// A.4's closing leg is real work on the initiator (v18): joining the welcomed
+		// group exports the cross-party secret, which commits local's OWN send-PQ
+		// pathlessly. The classical half is OWED — it rides the next classical commit.
+		#expect(localBase.epochs().pqEpoch == 2)
+		#expect(localBase.epochs().classicalEpoch == localClassicalBeforeBind)
+
+		// -- Step 6: the next exchange discharges the owed bind — peer first. A
+		// classical commit is LICENSED (v19) by a peer offer built against our
+		// current epoch, and local committed last in step 4, so local needs one
+		// inbound frame before its committing round. Then local's round staples
+		// the APQPrivateMessage (both halves); remote applies it and only THEN
+		// takes the turn — the bind is the receipt.
+		try remoteSession.exchange(with: localSession)
+		#expect(localBase.epochs().classicalEpoch == localClassicalBeforeBind + 1)
 		#expect(!localBase.myPqTurn())
 		#expect(remoteBase.myPqTurn())
-		// The initiator's own send group was untouched by the bootstrap.
-		#expect(localBase.epochs().pqEpoch == 1)
-
-		// -- Step 6: exchanges still flow fully established.
-		try localSession.exchange(with: remoteSession)
 
 		// Routing: still matched after the post-bootstrap exchange rounds.
 		#expect(try postAddressMatches(poster: localBase, listener: remoteBase))
@@ -241,32 +264,34 @@ struct LifecycleTests {
 		let localListenBeforeRekey = try localBase.shouldListenOn().rendezvousByEpoch.count
 		let rekeyInbound1 = try localSession.ingest(rekeyUpd.payload)
 		#expect(rekeyInbound1.kind == .rekey)
-		#expect(localBase.epochs().pqEpoch == 2)
+		#expect(localBase.epochs().pqEpoch == 3)
 		#expect(localBase.epochs().classicalEpoch == localClassicalBeforeRekey)
 		#expect(
 			try localBase.shouldListenOn().rendezvousByEpoch.count
 				== localListenBeforeRekey)
 
-		// Local's parked reply carries its Commit' plus the counter-Upd'(local).
+		// Local's parked reply is its Commit' — the round's ONE updatePath commit
+		// (v18: the counter-Upd' is gone; one A.5 round re-keys one group).
 		let rekeyReply = try #require(try localSession.advance(after: rekeyInbound1))
 		#expect(rekeyReply.kind == .rekey)
 		// Rekey Commit' frame — classify by opening the seal (wire tag sealed, v7).
 		#expect(try remoteBase.openIncoming(blob: rekeyReply.payload)?.kind == .pqSideBand(kind: .rekeyCommit))
 		#expect(try localSession.advance(after: rekeyInbound1) == nil)
 
-		// Remote applies local's Commit' to its recv mirror and commits the
-		// counter-Upd' on its own send-PQ: its pq epoch advances too.
+		// Remote applies local's Commit' to its recv mirror, and the closing ACK's
+		// PQ half commits EAGERLY on remote's own send-PQ (a pathless partial —
+		// the same eager-PQ/owed-classical split every bind takes). The classical
+		// half is owed and rides remote's next classical commit as the staple. No
+		// third side-band frame exists (v18).
 		let rekeyInbound2 = try remoteSession.ingest(rekeyReply.payload)
 		#expect(rekeyInbound2.kind == .rekey)
 		#expect(remoteBase.epochs().pqEpoch == 2)
-		let rekeyFinal = try #require(try remoteSession.advance(after: rekeyInbound2))
-		#expect(try localBase.openIncoming(blob: rekeyFinal.payload)?.kind == .pqSideBand(kind: .rekeyCommit))
+		#expect(try remoteSession.advance(after: rekeyInbound2) == nil)
 
-		// Local applies the final Commit'; the operation completes and the turn
-		// passes back to local.
-		let rekeyInbound3 = try localSession.ingest(rekeyFinal.payload)
-		#expect(rekeyInbound3.kind == .rekey)
-		#expect(try localSession.advance(after: rekeyInbound3) == nil)
+		// Remote's next committing round staples the ACK; local applies it and the
+		// turn passes back to local.
+		try remoteSession.exchange(with: localSession)
+		#expect(remoteBase.epochs().pqEpoch == 2)
 		#expect(localSession.turn == .weInitiate)
 		#expect(remoteSession.turn == .theyInitiate)
 

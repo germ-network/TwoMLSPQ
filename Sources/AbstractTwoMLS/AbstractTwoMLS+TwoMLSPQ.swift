@@ -115,7 +115,30 @@ import TwoMLSPQ
 //     pre-release floor (SESSION_ARCHIVE and INVITATION both → 1; the ladders carried
 //     no compatibility value) — regenerate ALL persisted sessions and invitations;
 //     the v15 key-package WIRE cut (a published artifact) is untouched.
-private let expectedBindingContract: UInt64 = 16
+// v17: burned by an interim build of the v18 work; never shipped.
+// v18: every round ends in a stapled bind. Side-band frames are RETAINED for re-send —
+//     new pqPendingOutbound(sealing:) peeks the sealed frame without consuming it
+//     (.fresh re-seals per hand-out; .stable holds the base still for chunking), and the
+//     new DuplicateSideBand error classifies a re-sent frame for a step already taken as
+//     a discardable duplicate. A BIND IS THE STAPLE, not a frame: pqRatchetBind /
+//     pqBootstrapBind LOSE their app parameter and OWE the classical half, which rides
+//     the binder's next classical COMMIT as the message-frame staple (draft-02 §7
+//     APQPrivateMessage) — so binds arrive via processIncoming, and pqRatchetApply /
+//     pqBootstrapApply are DELETED. A.5 reshaped to the same three-leg shape:
+//     Upd' → Commit' → stapled ACK; the counter-Upd' is gone, pqRekeyApply is
+//     initiator-only and returns Void, and one A.5 round re-keys ONE group (turn
+//     alternation covers the other). PqFrameKind loses ratchetBind/bootstrapBind and
+//     gains bootstrapWelcome. New pqReceiveBroken() query pairs with the new
+//     BindApplyFailed (peer's bind staple failed after the round's secret was consumed —
+//     receiving is poisoned until a restore) and BindDischargeFailed (our own owed bind
+//     failed mid-commit — permanently broken, route to re-establishment).
+// v19: evidence-gating — a classical commit no longer requires an app-approved proposal.
+//     A round commits when it folds an approved Upd (unchanged) OR when it owes a bind
+//     and is LICENSED by a peer offer built against our current epoch (proof the peer
+//     applied our previous commit). Host-visible: didCommit can be true with NO
+//     queueProposal, and committedRemoteClientId is nil on such a round (a proposal-less
+//     commit canonicalizes nothing of the peer's).
+private let expectedBindingContract: UInt64 = 19
 
 enum TwoMLSPQBindingContract {
 	static let verified: Void = {
@@ -580,53 +603,87 @@ extension AbstractTwoMLS {
 					detail: "message-path frame at the PQ side-band entry — "
 						+ "route to processIncoming")
 			}
+			// v18: binds are NOT side-band frames — a round's closing bind rides the
+			// binder's next classical COMMIT as the message-frame staple, so it
+			// arrives through `processIncoming` like any other message frame. This
+			// switch only ever sees the six side-band kinds, in lifecycle order.
 			switch kind {
-			case .rekeyUpdate:
-				// A.5 responder: commit the initiator's Upd' on our send-PQ; the
-				// [Commit'][counter-Upd'] reply parks for `advance` to hand out.
-				// A credential handoff announces the initiator's (already Phase
-				// 8-rotated) agent id in the Upd' — by the time this returns, the
-				// initiator's leaf in our send-PQ has moved to that agent's key.
-				let rotated = try base.pqRekeyRespond(updMsg: message)
-				return PQInbound(
-					kind: .rekey, advancedGroup: .ours,
-					newEpochs: epochs, rotatedCredential: rotated?.bytes)
-			case .rekeyCommit:
-				// Mid-operation (initiator: counter-Upd' present) our own send-PQ also
-				// committed and the final Commit' parks for `advance`; final (responder:
-				// empty counter) only our recv mirror advanced and the turn is ours.
-				let continued = try base.pqRekeyApply(msg: message)
-				return PQInbound(
-					kind: .rekey, advancedGroup: continued ? .ours : .theirs,
-					newEpochs: epochs, rotatedCredential: nil)
 			case .bootstrapKeyPackage:
+				// A.4 leg 1 (we respond): stand up our send group's deferred PQ
+				// half around the initiator's KP'; the Welcome' parks for `advance`.
 				try base.pqBootstrapRespond(kpMsg: message)
 				return PQInbound(
 					kind: .finishBootstrap, advancedGroup: .ours,
 					newEpochs: epochs, rotatedCredential: nil)
-			case .bootstrapBind:
-				try base.pqBootstrapApply(bindMsg: message)
+			case .bootstrapWelcome:
+				// A.4 leg 2 (we initiated): join the peer's new PQ group, commit
+				// our own send-PQ pathlessly, and OWE the classical half — the bind
+				// rides our next classical commit as the staple. `epochs` now reads
+				// pq+1 with classical unchanged; the pair evens out when the bind
+				// lands.
+				try base.pqBootstrapBind(welcomeMsg: message)
 				return PQInbound(
-					kind: .finishBootstrap, advancedGroup: .theirs,
+					kind: .finishBootstrap, advancedGroup: .ours,
 					newEpochs: epochs, rotatedCredential: nil)
 			case .ratchetEphemeralKey:
+				// A.3 (we respond): seal a fresh secret to the EK; the CT parks.
 				try base.pqRatchetRespond(ekMsg: message)
 				return PQInbound(
 					kind: .ratchet, advancedGroup: .theirs,
 					newEpochs: nil, rotatedCredential: nil)
 			case .ratchetCiphertext:
-				try base.pqRatchetBind(ctMsg: message, app: Data())
+				// A.3 (we initiated): open the sealed secret, commit our send-PQ,
+				// OWE the classical half. The round's app message travels on the
+				// committing round's own message frame — there is no app to pass.
+				try base.pqRatchetBind(ctMsg: message)
 				return PQInbound(
 					kind: .ratchet, advancedGroup: .ours,
 					newEpochs: epochs, rotatedCredential: nil)
-			case .ratchetBind:
-				let plaintext = try base.pqRatchetApply(bindMsg: message)
+			case .rekeyUpdate:
+				// A.5 (we respond): commit the initiator's Upd' on our send-PQ —
+				// the round's ONE updatePath commit, which also catches our own
+				// leaf up. Commit' parks for `advance`. A credential handoff
+				// announces the initiator's (already Phase 8-rotated) agent id in
+				// the Upd' — by the time this returns, the initiator's leaf in our
+				// send-PQ has moved to that agent's key.
+				let rotated = try base.pqRekeyRespond(updMsg: message)
 				return PQInbound(
-					kind: .ratchet, advancedGroup: .theirs,
-					newEpochs: epochs, rotatedCredential: nil,
-					plaintext: plaintext.isEmpty ? nil : plaintext)
+					kind: .rekey, advancedGroup: .ours,
+					newEpochs: epochs, rotatedCredential: rotated?.bytes)
+			case .rekeyCommit:
+				// A.5 (we initiated): apply the responder's Commit' to our recv
+				// mirror. One A.5 round re-keys ONE group — the turn alternation
+				// brings our own group's round next. Our stapled ACK (the round's
+				// closing bind) is owed internally and rides our next classical
+				// commit; nothing parks for `advance`.
+				try base.pqRekeyApply(msg: message)
+				return PQInbound(
+					kind: .rekey, advancedGroup: .theirs,
+					newEpochs: epochs, rotatedCredential: nil)
 			}
 			}
+		}
+
+		/// The retained side-band frame, sealed, WITHOUT consuming it — the
+		/// re-send path. Retention (v18) keeps the current round's outbound
+		/// available until the peer's answer proves it landed, so a driver may
+		/// hand this out on every send. `.fresh` re-seals per call (re-sends are
+		/// unlinkable on the wire); `.stable` repeats the bytes while the frame
+		/// is unchanged, which chunking requires. Advances no protocol state:
+		/// nothing to persist.
+		public func pendingSideBand(sealing: SideBandSealing) -> Data? {
+			base.pqPendingOutbound(sealing: sealing == .fresh ? .fresh : .stable)
+		}
+
+		/// Whether receiving is poisoned: a peer bind staple failed to apply
+		/// after the round's secret was consumed, so every further
+		/// `processIncoming` refuses with `.bindApplyFailed` while SENDING is
+		/// unaffected. Not reachable from an honest peer; healed by restoring
+		/// the last persisted state. A query rather than only an error, because
+		/// the urgency depends on the session's role — receive-critical treats
+		/// it as fatal, send-mostly can defer.
+		public var isReceiveBroken: Bool {
+			base.pqReceiveBroken()
 		}
 	}
 

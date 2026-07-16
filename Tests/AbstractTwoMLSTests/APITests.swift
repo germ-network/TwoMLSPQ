@@ -105,6 +105,8 @@ struct APIDemo {
 		#expect(localPQ.isFullyEstablished)
 		#expect(remotePQ.isFullyEstablished)
 
+		// The A.4 closing bind is OWED (v18): local's next committing round staples
+		// it, and this exchange is that round — remote applies it and takes the turn.
 		try localSession.exchange(with: remoteSession)
 
 		//routing follows the ratchet: when the peer's stapled Upd(self) is
@@ -122,7 +124,9 @@ struct APIDemo {
 		_ = try remoteSession.processIncoming(ciphertext: commitFrame.cipherText)
 
 		let (_, localListenLater) = try localSession.shouldListenOn()
-		#expect(localListenLater.count == localListen.count + 1)
+		// TWO new addresses since the capture: the A.4 bind-discharge commit (v18 —
+		// a classical commit like any other, so it mints one) and the Upd fold above.
+		#expect(localListenLater.count == localListen.count + 2)
 		let remotePostLater = try #require(try remoteSession.sendRendezvous)
 		#expect(remotePostLater != remotePost)
 		#expect(localListenLater.values.contains(remotePostLater))
@@ -133,7 +137,7 @@ struct APIDemo {
 		//commit's classical epoch keys the listen address the commit minted
 		#expect(
 			commitFrame.epochs
-				== AbstractTwoMLS.APQEpochs(pqEpoch: 1, classicalEpoch: 2))
+				== AbstractTwoMLS.APQEpochs(pqEpoch: 2, classicalEpoch: 3))
 		#expect(localListenLater[commitFrame.epochs.classicalEpoch] == remotePostLater)
 
 		//A.5 rekey: updatePath commits run on the PQ groups alone, so the
@@ -146,11 +150,11 @@ struct APIDemo {
 			throw TestErrors.unexpected
 		}
 		let rekeyIn2 = try remotePQ.ingest(rekeyReply.payload)
-		guard let rekeyFinal = try remotePQ.advance(after: rekeyIn2) else {
-			throw TestErrors.unexpected
-		}
-		_ = try localPQ.ingest(rekeyFinal.payload)
-		#expect(localPQ.epochs.pqEpoch == 2)
+		// v18: no third side-band frame — remote's closing ACK is owed and rides
+		// its next classical commit as the staple.
+		#expect(try remotePQ.advance(after: rekeyIn2) == nil)
+		try remoteSession.exchange(with: localSession)
+		#expect(localPQ.epochs.pqEpoch == 3)
 		#expect(remotePQ.epochs.pqEpoch == 2)
 
 		//and the session still messages both ways on the rekeyed groups
@@ -228,6 +232,11 @@ struct RotationDemo {
 		}
 		_ = try localPQ.ingest(bootReply.payload)
 		#expect(remotePQ.isFullyEstablished)
+		// Remote takes the turn only on APPLYING local's bind staple (v18), and
+		// local's committing round needs a LICENSE (v19): an inbound offer at its
+		// current epoch. Local committed last in the rotation dance, so run the
+		// exchange peer-first.
+		try remoteSession.exchange(with: localSession)
 		#expect(remotePQ.turn == .weInitiate)
 
 		//A.3 cannot carry a rotation — no updatePath rides the ratchet
@@ -250,11 +259,29 @@ struct RotationDemo {
 		}
 		let rekeyIn2 = try remotePQ.ingest(rekeyReply.payload)
 		guard rekeyIn2.rotatedCredential == nil else { throw TestErrors.unexpected }
-		guard let rekeyFinal = try remotePQ.advance(after: rekeyIn2) else {
-			throw TestErrors.unexpected
-		}
-		_ = try localPQ.ingest(rekeyFinal.payload)
-		#expect(localPQ.epochs.pqEpoch == 2)
+		// v18: no third side-band frame — remote's closing ACK is owed and rides
+		// its next classical commit as the staple (its PQ half already committed
+		// eagerly at the apply above).
+		#expect(try remotePQ.advance(after: rekeyIn2) == nil)
+		// Discharge remote's ACK via an approved FOLD (the crate's own
+		// discharge_bind shape) rather than the bare v19 license. MEASURED
+		// (2026-07-15, this bump): the license-only discharge works everywhere
+		// else in this suite, but for the ROTATED party it produces a frame the
+		// peer fails on with retriable DecryptionFailed — the plain-rekey ACK
+		// below, discharged by license from the un-rotated side, passes. Suspected
+		// TwoMLSPQ v0.5.0 edge in the v19 license path after a Phase 8 rotation +
+		// A.5 handoff; the crate's own rotation test also discharges via fold, so
+		// the license path is unexercised there. File upstream before relying on
+		// license-only discharge post-rotation.
+		_ = try localSession.prepareToEncrypt(proposing: nil)
+		let ackUpd = try localSession.encrypt(appMessage: Data("ack-upd".utf8))
+		let ackGot = try #require(try remoteSession.processIncoming(ciphertext: ackUpd.cipherText))
+		try remoteSession.queueProposal(digest: try #require(ackGot.proposal).digest)
+		let ackPrep = try #require(try remoteSession.prepareToEncrypt(proposing: nil))
+		#expect(ackPrep.didCommit)
+		let ackFrame = try remoteSession.encrypt(appMessage: Data("ack".utf8))
+		_ = try localSession.processIncoming(ciphertext: ackFrame.cipherText)
+		#expect(localPQ.epochs.pqEpoch == 3)
 		#expect(remotePQ.epochs.pqEpoch == 2)
 
 		//the rekeyed, rotated groups keep working — and a rotation-less rekey
@@ -268,10 +295,11 @@ struct RotationDemo {
 			throw TestErrors.unexpected
 		}
 		let plainIn2 = try localPQ.ingest(plainReply.payload)
-		guard let plainFinal = try localPQ.advance(after: plainIn2) else {
-			throw TestErrors.unexpected
-		}
-		_ = try remotePQ.ingest(plainFinal.payload)
+		// v18: local's closing ACK is likewise owed — no third frame to advance.
+		#expect(try localPQ.advance(after: plainIn2) == nil)
+		// Local's ACK discharges by the bare v19 license — the un-rotated party's
+		// license path works (contrast the fold above).
+		try localSession.exchange(with: remoteSession)
 	}
 }
 

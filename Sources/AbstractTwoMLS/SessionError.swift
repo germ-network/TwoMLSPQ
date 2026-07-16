@@ -55,6 +55,11 @@ extension AbstractTwoMLS {
 			/// A different welcome for an already-joined receive group — a
 			/// benign per-remote replay guard. Nothing to do.
 			case duplicateWelcome
+			/// A side-band frame for a step this session already took. Retention
+			/// (v18) makes these steady-state traffic — the peer re-sends its
+			/// frame until our answer lands — so a duplicate is a discard, never
+			/// a routing signal. Nothing to do.
+			case duplicateSideBand
 			/// A header frame that no receive-window key opens. One alone may be
 			/// a stranger's garbage; treat a RUN of these on a live session as a
 			/// reconnect signal (count them at the call site).
@@ -63,6 +68,21 @@ extension AbstractTwoMLS {
 			case malformedFrame
 			/// A stapled commit is ahead of the receive group — reconnect.
 			case epochDesync
+			/// A peer bind staple failed to apply AFTER the round's secret was
+			/// consumed: receiving is poisoned (every further processIncoming
+			/// refuses; the peer re-staples the same unappliable bind), while
+			/// SENDING is unaffected. Not reachable from an honest peer. Healed
+			/// by restoring the last persisted state — poll `isReceiveBroken`
+			/// to decide urgency by role (receive-critical: now; send-mostly:
+			/// deferred).
+			case bindApplyFailed
+			/// Our own owed bind failed mid-commit after its reservation was
+			/// consumed: the exporter leaf is spent, no retry can rebuild the
+			/// round, and the peer waits in its responded state forever. Not
+			/// reachable from any honest flow (it takes an internal MLS failure
+			/// mid-commit). The session's PQ binding is permanently broken —
+			/// route to re-establishment.
+			case bindDischargeFailed
 			/// The AS rejected a credential succession — authorize the fresh
 			/// proposal (`queueProposal`) and reprocess.
 			case credentialRejected
@@ -124,9 +144,10 @@ extension AbstractTwoMLS {
 				switch self {
 				case .decryptionFailed:
 					return .retryLater
-				case .staleFrame, .duplicateWelcome, .unopenableFrame, .malformedFrame:
+				case .staleFrame, .duplicateWelcome, .duplicateSideBand,
+					.unopenableFrame, .malformedFrame:
 					return .discardFrame
-				case .epochDesync:
+				case .epochDesync, .bindApplyFailed, .bindDischargeFailed:
 					return .reconnect
 				case .credentialRejected:
 					return .approveAndReprocess
