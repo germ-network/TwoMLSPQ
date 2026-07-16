@@ -1269,24 +1269,34 @@ impl TwoMlsPqSession {
             let (proposing, proposal_msg_bytes) = decode_proposal_section(&proposal_bytes)?;
             let digest = crate::sha256(&proposal_msg_bytes);
             // The evidence-gating watermark (see `peer_applied_send_epoch`). The peer staged
-            // this Upd in its recv group — which IS our send group — so its epoch is the peer's
-            // own view of our send group, and it could only have reached that view by applying
-            // our commits up to it. Read here, off the raw section, so evidence accrues on
-            // EVERY frame: approval is the app's to withhold, but the license is not the app's
-            // to stall.
+            // this Upd in its recv group — which IS our send group — so an offer that VALIDATES
+            // against our send group proves the peer reached the epoch we are sitting at, and
+            // could only have done so by applying our commits up to it. The license accrues on
+            // EVERY frame, not only approved ones — approval is the app's to withhold, the
+            // license is not the app's to stall — so this runs here, unconditionally.
             //
-            // Monotone, and it deliberately does not validate the offer (that is
-            // `queue_proposal`'s job): a frame that crossed one of our commits carries a
-            // now-stale epoch, and `max` simply ignores it rather than regressing the mark.
-            if let Some(offer_epoch) = MlsMessage::from_bytes(&proposal_msg_bytes)
-                .ok()
-                .and_then(|m| m.epoch())
+            // It must AUTHENTICATE, not just read the epoch field: that field is unsigned at
+            // this point (`queue_proposal` is where the offer is otherwise validated), so a
+            // malicious peer could inflate it and forge the license into discharging a bind the
+            // peer has not applied — two commits outstanding, the very hazard this gate exists
+            // to prevent. `validate_offered_update` is the same process-and-clear `queue_proposal`
+            // runs (no persistent state, safe to repeat), and a valid offer proves exactly our
+            // CURRENT send epoch — the most it can prove. Skip the work once already licensed.
+            if let Some(send_epoch) = inner
+                .send_group
+                .as_ref()
+                .map(|g| g.classical.current_epoch())
             {
-                inner.peer_applied_send_epoch = Some(
-                    inner
-                        .peer_applied_send_epoch
-                        .map_or(offer_epoch, |mark| mark.max(offer_epoch)),
-                );
+                let already = inner
+                    .peer_applied_send_epoch
+                    .is_some_and(|mark| mark >= send_epoch);
+                if !already
+                    && inner
+                        .validate_offered_update(&proposal_msg_bytes, &proposing)
+                        .is_ok()
+                {
+                    inner.peer_applied_send_epoch = Some(send_epoch);
+                }
             }
             inner.offered_proposal = Some((digest.clone(), proposal_msg_bytes, proposing.clone()));
             let proposal = Some(crate::QueuedRemoteProposal {

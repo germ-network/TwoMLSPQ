@@ -471,6 +471,66 @@ fn test_unlicensed_discharge_waits_for_evidence() {
     assert!(alice.my_pq_turn());
 }
 
+/// The license must AUTHENTICATE the offer, not trust the epoch field of raw proposal bytes.
+/// The peer's Upd is built in its recv group (= our send group), so its epoch is coupled to
+/// ours and an HONEST offer can never claim an epoch above our send group — but a malicious
+/// peer could SPLICE in a proposal claiming a higher one, forging the license into
+/// discharging a bind the peer has not applied (two commits outstanding, the hazard the gate
+/// exists to prevent). Here a legit frame from Alice is rewritten to carry a FOREIGN,
+/// higher-epoch Upd (from an unrelated session): it parses with a high `.epoch()` but does
+/// not validate against Bob's send group, so the watermark must not move.
+#[test]
+fn test_forged_high_epoch_offer_does_not_license() {
+    let (alice, bob) = establish_confirmed_sessions();
+    let bob_send_epoch = bob
+        .lock()
+        .send_group
+        .as_ref()
+        .unwrap()
+        .classical
+        .current_epoch();
+
+    // An unrelated session driven so its stapled Upd sits well above Bob's send epoch.
+    let (carol, dave) = establish_confirmed_sessions();
+    for _ in 0..4 {
+        approved_commit_round(&dave, &carol);
+    }
+    assert_ok!(carol.prepare_to_encrypt(None));
+    let carol_frame = assert_ok!(carol.encrypt(b"carol".to_vec()));
+    let carol_open = assert_some!(assert_ok!(dave.open_incoming(carol_frame.cipher_text)));
+    let (_, carol_section, _) = super::decode_message_frame(&carol_open.frame).unwrap();
+    let (_, foreign_upd) = super::decode_proposal_section(&carol_section).unwrap();
+    let forged_epoch = mls_rs::MlsMessage::from_bytes(&foreign_upd)
+        .unwrap()
+        .epoch()
+        .unwrap();
+    assert!(
+        forged_epoch > bob_send_epoch,
+        "the foreign Upd must claim a higher epoch than Bob's send group to be a real forgery"
+    );
+
+    // Splice the foreign high-epoch Upd into an otherwise-legit frame from Alice to Bob.
+    assert_ok!(alice.prepare_to_encrypt(None));
+    let alice_frame = assert_ok!(alice.encrypt(b"alice".to_vec()));
+    let alice_open = assert_some!(assert_ok!(bob.open_incoming(alice_frame.cipher_text)));
+    let (staple, _, app) = super::decode_message_frame(&alice_open.frame).unwrap();
+    let forged_section =
+        super::encode_proposal_section(&make_client().client_id().bytes, &foreign_upd);
+    let forged_frame = super::encode_message_frame(&staple, forged_section, app);
+    let forged_sealed = alice.lock().seal(&forged_frame).unwrap();
+
+    assert_some!(assert_ok!(bob.process_incoming(forged_sealed)));
+
+    // The forged high epoch did NOT license Bob: the offer failed to validate against his
+    // send group, so the watermark stayed put. (The old raw-epoch read would have jumped it
+    // to `forged_epoch`.)
+    let watermark = bob.lock().peer_applied_send_epoch;
+    assert!(
+        watermark.is_none_or(|m| m < forged_epoch),
+        "an unauthenticated high-epoch offer must not advance the license: {watermark:?} vs {forged_epoch}"
+    );
+}
+
 /// A rotation canonicalized by a DISCHARGING commit must land on the receiver exactly as
 /// one canonicalized by a plain commit.
 ///

@@ -251,7 +251,9 @@ pub fn version() -> String {
 // what has always thrown the "at most one commit outstanding per direction" rule (a fold IS
 // the evidence, since a stale-epoch offer is refused against the live send group); it is now
 // tracked explicitly (`peer_applied_send_epoch`, archived) because a proposal-less commit has
-// no fold to infer it from. Committing past an unapplied commit would break single-frame
+// no fold to infer it from. The tracker is stamped only from an offer that passes that same
+// validation — the raw epoch field is unsigned, so a spliced high-epoch offer cannot advance
+// it. Committing past an unapplied commit would break single-frame
 // healing AND supersede the only staple a bind's PQ half ever rides. Cadence-driven empty
 // commits are deliberately NOT offered: our commit invalidates the peer's in-flight offer, so
 // committing every licensed round would starve rotation for any host that deliberates.

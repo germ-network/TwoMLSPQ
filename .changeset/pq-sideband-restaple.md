@@ -150,7 +150,10 @@ spent — no classical reconnect repairs that). Folding *was* the evidence: the 
 `Upd(self)` in its recv group, which IS our send group, so the offer is bound to our epoch and
 `validate_offered_update` refuses a stale one against the live group. A proposal-less commit
 has no fold to infer it from, so the watermark is now explicit (`peer_applied_send_epoch`,
-read off every inbound frame's proposal, archived).
+archived). It is stamped only from an offer that passes the same `validate_offered_update` a
+fold runs: the epoch field of raw proposal bytes is unsigned, so a spliced high-epoch offer
+must not be trusted to advance it — a valid offer proves exactly our live send epoch, and the
+watermark is set to that.
 
 Why the proposal and not the peer's cross-injected PSK, which also proves application: the
 PSK rides **commits only**, so both directions would gate on each other and two concurrent

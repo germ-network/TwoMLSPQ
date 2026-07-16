@@ -290,22 +290,23 @@ struct SessionInner {
     /// evidence-gating watermark (book: Protocol Flows, "Evidence-gating"). `None` until the
     /// peer's first frame.
     ///
-    /// The peer builds its `Upd(self)` in its recv group, which IS our send group, so a
-    /// stapled proposal is bound to our send group's epoch: an offer at epoch `E` could only
-    /// have been produced by a party that had applied our commits through `E`. Read off every
-    /// inbound frame's proposal section — evidence rides every frame, which is what keeps the
-    /// license from deadlocking (a peer's cross-injected PSK proves the same thing but rides
-    /// commits only; see the book's note).
+    /// The peer builds its `Upd(self)` in its recv group, which IS our send group, so an offer
+    /// that VALIDATES against our send group proves the peer reached the epoch we are sitting
+    /// at. Set at receive off every frame's offer — evidence rides every frame, which is what
+    /// keeps the license from deadlocking (a peer's cross-injected PSK proves the same thing
+    /// but rides commits only; see the book's note) — but ONLY when the offer validates
+    /// (`validate_offered_update`): the raw epoch field is unauthenticated, and trusting it
+    /// would let a malicious peer splice a higher epoch and forge the license. A valid offer
+    /// proves exactly our current send epoch, so that is what this is stamped to.
     ///
     /// What it licenses: a commit that does NOT fold an approved proposal (the discharge of an
-    /// owed bind). A fold needs no separate check — it IS the evidence, since
-    /// `validate_offered_update` refuses a stale-epoch offer against the live send group.
-    /// Without the license a discharge could commit past a bind the peer has not applied,
-    /// superseding the only staple its PQ half ever rides.
+    /// owed bind). A fold needs no separate check — it IS the evidence, folding a proposal
+    /// `validate_offered_update` already accepted. Without the license a discharge could commit
+    /// past a bind the peer has not applied, superseding the only staple its PQ half ever rides.
     ///
-    /// Monotone (`max`), and bounded above by our own send epoch: the peer cannot apply a
-    /// commit we never made. Rides the archive — losing it would re-license a commit the
-    /// evidence no longer supports.
+    /// Monotone, and never exceeds our own send epoch (it is stamped TO it, and the peer cannot
+    /// have applied a commit we never made). Rides the archive — losing it would re-license a
+    /// commit the evidence no longer supports.
     peer_applied_send_epoch: Option<u64>,
     /// The A.5 analogue of [`last_cross_injected`] for the recv-PQ mirror (the peer's
     /// send-PQ): the peer send-PQ epoch we last cross-injected during a PQ re-key. Two
@@ -682,15 +683,15 @@ impl SessionInner {
         let peer_index = if mine == 0 { 1 } else { 0 };
         let prior_peer = sender_client_id(&recv.classical, peer_index)?;
         let prior_own = sender_client_id(&recv.classical, mine)?;
+        // The specific error here does not reach the host: `s` is already consumed, so the
+        // sole caller (the bind-staple arm) latches ANY failure of this method as
+        // `BindApplyFailed` and re-establish is the only recovery — a credential refusal is no
+        // more retriable in place than any other, since the round cannot be re-applied without
+        // the spent secret. So map to the plain `Mls`; the caller's latch is authoritative.
         let cl_attestation = match recv
             .classical
             .process_incoming_message(cl)
-            // The AS validates the credentials this commit carries, and its refusal is
-            // retriable (the staple re-rides every frame, so authorize-and-reprocess
-            // recovers the round) — flattening it into `Mls` would strand a host that
-            // routes `CredentialRejected` to that recovery. Non-credential errors keep
-            // mapping to `Mls`, which is `map_credential_err`'s own fallback.
-            .map_err(map_credential_err)?
+            .map_err(|_| TwoMlsPqError::Mls)?
         {
             ReceivedMessage::Commit(desc) => {
                 commit_attestation(&desc)?.ok_or(TwoMlsPqError::ApqInfoMismatch)?

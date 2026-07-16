@@ -95,12 +95,16 @@ fact, but any frame carrying their commit also carries their proposal at our epo
 `[staple][proposal][app]`, all sections mandatory — so proposal-evidence strictly contains
 commit-evidence, and it also arrives on the frames where they don't commit.)
 
-**The license is not approval.** It is read off the *raw* offer's epoch, before — and independent
-of — validation or `queue_proposal`: an offer the app never approves, is slow to approve, or
-whose credential would be refused still licenses the discharge. Approval is the app's to withhold
-(it is the AS authorization step, and folding stays gated on it); the license is not the app's to
-stall, so a bug or delay in approving a remote proposal can never block a bind's classical
-commit.
+**The license is not approval, but it is authenticated.** It accrues at receive, independent of
+`queue_proposal`: an offer the app never approves, is slow to approve, or whose credential the AS
+would refuse still licenses the discharge — approval is the app's to withhold (it is the AS
+authorization step, and folding stays gated on it), but the license is not the app's to stall, so
+a bug or delay in approving a remote proposal can never block a bind's classical commit. What the
+license does require is that the offer *validate* against our send group (the same
+`validate_offered_update` a fold runs, applied here unconditionally): the epoch field of raw
+proposal bytes is unsigned, so trusting it would let a malicious peer splice a higher epoch and
+forge the license into discharging a bind the peer has not applied. A valid offer proves exactly
+our current send epoch, and the watermark is stamped to that.
 
 This was implicit for as long as folding an approved proposal was the *only* way to commit: the
 fold IS the evidence, since `validate_offered_update` runs the offer through mls-rs against the
