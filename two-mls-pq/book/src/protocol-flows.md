@@ -105,7 +105,7 @@ sequenceDiagram
     Alice->>Alice: Creates an APQ group from Bob's APQ keyPackage = Alice's send group
     Alice->>Bob: One HPKE envelope [ app payload ∥ APQ Welcome (Alice's send group) ],<br/>sealed to the PQ EK in Bob's APQ keyPackage
 
-    Alice->>Bob: App messages in Alice's send group — each a fresh HPKE envelope to Bob's keyPackage (as the initial frame),<br/>re-stapling the APQ Welcome — any single one lets Bob join and read it. Once Alice joins Bob's send group she<br/>header-seals instead, still re-stapling the Welcome until her first commit supersedes it
+    Alice->>Bob: App messages in Alice's send group — each a fresh HPKE envelope to Bob's keyPackage (as the initial frame),<br/>re-stapling the APQ Welcome; any single one lets Bob join and read it. Once Alice joins Bob's send group she<br/>header-seals instead, still re-stapling the Welcome until her first commit supersedes it
 
     Note over Bob: Process Welcome
     Bob->>Bob: Processes the Welcome to produce a classical group
