@@ -26,12 +26,13 @@ use super::*;
 //
 // The space is BANDED. Each band owns a contiguous range of odd bytes, is packed from its
 // start, and keeps its remaining room at the end:
-//   0x01–0x03  message path      — APQWelcome, message frame. FULL, and closed by design:
-//                                  the message path has exactly one shape.
-//   0x05–0x0F  A.1 establishment — envelope (invitation channel), pre-establishment staple.
+//   0x01–0x05  message path      — APQWelcome, message frame, APQPrivateMessage (the staple
+//                                  slot's bind form, declared in `apq`). FULL, and closed by
+//                                  design: the message path has exactly these shapes.
+//   0x07–0x11  A.1 establishment — envelope (invitation channel), pre-establishment staple.
 //                                  2 of 6; the hybrid nested envelope would land here.
-//   0x11–0x2F  PQ side-band      — exactly the tags `pq_frame_kind` classifies, in lifecycle
-//                                  order: bootstrap, then ratchet, then re-key. 8 of 16.
+//   0x13–0x31  PQ side-band      — exactly the tags `pq_frame_kind` classifies, in lifecycle
+//                                  order: bootstrap, then ratchet, then re-key. 6 of 16.
 //
 // Banding is what makes "the side-band is 0x11–0x2F" a claim that survives growth, and it
 // was bought by a renumber: the tags were allocation-ordered, so appending the A.4 bind past
@@ -66,57 +67,54 @@ use super::*;
 // the stapled Upd for app approval.
 pub(crate) const MESSAGE_FRAME_TAG: u8 = 0x03;
 
-// ── Band: A.1 establishment (0x05–0x0F, 2 of 6 used) ────────────────────────────────
-// 0x05 is `key_packages::INITIAL_ENVELOPE_TAG` — declared there, not here, because an
+// ── Band: A.1 establishment (0x07–0x11, 2 of 6 used) ────────────────────────────────
+// 0x07 is `key_packages::INITIAL_ENVELOPE_TAG` — declared there, not here, because an
 // envelope is not a session frame. It heads this band; the staple below packs in behind it,
-// and the room past 0x07 is where a hybrid nested envelope would go.
+// and the room past 0x09 is where a hybrid nested envelope would go.
 
-/// §A.1 pre-establishment app staple: `[0x07][BSG-cl PrivateMessage]` — the initiator's
+/// §A.1 pre-establishment app staple: `[tag][BSG-cl PrivateMessage]` — the initiator's
 /// app message riding a §A.1 envelope's `stapled_message` section before its recv group
 /// exists (the 0x03 message frame is structurally unavailable then: its proposal section
 /// is mandatory and there is no recv group to propose into). Travels ONLY inside the
 /// HPKE envelope on the invitation channel — never header-sealed, so it is deliberately
 /// NOT an `opened_frame_kind`; the host hands it to `process_incoming` after the join.
-pub(crate) const PRE_ESTABLISHMENT_APP_TAG: u8 = 0x07;
+pub(crate) const PRE_ESTABLISHMENT_APP_TAG: u8 = 0x09;
 
-// ── Band: PQ side-band (0x11–0x2F, 8 of 16 used) ────────────────────────────────────
+// ── Band: PQ side-band (0x13–0x31, 6 of 16 used) ────────────────────────────────────
 // Exactly the tags `pq_frame_kind` classifies, ordered by lifecycle: a session bootstraps
 // its deferred PQ half once (A.4), then ratchets it repeatedly (A.3), and re-keys it
 // occasionally (A.5). Note the section numbers do NOT follow that order — the spec numbers
 // are historical; renumbering them is a separate, deferred change.
+//
+// No round's closing bind appears here: a bind is the message-frame STAPLE (the draft-02
+// §7 APQPrivateMessage, whose tag lives in the message-path band), so every side-band
+// frame below is answered by the round's next leg and none is terminal.
 
 /// A.4 bootstrap: this side's PQ key package, sent so the peer can stand up its deferred
 /// send-group PQ half.
-pub(crate) const PQ_BOOTSTRAP_KP_TAG: u8 = 0x11;
+pub(crate) const PQ_BOOTSTRAP_KP_TAG: u8 = 0x13;
 
 /// A.4 bootstrap reply: the new PQ group's welcome. PQ-groups-only — no classical commit
-/// rides here; the initiator's bind (0x15) is what reaches a classical group.
-pub(crate) const PQ_BOOTSTRAP_WELCOME_TAG: u8 = 0x13;
+/// rides here; the initiator's stapled bind is what reaches a classical group.
+pub(crate) const PQ_BOOTSTRAP_WELCOME_TAG: u8 = 0x15;
 
-/// A.4 bootstrap bind — the round's terminal frame, and structurally A.3's bind (0x1B):
-/// `[pq partial-commit][classical commit][app]`. The initiator sends it after joining the
-/// welcomed group, and it differs from A.3's only in where the injected secret came from —
-/// an exporter off the newly joined group rather than a KEM exchange. That secret is
-/// derivable only from INSIDE that group, so a bind that applies at all proves the
-/// initiator joined: A.4's receipt is a side effect of entropy it had to chain anyway.
-pub(crate) const PQ_BOOTSTRAP_BIND_TAG: u8 = 0x15;
-
-// PQ ratchet (book: Protocol Flows §A.3), cryptokit only:
-// 0x17 carries the initiator's ML-KEM encapsulation key, 0x19 the responder's ciphertext,
-// 0x1B the bind = [pq partial-commit][classical commit][app], all length-prefixed.
+// PQ ratchet (book: Protocol Flows §A.3), cryptokit only: the initiator's ML-KEM
+// encapsulation key and the responder's ciphertext. The round closes with the
+// initiator's stapled bind, not a frame.
 pub(crate) const PQ_EK_TAG: u8 = 0x17;
 pub(crate) const PQ_CT_TAG: u8 = 0x19;
-pub(crate) const PQ_BIND_TAG: u8 = 0x1B;
 
-// A.5 rekey (book: Protocol Flows §A.5), cryptokit only — updatePath commits run on the
-// PQ groups alone so the classical ratchet is never blocked behind a large ML-KEM
-// updatePath. 0x1D carries the initiator's Upd' proposal for the responder's send-PQ;
-// 0x1F = [Commit'][counter-Upd'-or-empty], length-prefixed — the responder's reply
-// carries its counter-proposal, the initiator's final commit an empty slot. Each Commit'
-// cross-injects a PSK exported from the opposite PQ send group; the bumped pq_epoch
-// reconciles into APQInfo at the next A.3 bind (no AppDataUpdate rides these commits).
-pub(crate) const PQ_REKEY_UPD_TAG: u8 = 0x1D;
-pub(crate) const PQ_REKEY_COMMIT_TAG: u8 = 0x1F;
+// A.5 rekey (book: Protocol Flows §A.5), cryptokit only — the one updatePath commit runs
+// on the PQ groups alone so the classical ratchet is never blocked behind a large ML-KEM
+// updatePath. PQ_REKEY_UPD carries the initiator's Upd' proposal for the responder's
+// send-PQ (the proposal replaces the proposer's leaf); PQ_REKEY_COMMIT the responder's
+// Commit' folding it (the updatePath replaces the committer's leaf, and a cross-PSK from
+// the responder's recv mirror rides along). The round's third leg is not a side-band
+// frame at all: the initiator ACKS with a pathless partial commit stapled onto its next
+// classical COMMIT — a conformant FULL commit whose AppDataUpdate reconciles the bumped
+// pq_epoch in-round (the side-band Commit' itself still carries no attestation).
+pub(crate) const PQ_REKEY_UPD_TAG: u8 = 0x1B;
+pub(crate) const PQ_REKEY_COMMIT_TAG: u8 = 0x1D;
 
 /// Encode a pre-establishment app staple: `[0x07][app message bytes]`.
 pub(crate) fn encode_pre_establishment_app(app: &[u8]) -> Vec<u8> {
@@ -126,29 +124,27 @@ pub(crate) fn encode_pre_establishment_app(app: &[u8]) -> Vec<u8> {
     out
 }
 
-/// The eight PQ side-band frame kinds the host routes through `TwoMlsPqSession::ingest`
+/// The six PQ side-band frame kinds the host routes through `TwoMlsPqSession::ingest`
 /// (the `begin`/`ingest`/`advance` surface in the AbstractTwoMLS adapter). Exported so the
 /// host classifies a frame from THIS binary via [`pq_frame_kind`] instead of hardcoding the
 /// tag bytes: the tags stay defined once, above, and a renumber can no longer drift out of
 /// sync with a hand-copied host switch.
+///
+/// No bind appears here: every round's closing bind rides the message path as the frame
+/// staple, so it reaches the host as an ordinary message frame for `process_incoming`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum PqFrameKind {
-    /// 0x05 — A.3 ratchet: the initiator's ML-KEM encapsulation key.
-    RatchetEphemeralKey,
-    /// 0x07 — A.3 ratchet: the responder's ciphertext.
-    RatchetCiphertext,
-    /// 0x09 — A.3 ratchet: the bind (`[pq partial-commit][classical commit][app]`).
-    RatchetBind,
-    /// 0x0B — A.4 bootstrap: this side's PQ key package.
+    /// 0x13 — A.4 bootstrap: this side's PQ key package.
     BootstrapKeyPackage,
-    /// 0x0D — A.4 bootstrap: the reply (the new PQ group's welcome).
+    /// 0x15 — A.4 bootstrap: the reply (the new PQ group's welcome).
     BootstrapWelcome,
-    /// 0x15 — A.4 bootstrap: the initiator's terminal bind
-    /// (`[pq partial-commit][classical commit][app]`), which also confirms the welcome.
-    BootstrapBind,
-    /// 0x0F — A.5 rekey: the initiator's Upd' proposal.
+    /// 0x17 — A.3 ratchet: the initiator's ML-KEM encapsulation key.
+    RatchetEphemeralKey,
+    /// 0x19 — A.3 ratchet: the responder's ciphertext.
+    RatchetCiphertext,
+    /// 0x1B — A.5 rekey: the initiator's Upd' proposal.
     RekeyUpdate,
-    /// 0x11 — A.5 rekey: the responder's `[Commit'][counter-Upd'-or-empty]` reply.
+    /// 0x1D — A.5 rekey: the responder's Commit' reply.
     RekeyCommit,
 }
 
@@ -185,18 +181,16 @@ pub enum SideBandSealing {
 }
 
 /// Classify a PQ side-band frame by its leading tag byte (`message[0]`). Returns `None` for
-/// any byte that is not one of the seven side-band tags — the host treats that as a malformed
+/// any byte that is not one of the six side-band tags — the host treats that as a malformed
 /// side-band frame. Single source of truth for the wire tags: the host dispatches on the
 /// returned kind rather than matching raw bytes it would otherwise have to keep in sync here.
 #[uniffi::export]
 pub fn pq_frame_kind(tag: u8) -> Option<PqFrameKind> {
     Some(match tag {
-        PQ_EK_TAG => PqFrameKind::RatchetEphemeralKey,
-        PQ_CT_TAG => PqFrameKind::RatchetCiphertext,
-        PQ_BIND_TAG => PqFrameKind::RatchetBind,
         PQ_BOOTSTRAP_KP_TAG => PqFrameKind::BootstrapKeyPackage,
         PQ_BOOTSTRAP_WELCOME_TAG => PqFrameKind::BootstrapWelcome,
-        PQ_BOOTSTRAP_BIND_TAG => PqFrameKind::BootstrapBind,
+        PQ_EK_TAG => PqFrameKind::RatchetEphemeralKey,
+        PQ_CT_TAG => PqFrameKind::RatchetCiphertext,
         PQ_REKEY_UPD_TAG => PqFrameKind::RekeyUpdate,
         PQ_REKEY_COMMIT_TAG => PqFrameKind::RekeyCommit,
         _ => return None,
@@ -264,22 +258,8 @@ fn read_sections<const N: usize>(body: &[u8]) -> Result<[Vec<u8>; N]> {
     Ok(out)
 }
 
-pub(crate) fn encode_pq_bind(
-    pq_commit: Vec<u8>,
-    classical_commit: Vec<u8>,
-    app: Vec<u8>,
-) -> Vec<u8> {
-    let mut out =
-        Vec::with_capacity(1 + 4 + pq_commit.len() + 4 + classical_commit.len() + 4 + app.len());
-    out.push(PQ_BIND_TAG);
-    push_section(&mut out, &pq_commit);
-    push_section(&mut out, &classical_commit);
-    push_section(&mut out, &app);
-    out
-}
-
-/// Encode the A.4 bootstrap reply: `[0x0D][pq_welcome…]`. PQ-groups-only per the spec — no
-/// classical commit rides along; the initiator's bind (0x15) carries the classical half.
+/// Encode the A.4 bootstrap reply: `[tag][pq_welcome…]`. PQ-groups-only per the spec — no
+/// classical commit rides along; the initiator's stapled bind carries the classical half.
 pub(crate) fn encode_bootstrap_welcome(pq_welcome: Vec<u8>) -> Vec<u8> {
     let mut out = Vec::with_capacity(1 + pq_welcome.len());
     out.push(PQ_BOOTSTRAP_WELCOME_TAG);
@@ -295,57 +275,23 @@ pub(crate) fn decode_bootstrap_welcome(bytes: &[u8]) -> Result<Vec<u8>> {
     Ok(rest.to_vec())
 }
 
-/// Encode the A.4 bootstrap bind: `[0x15][pq_commit][classical_commit][app]` — A.3's bind
-/// shape (`encode_pq_bind`) under its own tag, so the two rounds' terminal frames cannot be
-/// confused at the door.
-pub(crate) fn encode_bootstrap_bind(
-    pq_commit: Vec<u8>,
-    classical_commit: Vec<u8>,
-    app: Vec<u8>,
-) -> Vec<u8> {
-    let mut out =
-        Vec::with_capacity(1 + 4 + pq_commit.len() + 4 + classical_commit.len() + 4 + app.len());
-    out.push(PQ_BOOTSTRAP_BIND_TAG);
-    push_section(&mut out, &pq_commit);
-    push_section(&mut out, &classical_commit);
-    push_section(&mut out, &app);
-    out
-}
-
-pub(crate) fn decode_bootstrap_bind(bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
-    let (&tag, rest) = bytes.split_first().ok_or(TwoMlsPqError::Mls)?;
-    if tag != PQ_BOOTSTRAP_BIND_TAG {
-        return Err(TwoMlsPqError::Mls);
-    }
-    let [pq_commit, classical_commit, app] = read_sections::<3>(rest)?;
-    Ok((pq_commit, classical_commit, app))
-}
-
-pub(crate) fn decode_pq_bind(bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
-    let (&tag, rest) = bytes.split_first().ok_or(TwoMlsPqError::Mls)?;
-    if tag != PQ_BIND_TAG {
-        return Err(TwoMlsPqError::Mls);
-    }
-    let [pq_commit, classical_commit, app] = read_sections::<3>(rest)?;
-    Ok((pq_commit, classical_commit, app))
-}
-
-/// Encode an A.5 rekey Commit' frame: `[0x11][commit][counter-Upd'-or-empty]`.
-pub(crate) fn encode_pq_rekey_commit(commit: Vec<u8>, counter_proposal: Vec<u8>) -> Vec<u8> {
-    let mut out = Vec::with_capacity(1 + 8 + commit.len() + counter_proposal.len());
+/// Encode the A.5 rekey reply: `[tag][Commit' bytes]` — one payload, like the A.4
+/// welcome reply it is the sibling of. The old second section (the counter-Upd') died
+/// with the counter-proposal: the round's last leg is the initiator's stapled ack, not
+/// another side-band commit.
+pub(crate) fn encode_pq_rekey_commit(commit: Vec<u8>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + commit.len());
     out.push(PQ_REKEY_COMMIT_TAG);
-    push_section(&mut out, &commit);
-    push_section(&mut out, &counter_proposal);
+    out.extend_from_slice(&commit);
     out
 }
 
-pub(crate) fn decode_pq_rekey_commit(bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
+pub(crate) fn decode_pq_rekey_commit(bytes: &[u8]) -> Result<Vec<u8>> {
     let (&tag, rest) = bytes.split_first().ok_or(TwoMlsPqError::Mls)?;
     if tag != PQ_REKEY_COMMIT_TAG {
         return Err(TwoMlsPqError::Mls);
     }
-    let [commit, counter_proposal] = read_sections::<2>(rest)?;
-    Ok((commit, counter_proposal))
+    Ok(rest.to_vec())
 }
 
 /// The one message-path frame (0x03): `[staple][Upd(sender) proposal][app]`, every
@@ -417,21 +363,20 @@ mod pq_frame_kind_tests {
     #[test]
     fn classifies_every_side_band_tag() {
         assert_eq!(
+            pq_frame_kind(PQ_BOOTSTRAP_KP_TAG),
+            Some(PqFrameKind::BootstrapKeyPackage)
+        );
+        assert_eq!(
+            pq_frame_kind(PQ_BOOTSTRAP_WELCOME_TAG),
+            Some(PqFrameKind::BootstrapWelcome)
+        );
+        assert_eq!(
             pq_frame_kind(PQ_EK_TAG),
             Some(PqFrameKind::RatchetEphemeralKey)
         );
         assert_eq!(
             pq_frame_kind(PQ_CT_TAG),
             Some(PqFrameKind::RatchetCiphertext)
-        );
-        assert_eq!(pq_frame_kind(PQ_BIND_TAG), Some(PqFrameKind::RatchetBind));
-        assert_eq!(
-            pq_frame_kind(PQ_BOOTSTRAP_KP_TAG),
-            Some(PqFrameKind::BootstrapKeyPackage)
-        );
-        assert_eq!(
-            pq_frame_kind(PQ_BOOTSTRAP_BIND_TAG),
-            Some(PqFrameKind::BootstrapBind)
         );
         assert_eq!(
             pq_frame_kind(PQ_REKEY_UPD_TAG),
@@ -445,22 +390,24 @@ mod pq_frame_kind_tests {
 
     #[test]
     fn rejects_non_side_band_tags() {
-        // Bare-MLS first byte, the APQWelcome and message-frame tags, evens inside the
-        // side-band band, the pre-establishment staple tag (0x07 — envelope-interior only),
-        // the envelope tag (0x05 — invitation channel only), a RESERVED odd byte inside the
-        // side-band band (0x21 — in range, not allocated), the establishment band's reserve
-        // (0x09), and a byte past every band (0x31) are not side-band frames.
+        // Bare-MLS first byte, the three message-path tags (welcome, message frame, and
+        // the APQPrivateMessage staple form — a bind is not a side-band frame), evens
+        // inside the side-band band, the pre-establishment staple tag (envelope-interior
+        // only), the envelope tag (invitation channel only), the establishment band's
+        // reserve (0x0B), a RESERVED odd byte inside the side-band band (0x1F — in range,
+        // not allocated), and a byte past every band (0x33) are not side-band frames.
         for tag in [
             0x00,
             APQ_TAG,
             MESSAGE_FRAME_TAG,
-            0x12,
+            apq::APQ_PRIVATE_MESSAGE_TAG,
+            0x14,
             0x1A,
             PRE_ESTABLISHMENT_APP_TAG,
             crate::key_packages::INITIAL_ENVELOPE_TAG,
-            0x09,
-            0x21,
-            0x31,
+            0x0B,
+            0x1F,
+            0x33,
             0xFF,
         ] {
             assert_eq!(
@@ -493,17 +440,21 @@ mod pq_frame_kind_tests {
         Band {
             name: "message path",
             start: 0x01,
-            end: 0x03,
-            // Full, and closed by design: the message path has exactly one shape.
+            end: 0x05,
+            // Full, and closed by design: the message path has exactly these shapes. The
+            // APQPrivateMessage is the staple slot's bind form — it never appears as a
+            // top-level frame, but its tag is a first byte the staple slot discriminates
+            // on, so it is allocated here where the slot's other forms live.
             tags: &[
                 (APQ_TAG, "apq::APQ_TAG"),
                 (MESSAGE_FRAME_TAG, "MESSAGE_FRAME_TAG"),
+                (apq::APQ_PRIVATE_MESSAGE_TAG, "apq::APQ_PRIVATE_MESSAGE_TAG"),
             ],
         },
         Band {
             name: "A.1 establishment",
-            start: 0x05,
-            end: 0x0F,
+            start: 0x07,
+            end: 0x11,
             tags: &[
                 (
                     crate::key_packages::INITIAL_ENVELOPE_TAG,
@@ -514,16 +465,15 @@ mod pq_frame_kind_tests {
         },
         Band {
             name: "PQ side-band",
-            start: 0x11,
-            end: 0x2F,
-            // Lifecycle order: bootstrap once, then ratchet, then re-key.
+            start: 0x13,
+            end: 0x31,
+            // Lifecycle order: bootstrap once, then ratchet, then re-key. No binds — a
+            // round's closing bind is the message-frame staple, not a side-band frame.
             tags: &[
                 (PQ_BOOTSTRAP_KP_TAG, "PQ_BOOTSTRAP_KP_TAG"),
                 (PQ_BOOTSTRAP_WELCOME_TAG, "PQ_BOOTSTRAP_WELCOME_TAG"),
-                (PQ_BOOTSTRAP_BIND_TAG, "PQ_BOOTSTRAP_BIND_TAG"),
                 (PQ_EK_TAG, "PQ_EK_TAG"),
                 (PQ_CT_TAG, "PQ_CT_TAG"),
-                (PQ_BIND_TAG, "PQ_BIND_TAG"),
                 (PQ_REKEY_UPD_TAG, "PQ_REKEY_UPD_TAG"),
                 (PQ_REKEY_COMMIT_TAG, "PQ_REKEY_COMMIT_TAG"),
             ],

@@ -20,6 +20,28 @@ use crate::{CombinerError, Result};
 /// APQ welcome envelope tag: [0x01][u32-LE classical-len][classical][u32-LE pq-len][pq].
 pub const APQ_TAG: u8 = 0x01;
 
+/// APQ private-message envelope tag:
+/// `[0x05][u32-LE t-len][t_message][u32-LE pq-len][pq_message]`.
+///
+/// Germ framing around draft-ietf-mls-combiner-02 §7's `APQPrivateMessage`:
+///
+/// ```text
+/// struct {
+///   MLSPrivateMessage t_message;
+///   MLSPrivateMessage pq_message;
+/// } APQPrivateMessage
+/// ```
+///
+/// The draft defines no `APQCommit` — a FULL commit travels as this, each half's message
+/// carrying its own session's commit. That is what this is for: the A.3/A.4 bind's two
+/// commits, ridden as the message frame's staple.
+///
+/// **Why the tag exists.** The struct cannot self-discriminate: its first byte is its inner
+/// `MLSPrivateMessage`'s, i.e. `0x00`, which is exactly a bare `MLSMessage`. The staple slot
+/// tells its forms apart by first byte alone (`0x00` MLSMessage vs `0x01` APQWelcome), so
+/// the draft shape is wrapped, as [`APQ_TAG`] wraps `APQWelcome`.
+pub const APQ_PRIVATE_MESSAGE_TAG: u8 = 0x05;
+
 pub type MlsGroup<S, C> = Group<OurConfig<S, C>>;
 pub type PqMlsGroup<S, P> = Group<PqConfig<S, P>>;
 
@@ -184,37 +206,66 @@ where
 
 /// Encode the two-welcome APQ envelope (classical + pq).
 pub fn encode_apq_welcome(classical: Vec<u8>, pq: Vec<u8>) -> Vec<u8> {
-    let mut out = Vec::with_capacity(1 + 4 + classical.len() + 4 + pq.len());
-    out.push(APQ_TAG);
-    out.extend_from_slice(&(classical.len() as u32).to_le_bytes());
-    out.extend_from_slice(&classical);
-    out.extend_from_slice(&(pq.len() as u32).to_le_bytes());
-    out.extend_from_slice(&pq);
-    out
+    encode_apq_pair(APQ_TAG, classical, pq)
 }
 
 /// Decode the two-welcome APQ envelope into (classical, pq) welcome bytes.
 pub fn decode_apq_welcome(bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
+    decode_apq_pair(bytes, APQ_TAG)
+}
+
+/// Encode an `APQPrivateMessage` (draft-02 §7) in Germ framing: the traditional half's
+/// message and the PQ half's, each length-prefixed, under [`APQ_PRIVATE_MESSAGE_TAG`].
+///
+/// A FULL commit travels this way — `t_message` carries the classical commit, `pq_message`
+/// the PQ one — which is what makes the A.3/A.4 bind an ordinary staple rather than a frame
+/// kind of its own.
+pub fn encode_apq_private_message(t_message: Vec<u8>, pq_message: Vec<u8>) -> Vec<u8> {
+    encode_apq_pair(APQ_PRIVATE_MESSAGE_TAG, t_message, pq_message)
+}
+
+/// Decode an `APQPrivateMessage` into `(t_message, pq_message)` bytes.
+pub fn decode_apq_private_message(bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
+    decode_apq_pair(bytes, APQ_PRIVATE_MESSAGE_TAG)
+}
+
+/// `[tag][u32-LE a-len][a][u32-LE b-len][b]` — the shape every Germ-framed two-half draft
+/// structure shares.
+fn encode_apq_pair(tag: u8, a: Vec<u8>, b: Vec<u8>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + 4 + a.len() + 4 + b.len());
+    out.push(tag);
+    out.extend_from_slice(&(a.len() as u32).to_le_bytes());
+    out.extend_from_slice(&a);
+    out.extend_from_slice(&(b.len() as u32).to_le_bytes());
+    out.extend_from_slice(&b);
+    out
+}
+
+/// The inverse of [`encode_apq_pair`], and one of the crate's attacker-facing parsers: every
+/// length is checked against what is actually there before it is trusted, and trailing bytes
+/// are a hard error rather than ignored — a decoder that accepts a suffix lets one blob mean
+/// two things to two readers.
+fn decode_apq_pair(bytes: &[u8], expect_tag: u8) -> Result<(Vec<u8>, Vec<u8>)> {
     let (&tag, rest) = bytes.split_first().ok_or(CombinerError::Mls)?;
-    if tag != APQ_TAG {
+    if tag != expect_tag {
         return Err(CombinerError::Mls);
     }
     if rest.len() < 4 {
         return Err(CombinerError::Mls);
     }
-    let c_len = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
+    let a_len = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
     let rest = &rest[4..];
-    if rest.len() < c_len + 4 {
+    if rest.len() < a_len + 4 {
         return Err(CombinerError::Mls);
     }
-    let classical = rest[..c_len].to_vec();
-    let rest = &rest[c_len..];
-    let p_len = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
+    let a = rest[..a_len].to_vec();
+    let rest = &rest[a_len..];
+    let b_len = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
     let rest = &rest[4..];
-    if rest.len() != p_len {
+    if rest.len() != b_len {
         return Err(CombinerError::Mls);
     }
-    Ok((classical, rest.to_vec()))
+    Ok((a, rest.to_vec()))
 }
 
 /// Trailing domain byte that distinguishes a PQ-ratchet *injected-secret* PSK id from an
@@ -1110,6 +1161,47 @@ mod tests {
             alice_send.pq.as_ref().unwrap().group_id(),
             bob_recv.pq.as_ref().unwrap().group_id()
         );
+    }
+
+    /// draft-02 §7's `APQPrivateMessage`, in Germ framing. The halves must come back
+    /// distinct and in order — a pair codec that transposes them would still round-trip
+    /// through a symmetric test, so the two payloads differ.
+    #[test]
+    fn test_apq_private_message_round_trips() {
+        let t = vec![0xAA, 0xBB, 0xCC];
+        let pq = vec![0x11, 0x22];
+        let encoded = encode_apq_private_message(t.clone(), pq.clone());
+        assert_eq!(encoded[0], APQ_PRIVATE_MESSAGE_TAG);
+        assert_eq!(decode_apq_private_message(&encoded).unwrap(), (t, pq));
+    }
+
+    /// The two envelopes share one parser, so they must not share a tag: an APQWelcome must
+    /// not decode as an APQPrivateMessage or the staple slot could read a welcome as a
+    /// commit pair.
+    #[test]
+    fn test_apq_pair_envelopes_do_not_cross_decode() {
+        let welcome = encode_apq_welcome(vec![1, 2], vec![3, 4]);
+        assert!(decode_apq_private_message(&welcome).is_err());
+        let message = encode_apq_private_message(vec![1, 2], vec![3, 4]);
+        assert!(decode_apq_welcome(&message).is_err());
+    }
+
+    /// Trailing bytes are a hard error, not a suffix to ignore: a decoder that accepts one
+    /// lets a single blob mean two things to two readers.
+    #[test]
+    fn test_apq_pair_rejects_trailing_and_truncated() {
+        let mut trailing = encode_apq_private_message(vec![1, 2], vec![3, 4]);
+        trailing.push(0xFF);
+        assert!(decode_apq_private_message(&trailing).is_err());
+
+        let full = encode_apq_private_message(vec![1, 2], vec![3, 4]);
+        for cut in 1..full.len() {
+            assert!(
+                decode_apq_private_message(&full[..cut]).is_err(),
+                "a {cut}-byte prefix must not decode"
+            );
+        }
+        assert!(decode_apq_private_message(&[]).is_err());
     }
 
     #[test]

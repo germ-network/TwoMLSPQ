@@ -77,8 +77,8 @@ fn main() {
     alice_s.prepare_to_encrypt(Some(new_id)).unwrap();
     let rotation = alice_s.encrypt(payload.to_vec()).unwrap().cipher_text;
 
-    // PQ ratchet (architecture-diagrams PR #2 §A.3) — fresh session pair.
-    let (pq_ek, pq_ct, pq_bind, pq_commit_len, cl_commit_len, pq_app_len) = {
+    // PQ ratchet (book: Protocol Flows §A.3) — fresh session pair.
+    let (pq_ek, pq_ct, pq_bind, pq_commit_len, cl_commit_len, staple_len) = {
         let a = client();
         let b = client();
         let a_kp = combiner_kp(&a);
@@ -103,22 +103,34 @@ fn main() {
         let ek = a_s.pq_ratchet_begin().unwrap();
         b_s.pq_ratchet_respond(ek.clone()).unwrap();
         let ct = b_s.pq_take_pending_outbound().unwrap();
-        a_s.pq_ratchet_bind(ct.clone(), payload.to_vec()).unwrap();
-        let bind = a_s.pq_take_pending_outbound().unwrap();
-        // `bind` is sealed on the wire; open it on the receiver to read the plaintext
-        // `[tag ∥ pq_commit ∥ classical ∥ app]` layout the outer seal hides.
-        let plain_bind = b_s.open_incoming(bind.clone()).unwrap().unwrap().frame;
-        b_s.pq_ratchet_apply(bind.clone()).unwrap();
+        a_s.pq_ratchet_bind(ct.clone()).unwrap();
+        // The bind rides the next committing round as its staple (a draft-02 §7
+        // APQPrivateMessage): drive the fold that discharges it and capture the one
+        // message frame carrying both commits and the app.
+        b_s.prepare_to_encrypt(None).unwrap();
+        let upd = b_s.encrypt(b"upd".to_vec()).unwrap();
+        let res = a_s.process_incoming(upd.cipher_text).unwrap().unwrap();
+        a_s.queue_proposal(res.proposal.unwrap().digest).unwrap();
+        a_s.prepare_to_encrypt(None).unwrap();
+        let bind_frame = a_s.encrypt(payload.to_vec()).unwrap().cipher_text;
+        // Sealed on the wire; open on the receiver to dissect the plaintext
+        // `[0x03][staple][proposal][app]` whose staple is
+        // `[0x05][u32 t-len][t_message][u32 pq-len][pq_message]`.
+        let plain = b_s
+            .open_incoming(bind_frame.clone())
+            .unwrap()
+            .unwrap()
+            .frame;
+        b_s.process_incoming(bind_frame.clone()).unwrap();
 
         let rdlen = |buf: &[u8], at: usize| {
             u32::from_le_bytes([buf[at], buf[at + 1], buf[at + 2], buf[at + 3]]) as usize
         };
-        let pq_commit = rdlen(&plain_bind, 1);
-        let cl_at = 1 + 4 + pq_commit;
-        let cl = rdlen(&plain_bind, cl_at);
-        let app_at = cl_at + 4 + cl;
-        let app = rdlen(&plain_bind, app_at);
-        (ek.len(), ct.len(), bind.len(), pq_commit, cl, app)
+        let staple = rdlen(&plain, 1);
+        let cl = rdlen(&plain, 1 + 4 + 1);
+        let pq_at = 1 + 4 + 1 + 4 + cl;
+        let pq_commit = rdlen(&plain, pq_at);
+        (ek.len(), ct.len(), bind_frame.len(), pq_commit, cl, staple)
     };
 
     println!("\n=== TwoMLSPQ ciphertext sizes ({}) ===", suite_label());
@@ -141,13 +153,13 @@ fn main() {
     );
 
     {
-        println!("--- PQ ratchet (architecture-diagrams PR #2 §A.3) ---");
-        println!("PQ EK message (0x05, sealed) : {:>6} B", pq_ek);
-        println!("PQ ct message (0x07, sealed) : {:>6} B", pq_ct);
-        println!("PQ bind frame (0x09, sealed) : {:>6} B", pq_bind);
-        println!("  PQ partial-commit (no path): {:>6} B", pq_commit_len);
+        println!("--- PQ ratchet (book: Protocol Flows §A.3) ---");
+        println!("PQ EK message (0x17, sealed) : {:>6} B", pq_ek);
+        println!("PQ ct message (0x19, sealed) : {:>6} B", pq_ct);
+        println!("bind frame (0x03 + staple)   : {:>6} B", pq_bind);
+        println!("  APQPrivateMessage staple   : {:>6} B", staple_len);
         println!("  classical commit           : {:>6} B", cl_commit_len);
-        println!("  app                        : {:>6} B", pq_app_len);
+        println!("  PQ partial-commit (no path): {:>6} B", pq_commit_len);
 
         #[cfg(feature = "cryptokit")]
         let old_full = apq::pq_ratchet::full_pq_updatepath_commit_size(

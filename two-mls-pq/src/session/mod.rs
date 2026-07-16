@@ -64,40 +64,33 @@ use crate::providers;
 /// the one frame taking the classical fallback, the pre-A.4 `BOOTSTRAP_KP`: its key tracks
 /// the CLASSICAL epoch that ordinary messaging advances, so a long `Stable` pass over it
 /// could age past the peer's classical window. `Fresh` never meets this.
+/// A PQ commit that has landed, waiting for the classical commit that binds its entropy into
+/// the classical half.
+///
+/// The two epochs are RESERVATIONS. They were computed as `current + 1` of each half before
+/// the PQ commit, they ride both commits as the -02 `AppDataUpdate`, and they are checked
+/// twice by the receiver: pre-apply per half against `context.epoch + 1` (`apq::rules`), and
+/// post-apply across halves against both groups' actual epochs (`apply_bind`). Nothing here
+/// makes them true — the two rules on `SessionInner::owed_bind` do. `discharge_owed_bind`
+/// re-checks both against the live groups rather than trusting them, because the cost of
+/// being wrong is a bind the peer rejects with the PQ leaf already spent, which no retry
+/// can rebuild.
+struct OwedBind {
+    /// The applied PQ commit's bytes, verbatim, for the bind frame's first section. Public —
+    /// this is a commit message, not key material.
+    pq_commit: Vec<u8>,
+    /// The classical epoch this bind's commit must land on.
+    t_epoch: u64,
+    /// The PQ epoch the landed commit produced, and which `apq_psk` must be exported from.
+    pq_epoch: u64,
+}
+
+/// No frame here is ever terminal: every side-band frame is answered by its round's next
+/// leg (the last leg of every round is a stapled bind, which travels the message path),
+/// so the answer is what replaces or clears the slot — no retirement stamp exists.
 struct RetainedFrame {
     frame: Vec<u8>,
     seal: Option<Vec<u8>>,
-    /// What the peer must have applied for this frame to be spent, as `(family, epoch)`.
-    ///
-    /// Set only on a TERMINAL frame — the last of its round, which has no reply to retire
-    /// it and so would otherwise re-send forever. A frame that publishes no commit (an EK,
-    /// an `Upd'`, a `KP'`) carries `None`: its round retires it, because the peer's answer
-    /// is what replaces or clears it.
-    ///
-    /// Stamped with the FASTEST family the frame's commit reaches. The A.3 bind advances
-    /// both epochs, so it stamps CLASSICAL and ordinary message frames confirm it — those
-    /// flow. A.4's bind and A.5's final commit are PQ-only, so they stamp PQ and wait on
-    /// the peer's next side-band frame.
-    retire_at: Option<(HeaderFamily, u64)>,
-}
-
-/// Which header-key window opened a frame. Message frames seal under the classical family
-/// and side-band frames under the PQ one (the pre-A.4 `BOOTSTRAP_KP` under classical, via
-/// `seal_side_band`'s fallback), so the window that matched also names the family — and the
-/// epoch within it is the peer's application receipt.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(in crate::session) enum HeaderFamily {
-    Classical,
-    Pq,
-}
-
-/// A frame opened from a header-key window, with the receipt that opening it proved.
-pub(in crate::session) struct Opened {
-    pub(in crate::session) plaintext: Vec<u8>,
-    pub(in crate::session) family: HeaderFamily,
-    /// The epoch of the key that opened it — what the peer has demonstrably APPLIED of our
-    /// commits in that family. See `SessionInner::observe_receipt`.
-    pub(in crate::session) epoch: u64,
 }
 
 impl RetainedFrame {
@@ -113,7 +106,6 @@ impl RetainedFrame {
         Self {
             frame,
             seal: Some(sealed.to_vec()),
-            retire_at: None,
         }
     }
 
@@ -121,17 +113,7 @@ impl RetainedFrame {
     /// handed back from their producing call and so only ever reach the wire through a
     /// hand-out.
     fn unsealed(frame: Vec<u8>) -> Self {
-        Self {
-            frame,
-            seal: None,
-            retire_at: None,
-        }
-    }
-
-    /// Mark this a TERMINAL frame, spent once the peer reaches `epoch` in `family`.
-    fn retiring_at(mut self, family: HeaderFamily, epoch: u64) -> Self {
-        self.retire_at = Some((family, epoch));
-        self
+        Self { frame, seal: None }
     }
 }
 
@@ -208,25 +190,34 @@ struct SessionInner {
     state_seq: u64,
     my_state: PrincipalState,
     their_state: PrincipalState,
-    /// The A.3/A.5 round's outbound side-band frame, retained for re-send. Set by both
-    /// roles (initiator `pq_ratchet_begin`/`pq_ratchet_bind`/`pq_rekey_begin`, responder
-    /// `*_respond`), REPLACED when this side produces the round's next frame, and CLEARED
-    /// when this side's part in the round completes (the `*_apply` receivers).
+    /// The round's outbound side-band frame, retained for re-send. Set by both roles
+    /// (initiator `*_begin`, responder `*_respond`), REPLACED when this side produces the
+    /// round's next side-band frame, and CLEARED when the peer's answer proves it landed:
+    /// the initiator clears at its bind (the inbound CT / Welcome' / Commit' answered its
+    /// begin frame), the responder at the staple arm (the stapled bind answered its
+    /// reply). A round's closing bind parks NOTHING here — it travels the message path as
+    /// the staple — so the slot is empty whenever no round is open.
     ///
-    /// One slot serves both flows because they are mutually exclusive: every A.3 and A.5
-    /// entry point gates on `pq_inflight`, so only one round is ever open. A.4 does NOT
-    /// gate on it and therefore runs CONCURRENTLY — hence its own slot below, and NOT a
-    /// third field for A.5.
+    /// One slot serves all three flows because they are mutually exclusive: every A.3, A.4
+    /// and A.5 entry point gates on `pq_inflight`, so only one round is ever open.
     pending_side_band: Option<RetainedFrame>,
-    /// The highest epoch at which a peer frame has opened, per header family — what the
-    /// peer has demonstrably APPLIED of our commits. Set by `observe_receipt`; read by
-    /// `hand_out` to retire a terminal frame whose `retire_at` it has reached.
+    /// A PQ commit has landed and its classical partner is OWED — the APQ pair is
+    /// half-committed. Set by `commit_pq_and_owe_bind` (A.3's and A.4's trigger), consumed
+    /// by `discharge_owed_bind` on the next classical COMMIT.
     ///
-    /// Monotone by construction, so it is safe to compare against: evidence only accrues.
-    /// Rides the archive — losing it would strand a terminal frame in re-send forever,
-    /// which is exactly the state this exists to end.
-    peer_applied_classical: u64,
-    peer_applied_pq: u64,
+    /// Holds public bytes and two integers, never key material: the `apq_psk` is exported at
+    /// discharge, not here, precisely so nothing derived has to wait (or be archived) across
+    /// a wait we do not bound.
+    ///
+    /// While this is `Some`, two rules hold, and they are what make the reserved epochs in
+    /// `OwedBind` true rather than hopeful:
+    ///   * no further PQ commit may land (A.3/A.4 bind and A.5's commits refuse) — a second
+    ///     one would move `pq_epoch` out from under the reservation. `begin` is unaffected:
+    ///     an EK or an `Upd'` commits nothing, so PQ may start its next step.
+    ///   * the next classical commit MUST be this bind — a routine fold taking that epoch
+    ///     would strand `t_epoch` one behind, and the peer would reject the bind pre-apply
+    ///     with our PQ leaf already spent.
+    owed_bind: Option<OwedBind>,
     /// Whose move the PQ side-band is: the initiator owes the A.4 bootstrap; thereafter
     /// completing an operation passes the turn to the peer.
     pq_turn_mine: bool,
@@ -410,91 +401,145 @@ impl SessionInner {
         apq::forget_psk_stores(&self.psk_stores, psk_id);
     }
 
-    /// The bind both A.3 and A.4 close their round with: inject `s` into our send-PQ with a
-    /// pathless commit, chain the exported `apq_psk` into our classical half, and staple
-    /// `app`. Returns the three sections the caller frames.
+    /// The trigger half of the bind both A.3 and A.4 close their round with: inject `s` into
+    /// our send-PQ with a pathless commit, and OWE the classical half.
     ///
     /// The rounds differ ONLY in where `s` comes from — A.3 decapsulates it from the peer's
     /// CT, A.4 exports it from the group it just joined — so everything from here down is
     /// shared. That is the point: A.4's bind is not *like* A.3's, it IS A.3's.
     ///
+    /// **Why the halves split here.** The PQ half has no choice: `apq_psk` is exported from
+    /// its POST-commit epoch, so the classical commit cannot even be built until the PQ one
+    /// has applied. The classical half is the opposite — applying it advances the epoch our
+    /// ordinary traffic rides, onto a commit whose `apq_psk` the peer can only derive from
+    /// this bind's PQ half. Applied here, every frame we send before the bind lands would be
+    /// undeliverable; and for A.4 the trigger is INBOUND (a welcome arrived), which says
+    /// nothing about whether we have anything to send at all. So the classical commit waits
+    /// for the next classical COMMIT and rides it — see `discharge_owed_bind`.
+    ///
     /// A -02 FULL commit: both halves carry the AppDataUpdate attesting the absolute
     /// post-commit epochs of both groups, computed before either commit.
-    fn bind_with_secret(&mut self, s: &[u8], app: &[u8]) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+    fn commit_pq_and_owe_bind(&mut self, s: &[u8]) -> Result<()> {
         let stores = self.psk_stores.clone();
         let send = self
             .send_group
             .as_mut()
             .ok_or(TwoMlsPqError::SessionNotReady)?;
         let send_pq = send.pq.as_mut().ok_or(TwoMlsPqError::SessionNotReady)?;
+        // The attestation is a RESERVATION, not a prediction. It rides both commits, and each
+        // half is checked pre-apply against `context.epoch + 1` (`apq::rules`) and post-apply
+        // against both groups' actual epochs (`apply_bind`). The classical commit that carries
+        // it is owed — it lands on the next classical COMMIT, which may be some rounds off —
+        // so `t_epoch` is only correct because nothing else may take that epoch in the
+        // meantime, and `pq_epoch` only because no further PQ commit may land. Those are the
+        // two rules the owed bind imposes, and `discharge_owed_bind` re-checks both rather
+        // than trusting them.
         let attestation = ApqInfoUpdate {
             t_epoch: send.classical.current_epoch() + 1,
             pq_epoch: send_pq.current_epoch() + 1,
         };
-        let (pq_commit, apq_psk) =
-            apq::pq_ratchet::inject_and_commit(send_pq, s, &stores, attestation)?;
-        let cl_builder = send
-            .classical
-            .commit_builder()
-            .custom_proposal(attestation.to_custom_proposal()?);
-        let cl_out = apq_psk
-            .add_to_commit(cl_builder)?
-            .build()
-            .map_err(|_| TwoMlsPqError::Mls)?;
-        send.classical
-            .apply_pending_commit()
-            .map_err(|_| TwoMlsPqError::Mls)?;
-        // A bare PSK commit (the queued peer proposal is not cached — it is re-applied only
-        // at the routine fold), so the roster is unchanged; assert it.
-        apq::ensure_two_party(&send.classical)?;
-        // The commit consumed the one-shot apq PSK; drop it from every store it was
-        // registered into (the session registry plus the group-captured handles).
-        send.forget_psk(apq_psk.storage_id());
-        apq::forget_psk_stores(&stores, apq_psk.storage_id());
-        let cl_commit = cl_out
-            .commit_message
-            .to_bytes()
-            .map_err(|_| TwoMlsPqError::Mls)?;
-        let app_ct = send
-            .classical
-            .encrypt_application_message(app, vec![])
-            .map_err(|_| TwoMlsPqError::Mls)?
-            .to_bytes()
-            .map_err(|_| TwoMlsPqError::Mls)?;
-        // This commit advanced our send-group epoch, so any queued or offered peer proposal
-        // (an Update bound to the prior send epoch) is now stale and cannot be committed —
-        // drop it. The peer re-proposes at the new epoch once it observes this staple (the
-        // receiver freely drops; the proposer re-sends).
-        self.queued_proposal = None;
-        self.offered_proposal = None;
-        // Our send group advanced: record the new epoch's PSK in the session ledger.
-        self.remember_send_psk()?;
-        // The classical commit becomes the staple subsequent message frames re-send — if the
-        // BIND frame itself is lost, the classical stream still heals. (A message frame can
-        // overtake the BIND; the peer then lacks the APQ-PSK and the staple fails retriably
-        // until the BIND lands.)
-        self.current_staple = cl_commit.clone();
-        // The commit publishes new keys; tag the staple with the (already-bumped) push seq
-        // for `depends_on_seq`.
-        self.current_staple_seq = self.state_seq;
-        Ok((pq_commit, cl_commit, app_ct))
+        // S is folded into the new PQ epoch and wiped here: it is the secret we must not
+        // hold, and this commit is what discharges it. The `apq_psk` export is deliberately
+        // NOT done now — it spends the exporter leaf irreversibly, so exporting before the
+        // classical half is ready would mean holding live key material (and archiving it)
+        // across an unbounded wait. See `apq::pq_ratchet::export_apq_psk`.
+        let pq_commit = apq::pq_ratchet::inject_and_commit(send_pq, s, &stores, attestation)?;
+        // The APQ pair is now half-committed: PQ has moved, classical is owed. Nothing is
+        // held but public bytes and two integers.
+        self.owed_bind = Some(OwedBind {
+            pq_commit,
+            t_epoch: attestation.t_epoch,
+            pq_epoch: attestation.pq_epoch,
+        });
+        Ok(())
     }
 
-    /// The apply both A.3 and A.4 close their round with: apply the peer's pathless PQ
-    /// commit to our recv-PQ with the injected secret `s`, apply the classical commit, verify
-    /// the -02 FULL attestation across both halves, and return the stapled app message.
+    /// The classical half of the bind, run from the classical committing round that carries
+    /// it: export the reserved `apq_psk`, hand back the attestation and PSK for the caller to
+    /// fold into the commit it is already building, and yield the PQ commit the frame carries.
     ///
-    /// As with `bind_with_secret`, the rounds differ only in where `s` came from: A.3 held it
-    /// from encapsulating, A.4 re-derives it by exporting from its own copy of the group it
-    /// created. Everything below is identical.
+    /// Returns `None` when no bind is owed — the overwhelmingly common case, an ordinary
+    /// committing round.
+    ///
+    /// **This CHECKS the reservation rather than trusting it.** Both epochs were fixed before
+    /// the PQ commit and ride both halves as the -02 attestation; the receiver rejects a stale
+    /// one pre-apply, by which time our PQ leaf is spent and no retry can rebuild the round.
+    /// So a violated reservation must fail HERE, loudly, on our side, where nothing has been
+    /// sent yet — not on the peer's.
+    fn discharge_owed_bind(
+        &mut self,
+    ) -> Result<Option<(Vec<u8>, apq::ExportedPsk, ApqInfoUpdate)>> {
+        let Some(owed) = self.owed_bind.take() else {
+            return Ok(None);
+        };
+        let stores = self.psk_stores.clone();
+        let send = self
+            .send_group
+            .as_mut()
+            .ok_or(TwoMlsPqError::SessionNotReady)?;
+        let send_pq = send.pq.as_mut().ok_or(TwoMlsPqError::SessionNotReady)?;
+
+        // Rule: the next classical COMMIT is this bind. If a routine fold took the epoch we
+        // reserved, `t_epoch` is stale and the bind is already doomed.
+        if send.classical.current_epoch() + 1 != owed.t_epoch {
+            return Err(TwoMlsPqError::EpochDesync);
+        }
+        // Rule: no further PQ commit while a bind is owed. If one landed, `pq_epoch` is stale
+        // AND the export below would take the wrong epoch's leaf.
+        if send_pq.current_epoch() != owed.pq_epoch {
+            return Err(TwoMlsPqError::EpochDesync);
+        }
+
+        // Spend the exporter leaf now — the one moment it is needed. The responder re-derives
+        // the same value from its own mirror as it applies the PQ commit, so this never goes
+        // on the wire.
+        let apq_psk = apq::pq_ratchet::export_apq_psk(send_pq, &stores)?;
+        let attestation = ApqInfoUpdate {
+            t_epoch: owed.t_epoch,
+            pq_epoch: owed.pq_epoch,
+        };
+        // The turn passes HERE, not at the trigger. The round's terminal send is the commit
+        // this discharge rides, and until that exists we may still open the NEXT round — which
+        // is the point of waiting: its `begin` frame parks in `pending_side_band` and rides the
+        // same `EncryptResult` as this bind, so the next round costs no extra trip (both land
+        // before the peer takes a turn).
+        //
+        // The two rounds are then in flight together but on DIFFERENT paths — this one's bind
+        // in the STAPLE, the next one's EK in the side-band slot — so they never contend, and
+        // each is persisted by its own path's rules.
+        //
+        // Rule 2 is therefore not covered by the turn and is checked explicitly at each bind
+        // entry point (`owed_bind.is_some()`).
+        self.pq_turn_mine = false;
+        Ok(Some((owed.pq_commit, apq_psk, attestation)))
+    }
+
+    /// The apply both A.3 and A.4 close their round with: apply the peer's pathless PQ commit
+    /// to our recv-PQ with the injected secret `s`, apply the classical commit, and verify the
+    /// -02 FULL attestation across both halves.
+    ///
+    /// Run from the STAPLE slot, because the bind is an `APQPrivateMessage` there rather than a
+    /// frame of its own. It therefore does NOT touch the app message: that is the enclosing
+    /// message frame's own section, which the ordinary path decrypts once this returns — the
+    /// same order as before, since the classical commit has applied by then.
+    ///
+    /// As with `commit_pq_and_owe_bind`, the rounds differ only in where `s` came from: A.3
+    /// held it from encapsulating, A.4 re-derives it by exporting from its own copy of the
+    /// group it created. Everything below is identical.
     fn apply_bind(
         &mut self,
         s: &[u8],
         stores: &[InMemoryPreSharedKeyStorage],
         pq_commit: &[u8],
         cl_commit: &[u8],
-        app_ct: &[u8],
-    ) -> Result<Vec<u8>> {
+    ) -> Result<()> {
+        // The classical half is a FULL folding commit, so it may bind the cross-party
+        // TwoMLS-PSK of our send group -- possibly at an epoch we've since moved past
+        // (the peer's frame can cross one of our commits). Live-inject the session-held
+        // ledger before processing, exactly as the plain commit-staple arm does.
+        if self.send_group.is_some() {
+            self.inject_send_psks()?;
+        }
         let recv = self
             .recv_group
             .as_mut()
@@ -524,12 +569,12 @@ impl SessionInner {
         // necessarily post-apply, because comparing the two halves' epochs requires both
         // commits to have been applied (mls-rs `process_incoming_message` validates and
         // applies atomically; there is no inspect-without-apply short of a fork change).
-        // That residual check still gates every observable effect: it runs BEFORE the
-        // stapled app message is decrypted (line below), BEFORE the one-shot apq PSK is
-        // forgotten, and BEFORE the turn passes — so on a bad attestation from our sole
-        // counterparty no plaintext is released and no turn/PSK state is confirmed. The
-        // only thing an attestation forgery can force is a self-inflicted epoch advance
-        // that then errors out, which is within the two-party DoS threat model.
+        // That residual check still gates every observable effect: it runs BEFORE the frame's
+        // app message is decrypted (the caller does that only if this returns Ok), BEFORE the
+        // one-shot apq PSK is forgotten, and BEFORE the turn passes — so on a bad attestation
+        // from our sole counterparty no plaintext is released and no turn/PSK state is
+        // confirmed. The only thing an attestation forgery can force is a self-inflicted epoch
+        // advance that then errors out, which is within the two-party DoS threat model.
         if cl_attestation != pq_attestation
             || pq_attestation.pq_epoch != recv_pq.current_epoch()
             || cl_attestation.t_epoch != recv.classical.current_epoch()
@@ -543,45 +588,12 @@ impl SessionInner {
         // registered into (the session registry plus the group-captured handles).
         recv.forget_psk(apq_psk.storage_id());
         apq::forget_psk_stores(stores, apq_psk.storage_id());
-        let app = MlsMessage::from_bytes(app_ct).map_err(|_| TwoMlsPqError::Mls)?;
-        let out = match recv
-            .classical
-            .process_incoming_message(app)
-            .map_err(|_| TwoMlsPqError::Mls)?
-        {
-            ReceivedMessage::ApplicationMessage(m) => Ok(m.data().to_vec()),
-            _ => Err(TwoMlsPqError::DecryptionFailed),
-        };
-        out
+        Ok(())
     }
 
-    /// Seal `which` slot's retained frame for hand-out, filling its `Stable` cache on a
+    /// Seal the retained side-band frame for hand-out, filling its `Stable` cache on a
     /// miss. `None` when the slot is empty (the quiescent case — nothing to re-send).
-    /// Drop `which`'s frame if the peer has demonstrably applied what it carries — a
-    /// terminal frame with a met stamp has nothing left to heal, and re-sending it forever
-    /// is the lingering this exists to end. Returns whether the slot is empty afterwards.
-    ///
-    /// Checked lazily, at the hand-out paths, rather than eagerly on receipt: that keeps
-    /// `observe_receipt` a plain monotone observation and lets the clearing ride whatever
-    /// persist its caller was already doing. BOTH hand-out paths must call it — a take that
-    /// skipped it would serve a spent frame in place of the live one.
-    fn retire_if_spent(&mut self) -> bool {
-        if let Some((family, epoch)) = self.pending_side_band.as_ref().and_then(|r| r.retire_at) {
-            let applied = match family {
-                HeaderFamily::Classical => self.peer_applied_classical,
-                HeaderFamily::Pq => self.peer_applied_pq,
-            };
-            if applied >= epoch {
-                self.pending_side_band = None;
-            }
-        }
-        self.pending_side_band.is_none()
-    }
-
     fn hand_out(&mut self, sealing: SideBandSealing) -> Option<Vec<u8>> {
-        if self.retire_if_spent() {
-            return None;
-        }
         // Lift the frame out before sealing: `seal_side_band` borrows the whole inner, so
         // it cannot run while a slot borrow is live.
         let (frame, cached) = {
@@ -859,8 +871,7 @@ fn build_session(
             },
             pq_turn_mine: initiated,
             pending_side_band: None,
-            peer_applied_classical: 0,
-            peer_applied_pq: 0,
+            owed_bind: None,
             send_psk_ledger: VecDeque::new(),
             retired_send_psks: Vec::new(),
             last_cross_injected: None,

@@ -47,16 +47,13 @@ In its place we have two PQ operations:
     
     We still need to regularly re-key the PQ group, on cadence, and to hand the PQ leaves to a credential the classical ratchet has already canonicalized (credential changes are proposed and approved in the classical ratchet — see the TwoMLS AS note below; the PQ re-key only catches the PQ leaves up):
     
-    1. The initiator (Alice) sends a proposal to update her leafNode in the PQ half of the respondent’s (Bob’s) send group
-    2. On receipt, Bob makes a full commit in his send group, sends the commit and a corresponding proposal to Alice.
-        1. Like in TwoMLS, each of these full commits injects a PSK from the opposite send group.
-    3. On receipt of Bob’s PQ commit and proposal, Alice commit’s Bob’s proposal and returns it.
-    4. On receipt of Alice’s commit, Bob is now the initiator
+    1. The initiator (Alice) sends a proposal to update her leafNode in the PQ half of the respondent’s (Bob’s) send group — the proposal replaces the *proposer’s* leaf
+    2. On receipt, Bob makes a full commit in his send group — the one large updatePath commit of the round, which also replaces the *committer’s* leaf (this is where Bob’s own leaf catches up to a rotated credential)
+        1. Like in TwoMLS, this full commit injects a PSK from the opposite send group.
+    3. On receipt of Bob’s PQ commit, Alice applies it and acks: a pathless partial commit on her own send group importing a secret exported from the just-rekeyed group, bound to her classical group exactly as the PQ ratchet’s bind is — it rides her next classical commit as the staple. Deriving the secret requires having applied Bob’s commit, so an ack that applies at all is the receipt.
+    4. On receipt of the stapled ack, Bob is now the initiator
     
-    These commits happen in isolation on the PQ group, otherwise we block the classical ratchet on transmitting the PQ full commits. 
-    
-
-(we could take an extra step to separately export a secret to the classical, but that mucks with the timing as the classical ratchet does block the binding of the PQ ratchet. Cleaner to have - perform 1.5 exchanges, then you can resume the PQ ratchet).
+    One round re-keys ONE group; the turn alternation brings the other group’s round next. The large updatePath commit happens in isolation on the PQ group, otherwise we block the classical ratchet on transmitting it — only the small pathless ack rides the classical staple.
 
 1. Session establishment
     1. Bob posts an APQ keyPackage
@@ -260,12 +257,16 @@ FULL commit and does not use that pair. Our three operations, by name:
   Commit' (cheap — no per-member PQ ciphertexts) plus the classical commit
   importing the re-exported `apq_psk`, carried together as the -02 `APQPrivateMessage`
   the message frame staples. Introduces PQ Post-Compromise Security.
-- **PQ re-key** (A.5) — updatePath Commit's in the PQ groups alone (the
-  expensive leaf rotation), with no classical commit; run rarely, off the
-  classical ratchet's critical path.
+- **PQ re-key** (A.5) — ONE updatePath Commit' in the PQ group alone (the
+  expensive leaf rotation, run rarely, off the classical ratchet's critical
+  path), answered by the initiator's ack — which is structurally the A.3 bind:
+  a path-less partial Commit' plus its classical partner, stapled as one
+  `APQPrivateMessage`. One round re-keys one group; the turn alternation
+  covers the other.
 
-What -02 calls a FULL commit is, here, the bind (A.3) plus the re-key (A.5),
-decomposed — our extension to the draft.
+What -02 calls a FULL commit is, here, the bind — which closes every round
+(A.3, A.4 and A.5 alike); the re-key's standalone updatePath Commit' is our
+extension to the draft.
 
 ### A.1 Session establishment (granular)
 
@@ -453,23 +454,31 @@ exports it from her recv mirror to build the bind, and Bob exports it from his s
 apply it. A later A.5 re-key must not re-export that epoch from either. (Both watermarks are
 load-bearing; omitting the responder's makes the next re-key fail on a consumed leaf.)
 
-### A.5 PQ re-key (granular) — PQ-group updatePath commits, isolated from classical
+### A.5 PQ re-key (granular) — the one updatePath commit, isolated from classical
 
 > **Note on -02 conformance.** Draft -02 defines no *standalone* PQ-group commit:
 > every PQ commit is one half of a simultaneous **FULL commit** (PQ + paired
 > classical) with synchronized epoch bookkeeping. Germ's PQ re-key deliberately
-> commits in the PQ groups **alone** (so the classical ratchet is not blocked on
-> large PQ updatePaths), which is an extension beyond -02. (As the preamble
-> notes, the implementation carries no `AppDataUpdate` / `APQInfo` bookkeeping at
-> all — the epoch pair is read live from the groups.) The bumped `pq_epoch` is
-> bound into the classical half at the next PQ ratchet bind (A.3), which
-> re-exports `apq_psk`. The cross-injected `PSK(from …-PQ)` below is
-> the TwoMLS PQ-to-PQ export between send groups, distinct from `apq_psk`.
-> Like the classical ratchet (§Classical Ratchet), this cross-injection is
-> event-driven: a re-key binds the opposite PQ send group only when it has
-> advanced since the last binding, so a re-key that follows another with no
-> intervening PQ commit from the peer carries no cross-party PSK (the leaf
-> rotation still happens via the updatePath).
+> runs its one large updatePath commit in the PQ group **alone** (so the
+> classical ratchet is not blocked on large ML-KEM updatePaths), which is an
+> extension beyond -02 — but the round *ends* conformantly: the initiator's ack
+> is an ordinary bind (a -02 FULL commit pair riding the message-frame staple as
+> an `APQPrivateMessage`), whose `AppDataUpdate` reconciles the bumped
+> `pq_epoch` in-round. The cross-injected `PSK(from …-PQ)` below is the TwoMLS
+> PQ-to-PQ export between send groups, distinct from `apq_psk`. Like the
+> classical ratchet (§Classical Ratchet), this cross-injection is event-driven:
+> a re-key binds the opposite PQ send group only when it has advanced since the
+> last binding, so a re-key that follows another with no intervening PQ commit
+> from the peer carries no cross-party PSK (the leaf rotation still happens via
+> the updatePath).
+>
+> **The round is `X → Y → bind`, like A.3 and A.4.** The proposal replaces the
+> *proposer's* leaf (this is where the initiator's credential handoff rides);
+> the full commit replaces the *committer's* leaf (this is where the responder's
+> own leaf catches up to an already-canonical credential); the pathless ack
+> signals receipt through the classical channel. One round re-keys ONE group —
+> the turn alternation brings the other group's round next, at the same bytes
+> per group as the old two-in-one shape, and no large frame is ever terminal.
 
 ```mermaid
 sequenceDiagram
@@ -477,16 +486,17 @@ sequenceDiagram
     participant Alice
     participant Bob
 
-    Note over Alice,Bob: Run on cadence, or to carry a credential the classical ratchet (A.2) has already<br/>canonicalized onto the PQ leaves (catch-up). PQ updatePath commits,<br/>run in isolation on the PQ groups so the classical ratchet is not blocked.<br/>Each commit cross-injects a PSK from the opposite send group's PQ half (TwoMLS-style).
+    Note over Alice,Bob: Run on cadence, or to carry a credential the classical ratchet (A.2) has already<br/>canonicalized onto the PQ leaves (catch-up). The one updatePath commit runs<br/>in isolation on the PQ group so the classical ratchet is not blocked.
 
     Alice-)Bob: Upd'(Alice) proposal to update Alice's leaf in [BSG-PQ], side-band frame
     Bob-)Bob: Export PSK from [ASG-PQ]
     Bob-)Bob: [BSG-PQ] Commit'(Upd'(Alice)) with updatePath + PSK(from ASG-PQ) → pq_epoch++
-    Bob-)Alice: Commit' [BSG-PQ] + corresponding Upd'(Bob) proposal for [ASG-PQ], side-band frame
+    Note over Bob: The updatePath also replaces Bob's own leaf — his credential<br/>catch-up channel when a rotation has been canonicalized.
+    Bob-)Alice: Commit' [BSG-PQ], side-band frame — re-sent until the ack answers it
     Alice-)Alice: Apply Commit' to [BSG-PQ]
-    Alice-)Alice: Export PSK from [BSG-PQ]
-    Alice-)Alice: [ASG-PQ] Commit'(Upd'(Bob)) with updatePath + PSK(from BSG-PQ) → pq_epoch++
-    Alice-)Bob: Commit' [ASG-PQ], side-band frame
-    Bob-)Bob: Apply Commit' to [ASG-PQ]
-    Note over Alice,Bob: Bumped pq_epoch is bound into the classical half at the next PQ ratchet bind (A.3).<br/>Bob is now the initiator.
+    Alice-)Alice: Export S from [BSG-PQ] at its NEW epoch — deriving S proves the apply
+    Alice-)Alice: [ASG-PQ] pathless partial commit importing S → pq_epoch++, classical half OWED
+    Alice-)Bob: Ack rides Alice's next classical COMMIT as the APQPrivateMessage staple
+    Bob-)Bob: Re-derives S from [BSG-PQ], applies both halves from the staple
+    Note over Alice,Bob: The ack is a conformant FULL commit — its attestation reconciles the bumped<br/>pq_epoch in-round. Bob is now the initiator, and the next A.5 re-keys [ASG-PQ].
 ```

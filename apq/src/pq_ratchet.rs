@@ -114,17 +114,26 @@ impl Drop for InjectedSecret<'_> {
 }
 
 /// Initiator (committer) — inject S into `pq_group` via a pathless PSK commit carrying the
-/// -02 `AppDataUpdate` epoch attestation, apply it, and re-export the `apq_psk` from the
-/// new PQ epoch (registered for the classical bind). The injected secret S stays an
-/// *external* PSK (it is externally-sourced KEM entropy, not an exporter-derived value);
-/// the re-exported `apq_psk` is an application PSK.
-/// Returns `(pq_commit_bytes, apq_psk)`.
+/// -02 `AppDataUpdate` epoch attestation, and apply it. The injected secret S stays an
+/// *external* PSK (it is externally-sourced KEM entropy, not an exporter-derived value).
+/// Returns the commit bytes.
+///
+/// This deliberately does NOT export the `apq_psk`. The classical bind that consumes it
+/// rides the next classical COMMIT, which the caller does not control and which may be a
+/// while off — and the export is the one step that must not happen early: `export_psk`
+/// SPENDS the exporter leaf, irreversibly, so exporting here would mean holding live key
+/// material (and archiving it) across an unbounded wait. Call [`export_apq_psk`] when the
+/// classical half is actually ready to commit.
+///
+/// S itself is folded in and wiped HERE. It is the secret we must not hold, and this commit
+/// is what discharges it — which is why the PQ half moves at the trigger while the classical
+/// half waits.
 pub fn inject_and_commit<Cfg: MlsConfig>(
     pq_group: &mut Group<Cfg>,
     s: &[u8],
     stores: &[InMemoryPreSharedKeyStorage],
     attestation: ApqInfoUpdate,
-) -> Result<(Vec<u8>, ExportedPsk)> {
+) -> Result<Vec<u8>> {
     let secret = InjectedSecret::register(pq_group, s, stores);
     let out = pq_group
         .commit_builder()
@@ -137,15 +146,30 @@ pub fn inject_and_commit<Cfg: MlsConfig>(
         .apply_pending_commit()
         .map_err(|_| CombinerError::Mls)?;
     crate::group::ensure_two_party(pq_group)?;
-    // S is now folded into the new epoch; wipe it from the stores before re-exporting.
+    // S is now folded into the new epoch; wipe it from the stores.
     drop(secret);
-    let apq_psk = export_psk(pq_group, PskDomain::Apq)?;
-    crate::group::register_psk_stores(stores, apq_psk.storage_id(), apq_psk.psk());
     let bytes = out
         .commit_message
         .to_bytes()
         .map_err(|_| CombinerError::Mls)?;
-    Ok((bytes, apq_psk))
+    Ok(bytes)
+}
+
+/// Export the `apq_psk` from the PQ group's CURRENT epoch and register it for the classical
+/// bind — the deferred second half of [`inject_and_commit`].
+///
+/// The epoch this exports from is the one the caller's attestation reserved: no further PQ
+/// commit may land while a bind is owed, precisely so this export lands on the attested
+/// epoch and the responder — re-exporting the same value from its own mirror as it applies
+/// the commit — derives an identical PSK. The exporter leaf is spent once per (group, epoch,
+/// component), so call this exactly once per owed bind.
+pub fn export_apq_psk<Cfg: MlsConfig>(
+    pq_group: &mut Group<Cfg>,
+    stores: &[InMemoryPreSharedKeyStorage],
+) -> Result<ExportedPsk> {
+    let apq_psk = export_psk(pq_group, PskDomain::Apq)?;
+    crate::group::register_psk_stores(stores, apq_psk.storage_id(), apq_psk.psk());
+    Ok(apq_psk)
 }
 
 /// Responder (applier) — register S (held since `encapsulate`), apply the initiator's pathless PQ
@@ -300,13 +324,12 @@ mod tests {
             t_epoch: cl_epoch_before + 1,
             pq_epoch: pq_epoch_before + 1,
         };
-        let (pq_commit, apq_psk) = inject_and_commit(
-            asg.pq.as_mut().unwrap(),
-            &s_alice,
-            &[alice.pq().secret_store(), alice.classical().secret_store()],
-            attestation,
-        )
-        .unwrap();
+        let a_stores = [alice.pq().secret_store(), alice.classical().secret_store()];
+        let pq_commit =
+            inject_and_commit(asg.pq.as_mut().unwrap(), &s_alice, &a_stores, attestation).unwrap();
+        // The export is now a separate step — a session defers it until its classical half is
+        // ready to commit. Nothing here waits, so do both back to back.
+        let apq_psk = export_apq_psk(asg.pq.as_mut().unwrap(), &a_stores).unwrap();
         let cl_out = apq_psk
             .add_to_commit(asg.classical.commit_builder())
             .unwrap()
@@ -441,7 +464,7 @@ mod tests {
             t_epoch: asg.classical.current_epoch() + 1,
             pq_epoch: asg.pq.as_ref().unwrap().current_epoch() + 1,
         };
-        let (pq_commit, _) =
+        let pq_commit =
             inject_and_commit(asg.pq.as_mut().unwrap(), &s_alice2, &a_stores, good).unwrap();
         let _ = (s_bob, s_bob2);
         let b_stores = [bob.pq().secret_store(), bob.classical().secret_store()];

@@ -306,17 +306,17 @@ pub struct HpkeSealed {
     pub ciphertext: Vec<u8>,
 }
 
-/// Leading tag byte of the §A.1 envelope blob (`[0x05][u32-LE kem_len][kem_output]
+/// Leading tag byte of the §A.1 envelope blob (`[tag][u32-LE kem_len][kem_output]
 /// [ciphertext]`) — the one frame kind that travels the invitation channel. Distinct from
-/// every message-path (0x00/0x01/0x03), side-band (0x11–0x1F), and staple (0x07) tag so a
-/// host can classify the blob by its first byte; `open_incoming` / `process_incoming` never
-/// see it (an envelope reaching them fails loudly).
+/// every message-path (0x00/0x01/0x03/0x05), side-band (0x13–0x1D), and pre-establishment
+/// staple (0x09) tag so a host can classify the blob by its first byte; `open_incoming` /
+/// `process_incoming` never see it (an envelope reaching them fails loudly).
 ///
 /// This byte is allocated out of the shared tag space but declared here rather than in
-/// `session::frames`, because an envelope is not a session frame. `frames::tests::TAG_SPACE`
+/// `session::frames`, because an envelope is not a session frame. `frames::tests::BANDS`
 /// is where the whole space is visible at once and where the distinctness this doc claims is
 /// actually enforced — asserting it in prose is how 0x15 got claimed twice once already.
-pub const INITIAL_ENVELOPE_TAG: u8 = 0x05;
+pub const INITIAL_ENVELOPE_TAG: u8 = 0x07;
 
 /// [`INITIAL_ENVELOPE_TAG`] for hosts that parse the outer frame themselves —
 /// splitting kem/ct for `hpke_open` + `decode_initial_plaintext` keeps the raw
@@ -338,7 +338,7 @@ pub fn initial_envelope_tag() -> u8 {
 /// - `welcome` — the bare MLS `APQWelcome_A` to hand to `receive` (no app payload).
 /// - `return_key_package` — the initiator's return-group combiner key package as one
 ///   opaque [`encode_combiner_key_package`] blob (decode before handing to `receive`).
-/// - `stapled_message` — a pre-establishment app message (`[0x07][BSG-cl ciphertext]`),
+/// - `stapled_message` — a pre-establishment app message (`[0x09][BSG-cl ciphertext]`),
 ///   re-stapled on every initiator frame until establishment; hand it to the spawned
 ///   session's `process_incoming` AFTER the join (fail-open: it is an optional early
 ///   delivery — the sender re-sends until its first commit).

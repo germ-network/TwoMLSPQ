@@ -188,15 +188,16 @@ pub(crate) mod archive_wire {
         pub(in crate::session) bytes: Zeroizing<Vec<u8>>,
     }
 
-    /// The archivable `PqInflight` round state, tag-dispatched by `kind` so all four
+    /// The archivable `PqInflight` round state, tag-dispatched by `kind` so all six
     /// variants share one optional-payload struct — the flat-struct style the rest of
-    /// this module uses in place of codec enums. The A.5 markers carry no secrets (their
-    /// round state lives in the group snapshots); the A.3 variants carry the round's KEM
-    /// material (see [`super::TwoMlsPqSession::archive`] for why persisting it is sound).
+    /// this module uses in place of codec enums. The A.4/A.5 markers carry no secrets
+    /// (their round state lives in the group snapshots); the A.3 variants carry the
+    /// round's KEM material (see [`super::TwoMlsPqSession::archive`] for why persisting
+    /// it is sound).
     ///
-    /// - `0` `Initiating`     — `ephemeral` set; `secret`/`rotating` absent.
-    /// - `1` `Responding`     — `secret` set; `ephemeral`/`rotating` absent.
-    /// - `2` `RekeyInitiated` — `rotating` optional; no KEM payload.
+    /// - `0` `Initiating`     — `ephemeral` set; `secret` absent.
+    /// - `1` `Responding`     — `secret` set; `ephemeral` absent.
+    /// - `2` `RekeyInitiated` — no payload.
     /// - `3` `RekeyResponded` — no payload.
     /// - `4` `BootstrapInitiated` — no payload (the welcome is self-sufficient).
     /// - `5` `BootstrapResponded` — no payload.
@@ -208,16 +209,20 @@ pub(crate) mod archive_wire {
         pub(in crate::session) kind: u8,
         pub(in crate::session) ephemeral: Option<PqEphemeralBlob>,
         pub(in crate::session) secret: Option<SecretBlob>,
-        pub(in crate::session) rotating: Option<Vec<u8>>,
     }
 
-    /// A terminal frame's retirement stamp: the header family whose epoch retires it, and
-    /// that epoch. `family` is `0` classical / `1` PQ; `from_archive` rejects any other
-    /// value as `ArchiveInvalid`.
+    /// A PQ commit awaiting the classical commit that binds its entropy across — see
+    /// `SessionInner::owed_bind`.
+    ///
+    /// Carries no key material, and needs none: `apq_psk` is exported at the commit that
+    /// consumes it, so what waits here is a public commit message and the two epochs it
+    /// reserved. That is the whole reason this can ride the archive as plain bytes while the
+    /// round's secrets never do.
     #[derive(MlsSize, MlsEncode, MlsDecode)]
-    pub(in crate::session) struct WireRetireAt {
-        pub(in crate::session) family: u8,
-        pub(in crate::session) epoch: u64,
+    pub(in crate::session) struct WireOwedBind {
+        pub(in crate::session) pq_commit: Vec<u8>,
+        pub(in crate::session) t_epoch: u64,
+        pub(in crate::session) pq_epoch: u64,
     }
 
     /// The persisted form of a `TwoMlsPqSession`. Everything a session needs to resume,
@@ -262,8 +267,9 @@ pub(crate) mod archive_wire {
         pub(in crate::session) recv_header_keys_pq: Vec<HeaderKeyEntry>,
         pub(in crate::session) pending_outbound: Option<Vec<u8>>,
         pub(in crate::session) pending_proposal_hash: Option<Vec<u8>>,
-        /// The commit-or-welcome staple every outbound frame re-sends. Never empty on a
-        /// valid archive (validated on restore: non-empty, first byte 0x00 or 0x01).
+        /// The staple every outbound frame re-sends: a commit, a welcome, or an
+        /// APQPrivateMessage (a discharged bind). Never empty on a valid archive
+        /// (validated on restore: non-empty, first byte 0x00, 0x01 or 0x05).
         #[mls_codec(with = "mls_rs_codec::byte_vec")]
         pub(in crate::session) current_staple: Vec<u8>,
         pub(in crate::session) pending_proposal_message: Option<WireStagedProposal>,
@@ -278,15 +284,16 @@ pub(crate) mod archive_wire {
         /// The Authentication Service state: both parties' credential sequences.
         pub(in crate::session) auth_mine: WirePartySequence,
         pub(in crate::session) auth_theirs: WirePartySequence,
-        /// The retained A.3/A.5 side-band frame (plaintext). Its `Stable` seal cache is
+        /// The retained side-band frame (plaintext), every one of which is answered by the
+        /// round's next leg — no retirement stamp exists. Its `Stable` seal cache is
         /// live-only and deliberately absent here — see `RetainedFrame`.
         pub(in crate::session) pending_side_band: Option<Vec<u8>>,
-        /// The terminal-frame retirement stamps and the peer-applied watermarks they are
-        /// compared against. Without these a restore would strand a terminal frame in
-        /// re-send forever.
-        pub(in crate::session) side_band_retire_at: Option<WireRetireAt>,
-        pub(in crate::session) peer_applied_classical: u64,
-        pub(in crate::session) peer_applied_pq: u64,
+        /// A landed PQ commit whose classical partner is owed. Public bytes and two
+        /// reserved epochs — no key material, because `apq_psk` is exported at the commit
+        /// that consumes it, not at the trigger. Without this a restore mid-hold would
+        /// strand the round for good: the PQ leaf is spent, so the commit cannot be rebuilt
+        /// and the classical half could never be bound.
+        pub(in crate::session) owed_bind: Option<WireOwedBind>,
         pub(in crate::session) pq_inflight: Option<WirePqInflight>,
         /// The initiator's retained pre-establishment envelope state (v10): the peer
         /// key package pre-establishment frames are HPKE-sealed to, the host's
@@ -352,44 +359,15 @@ fn principal_from_wire(blob: archive_wire::SigningIdentityBlob) -> Result<Arc<Tw
     )
 }
 
+/// Rebuild a retained frame. The `Stable` seal cache is live-only, so a restore starts
+/// with none — a chunking pass restarts with a fresh base, which a host must already
+/// tolerate.
+fn retained_from_wire(frame: Option<Vec<u8>>) -> Option<RetainedFrame> {
+    frame.map(RetainedFrame::unsealed)
+}
+
 /// `PqInflight` → its wire form. The A.3 variants carry the round's KEM material; the
-/// A.5 markers carry only a discriminant (and an optional rotation ClientId).
-fn wire_retire_at((family, epoch): (HeaderFamily, u64)) -> archive_wire::WireRetireAt {
-    archive_wire::WireRetireAt {
-        family: match family {
-            HeaderFamily::Classical => 0,
-            HeaderFamily::Pq => 1,
-        },
-        epoch,
-    }
-}
-
-/// Rebuild a retained frame and its terminal-retirement stamp. The `Stable` seal cache is
-/// live-only, so a restore starts with none — a chunking pass restarts with a fresh base,
-/// which a host must already tolerate.
-fn retained_from_wire(
-    frame: Option<Vec<u8>>,
-    retire_at: Option<archive_wire::WireRetireAt>,
-) -> Result<Option<RetainedFrame>> {
-    let Some(frame) = frame else {
-        // A stamp with no frame to stamp is a corrupt or forged archive.
-        return match retire_at {
-            Some(_) => Err(TwoMlsPqError::ArchiveInvalid),
-            None => Ok(None),
-        };
-    };
-    let retained = RetainedFrame::unsealed(frame);
-    let Some(stamp) = retire_at else {
-        return Ok(Some(retained));
-    };
-    let family = match stamp.family {
-        0 => HeaderFamily::Classical,
-        1 => HeaderFamily::Pq,
-        _ => return Err(TwoMlsPqError::ArchiveInvalid),
-    };
-    Ok(Some(retained.retiring_at(family, stamp.epoch)))
-}
-
+/// A.4/A.5 markers carry only a discriminant.
 fn wire_pq_inflight(inflight: &PqInflight) -> archive_wire::WirePqInflight {
     use archive_wire::{PqEphemeralBlob, SecretBlob, WirePqInflight};
     match inflight {
@@ -400,37 +378,31 @@ fn wire_pq_inflight(inflight: &PqInflight) -> archive_wire::WirePqInflight {
                 ek: eph.encapsulation_key(),
             }),
             secret: None,
-            rotating: None,
         },
         PqInflight::Responding(s) => WirePqInflight {
             kind: 1,
             ephemeral: None,
             secret: Some(SecretBlob { bytes: s.clone() }),
-            rotating: None,
         },
-        PqInflight::RekeyInitiated { rotating } => WirePqInflight {
+        PqInflight::RekeyInitiated => WirePqInflight {
             kind: 2,
             ephemeral: None,
             secret: None,
-            rotating: rotating.as_ref().map(|id| id.bytes.clone()),
         },
         PqInflight::RekeyResponded => WirePqInflight {
             kind: 3,
             ephemeral: None,
             secret: None,
-            rotating: None,
         },
         PqInflight::BootstrapInitiated => WirePqInflight {
             kind: 4,
             ephemeral: None,
             secret: None,
-            rotating: None,
         },
         PqInflight::BootstrapResponded => WirePqInflight {
             kind: 5,
             ephemeral: None,
             secret: None,
-            rotating: None,
         },
     }
 }
@@ -444,7 +416,6 @@ fn pq_inflight_from_wire(wire: archive_wire::WirePqInflight) -> Result<PqInfligh
             kind: 0,
             ephemeral: Some(eph),
             secret: None,
-            rotating: None,
         } => Ok(PqInflight::Initiating(
             apq::pq_ratchet::PqEphemeral::from_bytes(&eph.dk, &eph.ek),
         )),
@@ -452,33 +423,26 @@ fn pq_inflight_from_wire(wire: archive_wire::WirePqInflight) -> Result<PqInfligh
             kind: 1,
             ephemeral: None,
             secret: Some(s),
-            rotating: None,
         } => Ok(PqInflight::Responding(s.bytes)),
         WirePqInflight {
             kind: 2,
             ephemeral: None,
             secret: None,
-            rotating,
-        } => Ok(PqInflight::RekeyInitiated {
-            rotating: rotating.map(|bytes| ClientId { bytes }),
-        }),
+        } => Ok(PqInflight::RekeyInitiated),
         WirePqInflight {
             kind: 3,
             ephemeral: None,
             secret: None,
-            rotating: None,
         } => Ok(PqInflight::RekeyResponded),
         WirePqInflight {
             kind: 4,
             ephemeral: None,
             secret: None,
-            rotating: None,
         } => Ok(PqInflight::BootstrapInitiated),
         WirePqInflight {
             kind: 5,
             ephemeral: None,
             secret: None,
-            rotating: None,
         } => Ok(PqInflight::BootstrapResponded),
         _ => Err(TwoMlsPqError::ArchiveInvalid),
     }
@@ -547,11 +511,15 @@ fn session_from_wire(wire: archive_wire::SessionArchive) -> Result<Arc<TwoMlsPqS
         return Err(TwoMlsPqError::ArchiveInvalid);
     }
     // The staple is never empty on a live session (set at construction), and its
-    // first byte is one of the two staple forms: APQWelcome (0x01) or MLSMessage
-    // (0x00). This check also structurally rejects pre-v2 archive layouts, whose
-    // bytes can otherwise alias into these fields (an Option-None byte reads as an
-    // empty byte_vec).
-    if !matches!(wire.current_staple.first(), Some(&0x00) | Some(&APQ_TAG)) {
+    // first byte is one of the three staple forms: MLSMessage (0x00), APQWelcome
+    // (0x01), or APQPrivateMessage (0x05 -- a discharged bind, the staple until the
+    // next commit supersedes it). This check also structurally rejects pre-v2
+    // archive layouts, whose bytes can otherwise alias into these fields (an
+    // Option-None byte reads as an empty byte_vec).
+    if !matches!(
+        wire.current_staple.first(),
+        Some(&0x00) | Some(&APQ_TAG) | Some(&apq::APQ_PRIVATE_MESSAGE_TAG)
+    ) {
         return Err(TwoMlsPqError::ArchiveInvalid);
     }
 
@@ -646,12 +614,12 @@ fn session_from_wire(wire: archive_wire::SessionArchive) -> Result<Arc<TwoMlsPqS
             pq_turn_mine: wire.pq_turn_mine,
             // The seal cache is live-only, so a restore restarts any chunking pass with a
             // fresh base — the frames themselves ride the archive, so re-sending resumes.
-            pending_side_band: retained_from_wire(
-                wire.pending_side_band,
-                wire.side_band_retire_at,
-            )?,
-            peer_applied_classical: wire.peer_applied_classical,
-            peer_applied_pq: wire.peer_applied_pq,
+            pending_side_band: retained_from_wire(wire.pending_side_band),
+            owed_bind: wire.owed_bind.map(|o| super::OwedBind {
+                pq_commit: o.pq_commit,
+                t_epoch: o.t_epoch,
+                pq_epoch: o.pq_epoch,
+            }),
             send_psk_ledger: wire
                 .send_psk_ledger
                 .into_iter()
@@ -884,13 +852,14 @@ fn build_archive_wire(
             auth_mine,
             auth_theirs,
             pending_side_band: inner.pending_side_band.as_ref().map(|r| r.frame.clone()),
-            side_band_retire_at: inner
-                .pending_side_band
+            owed_bind: inner
+                .owed_bind
                 .as_ref()
-                .and_then(|r| r.retire_at)
-                .map(wire_retire_at),
-            peer_applied_classical: inner.peer_applied_classical,
-            peer_applied_pq: inner.peer_applied_pq,
+                .map(|o| archive_wire::WireOwedBind {
+                    pq_commit: o.pq_commit.clone(),
+                    t_epoch: o.t_epoch,
+                    pq_epoch: o.pq_epoch,
+                }),
             pq_inflight,
             initial_their_kp: inner.initial_their_kp.as_ref().map(wire_combiner_kp),
             initial_app_payload: inner.initial_app_payload.clone(),

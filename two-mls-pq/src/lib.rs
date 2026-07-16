@@ -202,23 +202,46 @@ pub fn version() -> String {
 // accumulated ladders carried no compatibility value — history stays in git): ALL
 // persisted sessions and invitations regenerate. The v15 key-package wire cut
 // (COMBINER_KEY_PACKAGE_VERSION 3, a published artifact, not an archive) is untouched.
-// v17 (2026-07-15, A.4's third leg + tag banding): A.4 is a well-formed three-leg round —
-// KP' -> Welcome' -> BIND — so the bootstrap ends on a receipt rather than a silent turn
-// flip, and it registers in the single side-band slot alongside A.3/A.5 (a bootstrap and a
-// ratchet can no longer be in flight at once). New `pq_bootstrap_bind`; `EncryptOutput`
-// gained an optional `side_band` frame and `encrypt` a `SideBandSealing` parameter (Fresh
-// re-seals per hand-out, Stable holds the base still for chunking) — both caught by
-// uniffi's checksum. NOT caught by it, and the reason this bumps: `pq_take_pending_outbound`
-// now honours retirement (a spent frame is withdrawn once a peer receipt proves it landed)
-// where it previously served whatever sat in the slot. Wire: the tag space is RENUMBERED
-// into bands, each packed from its start with its room at the end — message path 0x01-0x03
-// (full, and closed by design), A.1 establishment 0x05-0x0F (envelope 0x15->0x05, staple
-// 0x13->0x07; the room is where a hybrid nested envelope would land), PQ side-band 0x11-0x2F
-// in lifecycle order (bootstrap 0x11/0x13/0x15, ratchet 0x17/0x19/0x1B, re-key 0x1D/0x1F).
-// A band's reserved bytes are unallocated and must not classify. Hosts classify via
-// `pq_frame_kind`, never raw bytes, so this is a wire cut only — stale frames from older
-// builds fail loudly. Archive layout versions are untouched (pre-release hard cut).
-const BINDING_CONTRACT_VERSION: u64 = 17;
+// v18 (2026-07-15, every round ends in a stapled bind; 17 was burned by an interim build
+// of this same work and is skipped):
+// - Side-band frames are RETAINED for re-send (a frame lost in transport stalled its round
+//   with no way to heal): new `pq_pending_outbound(sealing: SideBandSealing)` peeks the
+//   sealed frame without consuming it (`Fresh` re-seals per hand-out, `Stable` holds the
+//   base still for chunking); new `DuplicateSideBand` error classifies a re-sent frame for
+//   a step already taken as a discardable duplicate. A.4 is a well-formed three-leg round
+//   (KP' -> Welcome' -> bind) registered in the single side-band slot alongside A.3/A.5.
+// - A BIND IS THE STAPLE, not a frame. A.3's and A.4's closing leg commits the PQ half
+//   pathlessly and OWES the classical half, which rides the binder's next classical COMMIT
+//   as the message-frame staple in draft-02 §7 `APQPrivateMessage` form — re-sent until
+//   superseded, so a lost bind heals by the staple's own machinery. `pq_ratchet_bind` /
+//   `pq_bootstrap_bind` LOSE their `app` parameter (the app travels on the committing
+//   round's own message frame); `pq_ratchet_apply` / `pq_bootstrap_apply` are DELETED (the
+//   bind arrives via `process_incoming`) — all caught by uniffi's checksum. NOT caught by
+//   it, and the reason this bumps: the staple slot gained a third form, `[0x05]`
+//   APQPrivateMessage alongside `[0x00]` commit and `[0x01]` APQWelcome.
+// - A.5 takes the same shape: Upd' (proposal — replaces the proposer's leaf, and carries
+//   the initiator's credential handoff) -> Commit' (the round's one updatePath commit —
+//   replaces the committer's leaf, now also the responder's own-leaf credential catch-up)
+//   -> a stapled ACK (pathless partial commit; a conformant FULL commit pair whose
+//   attestation reconciles the bumped pq_epoch in-round). The counter-Upd' is gone:
+//   `PQ_REKEY_COMMIT` carries one payload, `pq_rekey_apply` is initiator-only and returns
+//   `Result<()>`, and one A.5 round re-keys ONE group — the turn alternation brings the
+//   other group's round next.
+// - Retirement does not exist: every large frame is answered by a bind and every round's
+//   terminal leg is a staple, so retained frames clear on the ordinary round-complete rule
+//   and nothing re-sends forever. (An interim build withdrew spent frames on a peer
+//   application receipt; the receipt machinery is gone because nothing needs it.)
+// - Wire: `PQ_BIND` and `PQ_BOOTSTRAP_BIND` are deleted with their `PqFrameKind` variants
+//   (a bind is not a side-band frame), the message-path band GROWS to admit
+//   `apq::APQ_PRIVATE_MESSAGE_TAG`, and every band below shifts — message path 0x01-0x05
+//   (FULL: welcome 0x01, message frame 0x03, private-message staple form 0x05), A.1
+//   establishment 0x07-0x11 (envelope 0x05->0x07, pre-establishment staple 0x07->0x09),
+//   PQ side-band 0x13-0x31 in lifecycle order (bootstrap 0x13/0x15, ratchet 0x17/0x19,
+//   re-key 0x1B/0x1D). A band's reserved bytes are unallocated and must not classify.
+//   Hosts classify via `pq_frame_kind`, never raw bytes, so this is a wire cut only —
+//   stale frames from older builds fail loudly. Archive layout versions are untouched
+//   (pre-release hard cut; blobs from interim builds fail to decode and regenerate).
+const BINDING_CONTRACT_VERSION: u64 = 18;
 
 /// See `BINDING_CONTRACT_VERSION`. Exported so the Swift layer can verify the
 /// binding it was generated with matches the binary it loaded.

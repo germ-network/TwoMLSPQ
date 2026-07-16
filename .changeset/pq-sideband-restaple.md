@@ -18,9 +18,9 @@ the classical stream stalls retriably "until the BIND lands" — forever, if the
 bind is gone. A.4 is worse: a lost KP' means the session never reaches full
 establishment.
 
-Both roles' frames are now retained in `pending_pq_outbound` (already archived,
+Both roles' frames are now retained in `pending_side_band` (already archived,
 so retention survives restore), replaced when this side produces the round's next
-frame and cleared when its part in the round completes. This mirrors
+frame and cleared when the peer's answer proves it landed. This mirrors
 `current_staple`, which has always re-sent the classical commit on every frame so
 that any single received frame heals the peer.
 
@@ -70,12 +70,10 @@ The cause was A.4's two-leg shape. A.3 and A.5 end with the initiator finalising
 what lets the turn pass on a receipt; A.4 stopped at KP' → Welcome, so it had no finalising
 leg and handed the turn over early to compensate. It now has one:
 
-**KP' → Welcome' → Bind.** The initiator joins the welcomed group, exports the cross-party
+**KP' → Welcome' → bind.** The initiator joins the welcomed group, exports the cross-party
 secret from its birth epoch, injects it into its own send-PQ with a pathless commit, and
-chains the exported apq_psk into its classical half — `encode_bootstrap_bind`
-(`[pq_commit][classical_commit][app]`), which is A.3's bind under its own tag.
-The only difference from A.3 is where the secret comes from: a group exporter rather than a
-KEM exchange.
+OWES the classical half. The only difference from A.3's bind is where the secret comes
+from: a group exporter rather than a KEM exchange.
 
 Three things fall out:
 
@@ -90,55 +88,97 @@ Three things fall out:
   A.5 apart. So `pq_pending_outbound` returns at most one frame, and the second slot the
   first cut of this change added is gone.
 
-`pq_bootstrap_apply` now means the RESPONDER's leg-4 apply and returns the stapled app, as
-`pq_ratchet_apply` does; the initiator's join-and-bind is `pq_bootstrap_bind`. Like
-`pq_ratchet_bind`, it refuses with `SessionNotReady` while a prepared-but-unsent classical
-commit is staged — the bind's own commit would displace one that has never ridden a frame,
-and the peer would then hit `EpochDesync` with nothing lost on the wire. Retriable: bind
-after the round's `encrypt`. The exposure is sharper than A.3's, whose trigger the host asks
-for: A.4's is an INBOUND welcome, so a host that prepares a round and then receives it before
-its `encrypt` meets this without having done anything wrong. The old
-`PQ_BOOTSTRAP_BIND` tag is renamed `PQ_BOOTSTRAP_WELCOME` — it has always carried a welcome,
-and the bind name goes to the frame that earns it.
+The old `PQ_BOOTSTRAP_BIND` tag briefly named this leg's frame; the frame is gone (see the
+staple section below) and the tag with it.
 
-Two consequences worth knowing:
+One consequence worth knowing: **A.4 is no longer PQ-groups-only.** Its bind carries a
+classical commit, so it advances the initiator's epochs (1/1 → 2/2) where the old bootstrap
+advanced nothing. Post-A.4 state is therefore asymmetric: the responder's send-PQ is born at
+A.4 and does not move until its own next bind. Classical never blocks on PQ — this defers
+freshness, not liveness.
 
-- **A.4 is no longer PQ-groups-only.** Its bind carries a classical commit, so it advances
-  the initiator's epochs (1/1 → 2/2) where the old bootstrap advanced nothing. Post-A.4
-  state is therefore asymmetric: the responder's send-PQ is born at A.4 and does not move
-  until its own next bind. Classical never blocks on PQ — this defers freshness, not
-  liveness.
-- **A.4's terminal frame gets the FAST receipt.** Its classical commit means an ordinary peer
-  message frame retires it, where the old PQ-only bootstrap could only be confirmed by a peer
-  side-band frame.
+## A bind is the staple, not a frame
 
-## Terminal frames retire on the peer's application receipt
+draft-ietf-mls-combiner-02 §7 defines the wire shapes, and it has **no `APQCommit`**: a
+FULL commit travels as `APQPrivateMessage { t_message; pq_message; }`. The old bind frame
+`[pq_commit][cl_commit][app]` was a Germ invention sitting exactly where the draft already
+had the shape — the book's claim that the Germ frames *enclose* the draft-02 wire shapes
+rather than replacing them was false for the bind. So the bind is now that struct, riding
+where a classical commit already rides: the message-frame **staple**.
 
-A round's last frame — A.3's bind, A.4's BootstrapBind, A.5's final Commit′ — has no reply,
-so retention alone would re-send it forever, riding every message send.
+The trigger (`pq_ratchet_bind` / `pq_bootstrap_bind`) commits the PQ half pathlessly and
+records the classical half as OWED; the next classical COMMIT discharges it — exports the
+`apq_psk` from the reserved epoch, folds it and the shared attestation into the commit it
+is already building, and staples both halves as one `APQPrivateMessage`. Nothing about the
+bind is parked on the side-band: the staple re-sends until superseded, so a lost bind heals
+by machinery that already existed, and `apply_bind` collapses into the ordinary staple path
+on the receiver. The binds lose their `app` parameter (the committing round's own message
+frame carries the app), and `pq_ratchet_apply` / `pq_bootstrap_apply` are deleted — the
+bind arrives via `process_incoming` like any staple.
 
-The receipt was already on the wire and was being thrown away. We seal to the peer under
-OUR recv group, so the peer seals to us under ITS recv group — which is our SEND group — at
-the epoch it has actually applied. `recv_header_keys`' own doc said as much: "the peer seals
-frames to me under my send group (their recv group) *as they last applied it*". `try_open`
-iterated a map keyed by exactly that epoch and returned only the plaintext. It now returns
-the epoch and the window that matched, and a terminal frame carries the `(family, epoch)`
-that spends it.
+The owed state is two rules, enforced explicitly while it stands: **at most one owed bind**
+(a second PQ commit would move `pq_epoch` out from under the attestation the first one
+reserved), and **the next classical COMMIT is the bind** (not the next send — non-committing
+rounds flow freely, so PQ never holds up classical). `discharge_owed_bind` re-checks both
+against the live groups, because a violated reservation must fail loudly on our side, where
+nothing has been sent, not on the peer's with our PQ leaf already spent. The turn passes at
+discharge rather than at the trigger: one `EncryptResult` can then carry this round's bind
+in the staple and the next round's `begin` frame in the side-band slot — different paths,
+no contention — saving a round trip in async messaging.
 
-Consequences worth knowing:
+The wrapper tag exists because the struct cannot self-discriminate: its first byte is its
+inner `MLSPrivateMessage`'s `0x00`, identical to a bare commit, and the staple slot tells
+its forms apart by first byte alone (`0x00` MLSMessage, `0x01` APQWelcome, `0x05`
+APQPrivateMessage).
 
-- **The A.3 bind retires fast.** It advances both epochs, so it stamps CLASSICAL and any
-  ordinary message frame confirms it — and messages flow.
-- **A.4 and A.5 retire on a peer SIDE-BAND frame**, because both are PQ-only. A.5 is
-  deliberately so ("updatePath commits run on the PQ groups alone so the classical ratchet
-  is never blocked behind a large ML-KEM updatePath"), and welding it to a classical round
-  to get a faster receipt would reintroduce exactly that coupling. Accepted: the lingering
-  is bounded by the host's PQ cadence, not by the protocol.
-- **Unforgeable and free** — the key is derivable only inside the group at that epoch, and
-  it already rides every frame. No new wire bytes, no protocol change, and nothing that
-  could leak processing outcome.
-- **Monotone**: old epochs are retained so a lagging peer still lands, so a frame opening at
-  an older epoch is not evidence of regression — evidence only accrues.
+## A.5 becomes the same round shape: proposal, full commit, stapled ack
+
+A.5 was `Upd' → [Commit'][counter-Upd'] → Commit2`, rekeying both PQ groups in one round —
+and `Commit2` was both **terminal** (nothing answers it) and **large** (updatePath). Its
+last leg is now the same ack every round ends with: a small pathless partial commit riding
+the staple.
+
+    leg 1  initiator: Upd'(self) into the peer's send-PQ     proposal — replaces the
+                                                             PROPOSER's leaf
+    leg 2  responder: Commit' folding it, with updatePath    the round's ONE large frame —
+                                                             replaces the COMMITTER's leaf
+    leg 3  initiator: applies it, ACKS with a partial        small, a STAPLE, and a
+           commit exporting from the NEW epoch               conformant FULL commit
+
+All three rounds are now `X → Y → bind`, differing only in where the bind's secret comes
+from (KEM decapsulation; CrossParty export at the birth epoch; CrossParty export at the
+rekeyed epoch). The counter-proposal is gone, so one A.5 round re-keys ONE group — the same
+bytes per group as before (one updatePath commit each), across two rounds whose turn
+alternation the protocol already had. The ack's attestation reconciles the bumped `pq_epoch`
+into APQInfo **in-round**, where the old design deferred it to the next A.3 bind; the
+side-band `Commit'` itself still carries no attestation, preserving the A.5 isolation rule
+(the large PQ frame never rides the message path — "classical stapled commits carry no PQ
+keys").
+
+The credential handoff redistributes with the legs. The initiator's handoff rides its leg-1
+`Upd'` (a proposal replaces the proposer's leaf) — as it always did. The old counter-commit
+also moved the initiator's OWN send-PQ leaf; that updatePath is gone, so the committer
+replacement moves where the updatePath went: `pq_rekey_respond`'s Commit' now catches the
+RESPONDER's leaf up to the session's canonical identity whenever it lags (the PQ analogue of
+the classical commit's own-leaf catch-up, validated by the AS's already-canonical rule).
+Each party's send-PQ leaf hands off when it responds; the turn alternation brings that round
+around.
+
+## The peer-application receipt existed, and nothing needs it
+
+An earlier cut of this work retired terminal frames on a receipt recovered from header
+encryption, and the finding behind it was real: we seal to the peer under OUR recv group, so
+the peer seals to us under ITS recv group — our SEND group — at the epoch it has actually
+applied, which makes the epoch of the key that opens a frame an unforgeable, free,
+already-on-the-wire proof of what the peer has applied. `try_open` was discarding it.
+
+It is not recovered any more, because nothing needs it: with every round ending in a stapled
+bind, **no frame is both terminal and unanswered**. Every large frame is answered by the
+round's next leg (an EK by a CT, a KP' by a Welcome', a Commit' by the stapled ack), and the
+answer is what clears the retained frame — the ordinary round-complete rule, no stamps, no
+watermarks, no `(family, epoch)` on the wire structs. Should a future frame genuinely need a
+terminal receipt, the mechanism is a matter of record: the window that opens a frame names
+the family, and the epoch within it is the receipt.
 
 ## The tag space is banded, and the bands are enforced
 
@@ -156,15 +196,16 @@ the end:
 
 | Band | Range | Used |
 |------|-------|------|
-| Message path | 0x01-0x03 | 2 / 2 — full, and closed by design: the message path has exactly one shape |
-| A.1 establishment | 0x05-0x0F | 2 / 6 — the hybrid nested envelope would land in the room |
-| PQ side-band | 0x11-0x2F | 8 / 16 — lifecycle order: bootstrap, ratchet, re-key |
+| Message path | 0x01-0x05 | 3 / 3 — full, and closed by design: welcome, message frame, and the APQPrivateMessage staple form |
+| A.1 establishment | 0x07-0x11 | 2 / 6 — the hybrid nested envelope would land in the room |
+| PQ side-band | 0x13-0x31 | 6 / 16 — lifecycle order: bootstrap, ratchet, re-key; no binds (a bind is the staple) |
 
 Allocation order had left the side-band non-contiguous and silently falsified five
-`0x05-0x11` range shorthands across the code and book; a range in prose should at least not
+range shorthands across the code and book; a range in prose should at least not
 be a lie. Extending the protocol is no longer "take the next unused odd value" — it is
 "append at the end of the right band, into the room it already reserves". Only a band that
-FILLS moves anything below it.
+FILLS moves anything below it — which happened once within this very change: the bind
+becoming the staple's third form FILLED the message path, and every band below shifted.
 
 The room is free in both directions that could have cost something. On the wire, header
 encryption seals every blob, so a tag is never observed and a sparse space fingerprints
@@ -181,6 +222,7 @@ classified" would wave through a reserve that quietly started routing.
 `frames::tests::BANDS` is the record, and the book's `wire-format.md` table is its prose
 half.
 
-**This is a wire cut** (`BINDING_CONTRACT_VERSION` 17). Hosts classify via `pq_frame_kind`
-and never match raw bytes, so no host code changes; stale frames from older builds fail
-loudly in the decoders, as they already did across the previous renumber.
+**This is a wire cut** (`BINDING_CONTRACT_VERSION` 18; 17 was burned by an interim build of
+this same work). Hosts classify via `pq_frame_kind` and never match raw bytes, so no host
+code changes beyond the deleted bind cases; stale frames from older builds fail loudly in
+the decoders, as they already did across the previous renumber.

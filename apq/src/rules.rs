@@ -50,8 +50,9 @@ pub enum RuleError {
     NotTwoParty,
     /// An `AppDataUpdate` custom proposal failed validation: more than one, not the
     /// committer's own, a malformed payload, an attested epoch that is not this group's
-    /// next, or co-riding an Update (a FULL commit never folds one in this protocol —
-    /// that shape difference is what keeps A.5 re-key commits AppDataUpdate-free).
+    /// next, or co-riding an Update on the PQ half (a FULL commit's PQ half is a
+    /// pathless PSK-injection commit and never folds one — that shape difference is
+    /// what keeps A.5 re-key commits AppDataUpdate-free).
     #[error("invalid AppDataUpdate proposal")]
     BadAppDataUpdate,
 }
@@ -97,9 +98,12 @@ impl MlsRules for TwoMlsRules {
         // (see `component.rs`), committed by the committer itself on a FULL commit's
         // halves. Its same-half epoch must be exactly this group's next epoch (the
         // pre-commit context is in hand here); the cross-half equality is verified in the
-        // session layer, which sees both groups. It never co-rides an Update: no FULL
-        // commit in this protocol folds one, and that shape difference is what keeps A.5
-        // re-key commits (Update + PSK) AppDataUpdate-free at the rules level.
+        // session layer, which sees both groups. On the PQ half it never co-rides an
+        // Update: a FULL commit's PQ half is a pathless PSK-injection commit, and that
+        // shape difference is what keeps A.5 re-key commits (Update + PSK, on the PQ
+        // groups) AppDataUpdate-free at the rules level. The CLASSICAL half is the
+        // opposite — the bind rides a FOLDING round (the discharge), so the peer's
+        // Update co-riding there is the norm, not a violation.
         let customs = proposals.custom_proposals();
         if customs.len() > 1 {
             return Err(RuleError::BadAppDataUpdate);
@@ -112,15 +116,19 @@ impl MlsRules for TwoMlsRules {
                 Sender::Member(index) if index == committer.index => {}
                 _ => return Err(RuleError::BadAppDataUpdate),
             }
-            if !proposals.update_proposals().is_empty() {
+            let is_pq = match crate::client::suite_is_pq(context.cipher_suite) {
+                Some(v) => v,
+                None => return Err(RuleError::BadAppDataUpdate),
+            };
+            if is_pq && !proposals.update_proposals().is_empty() {
                 return Err(RuleError::BadAppDataUpdate);
             }
             let update = ApqInfoUpdate::from_custom_proposal(&custom.proposal)
                 .map_err(|_| RuleError::BadAppDataUpdate)?;
-            let attested = match crate::client::suite_is_pq(context.cipher_suite) {
-                Some(true) => update.pq_epoch,
-                Some(false) => update.t_epoch,
-                None => return Err(RuleError::BadAppDataUpdate),
+            let attested = if is_pq {
+                update.pq_epoch
+            } else {
+                update.t_epoch
             };
             if attested != context.epoch + 1 {
                 return Err(RuleError::BadAppDataUpdate);
