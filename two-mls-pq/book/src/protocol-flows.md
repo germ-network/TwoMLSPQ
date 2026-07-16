@@ -87,16 +87,36 @@ per-direction rule, and it is the invariant two other properties silently rest o
 
 **The evidence is the peer's stapled proposal, and it is in-protocol.** The peer builds its
 `Upd(self)` in *its recv group*, which **is** our send group, so the proposal is bound to our
-send group's epoch: an offer that validates at our current epoch could only have been produced by
-a party that had applied our commits through it. Our own commit invalidates any offer still in
-flight (it was built for the prior epoch), and the peer re-proposes at the new epoch on its next
-frame — so the license is re-earned exactly once per round trip.
+send group's epoch: an offer bound to our current epoch could only have been produced by a party
+that had applied our commits through it. Our own commit invalidates any offer still in flight
+(it was built for the prior epoch), and the peer re-proposes at the new epoch on its next frame —
+so the license is re-earned exactly once per round trip. (The peer's *commit* proves the same
+fact, but any frame carrying their commit also carries their proposal at our epoch — the frame is
+`[staple][proposal][app]`, all sections mandatory — so proposal-evidence strictly contains
+commit-evidence, and it also arrives on the frames where they don't commit.)
+
+**The license is not approval.** It is read off the *raw* offer's epoch, before — and independent
+of — validation or `queue_proposal`: an offer the app never approves, is slow to approve, or
+whose credential would be refused still licenses the discharge. Approval is the app's to withhold
+(it is the AS authorization step, and folding stays gated on it); the license is not the app's to
+stall, so a bug or delay in approving a remote proposal can never block a bind's classical
+commit.
 
 This was implicit for as long as folding an approved proposal was the *only* way to commit: the
 fold IS the evidence, since `validate_offered_update` runs the offer through mls-rs against the
 live send group and a stale-epoch offer is refused there. Committing without a fold (to discharge
 an owed bind) needs the same license, so the watermark is now tracked explicitly rather than
 inferred from the fold.
+
+**Where each ratchet advances.** TwoMLS is a state machine advanced by sending and processing
+messages: the PQ ratchet advances when a PQ step is processed, but the classical ratchet advances
+only at `prepare_to_encrypt` — the host's own next send. So the library never commits classically
+behind the app: a PQ trigger leaves an *owed* bind, and the discharge (fold or licensed
+proposal-less commit) rides whatever round the host starts. There is deliberately no third reason
+to commit — no commit on cadence merely because the license is present — since every commit of
+ours invalidates the peer's in-flight offer, and committing every licensed round would churn
+offers inside the window the peer's app has to approve them. A host that wants leaf-refresh PCS
+faster than its PQ cadence should run the PQ ratchet faster; the bind carries both PCS sources.
 
 > **Why the proposal and not the PSK.** The peer's commit that cross-injects a PSK exported from
 > our send group at epoch *E* is also proof it applied *E* — it cannot export from a mirror it has
