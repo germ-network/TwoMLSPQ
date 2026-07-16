@@ -267,25 +267,29 @@ synchronized membership —
 - a **classical MLS group** (traditional ciphersuite).
 
 The two halves are bound by exporting a secret from the PQ group and importing
-it into the classical group as an external **PreSharedKey** proposal.
+it into the classical group as a **PreSharedKey** proposal.
 
-> **Implemented binding (diverges from draft -02).** The implementation uses
-> the plain MLS exporter rather than the draft's Safe Extensions recipe:
+> **Implemented binding (conforms to draft -02).** The `apq_psk` follows the
+> draft's Safe Extensions recipe (`draft-ietf-mls-extensions-08` §4.4) and is
+> imported as an `application(3)` PSK:
 >
 > ```
-> apq_psk    = MLS-Exporter(label="exportSecret", context="derive", length=32)   # in the PQ group
-> apq_psk_id = pq_epoch (u64 LE) ‖ pq_group_id
+> apq_exporter = SafeExportSecret(component_id = 0xFF01)   # consumed leaf of the PQ epoch's exporter tree
+> apq_psk_id   = DeriveSecret(apq_exporter, "psk_id")
+> apq_psk      = DeriveSecret(apq_exporter, "psk")
 > ```
 >
-> (The A.3 injected secret S uses the same id scheme with a trailing domain
-> byte `0x52`, keeping it disjoint from exported ids.) There is no `APQInfo`
-> GroupContext extension, no `AppDataUpdate` proposal, and no tracked
-> `t_epoch`: the epoch pair is read live from the two groups
-> (`ApqEpochs { pq_epoch, classical_epoch }`). For reference, draft -02
-> instead derives `apq_psk`/`apq_psk_id` via `DeriveSecret` from a
-> `SafeExportSecret(...)` on the `epoch_secret`, imports with the combiner's
-> `component_id`, and records/verifies epochs through an `APQInfo` extension
-> updated by `AppDataUpdate` proposals in every FULL commit.
+> The draft's bookkeeping rides with it: an `APQInfo` GroupContext extension
+> (type `0xF0A1`) in both halves, and an `AppDataUpdate` proposal (type
+> `0x0008`) in both commits of every FULL commit attesting the post-commit
+> `(t_epoch, pq_epoch)` pair. [PSK Binding](./psk-binding.md) has the full
+> recipe, [group rules](./group-rules.md) rule 7 the verification, and the
+> [Wire Format](./wire-format.md) chapter the conformance cutover. Two
+> deliberate deviations remain: `APQInfo` is written once at creation and
+> never rewritten — epoch freshness lives in the per-commit `AppDataUpdate`,
+> not a rewritten extension — and the A.3 injected secret `S` is Germ's own
+> addition, an `external(1)` PSK with id `LE-u64(epoch) ‖ group_id ‖ 0x52`,
+> kept disjoint from the exported application ids.
 
 A full session is thus **four MLS groups**: `ASG-PQ`, `ASG-cl`, `BSG-PQ`, `BSG-cl`.
 
@@ -345,7 +349,7 @@ sequenceDiagram
 
     Note over Alice: Build Alice's send group (ASG) as an APQ group
     Alice->>Alice: [ASG-PQ] Add'(Bob KP') + Commit' → ASG-PQ epoch 1
-    Alice->>Alice: Export apq_psk from ASG-PQ (MLS exporter, psk_id = LE(pq_epoch) ‖ group_id)
+    Alice->>Alice: Export apq_psk from ASG-PQ (Safe Extensions, component 0xFF01)
     Alice->>Alice: [ASG-cl] Add(Bob KP) + PSK=apq_psk + Commit → ASG-cl epoch 1 (PQ-seeded)
 
     Alice->>Bob: One HPKE envelope [ app payload ∥ APQ Welcome = { Welcome' [ASG-PQ], Welcome(PSK) [ASG-cl] } ],<br/>sealed to the PQ EK in Bob's KP'
