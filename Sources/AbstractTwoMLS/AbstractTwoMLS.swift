@@ -64,8 +64,8 @@ extension AbstractTwoMLS {
 	// `Invitation`, and `PQRatchet` throws `AbstractTwoMLS.SessionError`.
 	// Discriminate on its `code` / `disposition` — never on a backend error type
 	// (that defeats the abstraction). Drive recovery off `disposition`
-	// (`.retryLater`, `.reconnect`, `.approveAndReprocess`, …); a run of
-	// `.unopenableFrame` on a live session is the reconnect signal. After a
+	// (`.retryLater`, `.reestablish`, `.approveAndReprocess`, …); a run of
+	// `.unopenableFrame` on a live session is the re-establish signal. After a
 	// `.retryLater` (`.decryptionFailed`) failure from `processIncoming`,
 	// reconcile identity from `theirPrincipalState` — a staple may have applied
 	// before the app message failed (see `PrincipalState`).

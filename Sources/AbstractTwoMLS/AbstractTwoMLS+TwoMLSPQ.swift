@@ -434,7 +434,7 @@ extension AbstractTwoMLS {
 		) throws(AbstractTwoMLS.SessionError) -> PQDecryptResult? {
 			// `.misroutedFrame` if a PQ side-band frame lands here (route it to
 			// `ingest`); `.decryptionFailed` is transient (retry); `.epochDesync`
-			// means reconnect. After a `.retryLater` failure, reconcile identity
+			// means re-establish. After a `.retryLater` failure, reconcile identity
 			// via `theirPrincipalState` — a staple may have applied.
 			try mapPQErrors(.processIncoming) {
 				try base.processIncoming(ciphertext: ciphertext)
@@ -598,12 +598,12 @@ extension AbstractTwoMLS {
 			// trial-decrypt window per frame for nothing.
 			guard let opened = try base.openIncoming(blob: message) else {
 				// No header key opened it (M2a). One alone may be a stranger's
-				// garbage or a reconnect-gap frame; treat a RUN of these on a live
-				// session as a reconnect signal (count at the call site).
+				// garbage or a desync-gap frame; treat a RUN of these on a live
+				// session as a re-establish signal (count at the call site).
 				throw AbstractTwoMLS.SessionError(
 					code: .unopenableFrame,
 					detail: "no receive-window key opens this blob; "
-						+ "a run of these is a reconnect signal")
+						+ "a run of these is a re-establish signal")
 			}
 			guard case let .pqSideBand(kind) = opened.kind else {
 				// A message-path frame reached the side-band entry point (M2b).

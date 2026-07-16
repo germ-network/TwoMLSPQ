@@ -40,7 +40,7 @@ struct MalformedFrameTests {
 			encodedRemoteKpkg: remote.currentInvitation.encodedKeyPackage
 		)
 		let pq = session as any AbstractTwoMLS.PQRatchetingSession
-		// No receive-window key opens these (M2a) — the reconnect-signal code,
+		// No receive-window key opens these (M2a) — the re-establish-signal code,
 		// distinct from a misrouted message frame.
 		for frame in [Data([0x00]), Data()] {
 			do {

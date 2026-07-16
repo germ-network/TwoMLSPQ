@@ -21,11 +21,13 @@ extension AbstractTwoMLS {
 			/// Transient: redelivery or reordering heals it. Retry.
 			case retryLater
 			/// Drop this frame; the session/invitation is unaffected. (See
-			/// `.unopenableFrame` for the reconnect-run heuristic.)
+			/// `.unopenableFrame` for the re-establish-run heuristic.)
 			case discardFrame
-			/// The direction is desynced past self-healing — run the reconnect
-			/// path (re-establish the send/receive pairing).
-			case reconnect
+			/// The session direction cannot self-heal, and no in-session
+			/// recovery exists at this layer — re-establish the session out of
+			/// band (the app's re-exchange path). Distinct from
+			/// restore-recovery, which is `.retryLater` + `isReceiveBroken`.
+			case reestablish
 			/// A peer credential needs authorizing: approve the fresh proposal
 			/// (`queueProposal`) and reprocess — the staple re-rides.
 			case approveAndReprocess
@@ -62,11 +64,12 @@ extension AbstractTwoMLS {
 			case duplicateSideBand
 			/// A header frame that no receive-window key opens. One alone may be
 			/// a stranger's garbage; treat a RUN of these on a live session as a
-			/// reconnect signal (count them at the call site).
+			/// re-establish signal (count them at the call site).
 			case unopenableFrame
 			/// A structurally malformed frame (truncated header, bad length).
 			case malformedFrame
-			/// A stapled commit is ahead of the receive group — reconnect.
+			/// A stapled commit is ahead of the receive group; the bridging
+			/// commit no longer rides any frame — re-establish.
 			case epochDesync
 			/// A peer bind staple failed to apply AFTER the round's secret was
 			/// consumed: receiving is poisoned (every further processIncoming
@@ -76,7 +79,7 @@ extension AbstractTwoMLS {
 			/// `isReceiveBroken` to decide urgency by role (receive-critical:
 			/// now; send-mostly: deferred).
 			///
-			/// Disposition is `.retryLater`, NOT `.reconnect`, and the
+			/// Disposition is `.retryLater`, NOT `.reestablish`, and the
 			/// difference is custody: frames refused in the poisoned window were
 			/// never consumed and WILL decrypt after the restore, so a host that
 			/// acks-and-drops them on a session-recovery exit destroys messages
@@ -156,7 +159,9 @@ extension AbstractTwoMLS {
 					.unopenableFrame, .malformedFrame:
 					return .discardFrame
 				case .epochDesync, .bindDischargeFailed:
-					return .reconnect
+					// The crate words this "re-establish the session" too; the
+					// recovery is out-of-session (tear down and re-exchange).
+					return .reestablish
 				case .bindApplyFailed:
 					// Custody: the poisoned window's frames are recoverable
 					// after the restore — never let an exit ack them away.
