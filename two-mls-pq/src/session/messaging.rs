@@ -990,7 +990,13 @@ impl TwoMlsPqSession {
                                 return Err(TwoMlsPqError::SessionNotReady);
                             }
                         };
-                        inner.apply_bind(&s, &stores, &pq_message, &t_message)?;
+                        // The bind's classical half is the peer's routine FULL commit — a
+                        // discharge only ever rides a round that folds our approved Upd —
+                        // so it carries identity exactly as a plain commit staple does:
+                        // report what moved into the same bookkeeping the plain arm feeds.
+                        let moved = inner.apply_bind(&s, &stores, &pq_message, &t_message)?;
+                        new_sender = moved.new_sender;
+                        canonicalized_own = moved.canonicalized_own;
                         staple_applied = true;
                         // The round is closed: the peer relinquished at its terminal send,
                         // and applying it is what takes the turn.

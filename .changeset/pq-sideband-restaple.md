@@ -126,6 +126,14 @@ discharge rather than at the trigger: one `EncryptResult` can then carry this ro
 in the staple and the next round's `begin` frame in the side-band slot — different paths,
 no contention — saving a round trip in async messaging.
 
+**A bind's classical half is the routine FOLDING commit**, and that follows from rule 3: a
+discharge only ever rides a round that folds the peer's approved Upd. So the frame carrying
+a bind carries everything a plain commit frame does — including a credential rotation's
+canonical step, when the folded Upd names a candidate. Hosts see no new case (the rotation
+surfaces on `remote_commit` exactly as it does off a plain commit); the wire shape that
+delivers it is the only difference, which is why the receiver's identity bookkeeping runs
+off what the applied commit MOVED rather than off which staple form carried it.
+
 The wrapper tag exists because the struct cannot self-discriminate: its first byte is its
 inner `MLSPrivateMessage`'s `0x00`, identical to a bare commit, and the staple slot tells
 its forms apart by first byte alone (`0x00` MLSMessage, `0x01` APQWelcome, `0x05`

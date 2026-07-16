@@ -536,15 +536,11 @@ impl TwoMlsPqSession {
                     None
                 }
             };
-            match inner.pq_inflight.take() {
-                Some(PqInflight::RekeyInitiated) => {}
-                // Unreachable: the guard at the top of this function admits only
-                // `RekeyInitiated`. Kept (with the state restored) purely as exhaustiveness
-                // defense should the guard and this match ever drift apart.
-                other => {
-                    inner.pq_inflight = other;
-                    return Err(TwoMlsPqError::SessionNotReady);
-                }
+            // Exhaustiveness defense should the guard at the top of this function and this
+            // body ever drift apart — a pure READ, never a take: the inflight state has to
+            // survive every fallible step below (see the clear after the apply).
+            if !matches!(inner.pq_inflight, Some(PqInflight::RekeyInitiated)) {
+                return Err(TwoMlsPqError::SessionNotReady);
             }
             // Apply the responder's Commit' to our recv mirror. It may carry the
             // responder's own-leaf credential catch-up (see `pq_rekey_respond`), which the
@@ -572,6 +568,19 @@ impl TwoMlsPqSession {
                 // A peer commit must never change the two-party shape.
                 apq::ensure_two_party(&*recv_pq)?;
             }
+            // The Commit' has APPLIED: the round's inbound leg is complete, so the inflight
+            // state goes now — deliberately not before it.
+            //
+            // Everything above is fallible, and the credential catch-up this Commit' may
+            // carry is refused RETRIABLY by design (see `pq_rekey_respond`: the AS admits
+            // only an already-canonical identity, so a Commit' racing ahead of our classical
+            // rotation staple is rejected until that staple lands). Clearing the state
+            // first would make that retry unreachable: the responder re-sends its Commit'
+            // as designed, but our guard — seeing no round in flight and still holding the
+            // turn, which passes only at a discharge that never happened — would answer
+            // SessionNotReady forever, deadlocking both sides for good (the closure's
+            // mutations persist even on Err).
+            inner.pq_inflight = None;
             // The Commit' we just applied consumed the send-PQ cross-PSK we pre-registered
             // above; drop it from the store.
             if let Some(id) = &pre_registered_send_pq {

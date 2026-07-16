@@ -85,6 +85,26 @@ struct OwedBind {
     pq_epoch: u64,
 }
 
+/// The leaf-identity moves an applied peer commit carried. Both `None` on the ordinary
+/// round, where the commit refreshes leaf keys without touching a credential.
+///
+/// Identity travels IN the leaves (the AS validates it during processing), so what an
+/// applied commit MOVED is the only evidence of a credential step — and the two directions
+/// mean different things, which is why they are separate fields rather than a flag:
+///
+/// - `new_sender` — the PEER's leaf moved: its catch-up to a credential our own commit
+///   already canonicalized. Reported to the app as the frame's new sender.
+/// - `canonicalized_own` — OUR leaf moved: the peer committed one of our candidate Upds,
+///   and that commit DEFINES our next canonical credential (the Phase-8 canonical step).
+///
+/// Every arm that applies a peer classical commit must report these, because the session's
+/// principal state, the AS sequences, and the group leaves are only consistent if they move
+/// together — see `process_incoming`, where both staple arms feed one bookkeeping block.
+struct LeafChanges {
+    new_sender: Option<ClientId>,
+    canonicalized_own: Option<Vec<u8>>,
+}
+
 /// No frame here is ever terminal: every side-band frame is answered by its round's next
 /// leg (the last leg of every round is a stapled bind, which travels the message path),
 /// so the answer is what replaces or clears the slot — no retirement stamp exists.
@@ -516,7 +536,8 @@ impl SessionInner {
 
     /// The apply both A.3 and A.4 close their round with: apply the peer's pathless PQ commit
     /// to our recv-PQ with the injected secret `s`, apply the classical commit, and verify the
-    /// -02 FULL attestation across both halves.
+    /// -02 FULL attestation across both halves. Returns the leaf-identity changes the classical
+    /// half carried, for the caller's AS bookkeeping (see [`LeafChanges`]).
     ///
     /// Run from the STAPLE slot, because the bind is an `APQPrivateMessage` there rather than a
     /// frame of its own. It therefore does NOT touch the app message: that is the enclosing
@@ -532,7 +553,7 @@ impl SessionInner {
         stores: &[InMemoryPreSharedKeyStorage],
         pq_commit: &[u8],
         cl_commit: &[u8],
-    ) -> Result<()> {
+    ) -> Result<LeafChanges> {
         // The classical half is a FULL folding commit, so it may bind the cross-party
         // TwoMLS-PSK of our send group -- possibly at an epoch we've since moved past
         // (the peer's frame can cross one of our commits). Live-inject the session-held
@@ -548,10 +569,23 @@ impl SessionInner {
         let (apq_psk, pq_attestation) =
             apq::pq_ratchet::apply_injected_commit(recv_pq, s, pq_commit, stores)?;
         let cl = MlsMessage::from_bytes(cl_commit).map_err(|_| TwoMlsPqError::Mls)?;
+        // Snapshot both leaves before the apply: the bind's classical half is the peer's
+        // routine FULL commit (the discharge only ever rides a round that folds our
+        // approved Upd), so a credential can move here exactly as on a plain commit
+        // staple — see `LeafChanges`.
+        let mine = recv.classical.current_member_index();
+        let peer_index = if mine == 0 { 1 } else { 0 };
+        let prior_peer = sender_client_id(&recv.classical, peer_index)?;
+        let prior_own = sender_client_id(&recv.classical, mine)?;
         let cl_attestation = match recv
             .classical
             .process_incoming_message(cl)
-            .map_err(|_| TwoMlsPqError::Mls)?
+            // The AS validates the credentials this commit carries, and its refusal is
+            // retriable (the staple re-rides every frame, so authorize-and-reprocess
+            // recovers the round) — flattening it into `Mls` would strand a host that
+            // routes `CredentialRejected` to that recovery. Non-credential errors keep
+            // mapping to `Mls`, which is `map_credential_err`'s own fallback.
+            .map_err(map_credential_err)?
         {
             ReceivedMessage::Commit(desc) => {
                 commit_attestation(&desc)?.ok_or(TwoMlsPqError::ApqInfoMismatch)?
@@ -584,11 +618,17 @@ impl SessionInner {
         // Peer commits (the PQ partial above is checked inside `apply_injected_commit`)
         // must never change the two-party shape.
         apq::ensure_two_party(&recv.classical)?;
+        // Read the leaves back only once the roster is re-asserted, as the plain arm does.
+        let new_peer = sender_client_id(&recv.classical, peer_index)?;
+        let new_own = sender_client_id(&recv.classical, mine)?;
         // The bind consumed the one-shot apq PSK; drop it from every store it was
         // registered into (the session registry plus the group-captured handles).
         recv.forget_psk(apq_psk.storage_id());
         apq::forget_psk_stores(stores, apq_psk.storage_id());
-        Ok(())
+        Ok(LeafChanges {
+            new_sender: (new_peer != prior_peer).then_some(ClientId { bytes: new_peer }),
+            canonicalized_own: (new_own != prior_own).then_some(new_own),
+        })
     }
 
     /// Seal the retained side-band frame for hand-out, filling its `Stable` cache on a

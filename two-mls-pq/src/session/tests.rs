@@ -352,6 +352,78 @@ fn test_queue_proposal_declared_mismatch_is_noop() {
     assert_eq!(bob.their_principal_state().client_id(), id_real);
 }
 
+/// A rotation canonicalized by a DISCHARGING commit must land on the receiver exactly as
+/// one canonicalized by a plain commit.
+///
+/// The two are the same commit: a discharge only ever rides a round that folds an approved
+/// Upd (rule 3 — `discharge_owed_bind` runs solely in `prepare_ratchet_commit`'s committing
+/// branch), so the bind's classical half IS the routine folding commit, carrying the same
+/// canonical credential step. It differs only in the shape that delivers it — an
+/// `APQPrivateMessage` staple instead of a bare commit — which is a wire detail the identity
+/// bookkeeping must not depend on.
+///
+/// The failure this pins is silent and permanent: the receiver's group leaf moves to the
+/// winner while its principal, AS sequence and signing client stay on the retired identity,
+/// so it re-proposes an identity the peer now refuses (CredentialRejected) with no way back.
+#[test]
+fn test_rotation_canonicalized_by_a_discharging_commit() {
+    let (alice, bob) = establish_full();
+    // Bob holds the turn after A.4: he opens an A.3 round and binds, so his next
+    // COMMITTING round is the one that must discharge it.
+    let ek = assert_ok!(bob.pq_ratchet_begin());
+    assert_ok!(alice.pq_ratchet_respond(ek));
+    let ct = assert_some!(alice.pq_take_pending_outbound());
+    assert_ok!(bob.pq_ratchet_bind(ct));
+
+    // Alice proposes her successor on the very frame Bob folds into that discharge.
+    let new_alice = make_client().client_id();
+    assert_ok!(alice.stage_rotation(new_alice.bytes.clone()));
+    assert!(matches!(
+        alice.my_principal_state(),
+        PrincipalState::Pending { .. }
+    ));
+    assert_ok!(alice.prepare_to_encrypt(Some(new_alice.clone())));
+    let rotation = assert_ok!(alice.encrypt(b"rotate".to_vec()));
+    let got = assert_some!(assert_ok!(bob.process_incoming(rotation.cipher_text)));
+    let offered = assert_some!(got.proposal);
+    assert_eq!(offered.proposing.bytes, new_alice.bytes);
+    assert_ok!(bob.queue_proposal(offered.digest));
+
+    // One round folds the rotation AND discharges the bind into a single staple.
+    let prepared = assert_ok!(bob.prepare_to_encrypt(None));
+    assert!(prepared.did_commit);
+    assert_eq!(
+        assert_some!(prepared.committed_remote_client_id).bytes,
+        new_alice.bytes,
+        "Bob's commit canonicalizes Alice's candidate"
+    );
+    let frame = assert_ok!(bob.encrypt(b"fold+bind".to_vec()));
+
+    // Alice applies it from the APQPrivateMessage staple: the canonical step must land.
+    let got = assert_some!(assert_ok!(alice.process_incoming(frame.cipher_text)));
+    let commit = assert_some!(got.remote_commit);
+    assert_eq!(
+        commit.new_recipient.bytes, new_alice.bytes,
+        "the bind staple carried our canonical step; the app must observe it"
+    );
+    assert_eq!(
+        alice.my_principal_state().client_id().bytes,
+        new_alice.bytes
+    );
+    assert!(matches!(
+        alice.my_principal_state(),
+        PrincipalState::Sync { .. }
+    ));
+    // The bind rode the same staple, so the PQ round closed on it too.
+    assert!(alice.my_pq_turn());
+
+    // The session survives, which is the point: Alice now signs as the winner, so her
+    // next proposal is one Bob can commit. A dropped canonical step surfaces here — she
+    // would re-propose the retired identity and Bob would refuse it.
+    approved_commit_round(&bob, &alice);
+    message_round(&alice, &bob, b"after-rotation");
+}
+
 /// An owed bind leaves the queued tally alone: the trigger commits only the PQ half
 /// (2/1 — classical owed), so the app-approved peer proposal stays queued, and the
 /// NEXT committing round both folds it and discharges the bind. (The old bind frame
@@ -913,6 +985,43 @@ fn test_pq_rekey_then_ratchet_still_works() {
     rekey_round(&bob, &alice);
     // A.3 ratchet after a rekey: Alice holds the turn.
     ratchet_round(&alice, &bob, b"post-rekey-ratchet");
+}
+
+/// A refused Commit' must leave the A.5 round exactly where it was, because the refusal
+/// the design actually expects is RETRIABLE: `pq_rekey_respond`'s Commit' may carry the
+/// responder's own-leaf credential catch-up, and the AS admits only an already-canonical
+/// identity — so a Commit' racing ahead of the classical rotation staple is rejected until
+/// that staple lands, and the responder re-sends it meanwhile.
+///
+/// Consuming the round state before that fallible apply made the retry unreachable: with no
+/// round in flight and the turn still ours (it passes only at a discharge that never
+/// happened), every re-sent Commit' would answer SessionNotReady — a permanent, persisted
+/// deadlock on both sides. Here a foreign-group Commit' stands in for any refusal; the
+/// property is that the round survives it.
+#[test]
+fn test_refused_rekey_commit_leaves_the_round_retriable() {
+    let (alice, bob) = establish_full();
+    let (carol, dave) = establish_full();
+
+    // Bob holds the turn after A.4, so he initiates and Alice's Commit' answers.
+    let upd = assert_ok!(bob.pq_rekey_begin(None));
+    assert_ok!(alice.pq_rekey_respond(upd));
+    let real = assert_some!(alice.pq_take_pending_outbound());
+
+    // An unrelated pair's Commit', taken as PLAINTEXT via its own initiator so it reaches
+    // Bob's apply rather than dying at the header seal.
+    let foreign_upd = assert_ok!(dave.pq_rekey_begin(None));
+    assert_ok!(carol.pq_rekey_respond(foreign_upd));
+    let foreign_sealed = assert_some!(carol.pq_take_pending_outbound());
+    let foreign = assert_some!(assert_ok!(dave.open_incoming(foreign_sealed))).frame;
+
+    // Refused — it commits another group entirely.
+    assert_err!(bob.pq_rekey_apply(foreign), TwoMlsPqError::Mls);
+
+    // The round is intact: the real Commit' still applies, and the ack still closes it.
+    assert_ok!(bob.pq_rekey_apply(real));
+    discharge_bind(&bob, &alice, b"after-refusal");
+    assert!(alice.my_pq_turn());
 }
 
 #[test]
