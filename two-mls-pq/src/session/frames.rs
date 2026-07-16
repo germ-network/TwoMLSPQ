@@ -101,14 +101,14 @@ pub(crate) const PQ_BOOTSTRAP_WELCOME_TAG: u8 = 0x13;
 /// initiator joined: A.4's receipt is a side effect of entropy it had to chain anyway.
 pub(crate) const PQ_BOOTSTRAP_BIND_TAG: u8 = 0x15;
 
-// PQ ratchet (architecture-diagrams PR #2 §A.3), cryptokit only:
+// PQ ratchet (book: Protocol Flows §A.3), cryptokit only:
 // 0x17 carries the initiator's ML-KEM encapsulation key, 0x19 the responder's ciphertext,
 // 0x1B the bind = [pq partial-commit][classical commit][app], all length-prefixed.
 pub(crate) const PQ_EK_TAG: u8 = 0x17;
 pub(crate) const PQ_CT_TAG: u8 = 0x19;
 pub(crate) const PQ_BIND_TAG: u8 = 0x1B;
 
-// A.5 rekey (architecture-diagrams §A.5), cryptokit only — updatePath commits run on the
+// A.5 rekey (book: Protocol Flows §A.5), cryptokit only — updatePath commits run on the
 // PQ groups alone so the classical ratchet is never blocked behind a large ML-KEM
 // updatePath. 0x1D carries the initiator's Upd' proposal for the responder's send-PQ;
 // 0x1F = [Commit'][counter-Upd'-or-empty], length-prefixed — the responder's reply

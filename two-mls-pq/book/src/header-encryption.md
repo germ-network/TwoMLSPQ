@@ -331,7 +331,7 @@ reason the window must be ≥ 2 even in the happy path).
 ### Establishment walkthrough
 
 Alice initiates; Bob accepts (send groups per the [Session
-Lifecycle](./session-lifecycle.md); this matches the architecture-diagrams §A.1
+Lifecycle](./session-lifecycle.md); this matches [Protocol Flows](./protocol-flows.md) §A.1
 orientation and the crate's constructor names — Alice builds `Group_A` ≡ ASG).
 
 1. **Alice `initiate(client, their_kp, app_payload)`** — builds Group_A; captures

@@ -39,7 +39,9 @@
 ## The PQ side-band
 
 Three flows run beside the message path on their own tagged frames (see
-[Wire Format](./wire-format.md)). A single **turn** alternates between the parties:
+[Wire Format](./wire-format.md)). This section is the caller's view — which function to
+call, in what order; [Protocol Flows](./protocol-flows.md) §A.3–A.5 is the protocol they
+implement, and why the epochs must line up as they do. A single **turn** alternates between the parties:
 the session initiator owes the bootstrap; completing an operation passes the turn to
 the peer (`my_pq_turn()`), and only one operation may be in flight at a time.
 
