@@ -940,13 +940,15 @@ impl TwoMlsPqSession {
             // CipherSuiteMismatch rather than a late opaque mls-rs error (matches the
             // establishment welcome path).
             check_welcome_suite(&pq_welcome, inner.suite.pq)?;
-            // Only the initiator of THIS bootstrap may close it.
-            if !matches!(inner.pq_inflight, Some(PqInflight::BootstrapInitiated)) {
-                return Err(TwoMlsPqError::SessionNotReady);
-            }
             // An already-up recv-PQ means we joined and bound already — the peer is
-            // re-sending its welcome until our bind lands. Discard: re-staple makes this
-            // steady-state, and it is reached before anything is touched.
+            // re-sending its welcome until our stapled bind lands. Discard: re-staple makes
+            // this steady-state, and it is reached before anything is touched.
+            //
+            // Checked BEFORE the `BootstrapInitiated` gate, not after: joining sets recv-PQ
+            // and clears `pq_inflight` to `None` in one closure, so a post-bind re-send is
+            // always {recv-PQ up, inflight None} — behind the inflight gate it would answer
+            // the retriable `SessionNotReady`, inviting the host to retry a round that is
+            // over, and the duplicate arm would be dead.
             if inner
                 .recv_group
                 .as_ref()
@@ -954,6 +956,12 @@ impl TwoMlsPqSession {
                 .unwrap_or(false)
             {
                 return Err(TwoMlsPqError::DuplicateSideBand);
+            }
+            // Only the initiator of THIS bootstrap may close it — a welcome with no bootstrap
+            // in flight (and recv-PQ still down, per the discard above) is genuinely
+            // ill-timed, not a duplicate.
+            if !matches!(inner.pq_inflight, Some(PqInflight::BootstrapInitiated)) {
+                return Err(TwoMlsPqError::SessionNotReady);
             }
             // Staple-stacking guard, as `pq_ratchet_bind` has: a prepared-but-unsent classical
             // commit is sitting in `current_staple` waiting for its `encrypt`, and the bind

@@ -55,6 +55,31 @@ fn test_pq_bootstrap_completes_deferred_halves() {
     );
 }
 
+/// A re-sent A.4 welcome, after the initiator has already joined and bound, is a discardable
+/// `DuplicateSideBand` — not the retriable `SessionNotReady` that would invite the host to
+/// retry a bootstrap that is over. The responder re-staples its welcome until the stapled
+/// bind lands, so these re-sends are steady-state, and the initiator's recv-PQ being up is
+/// what proves the step is done (its `pq_inflight` is already `None`, so this must be checked
+/// before the in-flight gate).
+#[test]
+fn test_duplicate_bootstrap_welcome_is_discardable() {
+    let (alice, bob) = establish_confirmed_sessions();
+    let kp = assert_ok!(alice.pq_bootstrap_begin(None));
+    assert_ok!(bob.pq_bootstrap_respond(kp));
+    // Keep the welcome as plaintext so the re-send does not depend on header-seal windows.
+    let welcome_sealed = assert_some!(bob.pq_pending_outbound(SideBandSealing::Fresh));
+    let welcome = assert_some!(assert_ok!(alice.open_incoming(welcome_sealed))).frame;
+    assert_ok!(alice.pq_bootstrap_bind(welcome.clone()));
+    discharge_bind(&alice, &bob, b"bootstrap-bind");
+    assert!(alice.is_fully_established());
+
+    // Alice's recv-PQ is up now: the same welcome re-sent is a duplicate, discardable.
+    assert_err!(
+        alice.pq_bootstrap_bind(welcome),
+        TwoMlsPqError::DuplicateSideBand
+    );
+}
+
 #[test]
 fn test_pq_bootstrap_begin_requires_turn() {
     let (_alice, bob) = establish_sessions();

@@ -9,9 +9,10 @@ use super::*;
 // ── The tag space ───────────────────────────────────────────────────────────────────
 // Every wire blob is discriminated by its first byte, so these values are ONE global
 // space — but they are declared in three places, because each tag lives with the thing it
-// tags: `APQ_TAG` (0x01) in the `apq` crate, `INITIAL_ENVELOPE_TAG` (0x05) in
-// `key_packages` (it rides the invitation channel and is not a session frame), and the
-// rest here. Ownership is local; allocation is global. That split is the hazard: a
+// tags: `APQ_TAG` (0x01) and `APQ_PRIVATE_MESSAGE_TAG` (0x05) in the `apq` crate,
+// `INITIAL_ENVELOPE_TAG` (0x07) in `key_packages` (it rides the invitation channel and is
+// not a session frame), and the rest here. Ownership is local; allocation is global. That
+// split is the hazard: a
 // collision is a silent wire misclassification rather than a compile error, and the file
 // you read when adding a session frame is not the file that declares the envelope tag.
 //
@@ -34,7 +35,7 @@ use super::*;
 //   0x13–0x31  PQ side-band      — exactly the tags `pq_frame_kind` classifies, in lifecycle
 //                                  order: bootstrap, then ratchet, then re-key. 6 of 16.
 //
-// Banding is what makes "the side-band is 0x11–0x2F" a claim that survives growth, and it
+// Banding is what makes "the side-band is 0x13–0x31" a claim that survives growth, and it
 // was bought by a renumber: the tags were allocation-ordered, so appending the A.4 bind past
 // the end left the side-band non-contiguous and silently falsified five "0x05–0x11" range
 // shorthands across the code and book. Prefer `pq_frame_kind` to a range test regardless —
@@ -118,7 +119,7 @@ pub(crate) const PQ_CT_TAG: u8 = 0x19;
 pub(crate) const PQ_REKEY_UPD_TAG: u8 = 0x1B;
 pub(crate) const PQ_REKEY_COMMIT_TAG: u8 = 0x1D;
 
-/// Encode a pre-establishment app staple: `[0x07][app message bytes]`.
+/// Encode a pre-establishment app staple: `[0x09][app message bytes]`.
 pub(crate) fn encode_pre_establishment_app(app: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(1 + app.len());
     out.push(PRE_ESTABLISHMENT_APP_TAG);
@@ -544,7 +545,7 @@ mod pq_frame_kind_tests {
     /// 256 bytes, so neither a reserved byte that quietly started classifying nor a stray
     /// `pq_frame_kind` arm outside the band can survive. Set equality is the real invariant;
     /// the range in prose is a summary of it, which is why this compares against the
-    /// registry rather than against `0x11..=0x2F` (the band's reserved bytes are in range but
+    /// registry rather than against `0x13..=0x31` (the band's reserved bytes are in range but
     /// unallocated, and must not classify).
     #[test]
     fn side_band_band_matches_the_classifier() {
