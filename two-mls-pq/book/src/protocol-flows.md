@@ -65,9 +65,48 @@ Now we have two independent state machines.
 
 1. Classical Ratchet
     1. The classical ratchet proceeds exactly as in TwoMLS, exchanging rounds of AppMessage + Proposal + Commit, all stapled together
-    2. A sender commits to its send group only when it folds a peer proposal its app has approved (`queue_proposal`); until then each frame re-staples the latest commit, and app messages keep flowing in the current epoch
-    3. Such a commit also re-injects a cross-party PSK exported from the sender's receive group (the TwoMLS binding), but only when that group has **advanced** since the sender last bound it — i.e. when the peer has produced new entropy to entangle with (a peer commit or a PQ ratchet). Re-binding an unadvanced peer epoch would add nothing, so a commit with no new peer entropy carries no cross-party PSK (it still folds the peer's Update and refreshes the sender's own leaf via the updatePath). This is what keeps the two send groups entangled with each other's *current* state, rather than re-stating a binding already in force.
+    2. A sender commits to its send group only when it is **licensed** to (see Evidence-gating below), and only when it has something to commit: a peer proposal its app has approved (`queue_proposal`), or an owed PQ bind to discharge. Until then each frame re-staples the latest commit, and app messages keep flowing in the current epoch
+    3. Such a commit also re-injects a cross-party PSK exported from the sender's receive group (the TwoMLS binding), but only when that group has **advanced** since the sender last bound it — i.e. when the peer has produced new entropy to entangle with (a peer commit or a PQ ratchet). Re-binding an unadvanced peer epoch would add nothing, so a commit with no new peer entropy carries no cross-party PSK (it still refreshes the sender's own leaf via the updatePath, and folds the peer's Update if it carries one). This is what keeps the two send groups entangled with each other's *current* state, rather than re-stating a binding already in force.
     4. Credential rotation rides this same ratchet (the TwoMLS AS): staged candidate credentials travel in the stapled Update proposals, the peer's approval of a proposal is the authorization, and the peer's commit canonicalizes the winner — the PQ leaves only catch up later (A.4/A.5)
+
+### Evidence-gating: at most one commit outstanding, per direction
+
+A sender may only commit **once the peer has demonstrably applied its previous commit**. Each
+send group is a single-writer channel — only its owner ever commits in it — so this is a
+per-direction rule, and it is the invariant two other properties silently rest on:
+
+- **Any single frame heals the peer.** Every frame re-staples the sender's latest commit, which
+  bridges a peer that is *at most one* commit behind. A sender that could commit twice while the
+  peer was away would produce a staple nothing bridges — an unrecoverable `EpochDesync` in
+  ordinary lossy messaging, rather than the reconnect-only edge it is.
+- **A bind's staple provably survives until applied.** A bind's PQ half exists on the wire only
+  as the current staple (§A.3–A.5); a superseded staple never re-sends, and by then `owed_bind`
+  is consumed and the PQ exporter leaf is spent. If a sender could commit past an unapplied bind,
+  the peer's recv-PQ mirror would permanently lose an epoch the sender's send-PQ has advanced
+  past — and no classical reconnect repairs a PQ group.
+
+**The evidence is the peer's stapled proposal, and it is in-protocol.** The peer builds its
+`Upd(self)` in *its recv group*, which **is** our send group, so the proposal is bound to our
+send group's epoch: an offer that validates at our current epoch could only have been produced by
+a party that had applied our commits through it. Our own commit invalidates any offer still in
+flight (it was built for the prior epoch), and the peer re-proposes at the new epoch on its next
+frame — so the license is re-earned exactly once per round trip.
+
+This was implicit for as long as folding an approved proposal was the *only* way to commit: the
+fold IS the evidence, since `validate_offered_update` runs the offer through mls-rs against the
+live send group and a stale-epoch offer is refused there. Committing without a fold (to discharge
+an owed bind) needs the same license, so the watermark is now tracked explicitly rather than
+inferred from the fold.
+
+> **Why the proposal and not the PSK.** The peer's commit that cross-injects a PSK exported from
+> our send group at epoch *E* is also proof it applied *E* — it cannot export from a mirror it has
+> not advanced. It is not used as the license because it rides **commits only**, and both
+> directions would then gate on each other: two sides that commit concurrently (neither having
+> seen the other's) each hold an unapplied commit and neither can produce the evidence that would
+> release the other. The proposal rides **every frame**, commit or not, so the license cannot
+> deadlock. (The injection remains a useful *check*, and the header-key application receipt —
+> deleted with the retirement machinery — was the weaker version of the same idea: it proved
+> transport-window position where the proposal proves MLS state incorporation.)
 
 Independently, we have an exchange of large PQ key messages, carried as dedicated side-band frames alongside the classical ratchet. The state flip-flops when each direction has finished receiving a message from the other.
 

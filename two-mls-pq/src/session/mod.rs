@@ -265,6 +265,27 @@ struct SessionInner {
     /// `SafeExportSecret` leaf (consumed, and adding no entropy), so we skip it. Rides the
     /// archive so a restore does not re-bind an epoch already bound.
     last_cross_injected: Option<u64>,
+    /// The highest epoch of OUR send group the peer has demonstrably APPLIED — the
+    /// evidence-gating watermark (book: Protocol Flows, "Evidence-gating"). `None` until the
+    /// peer's first frame.
+    ///
+    /// The peer builds its `Upd(self)` in its recv group, which IS our send group, so a
+    /// stapled proposal is bound to our send group's epoch: an offer at epoch `E` could only
+    /// have been produced by a party that had applied our commits through `E`. Read off every
+    /// inbound frame's proposal section — evidence rides every frame, which is what keeps the
+    /// license from deadlocking (a peer's cross-injected PSK proves the same thing but rides
+    /// commits only; see the book's note).
+    ///
+    /// What it licenses: a commit that does NOT fold an approved proposal (the discharge of an
+    /// owed bind). A fold needs no separate check — it IS the evidence, since
+    /// `validate_offered_update` refuses a stale-epoch offer against the live send group.
+    /// Without the license a discharge could commit past a bind the peer has not applied,
+    /// superseding the only staple its PQ half ever rides.
+    ///
+    /// Monotone (`max`), and bounded above by our own send epoch: the peer cannot apply a
+    /// commit we never made. Rides the archive — losing it would re-license a commit the
+    /// evidence no longer supports.
+    peer_applied_send_epoch: Option<u64>,
     /// The A.5 analogue of [`last_cross_injected`] for the recv-PQ mirror (the peer's
     /// send-PQ): the peer send-PQ epoch we last cross-injected during a PQ re-key. Two
     /// consecutive re-keys with no PQ commit from the peer in between leave this epoch
@@ -915,6 +936,10 @@ fn build_session(
             send_psk_ledger: VecDeque::new(),
             retired_send_psks: Vec::new(),
             last_cross_injected: None,
+            // No evidence until the peer's first frame: a fresh session has nothing
+            // outstanding to be licensed for, and its first commit is a fold (whose offer is
+            // its own evidence).
+            peer_applied_send_epoch: None,
             last_cross_injected_pq: None,
             last_send_pq_exported: None,
             listen_rendezvous: BTreeMap::new(),

@@ -260,6 +260,10 @@ pub(crate) mod archive_wire {
         pub(in crate::session) send_psk_ledger: Vec<PskEntry>,
         pub(in crate::session) retired_send_psks: Vec<ExternalPskId>,
         pub(in crate::session) last_cross_injected: Option<u64>,
+        /// The evidence-gating watermark (see `SessionInner::peer_applied_send_epoch`).
+        /// Without it a restore would re-license a discharge the evidence no longer
+        /// supports — the peer's proposal proving it is long gone from the wire.
+        pub(in crate::session) peer_applied_send_epoch: Option<u64>,
         pub(in crate::session) last_cross_injected_pq: Option<u64>,
         pub(in crate::session) last_send_pq_exported: Option<u64>,
         pub(in crate::session) listen_rendezvous: Vec<ListenEntry>,
@@ -630,6 +634,7 @@ fn session_from_wire(wire: archive_wire::SessionArchive) -> Result<Arc<TwoMlsPqS
                 .collect::<std::result::Result<_, _>>()?,
             retired_send_psks: wire.retired_send_psks,
             last_cross_injected: wire.last_cross_injected,
+            peer_applied_send_epoch: wire.peer_applied_send_epoch,
             last_cross_injected_pq: wire.last_cross_injected_pq,
             last_send_pq_exported: wire.last_send_pq_exported,
             listen_rendezvous: wire
@@ -794,6 +799,7 @@ fn build_archive_wire(
                 .collect(),
             retired_send_psks: inner.retired_send_psks.clone(),
             last_cross_injected: inner.last_cross_injected,
+            peer_applied_send_epoch: inner.peer_applied_send_epoch,
             last_cross_injected_pq: inner.last_cross_injected_pq,
             last_send_pq_exported: inner.last_send_pq_exported,
             listen_rendezvous: inner

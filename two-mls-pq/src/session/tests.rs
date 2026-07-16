@@ -352,15 +352,109 @@ fn test_queue_proposal_declared_mismatch_is_noop() {
     assert_eq!(bob.their_principal_state().client_id(), id_real);
 }
 
+/// PQ liveness must not depend on the app's approval policy. Rule 3 makes a bind wait for a
+/// classical COMMIT, and while folding an app-approved Upd was the only way to commit, an app
+/// that received offers and never approved them stranded every PQ round at 2/1 forever — the
+/// peer parked in `Responding`, the turn never passing.
+///
+/// The discharge now rides a proposal-less commit as soon as the peer's stapled offer
+/// licenses it (evidence-gating). Bob's app here never calls `queue_proposal`.
+#[test]
+fn test_never_approving_app_still_discharges_its_bind() {
+    let (alice, bob) = establish_full();
+
+    // Bob holds the turn: he runs an A.3 round to the trigger. PQ moves, classical is owed.
+    let before = bob.epochs();
+    let ek = assert_ok!(bob.pq_ratchet_begin());
+    assert_ok!(alice.pq_ratchet_respond(ek));
+    let ct = assert_some!(alice.pq_take_pending_outbound());
+    assert_ok!(bob.pq_ratchet_bind(ct));
+    assert_eq!(bob.epochs().pq_epoch, before.pq_epoch + 1);
+    assert_eq!(bob.epochs().classical_epoch, before.classical_epoch);
+
+    // Alice sends an ordinary frame. Bob's app ignores the offer it carries — but that
+    // offer is the LICENSE, and the license is not the app's to withhold.
+    assert_ok!(alice.prepare_to_encrypt(None));
+    let frame = assert_ok!(alice.encrypt(b"ordinary".to_vec()));
+    let got = assert_some!(assert_ok!(bob.process_incoming(frame.cipher_text)));
+    assert_some!(got.proposal); // offered, and deliberately never approved
+
+    // Bob's next round commits anyway, discharging the bind: 2/2.
+    let prepared = assert_ok!(bob.prepare_to_encrypt(None));
+    assert!(
+        prepared.did_commit,
+        "an owed bind must not wait on an approval that may never come"
+    );
+    assert!(
+        prepared.committed_remote_client_id.is_none(),
+        "nothing was folded — the peer's leaf stays where the app left it"
+    );
+    assert_eq!(bob.epochs().classical_epoch, before.classical_epoch + 1);
+
+    // Alice applies both halves from the staple and the round closes.
+    let discharge = assert_ok!(bob.encrypt(b"discharge".to_vec()));
+    let got = assert_some!(assert_ok!(alice.process_incoming(discharge.cipher_text)));
+    assert_eq!(
+        assert_some!(got.application_message).app_message_data,
+        b"discharge"
+    );
+    assert!(alice.my_pq_turn(), "the bind landed; the turn passed");
+}
+
+/// The license is the peer's stapled offer, not the app's approval — so a discharge WAITS
+/// when nothing proves the peer applied our last commit. Without this, a second commit would
+/// leave the peer two behind and supersede the bind's own staple before it ever landed,
+/// stranding the PQ half with the exporter leaf already spent.
+#[test]
+fn test_unlicensed_discharge_waits_for_evidence() {
+    let (alice, bob) = establish_full();
+
+    // Bob commits, and Alice's answering frame is deliberately never delivered — so Bob has
+    // no evidence she applied it.
+    assert_ok!(alice.prepare_to_encrypt(None));
+    let upd = assert_ok!(alice.encrypt(b"upd".to_vec()));
+    let got = assert_some!(assert_ok!(bob.process_incoming(upd.cipher_text)));
+    assert_ok!(bob.queue_proposal(assert_some!(got.proposal).digest));
+    assert!(assert_ok!(bob.prepare_to_encrypt(None)).did_commit);
+    drop(assert_ok!(bob.encrypt(b"committed".to_vec()))); // never delivered
+
+    // Bob binds, then tries to discharge with nothing licensing him.
+    let ek = assert_ok!(bob.pq_ratchet_begin());
+    assert_ok!(alice.pq_ratchet_respond(ek));
+    let ct = assert_some!(alice.pq_take_pending_outbound());
+    assert_ok!(bob.pq_ratchet_bind(ct));
+    let prepared = assert_ok!(bob.prepare_to_encrypt(None));
+    assert!(
+        !prepared.did_commit,
+        "unlicensed: Alice has not proven she applied Bob's last commit, so committing here \
+         would leave her two behind and supersede the bind's staple"
+    );
+    assert_ok!(bob.encrypt(b"still-owed".to_vec()));
+
+    // Bob's re-stapled commit reaches Alice; her next frame's offer is bound to his current
+    // epoch, which licenses the discharge on the very next round.
+    assert_ok!(bob.prepare_to_encrypt(None));
+    let healing = assert_ok!(bob.encrypt(b"heal".to_vec()));
+    assert_some!(assert_ok!(alice.process_incoming(healing.cipher_text)));
+    assert_ok!(alice.prepare_to_encrypt(None));
+    let evidence = assert_ok!(alice.encrypt(b"applied".to_vec()));
+    assert_some!(assert_ok!(bob.process_incoming(evidence.cipher_text)));
+
+    assert!(assert_ok!(bob.prepare_to_encrypt(None)).did_commit);
+    let discharge = assert_ok!(bob.encrypt(b"discharge".to_vec()));
+    assert_some!(assert_ok!(alice.process_incoming(discharge.cipher_text)));
+    assert!(alice.my_pq_turn());
+}
+
 /// A rotation canonicalized by a DISCHARGING commit must land on the receiver exactly as
 /// one canonicalized by a plain commit.
 ///
-/// The two are the same commit: a discharge only ever rides a round that folds an approved
-/// Upd (rule 3 — `discharge_owed_bind` runs solely in `prepare_ratchet_commit`'s committing
-/// branch), so the bind's classical half IS the routine folding commit, carrying the same
-/// canonical credential step. It differs only in the shape that delivers it — an
-/// `APQPrivateMessage` staple instead of a bare commit — which is a wire detail the identity
-/// bookkeeping must not depend on.
+/// A discharge that FOLDS is the routine folding commit, carrying the same canonical
+/// credential step; it differs only in the shape that delivers it — an `APQPrivateMessage`
+/// staple instead of a bare commit — which is a wire detail the identity bookkeeping must not
+/// depend on. (A discharge may also ride a proposal-less commit when the app never approves;
+/// that one moves no leaf, which is exactly why the bookkeeping keys off what the applied
+/// commit MOVED rather than off which staple form carried it.)
 ///
 /// The failure this pins is silent and permanent: the receiver's group leaf moves to the
 /// winner while its principal, AS sequence and signing client stay on the retired identity,

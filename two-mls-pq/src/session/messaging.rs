@@ -315,6 +315,27 @@ impl SessionInner {
     /// This mutates no session state (the caller records the approval only on `Ok`), so a
     /// rejected `queue_proposal` is a pure no-op and there is nothing cached to poison the
     /// next commit; the approved proposal is re-applied to the group at commit time.
+    /// The evidence-gating license: has the peer applied our send group's CURRENT epoch?
+    ///
+    /// True exactly when [`SessionInner::peer_applied_send_epoch`] has caught up to our send
+    /// group — i.e. the peer has produced a proposal bound to the epoch we are sitting at, so
+    /// nothing of ours is outstanding and a further commit cannot leave it more than one
+    /// behind. The watermark can never exceed our own epoch (the peer cannot apply a commit we
+    /// never made), so this is an equality test written as `>=` for its own safety.
+    ///
+    /// A fold does not consult this — see `prepare_ratchet_commit`.
+    fn peer_applied_our_send_epoch(&self) -> Result<bool> {
+        let send_epoch = self
+            .send_group
+            .as_ref()
+            .ok_or(TwoMlsPqError::SessionNotReady)?
+            .classical
+            .current_epoch();
+        Ok(self
+            .peer_applied_send_epoch
+            .is_some_and(|applied| applied >= send_epoch))
+    }
+
     pub(in crate::session) fn validate_offered_update(
         &mut self,
         proposal_bytes: &[u8],
@@ -393,12 +414,33 @@ impl SessionInner {
         selected: Option<ClientId>,
     ) -> Result<crate::PrepareEncryptResult> {
         let folded = self.queued_proposal.take();
-        let did_commit = folded.is_some();
+        // Two reasons to commit, and both are gated on the peer having applied our previous
+        // commit — the evidence-gating license (book: Protocol Flows). One commit outstanding
+        // at a time is what makes any single frame heal the peer, and what keeps a bind's
+        // staple alive until it lands.
+        //
+        // 1. A FOLD, when the app approved the peer's Upd. Needs no license check: the offer
+        //    is epoch-bound and `validate_offered_update` refused it against the live send
+        //    group if it were stale, so holding it IS the evidence. Preferred when available
+        //    — it refreshes BOTH leaves where an empty commit refreshes only ours.
+        // 2. An owed BIND to discharge, license permitting. This is the case the fold cannot
+        //    serve: rule 3 makes the bind wait for a classical commit, so an app that never
+        //    approves would strand the PQ round at 2/1 forever — PQ liveness must not depend
+        //    on app approval policy. RFC 9420 forces an updatePath onto a proposal-less
+        //    commit, so the discharge still delivers both PCS sources (a fresh own leaf, plus
+        //    the `apq_psk` chaining the PQ half's entropy in); it simply leaves the peer's
+        //    leaf where it was — which is where it was staying regardless, precisely because
+        //    the app did not approve the Upd that would have moved it.
+        //
+        // Only these two. A commit on cadence, whenever licensed, is deliberately NOT
+        // offered: our commit invalidates whatever offer is in flight, so committing every
+        // licensed round would kill each offer inside the window the peer's app has to
+        // approve it — starving rotation (approval IS the AS authorization) for any host
+        // that deliberates across a round trip. The bind's discharge bounds that churn to
+        // the PQ cadence, which the host already chooses.
+        let licensed = self.peer_applied_our_send_epoch()?;
+        let did_commit = folded.is_some() || (self.owed_bind.is_some() && licensed);
 
-        // Commit our send group only when consuming the peer's approved Upd (cached via
-        // `queue_proposal` in the current epoch — committing on routine rounds would
-        // invalidate the peer's epoch-bound proposal). The commit also refreshes the
-        // cross-party TwoMLS-PSK exported from the recv group.
         if did_commit {
             // Capture the departing epoch's PSK before committing past it: a peer frame in
             // flight may reference it, and mls-rs can only export the current epoch.
@@ -668,7 +710,12 @@ impl SessionInner {
         Ok(crate::PrepareEncryptResult {
             proposal_message: proposal_bytes,
             proposal_hash,
-            committed_remote_client_id: if did_commit { Some(their_id) } else { None },
+            // What this commit CANONICALIZED of the peer's credential sequence — so it keys
+            // off the fold, not off `did_commit`. The two were the same thing while a fold
+            // was the only way to commit; a discharge riding a proposal-less commit
+            // canonicalizes nothing of theirs, and reporting their unchanged id here would
+            // be a canonicalization event a host could act on where none occurred.
+            committed_remote_client_id: folded.as_ref().map(|_| their_id),
             did_commit,
         })
     }
@@ -1180,6 +1227,26 @@ impl TwoMlsPqSession {
             // actual leaf.
             let (proposing, proposal_msg_bytes) = decode_proposal_section(&proposal_bytes)?;
             let digest = crate::sha256(&proposal_msg_bytes);
+            // The evidence-gating watermark (see `peer_applied_send_epoch`). The peer staged
+            // this Upd in its recv group — which IS our send group — so its epoch is the peer's
+            // own view of our send group, and it could only have reached that view by applying
+            // our commits up to it. Read here, off the raw section, so evidence accrues on
+            // EVERY frame: approval is the app's to withhold, but the license is not the app's
+            // to stall.
+            //
+            // Monotone, and it deliberately does not validate the offer (that is
+            // `queue_proposal`'s job): a frame that crossed one of our commits carries a
+            // now-stale epoch, and `max` simply ignores it rather than regressing the mark.
+            if let Some(offer_epoch) = MlsMessage::from_bytes(&proposal_msg_bytes)
+                .ok()
+                .and_then(|m| m.epoch())
+            {
+                inner.peer_applied_send_epoch = Some(
+                    inner
+                        .peer_applied_send_epoch
+                        .map_or(offer_epoch, |mark| mark.max(offer_epoch)),
+                );
+            }
             inner.offered_proposal = Some((digest.clone(), proposal_msg_bytes, proposing.clone()));
             let proposal = Some(crate::QueuedRemoteProposal {
                 digest,

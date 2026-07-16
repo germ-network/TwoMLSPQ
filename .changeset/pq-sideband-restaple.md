@@ -126,13 +126,51 @@ discharge rather than at the trigger: one `EncryptResult` can then carry this ro
 in the staple and the next round's `begin` frame in the side-band slot — different paths,
 no contention — saving a round trip in async messaging.
 
-**A bind's classical half is the routine FOLDING commit**, and that follows from rule 3: a
-discharge only ever rides a round that folds the peer's approved Upd. So the frame carrying
-a bind carries everything a plain commit frame does — including a credential rotation's
-canonical step, when the folded Upd names a candidate. Hosts see no new case (the rotation
-surfaces on `remote_commit` exactly as it does off a plain commit); the wire shape that
-delivers it is the only difference, which is why the receiver's identity bookkeeping runs
-off what the applied commit MOVED rather than off which staple form carried it.
+**A bind's classical half is an ordinary commit**, so the frame carrying a bind carries
+everything a plain commit frame does — including a credential rotation's canonical step,
+when the round folds an Upd naming a candidate. Hosts see no new case (the rotation surfaces
+on `remote_commit` exactly as it does off a plain commit); the wire shape that delivers it is
+the only difference, which is why the receiver's identity bookkeeping runs off what the
+applied commit MOVED rather than off which staple form carried it.
+
+## Evidence-gating: a commit needs a license, not an approval
+
+Rule 3 makes an owed bind wait for a classical COMMIT — and while folding an app-approved Upd
+was the only way to commit, that made **PQ liveness hostage to app approval policy**: an app
+that receives offers and never approves them stranded every PQ round at 2/1 forever, peer
+parked in `Responding`, turn never passing. A round now commits when it folds an approved Upd
+(unchanged) **or** when it owes a bind and is licensed.
+
+The license is the property that was already there, unnamed. A sender may only commit once
+the peer has demonstrably applied its previous commit — **at most one commit outstanding, per
+direction** — and two things rest on it: any single frame heals the peer (a staple bridges a
+peer at most one commit behind), and a bind's staple provably survives until applied (a
+superseded staple never re-sends, and by then `owed_bind` is consumed and the PQ exporter leaf
+spent — no classical reconnect repairs that). Folding *was* the evidence: the peer builds its
+`Upd(self)` in its recv group, which IS our send group, so the offer is bound to our epoch and
+`validate_offered_update` refuses a stale one against the live group. A proposal-less commit
+has no fold to infer it from, so the watermark is now explicit (`peer_applied_send_epoch`,
+read off every inbound frame's proposal, archived).
+
+Why the proposal and not the peer's cross-injected PSK, which also proves application: the
+PSK rides **commits only**, so both directions would gate on each other and two concurrent
+commits would deadlock — neither able to produce the evidence releasing the other. The
+proposal rides every frame. (The header-key application receipt deleted above was the weaker
+version of the same idea: transport-window position, where the proposal proves MLS state
+incorporation.)
+
+Deliberately NOT offered: **empty commits on cadence.** Our commit invalidates whatever offer
+is in flight, so committing every licensed round would kill each offer inside the window the
+peer's app has to approve it — starving rotation (approval IS the AS authorization) for any
+host that deliberates across a round trip. Tying the empty commit to an owed bind bounds that
+churn to the PQ cadence, which the host already chooses. An empty commit still carries an
+updatePath (RFC 9420 forces one), so a discharge delivers both PCS sources — a fresh own leaf
+and the `apq_psk` chaining the PQ half's entropy in; it simply leaves the peer's leaf where it
+was, which is where it was staying anyway.
+
+Host-visible: `did_commit` can now be true with no `queue_proposal`, and
+`committed_remote_client_id` is `None` on such a round — it reports what the commit
+CANONICALIZED, and a proposal-less commit canonicalizes nothing of the peer's.
 
 The wrapper tag exists because the struct cannot self-discriminate: its first byte is its
 inner `MLSPrivateMessage`'s `0x00`, identical to a bare commit, and the staple slot tells
@@ -230,7 +268,7 @@ classified" would wave through a reserve that quietly started routing.
 `frames::tests::BANDS` is the record, and the book's `wire-format.md` table is its prose
 half.
 
-**This is a wire cut** (`BINDING_CONTRACT_VERSION` 18; 17 was burned by an interim build of
+**This is a wire cut** (`BINDING_CONTRACT_VERSION` 19; 17 was burned by an interim build of
 this same work). Hosts classify via `pq_frame_kind` and never match raw bytes, so no host
 code changes beyond the deleted bind cases; stale frames from older builds fail loudly in
 the decoders, as they already did across the previous renumber.

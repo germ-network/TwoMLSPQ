@@ -241,7 +241,26 @@ pub fn version() -> String {
 //   Hosts classify via `pq_frame_kind`, never raw bytes, so this is a wire cut only —
 //   stale frames from older builds fail loudly. Archive layout versions are untouched
 //   (pre-release hard cut; blobs from interim builds fail to decode and regenerate).
-const BINDING_CONTRACT_VERSION: u64 = 18;
+// v19 (2026-07-15, evidence-gating): a classical commit no longer requires an app-approved
+// proposal. Rule 3 makes an owed PQ bind wait for a classical COMMIT, so while folding was
+// the only way to commit, an app that received offers and never approved them stranded every
+// PQ round at 2/1 forever — PQ liveness must not depend on approval policy. A round now
+// commits when it folds an approved Upd (unchanged) OR when it owes a bind and is LICENSED:
+// the peer's stapled Upd is built in its recv group — which IS our send group — so an offer
+// bound to our current epoch proves the peer applied our previous commit. That license is
+// what has always thrown the "at most one commit outstanding per direction" rule (a fold IS
+// the evidence, since a stale-epoch offer is refused against the live send group); it is now
+// tracked explicitly (`peer_applied_send_epoch`, archived) because a proposal-less commit has
+// no fold to infer it from. Committing past an unapplied commit would break single-frame
+// healing AND supersede the only staple a bind's PQ half ever rides. Cadence-driven empty
+// commits are deliberately NOT offered: our commit invalidates the peer's in-flight offer, so
+// committing every licensed round would starve rotation for any host that deliberates.
+// Host-visible: `did_commit` can be true with no `queue_proposal`, and
+// `committed_remote_client_id` is now `None` on such a round — it reports what the commit
+// CANONICALIZED, and a proposal-less commit canonicalizes nothing of the peer's. Archive
+// layout gained a field (pre-release hard cut: old blobs fail to decode and regenerate).
+// The book's Protocol Flows chapter states the property under "Evidence-gating".
+const BINDING_CONTRACT_VERSION: u64 = 19;
 
 /// See `BINDING_CONTRACT_VERSION`. Exported so the Swift layer can verify the
 /// binding it was generated with matches the binary it loaded.
@@ -317,6 +336,9 @@ pub struct RendezvousId {
 pub struct PrepareEncryptResult {
     pub proposal_message: Vec<u8>,
     pub proposal_hash: Vec<u8>,
+    /// The peer credential this round's commit CANONICALIZED, or `None` when it
+    /// canonicalized none — including on a committing round that folded nothing (a bind
+    /// discharging on its own; see `did_commit`). Not a synonym for `did_commit`.
     pub committed_remote_client_id: Option<ClientId>,
     pub did_commit: bool,
 }
