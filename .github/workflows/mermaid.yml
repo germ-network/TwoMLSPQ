@@ -38,7 +38,16 @@ jobs:
           node-version: "22"
 
       - name: Install mermaid-cli
-        run: npm install -g @mermaid-js/mermaid-cli@11.4.2
+        run: |
+          npm install -g @mermaid-js/mermaid-cli@11.4.2
+          # mermaid-cli parses by DRIVING a headless browser — it is the real renderer, not
+          # a grammar reimplementation, which is the whole reason to prefer it. The cost is
+          # that chromium must actually launch, and it cannot sandbox itself inside the
+          # Actions container: without these flags every chart fails identically with
+          # "Failed to launch the browser process", which looks exactly like every chart
+          # being broken.
+          npx --yes puppeteer browsers install chrome
+          echo '{"args":["--no-sandbox","--disable-setuid-sandbox"]}' > /tmp/puppeteer.json
 
       - name: Parse every mermaid fence
         run: |
@@ -70,7 +79,7 @@ jobs:
           fails=0
           for c in "${charts[@]}"; do
             name=$(basename "$c" .mmd)
-            if err=$(mmdc --input "$c" --output "/tmp/$name.svg" 2>&1); then
+            if err=$(mmdc --puppeteerConfigFile /tmp/puppeteer.json --input "$c" --output "/tmp/$name.svg" 2>&1); then
               echo "ok    $name"
             else
               fails=$((fails + 1))
@@ -83,4 +92,9 @@ jobs:
 
           echo
           echo "$((${#charts[@]} - fails))/${#charts[@]} charts parse"
+          if [ "$fails" -eq "${#charts[@]}" ] && [ "${#charts[@]}" -gt 1 ]; then
+            echo
+            echo "EVERY chart failed. That is almost never the charts — it is this job."
+            echo "Check the browser launched at all before believing the diagnostics above."
+          fi
           exit $fails
