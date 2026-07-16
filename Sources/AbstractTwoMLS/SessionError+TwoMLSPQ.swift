@@ -24,8 +24,12 @@ enum PQErrorSurface {
 	case prepareToEncrypt
 	case encrypt
 	case pqOperation
-	/// Entry points where `SessionNotReady` is not expected; treat it as a
-	/// sequencing violation (the honest fallback).
+	/// The side-band entry point. `SessionNotReady` here is an ill-timed
+	/// frame (v18 narrowed `DuplicateSideBand` to steps PROVABLY done, so
+	/// merely ill-timed re-sends still surface as `SessionNotReady`) — mapped
+	/// to `.misroutedFrame` so its disposition stays a frame-level discard
+	/// rather than a caller bug; retention means the peer re-sends until
+	/// answered, so discarding is lossless.
 	case ingest
 	case receive
 	case decodeHeader
@@ -46,7 +50,7 @@ enum PQErrorSurface {
 
 extension AbstractTwoMLS.SessionError {
 	/// Translate one backend error at a known surface. Exhaustive over
-	/// `TwoMlsPqError`'s 22 cases — a binding bump that adds a case fails
+	/// `TwoMlsPqError`'s 25 cases — a binding bump that adds a case fails
 	/// compilation HERE, which is part of the re-sync ritual (see the contract
 	/// ladder in AbstractTwoMLS+TwoMLSPQ.swift). LinearEncodingError (from the
 	/// digest lifts) and everything else — including the fileprivate
@@ -98,6 +102,12 @@ extension AbstractTwoMLS.SessionError {
 				code = .sinkAlreadyInstalled
 			case .AppBindingMismatch:
 				code = .appBindingMismatch
+			case .DuplicateSideBand:
+				code = .duplicateSideBand
+			case .BindApplyFailed:
+				code = .bindApplyFailed
+			case .BindDischargeFailed:
+				code = .bindDischargeFailed
 			}
 			self.init(code: code, underlying: pq)
 
