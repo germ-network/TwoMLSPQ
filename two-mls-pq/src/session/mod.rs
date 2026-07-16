@@ -241,6 +241,15 @@ struct SessionInner {
     /// Whose move the PQ side-band is: the initiator owes the A.4 bootstrap; thereafter
     /// completing an operation passes the turn to the peer.
     pq_turn_mine: bool,
+    /// Set when applying a peer's bind staple failed AFTER the round's secret was consumed
+    /// (`apply_bind` past its `take` of `pq_inflight`). The staple re-rides every frame and
+    /// can never apply now, so every inbound frame carrying it fails before its app message
+    /// — receiving is broken while sending still works. In-memory only (inbound processing
+    /// persists on success, so this is never written to a blob), which is exactly why it
+    /// heals on restore: reloading the last persisted state predates the failed take. Read
+    /// by `pq_receive_broken`; a host decides how fatal that is (see
+    /// [`TwoMlsPqError::BindApplyFailed`]).
+    bind_apply_broken: bool,
     /// Cross-party TwoMLS-PSKs of OUR send group's recent epochs, owned by the session
     /// (destined for the session archive; the mls-rs secret stores are ephemeral plumbing,
     /// filled just-in-time by `inject_send_psks`). The peer binds the PSK of our send
@@ -940,6 +949,9 @@ fn build_session(
             // outstanding to be licensed for, and its first commit is a fold (whose offer is
             // its own evidence).
             peer_applied_send_epoch: None,
+            // Not written to any blob — a restore lands before any failed take (see the
+            // field), so it always starts clear.
+            bind_apply_broken: false,
             last_cross_injected_pq: None,
             last_send_pq_exported: None,
             listen_rendezvous: BTreeMap::new(),

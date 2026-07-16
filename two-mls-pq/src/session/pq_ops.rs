@@ -638,6 +638,17 @@ impl TwoMlsPqSession {
         self.lock().pq_turn_mine
     }
 
+    /// Whether receiving is broken: a peer bind staple failed to apply after the round's
+    /// secret was consumed, so `process_incoming` now refuses every frame with
+    /// [`TwoMlsPqError::BindApplyFailed`] (the peer re-staples the same unappliable bind
+    /// forever). SENDING is unaffected. Not reachable from an honest peer, and healed by
+    /// restoring the last persisted state — how urgent that is depends on what the session
+    /// is for (a receive-critical role treats it as fatal; a send-mostly role can defer),
+    /// which is why this is a query rather than only an error a host trips over.
+    pub fn pq_receive_broken(&self) -> bool {
+        self.lock().bind_apply_broken
+    }
+
     /// The current round's outbound side-band frame, sealed, WITHOUT consuming it — the
     /// side-band analogue of re-stapling `current_staple` onto every message frame. `None`
     /// when the side-band is quiescent, which is what lets a host send a bare message.

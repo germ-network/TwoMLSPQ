@@ -260,6 +260,16 @@ pub fn version() -> String {
 // CANONICALIZED, and a proposal-less commit canonicalizes nothing of the peer's. Archive
 // layout gained a field (pre-release hard cut: old blobs fail to decode and regenerate).
 // The book's Protocol Flows chapter states the property under "Evidence-gating".
+// Also in v19: the two irrecoverable-failure paths a bind's owed state creates are now
+// surfaced, not silent (neither is reachable from an honest flow — both take an internal
+// MLS failure). `BindDischargeFailed` (fatal): the classical commit discharging a bind
+// failed after the reservation was consumed and the exporter leaf spent — the round cannot
+// be rebuilt, so it wears its own error, not the retriable one it would otherwise, and the
+// host re-establishes. `BindApplyFailed` + `pq_receive_broken()`: applying a peer's bind
+// staple failed after the round's secret was consumed, so RECEIVING is broken (every frame
+// re-staples the same unappliable bind) while SENDING still works — in-memory only, so
+// restoring the last persisted state heals it, and queryable so a host sets its own
+// severity by role. Both variants appended to `TwoMlsPqError` (ordinals stable).
 const BINDING_CONTRACT_VERSION: u64 = 19;
 
 /// See `BINDING_CONTRACT_VERSION`. Exported so the Swift layer can verify the
@@ -678,12 +688,35 @@ pub enum TwoMlsPqError {
     /// On `TwoMlsPqInvitation::receive` this is raised before any invitation state is
     /// claimed, so the invitation stays fully reusable for the genuine welcome.
     //
+    #[error("AppBinding missing, unexpected, or inconsistent")]
+    AppBindingMismatch,
+    /// FATAL: the classical commit that was discharging an owed bind failed AFTER the
+    /// reservation was consumed. The PQ round cannot be rebuilt — the exporter leaf is
+    /// spent and `owed_bind` is gone — and the failed state persists, so no retry
+    /// recovers it: the peer waits in its responded state forever and this session's PQ
+    /// binding is permanently broken. Not reachable from any honest flow (it takes an
+    /// internal MLS failure mid-commit); surfaced loudly, as its own variant, precisely
+    /// so a host never mistakes it for the retriable error it would otherwise wear.
+    /// Route to re-establishment.
+    #[error("bind discharge failed after the reservation was consumed; re-establish")]
+    BindDischargeFailed,
+    /// Receiving on this session is broken: applying a peer's bind staple failed after
+    /// the round's secret was consumed, so the staple — which the peer re-sends on every
+    /// frame until its next commit, which evidence-gating now forbids it — can never
+    /// apply, and every inbound frame carrying it fails before its app message is
+    /// touched. SENDING still works. Unlike [`Self::BindDischargeFailed`] this is
+    /// in-memory only (inbound processing persists on success), so restoring from the
+    /// last persisted state recovers the round. Not reachable from an honest peer; how
+    /// critical it is depends on what the session is for, which is why it is queryable
+    /// (`pq_receive_broken`) rather than only thrown.
+    ///
+    //
     // Deliberately the LAST variant: uniffi numbers error cases by position, so appending
     // keeps every prior variant's ordinal stable. Keep appending future variants here (the
     // contract bump already forces binding/binary pairing, but there is no reason to
     // renumber the survivors).
-    #[error("AppBinding missing, unexpected, or inconsistent")]
-    AppBindingMismatch,
+    #[error("bind apply failed with the round secret consumed; receive is broken until restore")]
+    BindApplyFailed,
 }
 
 /// SHA-256 over `bytes` — the single hashing primitive behind every digest this

@@ -1369,6 +1369,105 @@ fn test_bind_moves_pq_and_owes_classical() {
     );
 }
 
+/// The fatal `BindDischargeFailed` wrapper does NOT over-fire: an ordinary discharge — the
+/// overwhelmingly common case — succeeds without tripping it, and so does a NON-discharging
+/// committing round (a plain fold with no owed bind, which must keep its own retriable error
+/// taxonomy). Only a failure while a bind is genuinely being discharged is fatal.
+#[test]
+fn test_ordinary_discharge_is_not_flagged_fatal() {
+    let (alice, bob) = establish_full();
+    // A clean A.3 round through its discharge — no error, no fatal wrapper.
+    ratchet_round(&alice, &bob, b"clean");
+    // A plain fold with nothing owed still commits normally.
+    approved_commit_round(&bob, &alice);
+    message_round(&alice, &bob, b"after");
+}
+
+/// Finding 4, surfaced: if applying a peer's bind staple fails after the round's secret is
+/// consumed, RECEIVING is broken (the peer re-staples the same unappliable bind forever) but
+/// SENDING still works — and the break is queryable so a host classifies its severity, and
+/// heals on restore because it was never persisted.
+///
+/// The failure is not reachable from an honest peer, so it is induced by corrupting the held
+/// secret just before the responder applies the staple.
+#[test]
+fn test_failed_bind_apply_breaks_receive_not_send_and_heals_on_restore() {
+    let (alice, bob) = establish_full();
+
+    // Bob holds the turn after A.4, so he initiates; Alice responds and holds S.
+    let ek = assert_ok!(bob.pq_ratchet_begin());
+    assert_ok!(alice.pq_ratchet_respond(ek));
+    let ct = assert_some!(alice.pq_take_pending_outbound());
+    assert_ok!(bob.pq_ratchet_bind(ct));
+
+    // Alice offers the Upd Bob's discharge will fold, and Bob builds the discharge staple.
+    assert_ok!(alice.prepare_to_encrypt(None));
+    let offer = assert_ok!(alice.encrypt(b"offer".to_vec()));
+    let got = assert_some!(assert_ok!(bob.process_incoming(offer.cipher_text)));
+    assert_ok!(bob.queue_proposal(assert_some!(got.proposal).digest));
+    assert!(assert_ok!(bob.prepare_to_encrypt(None)).did_commit);
+    let discharge = assert_ok!(bob.encrypt(b"discharge".to_vec()));
+
+    // Snapshot Alice at her last good persisted state — AFTER she sent (and persisted) that
+    // Upd, so the restore holds the leaf key Bob's commit folds, exactly as a real reload
+    // from the last blob would. THEN corrupt the live Alice's held secret so applying the
+    // discharge fails with the secret already consumed — the exact unrecoverable ordering.
+    let alice_restore = round_trip(&alice);
+    {
+        let mut inner = alice.lock();
+        assert!(
+            matches!(inner.pq_inflight, Some(super::PqInflight::Responding(_))),
+            "Alice should hold S as the A.3 responder"
+        );
+        if let Some(super::PqInflight::Responding(s)) = inner.pq_inflight.as_mut() {
+            s[0] ^= 0xFF;
+        }
+    }
+
+    // The discharge staple fails to apply, latching the break with the honest error.
+    assert_err!(
+        alice.process_incoming(discharge.cipher_text.clone()),
+        TwoMlsPqError::BindApplyFailed
+    );
+    assert!(alice.pq_receive_broken());
+
+    // Every further inbound frame is refused with the same queryable error — not the
+    // retriable SessionNotReady the raw retry would surface.
+    assert_ok!(bob.prepare_to_encrypt(None));
+    let another = assert_ok!(bob.encrypt(b"more".to_vec()));
+    assert_err!(
+        alice.process_incoming(another.cipher_text),
+        TwoMlsPqError::BindApplyFailed
+    );
+
+    // But SENDING is unaffected: Alice can still encrypt, and Bob reads it.
+    assert_ok!(alice.prepare_to_encrypt(None));
+    let out = assert_ok!(alice.encrypt(b"still-sending".to_vec()));
+    let got = assert_some!(assert_ok!(bob.process_incoming(out.cipher_text)));
+    assert_eq!(
+        assert_some!(got.application_message).app_message_data,
+        b"still-sending"
+    );
+
+    // Restoring the last good state heals it: the break was never persisted (inbound
+    // processing persists on success only), so the restore starts clean AND holds the
+    // uncorrupted secret. Bob re-staples the same bind on every frame, so the restored
+    // Alice applies it and the round closes.
+    assert!(!alice_restore.pq_receive_broken());
+    let got = assert_some!(assert_ok!(
+        alice_restore.process_incoming(discharge.cipher_text)
+    ));
+    assert_eq!(
+        assert_some!(got.application_message).app_message_data,
+        b"discharge"
+    );
+    assert!(
+        alice_restore.my_pq_turn(),
+        "the bind applied cleanly on the restore; the round closed and the turn passed"
+    );
+    assert!(!alice_restore.pq_receive_broken());
+}
+
 /// Negative control on the reservation re-check: `discharge_owed_bind` re-checks the
 /// reserved epochs against the live groups rather than trusting them, because a stale
 /// reservation shipped to the peer is refused with our PQ leaf already spent. Nothing
@@ -1392,13 +1491,19 @@ fn test_discharge_refuses_a_violated_reservation() {
         owed.t_epoch += 1;
     }
 
-    // The committing round that would discharge it refuses with EpochDesync — on
-    // Alice's side, with nothing sent.
+    // The committing round that would discharge it refuses — on Alice's side, with nothing
+    // sent. And because a bind was being discharged when the reservation check failed, the
+    // error is the FATAL `BindDischargeFailed`, not the retriable one it would wear
+    // otherwise: the reservation was already consumed and the leaf spent, so a host must
+    // route to re-establishment rather than retry.
     assert_ok!(bob.prepare_to_encrypt(None));
     let upd = assert_ok!(bob.encrypt(b"upd".to_vec()));
     let got = assert_some!(assert_ok!(alice.process_incoming(upd.cipher_text)));
     assert_ok!(alice.queue_proposal(assert_some!(got.proposal).digest));
-    assert_err!(alice.prepare_to_encrypt(None), TwoMlsPqError::EpochDesync);
+    assert_err!(
+        alice.prepare_to_encrypt(None),
+        TwoMlsPqError::BindDischargeFailed
+    );
 }
 
 /// Archive mid-hold: the owed bind (public bytes and two reserved epochs — no key

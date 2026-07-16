@@ -616,6 +616,10 @@ fn session_from_wire(wire: archive_wire::SessionArchive) -> Result<Arc<TwoMlsPqS
             my_state,
             their_state,
             pq_turn_mine: wire.pq_turn_mine,
+            // Deliberately not archived and always restored clear: the wedge it marks is an
+            // in-memory apply failure, and restoring predates the failed take — so a restore
+            // IS the recovery (see `SessionInner::bind_apply_broken`).
+            bind_apply_broken: false,
             // The seal cache is live-only, so a restore restarts any chunking pass with a
             // fresh base — the frames themselves ride the archive, so re-sending resumes.
             pending_side_band: retained_from_wire(wire.pending_side_band),

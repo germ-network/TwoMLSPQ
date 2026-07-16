@@ -523,99 +523,25 @@ impl SessionInner {
                     .process_incoming_message(msg)
                     .map_err(map_credential_err)?;
             }
-            // THIS is the commit an owed bind has been waiting for — rule 3: the next classical
-            // COMMIT is the bind. Discharging here rather than at any send is what makes the
-            // reserved `t_epoch` true, because nothing else may take this epoch. `None` on the
-            // overwhelmingly common round, where no bind is owed.
-            //
-            // It spends the reserved PQ epoch's exporter leaf, so it must run exactly once per
-            // owed bind, and only on a round that genuinely commits.
-            let owed = self.discharge_owed_bind()?;
-            let commit_output = {
-                let send = self
-                    .send_group
-                    .as_mut()
-                    .ok_or(TwoMlsPqError::SessionNotReady)?;
-                let mut builder = send.classical.commit_builder();
-                if let Some(psk) = &cross_psk {
-                    builder = psk.add_to_commit(builder)?;
-                }
-                // The bind's classical half: `apq_psk` chains the PQ entropy in, and the
-                // attestation rides as the -02 AppDataUpdate — the same one already on the PQ
-                // commit, which is what makes the two a single FULL commit.
-                if let Some((_, apq_psk, attestation)) = &owed {
-                    builder = builder.custom_proposal(attestation.to_custom_proposal()?);
-                    builder = apq_psk.add_to_commit(builder)?;
-                }
-                if let Some((signer, identity)) = handoff {
-                    builder = builder.set_new_signing_identity(signer, identity);
-                }
-                builder.build().map_err(map_credential_err)?
-            };
-            {
-                let send = self
-                    .send_group
-                    .as_mut()
-                    .ok_or(TwoMlsPqError::SessionNotReady)?;
-                send.classical
-                    .apply_pending_commit()
-                    .map_err(|_| TwoMlsPqError::Mls)?;
-                // This commit folds the app-approved peer proposal from the cache: if
-                // the peer smuggled anything but an Update there (an Add would grow the
-                // roster through OUR commit), reject the result.
-                apq::ensure_two_party(&send.classical)?;
-                // The commit consumed the one-shot recv-group PSK (when one rode it); drop
-                // it from the store.
-                if let Some(psk) = &cross_psk {
-                    send.forget_psk(psk.storage_id());
-                }
-                // Same for the bind's one-shot apq PSK, which this commit has now consumed.
-                if let Some((_, apq_psk, _)) = &owed {
-                    send.forget_psk(apq_psk.storage_id());
-                }
-            }
-            if let Some((_, apq_psk, _)) = &owed {
-                apq::forget_psk_stores(&self.psk_stores, apq_psk.storage_id());
-            }
-            // OUR commit of the peer's approved Upd is the canonical step of THEIR
-            // credential sequence: the committed credential defines their next identity.
-            if let Some((_, proposing, _)) = &folded {
-                if *proposing != self.their_state.client_id().bytes {
-                    self.with_auth(|core| core.theirs.commit(proposing.clone()));
-                    self.their_state = PrincipalState::Sync {
-                        client_id: ClientId {
-                            bytes: proposing.clone(),
-                        },
-                    };
-                }
-            }
-            // Our send group advanced: record the new epoch's PSK in the session ledger.
-            self.remember_send_psk()?;
-            // The new commit becomes the staple every frame re-sends until superseded.
-            let cl_commit = commit_output
-                .commit_message
-                .to_bytes()
-                .map_err(|_| TwoMlsPqError::Mls)?;
-            self.current_staple = match &owed {
-                // A bind discharged into this commit, so the staple is the draft-02 §7
-                // APQPrivateMessage carrying BOTH halves. The PQ commit has to travel with its
-                // classical partner and nowhere else: the peer cannot apply the classical half
-                // without the `apq_psk` only the PQ half supplies, so a staple carrying one
-                // alone is unusable. Riding the staple is also what heals a lost bind — it
-                // re-sends on every frame until superseded, for free.
-                Some((pq_commit, _, _)) => {
-                    apq::encode_apq_private_message(cl_commit, pq_commit.clone())
-                }
-                None => cl_commit,
-            };
-            // This commit publishes new leaf keys; the push about to persist it lands at the
-            // (already-bumped) current `state_seq`, so tag the staple with it for `depends_on_seq`.
-            self.current_staple_seq = self.state_seq;
-            // This fold advanced our send epoch, so any still-unapproved offer is now
-            // bound to the prior epoch — drop it (the queued one was consumed by the
-            // `take` above). Mirrors the A.3 bind's clear; the peer re-proposes at the
-            // new epoch once it sees this commit's staple.
-            self.offered_proposal = None;
+            // From here the round turns destructive when a bind is owed: the discharge
+            // consumes the reservation and spends the exporter leaf, and NO failure past
+            // that point is recoverable — `mutate_and_persist` persists the half-committed
+            // state even on Err, the leaf cannot be re-derived, and the peer waits in its
+            // responded state for a staple that can never be rebuilt. None of it is
+            // reachable from an honest flow (everything folded or handed off here was
+            // validated when it was accepted), so a failure means an internal bug — and it
+            // must wear a FATAL name, not the retriable error it would otherwise surface
+            // as. The window is structural (one helper, one mapping) so a fallible line
+            // added to the tail cannot silently escape it.
+            let discharging = self.owed_bind.is_some();
+            self.discharge_and_commit(&folded, &cross_psk, handoff)
+                .map_err(|e| {
+                    if discharging {
+                        TwoMlsPqError::BindDischargeFailed
+                    } else {
+                        e
+                    }
+                })?;
         }
 
         // Upd(self) into the peer's send group — a proposal only; the peer commits it.
@@ -718,6 +644,115 @@ impl SessionInner {
             committed_remote_client_id: folded.as_ref().map(|_| their_id),
             did_commit,
         })
+    }
+
+    /// The destructive tail of a committing round: discharge any owed bind, build and
+    /// apply the commit, canonicalize the folded credential, and set the staple. One
+    /// helper so `prepare_ratchet_commit` can map ANY failure in it to the fatal
+    /// [`TwoMlsPqError::BindDischargeFailed`] when a bind was being discharged — the
+    /// window in which failure permanently strands the round (reservation consumed,
+    /// exporter leaf spent, state persisted even on Err). Structural on purpose: a
+    /// fallible line added here is inside the mapping by construction.
+    fn discharge_and_commit(
+        &mut self,
+        folded: &Option<(Vec<u8>, Vec<u8>, Vec<u8>)>,
+        cross_psk: &Option<apq::ExportedPsk>,
+        handoff: Option<(mls_rs::crypto::SignatureSecretKey, SigningIdentity)>,
+    ) -> Result<()> {
+        // THIS is the commit an owed bind has been waiting for — rule 3: the next classical
+        // COMMIT is the bind. Discharging here rather than at any send is what makes the
+        // reserved `t_epoch` true, because nothing else may take this epoch. `None` on the
+        // overwhelmingly common round, where no bind is owed.
+        //
+        // It spends the reserved PQ epoch's exporter leaf, so it must run exactly once per
+        // owed bind, and only on a round that genuinely commits.
+        let owed = self.discharge_owed_bind()?;
+        let commit_output = {
+            let send = self
+                .send_group
+                .as_mut()
+                .ok_or(TwoMlsPqError::SessionNotReady)?;
+            let mut builder = send.classical.commit_builder();
+            if let Some(psk) = cross_psk {
+                builder = psk.add_to_commit(builder)?;
+            }
+            // The bind's classical half: `apq_psk` chains the PQ entropy in, and the
+            // attestation rides as the -02 AppDataUpdate — the same one already on the PQ
+            // commit, which is what makes the two a single FULL commit.
+            if let Some((_, apq_psk, attestation)) = &owed {
+                builder = builder.custom_proposal(attestation.to_custom_proposal()?);
+                builder = apq_psk.add_to_commit(builder)?;
+            }
+            if let Some((signer, identity)) = handoff {
+                builder = builder.set_new_signing_identity(signer, identity);
+            }
+            builder.build().map_err(map_credential_err)?
+        };
+        {
+            let send = self
+                .send_group
+                .as_mut()
+                .ok_or(TwoMlsPqError::SessionNotReady)?;
+            send.classical
+                .apply_pending_commit()
+                .map_err(|_| TwoMlsPqError::Mls)?;
+            // This commit folds the app-approved peer proposal from the cache: if
+            // the peer smuggled anything but an Update there (an Add would grow the
+            // roster through OUR commit), reject the result.
+            apq::ensure_two_party(&send.classical)?;
+            // The commit consumed the one-shot recv-group PSK (when one rode it); drop
+            // it from the store.
+            if let Some(psk) = cross_psk {
+                send.forget_psk(psk.storage_id());
+            }
+            // Same for the bind's one-shot apq PSK, which this commit has now consumed.
+            if let Some((_, apq_psk, _)) = &owed {
+                send.forget_psk(apq_psk.storage_id());
+            }
+        }
+        if let Some((_, apq_psk, _)) = &owed {
+            apq::forget_psk_stores(&self.psk_stores, apq_psk.storage_id());
+        }
+        // OUR commit of the peer's approved Upd is the canonical step of THEIR
+        // credential sequence: the committed credential defines their next identity.
+        if let Some((_, proposing, _)) = folded {
+            if *proposing != self.their_state.client_id().bytes {
+                self.with_auth(|core| core.theirs.commit(proposing.clone()));
+                self.their_state = PrincipalState::Sync {
+                    client_id: ClientId {
+                        bytes: proposing.clone(),
+                    },
+                };
+            }
+        }
+        // Our send group advanced: record the new epoch's PSK in the session ledger.
+        self.remember_send_psk()?;
+        // The new commit becomes the staple every frame re-sends until superseded.
+        let cl_commit = commit_output
+            .commit_message
+            .to_bytes()
+            .map_err(|_| TwoMlsPqError::Mls)?;
+        self.current_staple = match &owed {
+            // A bind discharged into this commit, so the staple is the draft-02 §7
+            // APQPrivateMessage carrying BOTH halves. The PQ commit has to travel with its
+            // classical partner and nowhere else: the peer cannot apply the classical half
+            // without the `apq_psk` only the PQ half supplies, so a staple carrying one
+            // alone is unusable. Riding the staple is also what heals a lost bind — it
+            // re-sends on every frame until superseded, for free.
+            Some((pq_commit, _, _)) => {
+                apq::encode_apq_private_message(cl_commit, pq_commit.clone())
+            }
+            None => cl_commit,
+        };
+        // This commit publishes new leaf keys; the push about to persist it lands at the
+        // (already-bumped) current `state_seq`, so tag the staple with it for `depends_on_seq`.
+        self.current_staple_seq = self.state_seq;
+        // This fold advanced our send epoch, so any still-unapproved offer is now
+        // bound to the prior epoch — drop it (the queued one was consumed by the
+        // caller's `take`). Mirrors the A.3 bind's clear; the peer re-proposes at the
+        // new epoch once it sees this commit's staple.
+        self.offered_proposal = None;
+        Ok(())
     }
 }
 
@@ -907,6 +942,14 @@ impl TwoMlsPqSession {
     }
 
     fn process_incoming_inner(&self, ciphertext: Vec<u8>) -> Result<Option<DecryptResult>> {
+        // Receiving is broken: a prior bind staple failed to apply with its secret already
+        // consumed, and the peer re-staples that same unappliable bind on every frame. Refuse
+        // up front with the honest, queryable error rather than re-run the doomed apply per
+        // frame — restoring from the last persisted state (which predates the failed take)
+        // is the recovery. Sending is unaffected; this guards only the receive path.
+        if self.lock().bind_apply_broken {
+            return Err(TwoMlsPqError::BindApplyFailed);
+        }
         // Header encryption: accept either the sealed blob off the wire or the frame a
         // host already took from `open_incoming` (see `open_or_raw`). The initiator's
         // initial welcome (invitation channel, unsealed) passes through untouched.
@@ -1037,11 +1080,34 @@ impl TwoMlsPqSession {
                                 return Err(TwoMlsPqError::SessionNotReady);
                             }
                         };
-                        // The bind's classical half is the peer's routine FULL commit — a
-                        // discharge only ever rides a round that folds our approved Upd —
-                        // so it carries identity exactly as a plain commit staple does:
-                        // report what moved into the same bookkeeping the plain arm feeds.
-                        let moved = inner.apply_bind(&s, &stores, &pq_message, &t_message)?;
+                        // The bind's classical half is the peer's routine commit — when it
+                        // folds our approved Upd it carries identity exactly as a plain
+                        // commit staple does, so report what moved into the same bookkeeping
+                        // the plain arm feeds (a proposal-less discharge simply moves
+                        // nothing, and `LeafChanges` is empty).
+                        //
+                        // `s` was just consumed and the exporter leaf spent, so a failure
+                        // here is unrecoverable in memory: the peer re-staples this bind on
+                        // every frame (its next commit, which would supersede it, is what
+                        // evidence-gating forbids while this one is unapplied), and each
+                        // retry would re-enter with `pq_inflight` already taken and hit the
+                        // `other` arm's `SessionNotReady` forever. Latch the break so the
+                        // guard at the top of `process_incoming` refuses those retries with
+                        // the honest `BindApplyFailed`, and so a host can ask. In-memory
+                        // only: this closure persists on success, so the latch never reaches
+                        // a blob and a restore predates the failed take.
+                        let moved = match inner.apply_bind(&s, &stores, &pq_message, &t_message) {
+                            Ok(moved) => moved,
+                            Err(_) => {
+                                // The specific reason (a torn PQ/classical apply, a rejected
+                                // credential, an attestation mismatch) does not change the
+                                // recovery — the secret is gone either way — so the breaking
+                                // frame surfaces the same honest `BindApplyFailed` the latched
+                                // guard gives every frame after it, not the raw error.
+                                inner.bind_apply_broken = true;
+                                return Err(TwoMlsPqError::BindApplyFailed);
+                            }
+                        };
                         new_sender = moved.new_sender;
                         canonicalized_own = moved.canonicalized_own;
                         staple_applied = true;

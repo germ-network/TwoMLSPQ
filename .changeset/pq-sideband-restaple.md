@@ -177,6 +177,27 @@ inner `MLSPrivateMessage`'s `0x00`, identical to a bare commit, and the staple s
 its forms apart by first byte alone (`0x00` MLSMessage, `0x01` APQWelcome, `0x05`
 APQPrivateMessage).
 
+## The bind's two failure paths are surfaced, not silent
+
+An owed bind consumes irreversible state — the reserved epoch, the PQ exporter leaf — so a
+failure while it is being spent cannot be retried away. Neither path is reachable from an
+honest flow (both take an internal MLS failure), but each now wears its own error instead of
+a misleadingly retriable one:
+
+- **`BindDischargeFailed` (fatal).** The classical commit discharging a bind failed after the
+  reservation was consumed and the leaf spent. The round can never be rebuilt and the peer
+  waits forever, so the host must re-establish rather than retry — which the dedicated variant
+  makes unmistakable. The whole destructive tail is now one helper (`discharge_and_commit`),
+  so the fatal mapping covers it by construction and a fallible line added there can't escape
+  it.
+- **`BindApplyFailed` + `pq_receive_broken()`.** Applying a peer's bind staple failed after
+  the round's secret was consumed, so RECEIVING is broken — the peer re-staples the same
+  unappliable bind on every frame (evidence-gating forbids it committing past it), and every
+  inbound frame fails before its app message. SENDING is unaffected. In-memory only (inbound
+  processing persists on success), so restoring the last persisted state heals it; and it is a
+  query, not only an error, because how urgent a receive-break is depends on what the session
+  is for — a receive-critical role treats it as fatal, a send-mostly role can defer.
+
 ## A.5 becomes the same round shape: proposal, full commit, stapled ack
 
 A.5 was `Upd' → [Commit'][counter-Upd'] → Commit2`, rekeying both PQ groups in one round —
