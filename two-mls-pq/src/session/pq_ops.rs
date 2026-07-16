@@ -92,8 +92,10 @@ impl TwoMlsPqSession {
         })
     }
 
-    /// Responder — encapsulate a fresh secret to the initiator's EK, hold it, and return the
-    /// ciphertext message (tag 0x19).
+    /// Responder — SEAL a fresh secret to the initiator's EK (bound to our current PQ epoch),
+    /// hold it, and return the ciphertext message (tag 0x19). The secret is random and sealed
+    /// rather than the KEM output itself, so the initiator's open is an explicit receipt (see
+    /// `apq::pq_ratchet::seal_injected_secret`).
     pub fn pq_ratchet_respond(&self, ek_msg: Vec<u8>) -> Result<()> {
         // Guard-first (see `pq_ratchet_begin`): validate the frame and check the turn/slot
         // state before the persist choke point, so a replayed or ill-timed EK frame can't force
@@ -123,8 +125,23 @@ impl TwoMlsPqSession {
             ek.to_vec()
         };
         self.mutate_and_persist(crate::BlobKind::Checkpoint, |inner| {
-            let (s, ct) = apq::pq_ratchet::encapsulate(&providers::pq_kem()?, &ek)?;
-            inner.pq_inflight = Some(PqInflight::Responding(Zeroizing::new(s)));
+            // The PSK binds the round to the group the secret is injected into — the
+            // initiator's send-PQ, which we mirror as our recv-PQ — at its current epoch.
+            let psk = {
+                let recv_pq = inner
+                    .recv_group
+                    .as_ref()
+                    .and_then(|g| g.pq.as_ref())
+                    .ok_or(TwoMlsPqError::SessionNotReady)?;
+                ct_seal_psk(recv_pq)?
+            };
+            let (s, ct) = apq::pq_ratchet::seal_injected_secret(
+                &providers::pq_kem()?,
+                &providers::header_aead_suite()?,
+                &ek,
+                &psk,
+            )?;
+            inner.pq_inflight = Some(PqInflight::Responding(s));
             let mut msg = vec![PQ_CT_TAG];
             msg.extend_from_slice(&ct);
             // Parked for re-send until the initiator's stapled bind answers it.
@@ -139,15 +156,15 @@ impl TwoMlsPqSession {
     /// the round's app message travels — an ordinary message frame's own section.
     pub fn pq_ratchet_bind(&self, ct_msg: Vec<u8>) -> Result<()> {
         // Guard-first (see `pq_ratchet_begin`): validate the frame and every turn/slot/staple
-        // precondition before the persist choke point. The `pq_inflight` state is checked here
-        // as a pure read; the closure below still `take`s it (guaranteed `Initiating`). A
-        // displaced or ill-timed CT frame is then a no-op that neither bumps the seq nor pushes
-        // a Checkpoint — and, crucially, never reaches the `take` that would consume a held
-        // ephemeral or the `remember_send_psk` that mutates.
-        let ct = {
+        // precondition — AND open the sealed secret — before the persist choke point. The open
+        // is a PURE read (decapsulate and the exporter mutate nothing), so a displaced,
+        // stale, or misdirected CT is a no-op that neither bumps the seq nor pushes a
+        // Checkpoint, and never reaches the closure's `take` of the held ephemeral. The
+        // opened secret is what the closure commits.
+        let s = {
             let inner = self.lock();
             let ct_msg = inner.open_or_raw(ct_msg);
-            let (&tag, ct) = ct_msg.split_first().ok_or(TwoMlsPqError::Mls)?;
+            let (&tag, wire_ct) = ct_msg.split_first().ok_or(TwoMlsPqError::Mls)?;
             if tag != PQ_CT_TAG {
                 return Err(TwoMlsPqError::Mls);
             }
@@ -173,27 +190,49 @@ impl TwoMlsPqSession {
                 return Err(TwoMlsPqError::SessionNotReady);
             }
             // Only an initiator holding the A.3 ephemeral can bind the ciphertext.
-            match inner.pq_inflight {
-                Some(PqInflight::Initiating(_)) => {}
+            let eph = match &inner.pq_inflight {
+                Some(PqInflight::Initiating(eph)) => eph,
                 // We already bound: the ephemeral was consumed and the turn passed, so this
                 // is the peer re-sending its CT until our bind lands. Discard.
                 None if !inner.pq_turn_mine => return Err(TwoMlsPqError::DuplicateSideBand),
                 _ => return Err(TwoMlsPqError::SessionNotReady),
-            }
-            ct.to_vec()
+            };
+            // OPEN the sealed secret. The PSK binds the group the secret is injected into
+            // (our send-PQ) at its current epoch; the AEAD key binds that AND the KEM shared
+            // secret, so a CT answering a DIFFERENT ephemeral (a stale round's, re-sent
+            // across the bundling window) or a different epoch fails the open EXPLICITLY —
+            // rejected here, ephemeral and PQ leaf intact, where a bare `decapsulate` would
+            // have handed back ML-KEM's implicit-rejection garbage to inject and strand the
+            // round on an unshared secret.
+            let psk = {
+                let send_pq = inner
+                    .send_group
+                    .as_ref()
+                    .and_then(|g| g.pq.as_ref())
+                    .ok_or(TwoMlsPqError::SessionNotReady)?;
+                ct_seal_psk(send_pq)?
+            };
+            apq::pq_ratchet::open_injected_secret(
+                &providers::pq_kem()?,
+                &providers::header_aead_suite()?,
+                eph,
+                wire_ct,
+                &psk,
+            )?
         };
         self.mutate_and_persist(crate::BlobKind::Checkpoint, |inner| {
             // Capture the departing epoch's PSK before the classical bind commit below.
             inner.remember_send_psk()?;
-            let eph = match inner.pq_inflight.take() {
-                Some(PqInflight::Initiating(eph)) => eph,
-                _ => return Err(TwoMlsPqError::SessionNotReady),
-            };
-            let s = Zeroizing::new(apq::pq_ratchet::decapsulate(
-                &providers::pq_kem()?,
-                &eph,
-                &ct,
-            )?);
+            // The ephemeral's only use — the open above — is done; discard it. Defensive
+            // re-check of the state the guard read, which nothing races under sequential
+            // driving.
+            match inner.pq_inflight.take() {
+                Some(PqInflight::Initiating(_)) => {}
+                other => {
+                    inner.pq_inflight = other;
+                    return Err(TwoMlsPqError::SessionNotReady);
+                }
+            }
             // Commit the PQ half and OWE the classical one. NOTHING is parked in
             // `pending_side_band` here — deliberately. The two commits ride our next classical
             // COMMIT as an APQPrivateMessage in the STAPLE (`discharge_owed_bind`), which is

@@ -270,6 +270,13 @@ pub fn version() -> String {
 // re-staples the same unappliable bind) while SENDING still works — in-memory only, so
 // restoring the last persisted state heals it, and queryable so a host sets its own
 // severity by role. Both variants appended to `TwoMlsPqError` (ordinals stable).
+// Also in v19 (WIRE): the A.3 ciphertext (0x19) is no longer a bare ML-KEM ciphertext. The
+// responder now picks a random injected secret and SEALS it to the initiator's EK under a
+// key bound to the KEM shared secret AND a repeatable epoch export of the inject-group
+// (`[u32 enc_len][enc][sealed]`). The initiator OPENS it before injecting — so a stale or
+// misdirected ciphertext, which ML-KEM's implicit rejection would decapsulate to garbage and
+// strand the round on, fails the AEAD tag explicitly and is rejected with the ephemeral and
+// PQ leaf intact. Bonus: S is hybrid-secure (holds if either ML-KEM or the epoch secret does).
 const BINDING_CONTRACT_VERSION: u64 = 19;
 
 /// See `BINDING_CONTRACT_VERSION`. Exported so the Swift layer can verify the

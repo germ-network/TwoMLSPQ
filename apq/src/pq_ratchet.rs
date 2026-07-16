@@ -2,10 +2,17 @@
 //! the PQ group via a *pathless* PSK commit, then re-exported into the classical group, so the
 //! whole bind is cheap and staple-able to an app message — no per-round PQ updatePath.
 //!
-//! The initiator sends an encapsulation key (EK), the responder encapsulates a fresh shared
-//! secret S and returns the ciphertext, and the initiator decapsulates. Both sides then inject S
-//! as a PSK into the PQ group (a commit with no updatePath) and re-export the `apq_psk` from the
-//! resulting epoch to bind into the classical group.
+//! The initiator sends an encapsulation key (EK); the responder picks a fresh random secret S
+//! and SEALS it to the EK under a key bound to both the KEM shared secret and an epoch-derived
+//! PSK ([`seal_injected_secret`]); the initiator opens it ([`open_injected_secret`]). Both
+//! sides then inject S as a PSK into the PQ group (a commit with no updatePath) and re-export
+//! the `apq_psk` from the resulting epoch to bind into the classical group.
+//!
+//! Sealing a random S rather than using the raw KEM output is what makes the open a receipt:
+//! ML-KEM decapsulation returns a garbage secret (implicit rejection), not an error, for a
+//! ciphertext that answers a different ephemeral, so a bare `decapsulate` cannot tell a stale
+//! or misdirected ciphertext from a good one — it would inject the garbage and strand the
+//! round. The AEAD tag over the sealed S fails explicitly instead, before anything is spent.
 //!
 //! Provider-agnostic: the KEM steps are generic over [`KemType`]; the caller supplies its
 //! provider's ML-KEM (e.g. CryptoKit's `MlKem768Kem`, aws-lc's `MlKemKem`). Both sides must
@@ -15,7 +22,7 @@ use mls_rs::client_builder::MlsConfig;
 use mls_rs::crypto::{HpkePublicKey, HpkeSecretKey};
 use mls_rs::psk::{ExternalPskId, PreSharedKey};
 use mls_rs::storage_provider::in_memory::InMemoryPreSharedKeyStorage;
-use mls_rs::{Group, MlsMessage};
+use mls_rs::{CipherSuiteProvider, Group, MlsMessage};
 use mls_rs_crypto_traits::KemType;
 use zeroize::Zeroizing;
 
@@ -71,6 +78,105 @@ pub fn encapsulate<K: KemType>(kem: &K, ek_bytes: &[u8]) -> Result<(Vec<u8>, Vec
 pub fn decapsulate<K: KemType>(kem: &K, eph: &PqEphemeral, ct: &[u8]) -> Result<Vec<u8>> {
     kem.decap(ct, &eph.dk, &eph.ek)
         .map_err(|_| CombinerError::Mls)
+}
+
+/// The injected secret is 32 bytes of fresh randomness, chosen by the responder and SEALED
+/// to the initiator rather than being the KEM shared secret itself.
+pub const INJECTED_SECRET_LEN: usize = 32;
+
+/// KDF `info` separating the CT-seal AEAD key from every other derivation off this suite.
+const CT_SEAL_KEY_INFO: &[u8] = b"germ.network.twomlspq.a3.ctSeal.key.v1";
+
+/// Derive the AEAD key that seals the round's secret, from the KEM shared secret and the
+/// epoch-bound PSK. Both must be right, so the key is wrong (and the AEAD open below fails
+/// EXPLICITLY, unlike ML-KEM's implicit rejection) whenever the ciphertext answers a
+/// different ephemeral (garbage `kem_ss`) OR a different group epoch (wrong `psk`). That
+/// dual dependency is also the hybrid: the secret stays confidential if EITHER ML-KEM holds
+/// or the group's epoch secret does.
+fn ct_seal_key<C: CipherSuiteProvider>(
+    suite: &C,
+    kem_ss: &[u8],
+    psk: &[u8],
+) -> Result<Zeroizing<Vec<u8>>> {
+    // Extract order follows HPKE's PSK key schedule: salt = KEM shared secret, ikm = PSK.
+    let prk = suite
+        .kdf_extract(kem_ss, psk)
+        .map_err(|_| CombinerError::Mls)?;
+    let key = suite
+        .kdf_expand(&prk, CT_SEAL_KEY_INFO, suite.aead_key_size())
+        .map_err(|_| CombinerError::Mls)?;
+    Ok(key)
+}
+
+/// `[u32-LE enc_len][enc][sealed]` — the responder's wire ciphertext: the KEM encapsulation
+/// and the AEAD-sealed secret. Length-prefixed so the split does not assume the KEM's
+/// ciphertext size.
+fn encode_ct(enc: &[u8], sealed: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + enc.len() + sealed.len());
+    out.extend_from_slice(&(enc.len() as u32).to_le_bytes());
+    out.extend_from_slice(enc);
+    out.extend_from_slice(sealed);
+    out
+}
+
+fn decode_ct(wire: &[u8]) -> Result<(&[u8], &[u8])> {
+    let (len_bytes, rest) = wire.split_at_checked(4).ok_or(CombinerError::Mls)?;
+    let enc_len =
+        u32::from_le_bytes(len_bytes.try_into().map_err(|_| CombinerError::Mls)?) as usize;
+    rest.split_at_checked(enc_len).ok_or(CombinerError::Mls)
+}
+
+/// Responder — encapsulate to the initiator's EK, then SEAL a fresh random secret `S` under a
+/// key bound to both the KEM shared secret and the epoch-derived `psk`. Returns `(S, wire_ct)`
+/// where `wire_ct` is `[enc][sealed S]`; the responder holds `S` to apply the initiator's
+/// bind later, and the initiator recovers the identical `S` via [`open_injected_secret`].
+///
+/// Sealing a random secret (rather than exporting the KEM output as `S`) is what gives the
+/// bind an explicit receipt: the AEAD tag over `S` fails to open under the wrong key, so a
+/// stale or misdirected ciphertext is rejected before any secret is injected — see
+/// [`open_injected_secret`].
+pub fn seal_injected_secret<K: KemType, C: CipherSuiteProvider>(
+    kem: &K,
+    suite: &C,
+    ek_bytes: &[u8],
+    psk: &[u8],
+) -> Result<(Zeroizing<Vec<u8>>, Vec<u8>)> {
+    let ek = HpkePublicKey::from(ek_bytes.to_vec());
+    let res = kem.encap(&ek).map_err(|_| CombinerError::Mls)?;
+    let key = ct_seal_key(suite, &res.shared_secret, psk)?;
+    let mut s = Zeroizing::new(vec![0u8; INJECTED_SECRET_LEN]);
+    suite.random_bytes(&mut s).map_err(|_| CombinerError::Mls)?;
+    // Single use per key (the key is unique per round through `kem_ss`), so a zero nonce is
+    // sound; empty AAD, because the key already binds the ephemeral and the epoch.
+    let nonce = vec![0u8; suite.aead_nonce_size()];
+    let sealed = suite
+        .aead_seal(&key, &s, None, &nonce)
+        .map_err(|_| CombinerError::Mls)?;
+    Ok((s, encode_ct(&res.enc, &sealed)))
+}
+
+/// Initiator step 2 — decapsulate with the held DK and OPEN the sealed secret. A ciphertext
+/// answering a different ephemeral (garbage `kem_ss`) or built against a different group
+/// epoch (wrong `psk`) yields the wrong AEAD key, so the open fails EXPLICITLY here — the
+/// caller rejects it with the round's ephemeral and PQ leaf untouched, where ML-KEM's own
+/// implicit rejection would have handed back a garbage secret to inject.
+pub fn open_injected_secret<K: KemType, C: CipherSuiteProvider>(
+    kem: &K,
+    suite: &C,
+    eph: &PqEphemeral,
+    wire_ct: &[u8],
+    psk: &[u8],
+) -> Result<Zeroizing<Vec<u8>>> {
+    let (enc, sealed) = decode_ct(wire_ct)?;
+    let kem_ss = kem
+        .decap(enc, &eph.dk, &eph.ek)
+        .map_err(|_| CombinerError::Mls)?;
+    let key = ct_seal_key(suite, &kem_ss, psk)?;
+    let nonce = vec![0u8; suite.aead_nonce_size()];
+    let s = suite
+        .aead_open(&key, sealed, None, &nonce)
+        .map_err(|_| CombinerError::Mls)?;
+    Ok(s)
 }
 
 /// PSK id for the injected secret S at the PQ group's current epoch. The trailing domain byte

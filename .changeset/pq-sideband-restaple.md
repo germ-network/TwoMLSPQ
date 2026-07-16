@@ -198,6 +198,29 @@ a misleadingly retriable one:
   query, not only an error, because how urgent a receive-break is depends on what the session
   is for — a receive-critical role treats it as fatal, a send-mostly role can defer.
 
+## The A.3 ciphertext seals a random secret, so a stale one is rejected cleanly
+
+ML-KEM decapsulation returns a garbage secret — not an error — for a ciphertext that answers
+a different ephemeral (implicit rejection). Under the bundling window a lagging peer's re-sent
+round-N ciphertext can reach the initiator while it holds round N+1's ephemeral; a bare
+decapsulate would inject that garbage, spend the PQ leaf, and strand the round on a secret the
+peer never shares — silently.
+
+So the A.3 secret is no longer the KEM output. The responder picks a **random** secret and
+**seals** it to the initiator's EK under a key derived from the KEM shared secret **and** a
+repeatable exporter of the group the secret is injected into, at its current epoch. The
+initiator **opens** it before injecting: a ciphertext answering the wrong ephemeral (garbage
+KEM secret) or built against a different epoch (wrong PSK) fails the AEAD tag **explicitly**,
+and is rejected in the bind's pre-persist guard with the ephemeral and PQ leaf untouched. The
+open is the receipt ML-KEM couldn't give.
+
+Two bonuses fall out. S is now **hybrid-secure** — `key = Extract(kem_ss, psk)` needs both, so
+it holds if *either* ML-KEM or the group's epoch secret does. And the epoch export is the
+plain **repeatable** exporter, deliberately not `SafeExport`: a one-shot leaf could be burned
+by a stale ciphertext's failed open, re-introducing the very brick through a different door;
+each A.3 round is already at a distinct epoch, so the epoch is the round nonce with no new
+state. The 0x19 frame gains the sealed secret (`[u32 enc_len][enc][sealed]`) — a wire cut.
+
 ## A.5 becomes the same round shape: proposal, full commit, stapled ack
 
 A.5 was `Upd' → [Commit'][counter-Upd'] → Commit2`, rekeying both PQ groups in one round —

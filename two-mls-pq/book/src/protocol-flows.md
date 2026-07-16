@@ -35,8 +35,8 @@ In its place we have two PQ operations:
 1. A PQ ratchet
     1. Takes the following steps:
         1. The initiator (Alice) sends a PQ EK, as a dedicated side-band frame
-        2. The respondent (Bob) replies with a fresh secret (S) encapsulated to the EK, as a dedicated side-band frame
-        3. On receipt of S, Alice imports it as a PSK into her PQ group as a partial commit and binds it to her classical group, advancing both halves' epochs
+        2. The respondent (Bob) picks a fresh random secret (S) and *seals* it to the EK — under a key bound to the KEM shared secret **and** a repeatable export of Alice's PQ group at its current epoch — returning `[enc][sealed S]` as a dedicated side-band frame. (Sealing a random S rather than using the KEM output directly is what lets Alice *open* it: ML-KEM decapsulation returns garbage, not an error, for a ciphertext answering a different ephemeral, so only the AEAD tag over S can reject a stale or misdirected ciphertext before it is injected. S is then hybrid-secure — it holds if either ML-KEM or the epoch secret does.)
+        3. Alice opens S (an explicit receipt; a stale ciphertext fails here with her ephemeral and PQ leaf intact), imports it as a PSK into her PQ group as a partial commit, and binds it to her classical group, advancing both halves' epochs
             1. The corresponding classical commit imports a PSK from the PQ group, as the draft’s FULL commit would
             2. Since the PQ commit doesn’t have an update path, it is only encrypted with the previous group secret and not any PQ ciphertexts, so we can staple it to outgoing messages alongside the classical commit
             3. Alice can then discard the corresponding DK and S.

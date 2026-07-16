@@ -99,8 +99,10 @@ pub(crate) const PQ_BOOTSTRAP_KP_TAG: u8 = 0x13;
 pub(crate) const PQ_BOOTSTRAP_WELCOME_TAG: u8 = 0x15;
 
 // PQ ratchet (book: Protocol Flows §A.3), cryptokit only: the initiator's ML-KEM
-// encapsulation key and the responder's ciphertext. The round closes with the
-// initiator's stapled bind, not a frame.
+// encapsulation key, and the responder's ciphertext — the KEM encapsulation plus the
+// AEAD-sealed injected secret (`[u32 enc_len][enc][sealed]`, opened by
+// `apq::pq_ratchet::open_injected_secret`), not a bare KEM ciphertext. The round closes
+// with the initiator's stapled bind, not a frame.
 pub(crate) const PQ_EK_TAG: u8 = 0x17;
 pub(crate) const PQ_CT_TAG: u8 = 0x19;
 

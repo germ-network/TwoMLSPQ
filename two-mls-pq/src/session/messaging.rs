@@ -46,6 +46,12 @@ pub(in crate::session) fn rendezvous_secret(
 // header seal is crypto-agile as its own layer.
 pub(in crate::session) const HEADER_KEY_LABEL: &[u8] = b"germ.network.twomlspq.headerKey.v1";
 pub(in crate::session) const HEADER_KEY_PQ_LABEL: &[u8] = b"germ.network.twomlspq.headerKey.pq.v1";
+/// Exporter label for the A.3 CT-seal PSK — the epoch-bound secret that keys the seal over
+/// the round's injected secret (see `apq::pq_ratchet::seal_injected_secret`). The plain
+/// REPEATABLE exporter, deliberately not `SafeExport`: both parties derive it independently
+/// and a stale ciphertext must be able to fail its open without a one-shot leaf it could
+/// otherwise burn. Its own label keeps it disjoint from the header-key exports above.
+pub(in crate::session) const CT_SEAL_PSK_LABEL: &[u8] = b"germ.network.twomlspq.a3.ctSeal.psk.v1";
 // PQ header window depth: the side-band is turn-based with one op in flight, so `pq_epoch`
 // advances slowly; a few recent keys cover any lag. Session-owned secrets, so this is a
 // plain "keep newest N", not tied to mls-rs retention or the (classical-only) rendezvous.
@@ -81,6 +87,20 @@ pub(in crate::session) fn header_key_pq(
 ) -> Result<Vec<u8>> {
     group
         .export_secret(HEADER_KEY_PQ_LABEL, group.group_id(), header_key_len()?)
+        .map(|secret| secret.as_bytes().to_vec())
+        .map_err(|_| TwoMlsPqError::Mls)
+}
+
+/// The A.3 CT-seal PSK for `group` at its CURRENT epoch: the repeatable exporter under
+/// [`CT_SEAL_PSK_LABEL`]. Both parties call this on their own copy of the group the round's
+/// secret is injected into (the initiator's send-PQ / the responder's recv-PQ mirror) — same
+/// group, same epoch, same value — and each round is at a distinct epoch, so the PSK is the
+/// round nonce with no state to track.
+pub(in crate::session) fn ct_seal_psk(
+    group: &crate::key_package_store::PqMlsGroup,
+) -> Result<Vec<u8>> {
+    group
+        .export_secret(CT_SEAL_PSK_LABEL, group.group_id(), 32)
         .map(|secret| secret.as_bytes().to_vec())
         .map_err(|_| TwoMlsPqError::Mls)
 }

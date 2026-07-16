@@ -1535,6 +1535,45 @@ fn test_pq_ratchet_round_trip_delivers_app_message() {
     ratchet_round(&alice, &bob, b"hello-pq");
 }
 
+/// A stale ciphertext re-sent from a completed round, crossing into the NEXT round while the
+/// initiator holds a fresh ephemeral, must be rejected with that ephemeral and its PQ leaf
+/// intact — not silently decapsulated into a garbage secret that poisons the round.
+///
+/// This is the bundling window: the initiator binds round N, opens round N+1, then discharges
+/// round N (clearing `owed_bind`) — and a lagging peer's re-sent round-N CT can now reach the
+/// bind guard. ML-KEM's implicit rejection would hand back garbage for it; the sealed-secret
+/// open (keyed by the round's ephemeral AND its group epoch) fails EXPLICITLY instead.
+#[test]
+fn test_stale_ciphertext_crossing_rounds_is_rejected() {
+    let (alice, bob) = establish_full();
+
+    // Round N: Bob (the turn holder) initiates, Alice responds, Bob binds. Keep the round-N
+    // ciphertext as PLAINTEXT so the re-send below does not depend on header-seal windows.
+    let ek1 = assert_ok!(bob.pq_ratchet_begin());
+    assert_ok!(alice.pq_ratchet_respond(ek1));
+    let ct1_sealed = assert_some!(alice.pq_pending_outbound(SideBandSealing::Fresh));
+    let ct1 = assert_some!(assert_ok!(bob.open_incoming(ct1_sealed))).frame;
+    assert_ok!(bob.pq_ratchet_bind(ct1.clone()));
+
+    // Bob opens round N+1 while still owing round N's bind (the bundling), then discharges
+    // round N — so `owed_bind` clears and Bob is left holding the round-N+1 ephemeral.
+    let ek2 = assert_ok!(bob.pq_ratchet_begin());
+    discharge_bind(&bob, &alice, b"round-n");
+
+    // The transport re-delivers round N's ciphertext. It answers a spent ephemeral and a
+    // prior epoch, so the open fails explicitly — the round-N+1 ephemeral is untouched.
+    assert_err!(bob.pq_ratchet_bind(ct1), TwoMlsPqError::Mls);
+
+    // Proof the ephemeral survived: the CORRECT round-N+1 ciphertext still binds, and the
+    // round completes cleanly.
+    assert_ok!(alice.pq_ratchet_respond(ek2));
+    let ct2 = assert_some!(alice.pq_pending_outbound(SideBandSealing::Fresh));
+    let ct2 = assert_some!(assert_ok!(bob.open_incoming(ct2))).frame;
+    assert_ok!(bob.pq_ratchet_bind(ct2));
+    discharge_bind(&bob, &alice, b"round-n+1");
+    assert!(alice.my_pq_turn());
+}
+
 /// The PQ side-band must survive a principal rotation: the injected-secret and apq PSKs
 /// have to land in the stores the group halves actually resolve from (captured at
 /// group creation), not the rotated-in client's stores — otherwise Alice's bind and
