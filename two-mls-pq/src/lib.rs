@@ -641,10 +641,12 @@ pub enum TwoMlsPqError {
     CipherSuiteMismatch,
     /// A stapled commit is for a *future* epoch of the receive group: the peer has advanced
     /// more than one commit past us, and the bridging commit no longer rides any frame (only
-    /// the sender's latest commit staples). Not transient — the direction needs the
-    /// reconnect path. Distinct from `DecryptionFailed`, which covers malformed or (possibly
+    /// the sender's latest commit staples). Not transient, and not recoverable in-library —
+    /// there is no reconnect at this layer. The recovery is OUT-OF-SESSION: the host
+    /// re-establishes a fresh session (restore cannot heal it; the persisted state is
+    /// desynced too). Distinct from `DecryptionFailed`, which covers malformed or (possibly
     /// reordered, hence retriable) unprocessable frames.
-    #[error("stapled commit is ahead of the receive group; reconnect required")]
+    #[error("stapled commit is ahead of the receive group; re-establish the session")]
     EpochDesync,
     /// A welcome arrived that differs from the one this session's receive group was joined
     /// from. Re-deliveries of the *same* welcome are normal and skipped silently (the peer

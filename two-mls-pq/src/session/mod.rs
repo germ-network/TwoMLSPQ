@@ -617,7 +617,7 @@ impl SessionInner {
     /// Classify a staple's classical commit against our recv group's epoch — the one place
     /// the re-staple ordering lives, called by BOTH staple arms so a change to how repeats or
     /// gaps are handled can never land in one and not the other. `Greater` (a commit we never
-    /// saw sits between) is reconnect territory, surfaced as `EpochDesync` before the app
+    /// saw sits between) is re-establish territory, surfaced as `EpochDesync` before the app
     /// ciphertext is touched.
     fn staple_epoch_action(&self, commit: &MlsMessage) -> Result<StapleAction> {
         let commit_epoch = commit.epoch().ok_or(TwoMlsPqError::DecryptionFailed)?;

@@ -95,7 +95,9 @@ What multiMLS-Swift `TwoMLS` actually does (verified against
 - **Establishment, second round:** the joiner's return frame (carrying Group_B's
   welcome) is sealed under the symmetric exporter of Group_A at the epoch the joiner
   joined; the initiator pre-computed that key at creation and holds it in
-  `reconnectArchive` until the return frame arrives.
+  `reconnectArchive` until the return frame arrives (a classical multiMLS-Swift
+  symbol — its name predates the split between establishment keys and the
+  classical rejoin stash it also holds).
 
 ## Relation to the classical stapling construction
 
@@ -116,8 +118,9 @@ the AD of the app message, then header-encrypts the outermost message. Assessmen
   header layer hides it; parsing is a try-cascade over unauthenticated nested
   structure (`uncheckedAuthData`) with genuinely odd control flow; and the commit
   must still be applied before the app message riding with it can be decrypted, so a
-  frame that fails late leaves the group advanced (the rejoin machinery exists
-  largely to recover from this).
+  frame that fails late leaves the group advanced (the classical rejoin machinery —
+  multiMLS-Swift's in-band recovery, no PQ counterpart — exists largely to recover
+  from this).
 - TwoMLSPQ replaced stapling with explicit length-prefixed tagged frames. The
   sender still writes the 32-byte proposal hash into the app message's AD, but —
   unlike the Swift stack — nothing on the receive side of this crate reads it back:
@@ -306,10 +309,10 @@ the inner tag; there is no ambiguity. Each trial is one ChaCha20-Poly1305 open �
 cost is bounded and linear in the combined (small) window. On success it classifies
 the opened frame's leading tag into `OpenedFrameKind` (`Message` for 0x01/0x03,
 `PqSideBand { PqFrameKind }` for 0x11–0x1F) and returns `OpenedFrame { kind, frame }`;
-the host routes `frame` by `kind`. On exhaustion it returns `Ok(None)` — the same
-"unknown, drop it" signal the reconnect path assigns, which trial decryption makes
-literal: an out-of-window frame and garbage are indistinguishable, by construction. An
-opened-but-unrecognized tag is `DecryptionFailed`.
+the host routes `frame` by `kind`. On exhaustion it returns `Ok(None)` — "unknown,
+drop it", which trial decryption makes literal: an out-of-window frame and garbage are
+indistinguishable, by construction. An opened-but-unrecognized tag is
+`DecryptionFailed`.
 
 **Convenience:** `process_incoming` and the `pq_*` receivers transparently remove the
 seal if present (`open_or_raw`), so a host may pass the sealed blob straight through
@@ -321,7 +324,8 @@ accepting an opened frame downgrades nothing an observer sees.
 
 **Observability caveat:** desyncs that mls-rs would once have surfaced loudly can read
 as a silent `None` here; a host tracking liveness should treat a run of `None`s on a
-live session as a reconnect signal.
+live session as a signal to re-establish the session (recovery is out-of-session —
+none exists at this layer).
 
 Frames that cross a commit in flight are covered by the window: if the peer sealed
 under my send group's epoch `n` while my `n → n+1` commit was in transit to them,

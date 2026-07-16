@@ -983,8 +983,8 @@ fn reconcile_persisted(
         // confirmed both recv_pq_epoch are None) — nothing to splice.
         (None, None) => None,
         // A newer core lacking a recv group the older checkpoint HAS would mean `recv_group`
-        // regressed Some→None. That is impossible today — nothing clears it once set (reconnect/
-        // reset is not implemented) — so this pairs a passing PQ-epoch check (both None) with a
+        // regressed Some→None. That is impossible today — nothing clears it once set (no
+        // in-library re-establish/reset exists) — so this pairs a passing PQ-epoch check (both None) with a
         // dropped recv group. Fail closed rather than silently discard the checkpoint's recv
         // group if a future change ever breaks that monotonicity.
         (None, Some(_)) => return Err(TwoMlsPqError::ArchiveInvalid),

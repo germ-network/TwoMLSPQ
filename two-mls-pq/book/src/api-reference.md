@@ -214,7 +214,7 @@ re-staples an already-persisted commit, so its `depends_on_seq` is already durab
 imposes no wait; the durability gate covers only key-material frames (routine frames rely
 on MLS's per-message `reuse_guard`, by design). `state_seq()` reports the current sequence
 for the frames — the establishment envelope, PQ side-band — whose return type carries none.
-Reconnect is not planned — see [Planned Features](./planned-features.md).
+In-library desync recovery is not planned — see [Planned Features](./planned-features.md).
 
 ## Errors
 
@@ -236,7 +236,7 @@ bootstrap key package naming a principal that is not the established peer (see
 Service's refusal (an unauthorized credential succession) — retryable where it arises
 from a staple: authorize (`queue_proposal` on a fresh delivery) and reprocess.
 `EpochDesync` means a stapled commit is more than one epoch ahead of the receive group
-(the bridging commit no longer rides any frame) — a reconnect condition, distinct from the
+(the bridging commit no longer rides any frame) — re-establish the session, distinct from the
 transient `DecryptionFailed`. `UnexpectedWelcome` means a welcome differing from the one a
 live session was joined from arrived (re-deliveries of the *same* welcome are silently
 idempotent). `CipherSuiteMismatch` is raised when a peer key

@@ -80,7 +80,7 @@ optional sections**:
   to the sender's current epoch: losing the frame that first carried a commit no
   longer strands the direction — the next frame heals it, and a lost bind heals
   by the same re-send. (Multi-commit gaps still exceed one staple; that is
-  reconnect territory.)
+  re-establish territory.)
 - **`proposal`** — the routine `Upd(sender)` addressed to the peer's send group,
   staged on every round, including principal-rotation rounds.
 - **`app`** — the application message; its authenticated data is
