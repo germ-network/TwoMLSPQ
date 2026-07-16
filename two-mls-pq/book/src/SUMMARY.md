@@ -7,6 +7,7 @@
 - [Session Lifecycle](./session-lifecycle.md)
 - [Wire Format](./wire-format.md)
 - [Header Encryption](./header-encryption.md)
+- [Protocol Flows](./protocol-flows.md)
 - [PSK Binding](./psk-binding.md)
 - [API Reference](./api-reference.md)
 - [Walkthrough: Alice & Bob](./walkthrough.md)

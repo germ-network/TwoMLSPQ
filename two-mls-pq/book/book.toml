@@ -6,10 +6,8 @@ src = "src"
 
 [output.html]
 default-theme = "navy"
+additional-js = ["mermaid.min.js", "mermaid-init.js"]
 # git-repository-url = "https://github.com/germ-network/TwoMLS"
 
-# The diagrams in `docs/` are Mermaid. To render them inline in the book, install the
-# preprocessor (`cargo install mdbook-mermaid` then `mdbook-mermaid install book`) and
-# uncomment the block below. Without it, Mermaid fences render as plain code blocks.
-# [preprocessor.mermaid]
-# command = "mdbook-mermaid"
+[preprocessor.mermaid]
+command = "mdbook-mermaid"

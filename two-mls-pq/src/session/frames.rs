@@ -22,7 +22,7 @@ use super::*;
 // the stapled Upd for app approval.
 pub(crate) const MESSAGE_FRAME_TAG: u8 = 0x03;
 
-// PQ ratchet (architecture-diagrams PR #2 §A.3), cryptokit only:
+// PQ ratchet (book: Protocol Flows §A.3), cryptokit only:
 // 0x05 carries the initiator's ML-KEM encapsulation key, 0x07 the responder's ciphertext,
 // 0x09 the bind = [pq partial-commit][classical commit][app], all length-prefixed.
 pub(crate) const PQ_EK_TAG: u8 = 0x05;
@@ -36,7 +36,7 @@ pub(crate) const PQ_BOOTSTRAP_KP_TAG: u8 = 0x0B;
 /// A.4 bootstrap reply: the new PQ group's welcome (PQ-groups-only; no classical commit).
 pub(crate) const PQ_BOOTSTRAP_BIND_TAG: u8 = 0x0D;
 
-// A.5 rekey (architecture-diagrams §A.5), cryptokit only — updatePath commits run on the
+// A.5 rekey (book: Protocol Flows §A.5), cryptokit only — updatePath commits run on the
 // PQ groups alone so the classical ratchet is never blocked behind a large ML-KEM
 // updatePath. 0x0F carries the initiator's Upd' proposal for the responder's send-PQ;
 // 0x11 = [Commit'][counter-Upd'-or-empty], length-prefixed — the responder's reply

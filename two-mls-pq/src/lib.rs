@@ -177,7 +177,7 @@ pub fn version() -> String {
 // unaffected (the binding is optional and rides the persisted group state).
 // v16 (2026-07-13, §A.1 pre-establishment sends): the initiator sends app messages
 // immediately after `initiate`, before the acceptor's return welcome (architecture
-// 08-twoMLSPQ-APQ §A.1) — `prepare_to_encrypt` pre-establishment is a NO-OP prepare
+// book: Protocol Flows §A.1) — `prepare_to_encrypt` pre-establishment is a NO-OP prepare
 // (`proposal_message` EMPTY; `proposal_hash` is the WELCOME digest — the one carve-out
 // on the v14 hash==sha256(message) guarantee) and `encrypt` emits a fresh §A.1 envelope
 // per frame, HPKE-sealed to the retained peer KP′, stapling the app message.

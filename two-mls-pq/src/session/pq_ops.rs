@@ -3,7 +3,7 @@
 //! A.5 PQ-only re-key (pq_rekey_*), plus the in-flight round state and the
 //! pq turn/outbound accessors. Every method here operates on the PQ frames
 //! classified in `frames` and is security-reviewed as a unit -- see
-//! docs 08 A.3-A.5.
+//! the book's Protocol Flows chapter, A.3-A.5.
 
 use super::*;
 

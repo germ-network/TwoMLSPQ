@@ -1,4 +1,4 @@
-//! Germ PQ ratchet (architecture-diagrams PR #2, §A.3): fresh ML-KEM entropy is injected into
+//! Germ PQ ratchet (two-mls-pq book: Protocol Flows §A.3): fresh ML-KEM entropy is injected into
 //! the PQ group via a *pathless* PSK commit, then re-exported into the classical group, so the
 //! whole bind is cheap and staple-able to an app message — no per-round PQ updatePath.
 //!
