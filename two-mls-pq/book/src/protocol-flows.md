@@ -211,25 +211,29 @@ synchronized membership —
 - a **classical MLS group** (traditional ciphersuite).
 
 The two halves are bound by exporting a secret from the PQ group and importing
-it into the classical group as an external **PreSharedKey** proposal.
+it into the classical group as a **PreSharedKey** proposal.
 
-> **Implemented binding (diverges from draft -02).** The implementation uses
-> the plain MLS exporter rather than the draft's Safe Extensions recipe:
+> **Implemented binding (conforms to draft -02).** The `apq_psk` follows the
+> draft's Safe Extensions recipe (`draft-ietf-mls-extensions-08` §4.4) and is
+> imported as an `application(3)` PSK:
 >
 > ```
-> apq_psk    = MLS-Exporter(label="exportSecret", context="derive", length=32)   # in the PQ group
-> apq_psk_id = pq_epoch (u64 LE) ‖ pq_group_id
+> apq_exporter = SafeExportSecret(component_id = 0xFF01)   # consumed leaf of the PQ epoch's exporter tree
+> apq_psk_id   = DeriveSecret(apq_exporter, "psk_id")
+> apq_psk      = DeriveSecret(apq_exporter, "psk")
 > ```
 >
-> (The A.3 injected secret S uses the same id scheme with a trailing domain
-> byte `0x52`, keeping it disjoint from exported ids.) There is no `APQInfo`
-> GroupContext extension, no `AppDataUpdate` proposal, and no tracked
-> `t_epoch`: the epoch pair is read live from the two groups
-> (`ApqEpochs { pq_epoch, classical_epoch }`). For reference, draft -02
-> instead derives `apq_psk`/`apq_psk_id` via `DeriveSecret` from a
-> `SafeExportSecret(...)` on the `epoch_secret`, imports with the combiner's
-> `component_id`, and records/verifies epochs through an `APQInfo` extension
-> updated by `AppDataUpdate` proposals in every FULL commit.
+> The draft's bookkeeping rides with it: an `APQInfo` GroupContext extension
+> (type `0xF0A1`) in both halves, and an `AppDataUpdate` proposal (type
+> `0x0008`) in both commits of every FULL commit attesting the post-commit
+> `(t_epoch, pq_epoch)` pair. [PSK Binding](./psk-binding.md) has the full
+> recipe, [group rules](./group-rules.md) rule 7 the verification, and the
+> [Wire Format](./wire-format.md) chapter the conformance cutover. Two
+> deliberate deviations remain: `APQInfo` is written once at creation and
+> never rewritten — epoch freshness lives in the per-commit `AppDataUpdate`,
+> not a rewritten extension — and the A.3 injected secret `S` is Germ's own
+> addition, an `external(1)` PSK with id `LE-u64(epoch) ‖ group_id ‖ 0x52`,
+> kept disjoint from the exported application ids.
 
 A full session is thus **four MLS groups**: `ASG-PQ`, `ASG-cl`, `BSG-PQ`, `BSG-cl`.
 
@@ -285,7 +289,7 @@ sequenceDiagram
 
     Note over Alice: Build Alice's send group (ASG) as an APQ group
     Alice->>Alice: [ASG-PQ] Add'(Bob KP') + Commit' → ASG-PQ epoch 1
-    Alice->>Alice: Export apq_psk from ASG-PQ (MLS exporter, psk_id = LE(pq_epoch) ‖ group_id)
+    Alice->>Alice: Export apq_psk from ASG-PQ (Safe Extensions, component 0xFF01)
     Alice->>Alice: [ASG-cl] Add(Bob KP) + PSK=apq_psk + Commit → ASG-cl epoch 1 (PQ-seeded)
 
     Alice->>Bob: One HPKE envelope [ app payload ∥ APQ Welcome = { Welcome' [ASG-PQ], Welcome(PSK) [ASG-cl] } ],<br/>sealed to the PQ EK in Bob's KP'
@@ -459,11 +463,12 @@ load-bearing; omitting the responder's makes the next re-key fail on a consumed 
 > every PQ commit is one half of a simultaneous **FULL commit** (PQ + paired
 > classical) with synchronized epoch bookkeeping. Germ's PQ re-key deliberately
 > commits in the PQ groups **alone** (so the classical ratchet is not blocked on
-> large PQ updatePaths), which is an extension beyond -02. (As the preamble
-> notes, the implementation carries no `AppDataUpdate` / `APQInfo` bookkeeping at
-> all — the epoch pair is read live from the groups.) The bumped `pq_epoch` is
-> bound into the classical half at the next PQ ratchet bind (A.3), which
-> re-exports `apq_psk`. The cross-injected `PSK(from …-PQ)` below is
+> large PQ updatePaths), which is an extension beyond -02. A standalone re-key
+> therefore carries no `AppDataUpdate` — attesting one half's epoch while the
+> other stands still is exactly what the proposal cannot express, and rule 7
+> rejects an attestation smuggled into one. The bumped `pq_epoch` is reconciled
+> into the classical half at the next PQ ratchet bind (A.3), which re-exports
+> `apq_psk` and attests the pair. The cross-injected `PSK(from …-PQ)` below is
 > the TwoMLS PQ-to-PQ export between send groups, distinct from `apq_psk`.
 > Like the classical ratchet (§Classical Ratchet), this cross-injection is
 > event-driven: a re-key binds the opposite PQ send group only when it has
