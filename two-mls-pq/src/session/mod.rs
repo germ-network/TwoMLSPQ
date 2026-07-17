@@ -1319,12 +1319,20 @@ impl TwoMlsPqSession {
             {
                 let client = Arc::clone(&inner.client);
                 let pq_store = client.combiner().pq_kp_store();
-                let (generated, mut captured) =
+                let (generated, captured) =
                     pq_store.capture(|| client.combiner().generate_pq_key_package());
                 let kp = generated?;
-                // The capture brackets exactly one generate; its absence is a library
-                // invariant violation, not a runtime condition.
-                let secret = captured.pop().ok_or(TwoMlsPqError::Mls)?;
+                // Exactly-one extraction (mirrors `invitation.rs::single_captured`): a
+                // generate inserts exactly one key package, so anything else means the
+                // store-global capture slot recorded a concurrent generate/injection on
+                // this shared client. Fail loudly rather than `pop()` the last insert and
+                // silently pair the signed commitment with the wrong secret (an
+                // unjoinable A.4 round the peer has already pinned).
+                let mut captured = captured.into_iter();
+                let secret = match (captured.next(), captured.next()) {
+                    (Some(secret), None) => secret,
+                    _ => return Err(TwoMlsPqError::Mls),
+                };
                 pq_store.remove_entry(&secret.0);
                 inner.bootstrap_kp = Some(kp);
                 inner.bootstrap_kp_secret = Some(secret);

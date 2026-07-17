@@ -768,19 +768,27 @@ impl TwoMlsPqSession {
             }
         }
         self.mutate_and_persist(crate::BlobKind::Checkpoint, |inner| {
-            // Consume the pre-committed KP: from here the retained side-band frame is the
-            // round's carrier (re-sent until the Welcome' answers it), and the commitment
-            // accessor goes quiet — the host read it at reply time.
+            // SEAL BEFORE CONSUMING. `mutate_and_persist` persists the closure's partial
+            // mutations even when it returns `Err`, and the pre-committed KP is
+            // one-of-a-kind — its hash is signed into establishment, so a lost KP can
+            // never be re-minted. Build and seal the frame from a BORROW first; only once
+            // the fallible `seal_side_band` has succeeded do we clear `bootstrap_kp` and
+            // register the round. A seal failure then leaves the KP intact and the call
+            // retriable, matching `pq_ratchet_begin` (whose ephemeral IS re-mintable).
             let kp = inner
                 .bootstrap_kp
-                .take()
+                .as_deref()
                 .ok_or(TwoMlsPqError::SessionNotReady)?;
             let mut msg = vec![PQ_BOOTSTRAP_KP_TAG];
-            msg.extend_from_slice(&kp);
+            msg.extend_from_slice(kp);
             // Side-band frame. Pre-A.4 our recv-PQ (Group_B.pq) is the group the bootstrap
             // is creating, so `seal_side_band` falls back to the classical seal for exactly
             // this frame; the peer opens it from its classical window.
             let sealed = inner.seal_side_band(&msg)?;
+            // Seal succeeded — consume the KP now that the retained side-band frame (below)
+            // is in hand to carry the round; the commitment accessor goes quiet (the host
+            // read it at reply time).
+            inner.bootstrap_kp = None;
             // Retain for re-send (see `pq_ratchet_begin`). A lost KP' is the worst of the
             // three to strand: without A.4 the session never reaches full establishment,
             // and this frame is what the peer's deferred send-PQ half is built around.
@@ -819,24 +827,23 @@ impl TwoMlsPqSession {
             // early, clear CipherSuiteMismatch rather than a late opaque mls-rs error.
             check_key_package_suite(kp, inner.suite.pq)?;
             // The KP′ must be the one the establishment SIGNED: the acceptor pinned
-            // `H(initiator's PQ keyPackage)` at `receive`, and a KP′ hashing to anything
-            // else is a substitution — rejected before any group is stood up around it.
-            // When pinned, this check REPLACES the names-the-established-peer equality
-            // below: it is strictly stronger (it pins the exact committed bytes, identity
-            // included), and unlike the live-principal equality it still admits the
-            // committed KP after a Phase 8 rotation (PQ leaves lag credentials by design;
-            // A.5 catches them up).
-            if let Some(expected) = inner.expected_bootstrap_kp_commitment.as_deref() {
-                if crate::sha256(kp) != expected {
-                    return Err(TwoMlsPqError::BootstrapKpMismatch);
-                }
-            } else if parse_mls_key_package(kp.to_vec())?.client_id != inner.their_state.client_id()
-            {
-                // No commitment pinned (a session predating it, or a direct-driven test
-                // harness): fall back to requiring the KP to name the established peer —
-                // the new PQ half's added leaf becomes a sender identity this library
-                // reports, so an unexpected principal is rejected here.
-                return Err(TwoMlsPqError::RemoteIdentityMismatch);
+            // `H(initiator's PQ keyPackage)` at `receive` (`accept_with` REQUIRES it, so a
+            // real acceptor always has one — its absence is an invariant violation, not a
+            // fallback to a weaker policy). A KP′ hashing to anything else is a
+            // substitution, rejected before any group is stood up. The hash pins the exact
+            // committed bytes, NOT that they name the established peer — a substitution
+            // reusing the acceptor's own id in the leaf is not caught here — but the leaf
+            // is AS-validated when the group is created below (`validate_member` admits
+            // only ids the acceptor already knows), so an unrelated third identity is
+            // rejected there. Unlike a live-principal identity check the commitment still
+            // admits the KP after a Phase 8 rotation, up to the acceptor's credential
+            // history window (PQ leaves lag credentials by design; A.5 catches them up).
+            let expected = inner
+                .expected_bootstrap_kp_commitment
+                .as_deref()
+                .ok_or(TwoMlsPqError::SessionNotReady)?;
+            if crate::sha256(kp) != expected {
+                return Err(TwoMlsPqError::BootstrapKpMismatch);
             }
             // Our send-PQ half must not already be up (checked last, matching the original body
             // order); the guard-first position prevents a full-Checkpoint push on a replay.
@@ -1023,7 +1030,6 @@ impl TwoMlsPqSession {
                     store.remove_entry(&secret.0);
                 }
                 let pq = joined?;
-                inner.bootstrap_kp_secret = None;
                 // -02 verification: the joined group must be the one whose id the classical
                 // half's APQInfo pre-allocated at establishment, and its own APQInfo must be
                 // the deferred mirror ({t: EPOCH_UNBOUND, pq: 1}, same identity fields).
@@ -1038,6 +1044,12 @@ impl TwoMlsPqSession {
                 verify_pq_half_unbound(&pq)?;
                 recv.set_pq(pq, client.combiner());
             }
+            // The join is now durable in `recv.pq`, so the pre-committed secret is spent —
+            // clear the session copy. Deferred to HERE (not right after the join call): a
+            // post-join validation above that fails leaves `recv.pq` unset (the round stays
+            // retriable) AND the secret intact, so the retry can still resolve the KP. The
+            // store copy was already the just-in-time one, removed above.
+            inner.bootstrap_kp_secret = None;
             // The receipt, and the entropy, in one step: the cross-party secret off the
             // birth epoch of the group we just joined. Derivable only from inside it, and
             // the peer re-derives the same value from its own copy (same group, epoch and
