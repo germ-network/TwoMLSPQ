@@ -147,8 +147,9 @@ SealedFrame   = [12-byte random nonce][AEAD ct+tag]   ; steady state (symmetric)
 EnvelopeFrame = [kem_output][AEAD ct+tag]             ; establishment only (HPKE)
 ```
 
-- The AEAD is a **single configured choice for the whole header layer**
-  (`providers::HEADER_AEAD_SUITE`, ChaCha20-Poly1305 today), *not* inherited from the
+- The AEAD is a **single choice for the whole header layer** (the declared suite's
+  header-AEAD facet, `providers::header_aead_suite()`, ChaCha20-Poly1305 today), *not*
+  inherited from the
   group whose exporter produced the key. Both families — message-path (classical
   exporter) and PQ side-band (PQ exporter) — seal with this one AEAD; the two-family
   split only chooses which group half derives the key. The key length
@@ -223,10 +224,10 @@ HeaderKeyPQ(G, e) = exportSecret(label = "germ.network.twomlspq.headerKey.pq.v1"
   random nonces the birthday margin (~2⁴⁸ frames per key) is far beyond any
   realistic per-epoch volume, so no mid-epoch rotation is needed.
 
-> **Rejected simplification — one classical family for both streams.** An earlier cut
-> sealed the side-band under the classical family too (the classical recv-group key is
+> **Rejected simplification — one classical family for both streams.** Sealing the
+> side-band under the classical family too (the classical recv-group key is
 > always available post-establishment, so it needs no second window or pre-A.4
-> fallback). It was replaced because it couples the side-band's outer-seal availability
+> fallback) is rejected because it couples the side-band's outer-seal availability
 > to the *async* classical cadence: a side-band frame in flight can be overtaken by
 > classical epoch advances driven by unrelated message traffic and, once they exceed
 > the classical retention window, become unopenable — a delivery-robustness dependency
@@ -377,8 +378,8 @@ for callers that already hold a plaintext welcome); the normal path is
 
 ### Host routing and the API
 
-The host used to route PQ side-band frames to `pq_*` entry points by the leading tag
-byte, which header encryption hides. The wire boundary moved one step:
+Header encryption hides the leading tag byte, so the host cannot route a raw blob to the
+`pq_*` entry points by its first byte; the wire boundary sits one step in:
 
 - **`open_incoming(blob) -> Option<OpenedFrame { kind, frame }>`** — the session
   method: one trial-decrypt pass over the receive window, returning the plaintext
@@ -393,14 +394,10 @@ byte, which header encryption hides. The wire boundary moved one step:
   the initiator's HPKE envelope), `pq_take_pending_outbound()`, and the direct returns
   of `pq_ratchet_begin` / `pq_bootstrap_begin` / `pq_rekey_begin`. The exported
   `hpke_seal_to_key_package` / `hpke_open` pair stays for other stacks; the main path
-  now uses `initiate(…, app_payload)` / `open_initial`.
+  uses `initiate(…, app_payload)` / `open_initial`.
 - **Archive**: both receive windows (`recv_header_keys`, `recv_header_keys_pq`) ride
   in the session archive as parallel `(epoch, key)` lists, entries validated to 32
-  bytes on restore. `SESSION_ARCHIVE_VERSION` bumped to 4; pre-release, so old
-  archives simply fail to decode and regenerate.
-- **Contract**: `BINDING_CONTRACT_VERSION` bumped to 8 — the FFI gains `open_incoming`
-  / `OpenedFrame` / `OpenedFrameKind` (v7) and the `initiate` `app_payload` parameter,
-  `open_initial`, and `InitialFrame` (v8); every outbound blob is now opaque.
+  bytes on restore.
 
 ### What this layer does and does not provide
 
@@ -422,10 +419,10 @@ is safe here because every candidate key is honestly derived and secret; the
 partitioning-oracle failure mode requires attacker-chosen keys, which this scheme
 never has.
 
-## What shipped (implementation)
+## Implementation
 
-1. `providers.rs`: `HEADER_AEAD_SUITE` (the single configured header-AEAD cipher suite)
-   and `header_aead_suite()` beside `pq_envelope_suite()` — the `CipherSuiteProvider`
+1. `providers.rs`: `header_aead_suite()` (the declared suite's header-AEAD facet) beside
+   `pq_envelope_suite()` — the `CipherSuiteProvider`
    whose `aead_seal`/`aead_open`/`random_bytes`/`aead_key_size`/`aead_nonce_size` back
    the seal.
 2. `session.rs`: `header_key(group)` and `header_key_pq(pq_group)` (length =
@@ -440,15 +437,13 @@ never has.
    `seal_side_band`); `pq_ratchet_begin` guarded on the recv group; `open_incoming`
    with `OpenedFrameKind`; `process_incoming` and the `pq_*` receivers `open_or_raw`
    their input.
-3. First frame: `initiate` gains `app_payload: Option<Vec<u8>>` and HPKE-envelopes
+3. First frame: `initiate` takes `app_payload: Option<Vec<u8>>` and HPKE-envelopes
    `[app_payload ∥ APQWelcome_A]` to the peer's KP′ (`key_packages::seal_initial_envelope`),
    returning it via `pending_outbound`; `TwoMlsPqInvitation::open_initial(blob) ->
-   InitialFrame { app_payload, welcome }` opens it (decrypt-only; does not consume the
+   OpenedInitial` opens it (decrypt-only; does not consume the
    invitation). `current_staple` keeps the plaintext welcome.
 4. Archive: `recv_header_keys` and `recv_header_keys_pq` as `(epoch, key)` entries,
-   32-byte validated on restore; `SESSION_ARCHIVE_VERSION` → 4,
-   `BINDING_CONTRACT_VERSION` → 8 (the `initiate` signature and `open_initial` /
-   `InitialFrame` are the FFI change; header encryption itself was 7).
+   32-byte validated on restore.
 5. Tests: sealed frames carry no plaintext framing; cross-commit crossing; restored
    session opens an in-flight frame (message *and* side-band); garbage → `None`;
    sealed side-band opens and classifies + full A.3/A.4/A.5 through sealed frames;

@@ -14,9 +14,9 @@ decision is a *facet* read from it:
 | `header_aead()` | the **classical half's AEAD** | the outer seal on every rendezvous-channel frame and the A.3 injected-secret seal. ChaCha20-Poly1305's 256-bit key has the strongest post-quantum margin — notably better than the PQ suite's AES-128-GCM — which is why the PQ side-band too is sealed with the classical AEAD |
 | `digest()` | the **classical half's hash** | every digest the crate emits: session ids, welcome digests, proposal/app AAD, the A.4 bootstrap-KP commitment (SHA-256, dispatched infallibly) |
 
-The header AEAD was previously documented as a deliberately *independent* configuration
-point; it is now a facet of the one declaration — changing any facet means declaring a new
-`TwoMlsSuite` variant, and both parties must run the same declaration to interoperate.
+The header AEAD is a facet of the one declaration, not an independent configuration point:
+changing any facet means declaring a new `TwoMlsSuite` variant, and both parties must run
+the same declaration to interoperate.
 
 **Lifecycle.** The suite is born at build time and goes **public at the key-package
 posting**: each half of a published `APQKeyPackage` names its cipher suite in the

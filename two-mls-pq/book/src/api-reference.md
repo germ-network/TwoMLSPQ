@@ -99,9 +99,11 @@ The receiving side of a published key package — no live client required.
 - `processed_welcome_group_id(welcome) -> Option<MlsGroupId>` — the content-keyed
   counterpart: resolve a re-delivered welcome by the digest of its exact bytes, no
   host token convention needed.
-- `open_initial(blob) -> InitialFrame { app_payload, welcome }` — open the initiator's
-  first frame (the §A.1 envelope `initiate` produced), recovering the app-layer welcome
-  and the MLS `welcome` to pass to `receive`. Decrypt-only and does **not** consume the
+- `open_initial(blob) -> OpenedInitial` — open the initiator's
+  first frame (the §A.1 envelope `initiate` produced), dispatching on the plaintext's inner
+  tag to `Establishment { frame }` (the app-layer welcome and the MLS `welcome` to pass to
+  `receive`) or `BootstrapKp { frame }` (the parallel A.4 KP′). Decrypt-only and does
+  **not** consume the
   invitation (validate before joining); `InvitationSpent` once a single-use invitation
   is consumed. The main receive path is `open_initial` → validate → `receive`.
 - `hpke_open(kem_output, ciphertext, info, aad)` — the lower-level decrypt used by
@@ -141,7 +143,7 @@ mismatch.
 
 State: `is_established`, `is_fully_established`, `has_receive_group`,
 `active_session_id`, `receive_group_id`, `my_principal_state`, `their_principal_state`,
-`pending_outbound` (the standalone copy of the own welcome — no longer consumed by
+`pending_outbound` (the standalone copy of the own welcome — not consumed by
 `encrypt`; the welcome also rides every pre-commit frame as the staple), `epochs`,
 `app_binding() -> Result<Option<Vec<u8>>>` (Swift `try appBinding() -> Data?`; the
 app-state binding the session was created with, read from the send group's GroupContext —

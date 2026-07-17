@@ -4,11 +4,9 @@ The authoritative TwoMLSPQ / APQ protocol design: session establishment, the cla
 ratchet, and the three PQ side-band operations, as message sequence diagrams. Appendix A
 gives the granular MLS operations behind each.
 
-This chapter used to live in the `architecture-diagrams` repo. It moved here for the reason
-that repo's README already gives for everything else it retired — *"duplicating it here is
-what let these docs drift"*. A protocol design that does not ride with its implementation
-drifts from it: the code cannot be reviewed against a spec in another repo, and a spec cannot
-fail a test. Here, a flow and the code that implements it change in one commit.
+This design rides with its implementation on purpose. A protocol design that does not is
+drifting from it: the code cannot be reviewed against a spec in another repo, and a spec
+cannot fail a test. Here, a flow and the code that implements it change in one commit.
 
 Where this chapter and the rest of the book overlap, the altitude differs rather than the
 content: [Session Lifecycle](./session-lifecycle.md) is the API caller's view of the same
@@ -292,7 +290,7 @@ it into the classical group as a **PreSharedKey** proposal.
 > `0x0008`) in both commits of every FULL commit attesting the post-commit
 > `(t_epoch, pq_epoch)` pair. [PSK Binding](./psk-binding.md) has the full
 > recipe, [group rules](./group-rules.md) rule 7 the verification, and the
-> [Wire Format](./wire-format.md) chapter the conformance cutover. Two
+> [Wire Format](./wire-format.md) chapter the draft-02 conformance. Two
 > deliberate deviations remain: `APQInfo` is written once at creation and
 > never rewritten — epoch freshness lives in the per-commit `AppDataUpdate`,
 > not a rewritten extension — and the A.3 injected secret `S` is Germ's own
@@ -384,7 +382,7 @@ is what roots the PQ leaf in the signed identity envelope: the side-band channel
 confidential to the established peer, but a bare MLS key package message carries no anchor
 signature of its own.
 
-The implementation matches (v20): `initiate` pre-commits the bootstrap key package
+The implementation matches: `initiate` pre-commits the bootstrap key package
 (`bootstrap_kp_commitment()` exposes the hash for the host's signed payload),
 `receive`/`accept` take the classical return KP plus the commitment,
 `pq_bootstrap_begin` sends the retained pre-committed KP — never a fresh mint — and
@@ -403,7 +401,7 @@ without an identity envelope. Exactly one of the two shapes is on the wire. Note
 step 8's "app payload" is that signed identity envelope; the "app messages" of step 9 are the
 ordinary application ciphertexts stapled to each pre-establishment frame — different things.
 
-**Envelope framing & parallel KP′ delivery (v21).** The §A.1 envelope is a RAW HPKE blob with
+**Envelope framing & parallel KP′ delivery.** The §A.1 envelope is a RAW HPKE blob with
 **no outer tag** — `[u32-LE kem_output_len][kem_output][ciphertext]` — because the invitation
 channel already routes it to the HPKE opener and an outer tag would only fingerprint which
 frames carry PQ material. The HPKE plaintext LEADS with an authenticated tag that selects the
@@ -422,7 +420,7 @@ early-arriving KP frame in memory, unarchived, and applies it only after the App
 verifies and the hash matches — the apply gate is structural (`pq_bootstrap_respond` cannot run
 before `receive` creates the session). See A.4.
 
-**The envelope seal binds the declared suite (v22).** Every §A.1 HPKE seal/open passes the
+**The envelope seal binds the declared suite.** Every §A.1 HPKE seal/open passes the
 declared suite's framing bytes — `[version][classical suite][pq suite]` — as AAD, **derived
 locally on both sides and never transmitted**: the sender from its build, the receiver from
 its invitation (whose posted keyPackage publicly named the pair in the first place). A peer
@@ -565,7 +563,7 @@ sequenceDiagram
     Note over Alice,Bob: Both send groups are now full APQ groups. Bob's dedicated principal was<br/>adopted at establishment (A.1) — if a rotation has since been canonicalized in the classical<br/>ratchet (A.2), the new PQ leaves simply carry the current credential (catch-up). BSG-PQ binds<br/>into BSG-cl at the next PQ ratchet (A.3, run by Bob on his send group) — classical never blocks<br/>on PQ, so this defers freshness, not liveness. Turn flips — Bob is now the initiator.
 ```
 
-**Parallel pre-delivery (v21).** The KP′ of step 1 is the one pre-committed at establishment
+**Parallel pre-delivery.** The KP′ of step 1 is the one pre-committed at establishment
 (`initiate` mints it; A.1's signed payload carries its hash), so it need not wait for the
 round to open post-establishment. The initiator ships it IN PARALLEL with the A.1 reply, in
 its own fresh HPKE envelope (`pq_bootstrap_envelope`) — same raw-blob outer shape as the reply,
@@ -622,7 +620,7 @@ load-bearing; omitting the responder's makes the next re-key fail on a consumed 
 > own leaf catches up to an already-canonical credential); the pathless ack
 > signals receipt through the classical channel. One round re-keys ONE group —
 > the turn alternation brings the other group's round next, at the same bytes
-> per group as the old two-in-one shape, and no large frame is ever terminal.
+> per group as a two-in-one full commit, and no large frame is ever terminal.
 
 ```mermaid
 sequenceDiagram
