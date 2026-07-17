@@ -1,5 +1,40 @@
 # Cipher Suites & Feature Flags
 
+## The declared suite
+
+A session's cryptography is **one up-front declaration**, not a set of independent knobs:
+the internal `TwoMlsSuite` enum names the whole configuration
+(`Curve25519ChaChaMlKem768` today, `TwoMlsSuite::CURRENT`), and every downstream crypto
+decision is a *facet* read from it:
+
+| Facet | Drawn from | Drives |
+|-------|-----------|--------|
+| `pair()` | both halves | group construction (`crypto_config`), the wire suite id (invitation/session archive headers, `APQInfo`), the APQ mode |
+| `hpke()` | the **PQ half** | the §A.1 establishment envelope and the parallel A.4 bootstrap-KP envelope (sealed to the PQ EK in the published KP′) |
+| `header_aead()` | the **classical half's AEAD** | the outer seal on every rendezvous-channel frame and the A.3 injected-secret seal. ChaCha20-Poly1305's 256-bit key has the strongest post-quantum margin — notably better than the PQ suite's AES-128-GCM — which is why the PQ side-band too is sealed with the classical AEAD |
+| `digest()` | the **classical half's hash** | every digest the crate emits: session ids, welcome digests, proposal/app AAD, the A.4 bootstrap-KP commitment (SHA-256, dispatched infallibly) |
+
+The header AEAD was previously documented as a deliberately *independent* configuration
+point; it is now a facet of the one declaration — changing any facet means declaring a new
+`TwoMlsSuite` variant, and both parties must run the same declaration to interoperate.
+
+**Lifecycle.** The suite is born at build time and goes **public at the key-package
+posting**: each half of a published `APQKeyPackage` names its cipher suite in the
+KeyPackage's cleartext framing, so the pair is readable off the posted KP. From there,
+the suite of every inbound §A.1 ciphertext is *defined* by which posted KP (→ which
+invitation) it was sealed to — the receiver holds a limited, known key set and never
+guesses — and the §A.1 HPKE seal additionally **binds** the declared suite via
+untransmitted AAD (`envelope_framing_aad()`, contract 22; see
+[wire format](./wire-format.md)). After establishment the pair rides `APQInfo` in every
+Welcome (joiners re-verify), heads the invitation and session archives (decoders reject a
+pair that is not the declared suite), and the header AEAD + digest facets govern every
+steady-state frame.
+
+This is agility *readiness*, not negotiation: exactly one variant exists and every
+decoder validates `== CURRENT`. Widening the accepted set (a suite → provider registry,
+per-invitation suites) is a separate, deferred protocol change; declaring the suite once,
+encoding it once, and binding it everywhere is that change's groundwork.
+
 ## Suites
 
 | Role | Value | Suite |

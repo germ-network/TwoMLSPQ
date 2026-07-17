@@ -381,11 +381,16 @@ pub enum OpenedInitial {
 /// `[0x13][KP′]` side-band frame). They are told apart only AFTER HPKE-open, by the inner
 /// authenticated leading tag. The fresh HPKE ephemeral per call makes each blob unlinkable
 /// (uniform pre-establishment traffic — every re-send is a distinct envelope).
+///
+/// The AAD is the declared suite's envelope framing (contract 22) — derived here, derived
+/// again by the opener, never transmitted; see [`envelope_framing_aad`].
 pub(crate) fn seal_hpke_blob(
     their_key_package: &CombinerKeyPackage,
     plaintext: Vec<u8>,
 ) -> Result<Vec<u8>> {
-    let sealed = hpke_seal_to_key_package(their_key_package.clone(), plaintext, None, None)?;
+    let aad = crate::suite::framing_aad(crate::suite::TwoMlsSuite::CURRENT);
+    let sealed =
+        hpke_seal_to_key_package(their_key_package.clone(), plaintext, None, Some(aad.to_vec()))?;
     let mut out = Vec::with_capacity(4 + sealed.kem_output.len() + sealed.ciphertext.len());
     out.extend_from_slice(&(sealed.kem_output.len() as u32).to_le_bytes());
     out.extend_from_slice(&sealed.kem_output);
@@ -482,11 +487,27 @@ pub fn decode_initial_plaintext(plaintext: Vec<u8>) -> Result<OpenedInitial> {
     }
 }
 
+/// The §A.1 envelope's HPKE AAD (contract 22): `[framing version (1)][classical u16 BE]
+/// [pq u16 BE]` — the declared suite's envelope framing, **derived locally on both sides
+/// and never transmitted** (RFC 9180 `aad` is a seal/open input, not part of the
+/// ciphertext; only byte-equality matters). Binding it means a peer whose declared suite
+/// pair or framing version differs fails the AEAD tag (`DecryptionFailed`) — downgrade
+/// binding of the WHOLE pair, classical half included, at zero wire bytes. Exported so a
+/// host driving the split path (`hpke_open` + `decode_initial_plaintext`) supplies the
+/// same bytes without hardcoding them — the `pq_frame_kind` convention; `open_initial`
+/// derives it internally.
+#[uniffi::export]
+pub fn envelope_framing_aad() -> Vec<u8> {
+    crate::suite::framing_aad(crate::suite::TwoMlsSuite::CURRENT).to_vec()
+}
+
 /// HPKE-seal `plaintext` to a published combiner key package's **PQ half** init key (spec
 /// §A.1: the envelope is sealed to the PQ EK in KP′, under the PQ suite) — the sender side
 /// of the initial routing-header pattern; the holder of the key package's invitation opens
 /// it with `TwoMlsPqInvitation::hpke_open`. `info` defaults to the key package's credential
-/// (the recipient's ClientId), matching `hpke_open`'s default.
+/// (the recipient's ClientId), matching `hpke_open`'s default. A §A.1 envelope seal passes
+/// [`envelope_framing_aad`] as `aad` (the crate's own seal paths do so via
+/// `seal_hpke_blob`); the parameter stays open for non-envelope uses.
 #[uniffi::export]
 pub fn hpke_seal_to_key_package(
     key_package: CombinerKeyPackage,
@@ -904,6 +925,8 @@ impl TwoMlsPqInvitation {
     /// inherited from classical TwoMLS, which sealed to its classical init key. `info`
     /// defaults to the ClientId; `kem_output` and `ciphertext` are the two components of the
     /// HPKE ciphertext (kept separate so this stays agnostic to any outer wire framing).
+    /// Opening a §A.1 envelope blob requires `aad = envelope_framing_aad()` (contract 22 —
+    /// the suite binding `open_initial` derives internally; without it the tag fails).
     /// Fails with `InvitationSpent` once a single-use invitation has been consumed — its
     /// captured PQ key-package material, and thus the init key this opens with, is then gone.
     pub fn hpke_open(
@@ -967,11 +990,15 @@ impl TwoMlsPqInvitation {
     /// section when present, else the `welcome` section (see `decode_initial_plaintext`).
     pub fn open_initial(&self, blob: Vec<u8>) -> Result<OpenedInitial> {
         // The blob is `[u32-LE kem_len][kem_output][ciphertext]` — no outer tag (contract 21).
-        // HPKE-open, then dispatch on the plaintext's inner leading tag.
+        // HPKE-open under the locally-derived envelope-framing AAD (contract 22: the declared
+        // suite's bytes, never transmitted — a peer declaring a different suite or framing
+        // version fails the tag as `DecryptionFailed`), then dispatch on the plaintext's
+        // inner leading tag.
         let mut rest = blob.as_slice();
         let kem_output = take_bytes(&mut rest).ok_or(TwoMlsPqError::Mls)?;
         let ciphertext = rest.to_vec();
-        let plaintext = self.hpke_open(kem_output, ciphertext, None, None)?;
+        let aad = crate::suite::framing_aad(crate::suite::TwoMlsSuite::CURRENT);
+        let plaintext = self.hpke_open(kem_output, ciphertext, None, Some(aad.to_vec()))?;
         decode_initial_plaintext(plaintext)
     }
 }
@@ -1303,6 +1330,117 @@ mod tests {
         let opened =
             assert_ok!(bob_inv.hpke_open(sealed.kem_output, sealed.ciphertext, None, None));
         assert_eq!(opened, b"routing-header".to_vec());
+    }
+
+    /// The exported §A.1 AAD is exactly the documented bytes: the framing version, then
+    /// the declared suite pair's wire encoding (the same 4 bytes the invitation/session
+    /// archive headers carry). A host on the split `hpke_open` path derives its aad from
+    /// this export, so the bytes are the contract.
+    #[test]
+    fn test_envelope_framing_aad_is_version_then_suite_pair() {
+        let aad = super::envelope_framing_aad();
+        let mut expected = vec![crate::suite::ENVELOPE_FRAMING_VERSION];
+        expected.extend_from_slice(&crate::providers::APQ_SUITE.to_wire());
+        assert_eq!(aad, expected);
+        assert_eq!(aad[0], 1, "contract 22 pins framing version 1");
+    }
+
+    /// The §A.1 envelope HPKE binds the declared suite via untransmitted AAD (contract
+    /// 22): the split-open path succeeds only under `envelope_framing_aad()` — a v21-style
+    /// `aad = None` open and a tampered-suite aad both fail the AEAD tag as
+    /// `DecryptionFailed` (deliberately opaque: an incompatible peer build is
+    /// indistinguishable from garbage by construction), while `open_initial` derives the
+    /// aad internally and still round-trips.
+    #[test]
+    fn test_open_initial_binds_envelope_framing_aad() {
+        use crate::test_utils::make_client;
+        use std::sync::Arc;
+
+        let alice = make_client();
+        let bob = make_client();
+        let bob_inv = assert_ok!(super::TwoMlsPqInvitation::restore(assert_ok!(
+            bob.generate_invitation(true)
+        )));
+        let alice_session = assert_ok!(crate::session::TwoMlsPqSession::initiate(
+            Arc::clone(&alice),
+            bob_inv.combiner_key_package(),
+            None
+        ));
+        let blob = assert_some!(alice_session.pending_outbound());
+
+        // Split the raw blob `[u32-LE kem_len][kem_output][ciphertext]` for the host path.
+        let kem_len = u32::from_le_bytes(blob[..4].try_into().unwrap()) as usize;
+        let kem_output = blob[4..4 + kem_len].to_vec();
+        let ciphertext = blob[4 + kem_len..].to_vec();
+
+        // A v21-style open (no aad) fails the tag: the compat cut is cryptographic, not
+        // a blob-shape change.
+        assert_err!(
+            bob_inv.hpke_open(kem_output.clone(), ciphertext.clone(), None, None),
+            crate::TwoMlsPqError::DecryptionFailed
+        );
+
+        // A tampered aad (wrong suite byte / wrong version) fails identically.
+        let mut wrong_suite = super::envelope_framing_aad();
+        *wrong_suite.last_mut().unwrap() ^= 0x01;
+        assert_err!(
+            bob_inv.hpke_open(
+                kem_output.clone(),
+                ciphertext.clone(),
+                None,
+                Some(wrong_suite)
+            ),
+            crate::TwoMlsPqError::DecryptionFailed
+        );
+
+        // The correct derived aad opens, and the plaintext dispatches as the
+        // establishment vector — the split-open host path end to end.
+        let plaintext = assert_ok!(bob_inv.hpke_open(
+            kem_output,
+            ciphertext,
+            None,
+            Some(super::envelope_framing_aad())
+        ));
+        assert!(matches!(
+            assert_ok!(super::decode_initial_plaintext(plaintext)),
+            super::OpenedInitial::Establishment { .. }
+        ));
+
+        // `open_initial` derives the same aad internally (state-free re-open).
+        assert!(matches!(
+            assert_ok!(bob_inv.open_initial(blob)),
+            super::OpenedInitial::Establishment { .. }
+        ));
+    }
+
+    /// The other direction of the contract-22 compat cut: a blob sealed WITHOUT the
+    /// envelope-framing aad (a v21 build's seal) fails `open_initial`'s tag check — the
+    /// suite binding is load-bearing on every §A.1 open, not advisory.
+    #[test]
+    fn test_open_initial_rejects_aad_none_seal() {
+        use crate::test_utils::make_client;
+
+        let bob = make_client();
+        let bob_inv = assert_ok!(super::TwoMlsPqInvitation::restore(assert_ok!(
+            bob.generate_invitation(true)
+        )));
+
+        // Seal a well-formed establishment-shaped plaintext the v21 way: aad = None.
+        let sealed = assert_ok!(super::hpke_seal_to_key_package(
+            bob_inv.combiner_key_package(),
+            vec![super::ESTABLISHMENT_VECTOR_TAG],
+            None,
+            None,
+        ));
+        let mut blob = Vec::with_capacity(4 + sealed.kem_output.len() + sealed.ciphertext.len());
+        blob.extend_from_slice(&(sealed.kem_output.len() as u32).to_le_bytes());
+        blob.extend_from_slice(&sealed.kem_output);
+        blob.extend_from_slice(&sealed.ciphertext);
+
+        assert_err!(
+            bob_inv.open_initial(blob),
+            crate::TwoMlsPqError::DecryptionFailed
+        );
     }
 
     #[test]

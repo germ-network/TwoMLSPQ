@@ -3579,10 +3579,10 @@ fn test_open_incoming_garbage_is_none() {
 }
 
 /// A sealed PQ side-band frame opens and classifies to the right `pq_*` kind, and the
-/// The header key length tracks the configured header AEAD's key size — so a future
-/// change of `HEADER_AEAD_SUITE` to a different-key-length cipher can't silently
-/// desync key derivation from the seal. (Sanity for the crypto-agility wiring; today
-/// both are 32 for ChaCha20-Poly1305.)
+/// The header key length tracks the declared suite's header-AEAD key size — so a future
+/// suite variant with a different-key-length cipher can't silently desync key
+/// derivation from the seal. (Sanity for the crypto-agility wiring; today both are 32
+/// for ChaCha20-Poly1305, `TwoMlsSuite::CURRENT.header_aead()`.)
 #[test]
 fn test_header_key_len_matches_aead() {
     use mls_rs::CipherSuiteProvider;

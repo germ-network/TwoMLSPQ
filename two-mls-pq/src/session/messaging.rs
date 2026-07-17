@@ -41,9 +41,11 @@ pub(in crate::session) fn rendezvous_secret(
 // it falls back to the classical seal (see `SessionInner::seal_side_band`).
 //
 // The two families only choose which group HALF derives the key; the AEAD that consumes
-// it is a single configured choice (`providers::HEADER_AEAD_SUITE`), independent of the
-// group suites, and the key length is that AEAD's key size (`header_key_len`) — so the
-// header seal is crypto-agile as its own layer.
+// it is the declared suite's `header_aead` facet (`TwoMlsSuite::CURRENT`, via
+// `providers::header_aead_suite`) — one facet of the same up-front declaration the group
+// suites come from, not an independent knob — and the key length is that AEAD's key size
+// (`header_key_len`). The header seal stays its own LAYER (this exporter label versions
+// it), but its cipher changes only by declaring a new suite variant.
 pub(in crate::session) const HEADER_KEY_LABEL: &[u8] = b"germ.network.twomlspq.headerKey.v1";
 pub(in crate::session) const HEADER_KEY_PQ_LABEL: &[u8] = b"germ.network.twomlspq.headerKey.pq.v1";
 /// Exporter label for the A.3 CT-seal PSK — the epoch-bound secret that keys the seal over
@@ -57,9 +59,9 @@ pub(in crate::session) const CT_SEAL_PSK_LABEL: &[u8] = b"germ.network.twomlspq.
 // plain "keep newest N", not tied to mls-rs retention or the (classical-only) rendezvous.
 pub(in crate::session) const PQ_HEADER_WINDOW: usize = 4;
 
-/// The header key length: the key size of the configured header AEAD
-/// (`providers::HEADER_AEAD_SUITE`), so the exporter output always matches whatever cipher
-/// seals the frame — no hardcoded assumption of a 32-byte (ChaCha) key.
+/// The header key length: the key size of the declared suite's header AEAD
+/// (`TwoMlsSuite::CURRENT.header_aead()`), so the exporter output always matches whatever
+/// cipher seals the frame — no hardcoded assumption of a 32-byte (ChaCha) key.
 pub(in crate::session) fn header_key_len() -> Result<usize> {
     use mls_rs::CipherSuiteProvider;
     Ok(providers::header_aead_suite()?.aead_key_size())

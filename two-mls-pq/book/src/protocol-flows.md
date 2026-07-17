@@ -422,6 +422,15 @@ early-arriving KP frame in memory, unarchived, and applies it only after the App
 verifies and the hash matches — the apply gate is structural (`pq_bootstrap_respond` cannot run
 before `receive` creates the session). See A.4.
 
+**The envelope seal binds the declared suite (v22).** Every §A.1 HPKE seal/open passes the
+declared suite's framing bytes — `[version][classical suite][pq suite]` — as AAD, **derived
+locally on both sides and never transmitted**: the sender from its build, the receiver from
+its invitation (whose posted keyPackage publicly named the pair in the first place). A peer
+declaring a different pair or framing version fails the AEAD tag, so the classical half —
+which the HPKE operation alone never touches — is downgrade-bound into establishment at zero
+wire bytes. See [wire format](./wire-format.md) and
+[cipher suites](./cipher-suites.md).
+
 ### A.2 Classical ratchet (granular) — classical-only commits
 
 ```mermaid

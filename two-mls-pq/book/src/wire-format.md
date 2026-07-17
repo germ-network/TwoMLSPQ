@@ -53,6 +53,20 @@ material; there is nothing it could disambiguate that the channel does not alrea
 initiator re-seals under a fresh HPKE ephemeral on every send (reply and bootstrap KP alike),
 so a stable inner KP′ never produces a linkable blob.
 
+**The seal binds the declared suite via untransmitted AAD (contract 22).** Both sides derive
+`[framing version (1)][classical u16 BE][pq u16 BE]` — the declared suite's wire bytes
+(`envelope_framing_aad()`) — and pass it as the HPKE `aad`; it never travels (RFC 9180 `aad`
+is a seal/open input, not part of the ciphertext, so only byte-equality matters). A peer whose
+declared pair or framing version differs fails the AEAD tag as `DecryptionFailed` —
+deliberately opaque, the header seal's "indistinguishable by construction" contract — which
+downgrade-binds the WHOLE pair, classical half included (the HPKE operation alone only ever
+touches the PQ half), at zero wire and zero plaintext bytes. The suite needs no *signaling*
+here: each half of a posted `APQKeyPackage` names its cipher suite in the KeyPackage's
+cleartext framing, and the suite of an inbound envelope is defined by which posted KP (→
+which invitation) it was sealed to. Hosts on the split `hpke_open` +
+`decode_initial_plaintext` path must supply `envelope_framing_aad()`; `open_initial` derives
+it internally. See [Cipher Suites](./cipher-suites.md) for the declared suite and its facets.
+
 The space is **banded**. Each band owns a contiguous range of odd bytes, is packed from its
 start, and keeps its remaining room at the end:
 
