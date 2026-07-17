@@ -113,6 +113,21 @@ impl SyntheticKeyPackageStore {
             .clear();
     }
 
+    /// Insert one key package's private material — the SESSION-owned custody path (the
+    /// pre-committed A.4 bootstrap KP secret is injected just-in-time before the
+    /// Welcome' join, mirroring how `inject_send_psks` fills the PSK stores).
+    pub(crate) fn insert_entry(&self, secret: KeyPackageSecret) {
+        self.do_insert(secret.0, secret.1);
+    }
+
+    /// Remove one key package's private material by storage id — the counterpart of
+    /// [`insert_entry`](Self::insert_entry): the just-in-time injection is cleaned up as
+    /// soon as the join has consumed it (and a generate whose secret moves into session
+    /// custody is removed here so it is not double-homed in the client archive).
+    pub(crate) fn remove_entry(&self, id: &[u8]) {
+        self.do_delete(id);
+    }
+
     /// Snapshot every stored key package as `(storage id, KeyPackageData)`, sorted by id for
     /// a deterministic byte order. Used by session archival to carry the client's retained
     /// key-package private material (e.g. an initiator's return-group key package, minted but

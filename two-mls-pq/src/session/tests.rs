@@ -4,7 +4,10 @@ use super::{SideBandSealing, TwoMlsPqSession};
 
 use crate::{
     assert_err, assert_ok, assert_some,
-    test_utils::{establish_confirmed_sessions, establish_sessions, make_client, make_combiner_kp},
+    test_utils::{
+        commitment_of, establish_confirmed_sessions, establish_sessions, make_classical_kp,
+        make_client, make_combiner_kp,
+    },
     PrincipalState, TwoMlsPqError,
 };
 
@@ -108,6 +111,160 @@ fn test_pq_bootstrap_respond_rejects_wrong_suite_key_package() {
     );
 }
 
+/// The A.4 KP′ must hash to the commitment pinned at establishment: a substituted PQ key
+/// package — valid suite, honest shape, wrong bytes — is rejected before any group is
+/// stood up, and the genuine pre-committed KP still completes the round. This is the
+/// check that anchors the ML-KEM key material to the SIGNED establishment payload: the
+/// side-band channel is confidential to the established peer, but a bare KP message
+/// carries no anchor signature of its own, so before the commitment a compromised
+/// classical channel could substitute the PQ leaf here.
+#[test]
+fn test_pq_bootstrap_respond_rejects_a_substituted_key_package() {
+    use crate::MlsCipherSuite;
+
+    let (alice, bob) = establish_confirmed_sessions();
+
+    // A stranger's genuine PQ-suite key package, framed exactly like the honest KP′.
+    let stranger = make_client();
+    let forged = assert_ok!(stranger.generate_key_package(MlsCipherSuite::ml_kem_768()));
+    let mut kp_msg = vec![super::PQ_BOOTSTRAP_KP_TAG];
+    kp_msg.extend_from_slice(&forged);
+    assert_err!(
+        bob.pq_bootstrap_respond(kp_msg),
+        TwoMlsPqError::BootstrapKpMismatch
+    );
+
+    // Rejected before any state was touched: the genuine round completes end-to-end.
+    let kp = assert_ok!(alice.pq_bootstrap_begin(None));
+    assert_ok!(bob.pq_bootstrap_respond(kp));
+    let welcome = assert_some!(bob.pq_take_pending_outbound());
+    assert_ok!(alice.pq_bootstrap_bind(welcome));
+    discharge_bind(&alice, &bob, b"bootstrap-bind");
+    assert!(alice.is_fully_established());
+    assert!(bob.is_fully_established());
+}
+
+/// The commitment accessor serves the host's reply-time envelope composition and goes
+/// quiet once `pq_bootstrap_begin` consumes the retained KP; an acceptor never has one.
+#[test]
+fn test_bootstrap_kp_commitment_lifecycle() {
+    let (alice, bob) = establish_confirmed_sessions();
+    // The initiator exposes the commitment from `initiate` until `begin` consumes it.
+    assert_eq!(assert_some!(alice.bootstrap_kp_commitment()).len(), 32);
+    // The acceptor holds the PIN, not the KP — nothing to expose.
+    assert!(bob.bootstrap_kp_commitment().is_none());
+    let _kp = assert_ok!(alice.pq_bootstrap_begin(None));
+    assert!(alice.bootstrap_kp_commitment().is_none());
+}
+
+/// A commitment of the wrong length could never match any KP′ — `receive` rejects it up
+/// front (before any invitation state is claimed) rather than letting it surface as a
+/// confusing A.4 failure long after establishment.
+#[test]
+fn test_receive_rejects_malformed_commitment() {
+    use crate::key_packages::TwoMlsPqInvitation;
+
+    let alice = make_client();
+    let bob = make_client();
+    let alice_kp = make_classical_kp(&alice);
+    let bob_inv = assert_ok!(TwoMlsPqInvitation::restore(assert_ok!(
+        bob.generate_invitation(true)
+    )));
+    let bob_kp = bob_inv.combiner_key_package();
+    let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
+    let envelope = assert_some!(alice_session.pending_outbound());
+    let opened = assert_ok!(bob_inv.open_initial(envelope));
+    let welcome = assert_some!(opened.welcome);
+    assert_err!(
+        bob_inv.receive(
+            welcome.clone(),
+            alice_kp.clone(),
+            vec![0u8; 31], // one byte short of a SHA-256
+            b"tok".to_vec(),
+            None,
+            None,
+            None
+        ),
+        TwoMlsPqError::BootstrapKpMismatch
+    );
+    // Rejected lock-free: the invitation is untouched and the genuine receive works.
+    assert_ok!(bob_inv.receive(
+        welcome,
+        alice_kp,
+        commitment_of(&alice_session),
+        b"tok".to_vec(),
+        None,
+        None,
+        None
+    ));
+}
+
+/// The pre-committed bootstrap KP survives a restore between reply and A.4: the public
+/// bytes ride the session archive and the private material rides the client's retaining
+/// key-package store inside it, so a restored-at-establishment initiator still opens the
+/// round with the KP the establishment signature committed to — and can join the
+/// Welcome' built around it. Without either half the anchor-signed commitment could
+/// never be honoured after a restart.
+#[test]
+fn test_precommitted_bootstrap_kp_survives_restore() {
+    let (alice, bob) = establish_confirmed_sessions();
+    let restored = round_trip(&alice);
+    drop(alice);
+
+    let kp = assert_ok!(restored.pq_bootstrap_begin(None));
+    // Bob's pinned commitment accepts the restored initiator's KP′ — the same bytes
+    // committed at initiate, or `BootstrapKpMismatch` here.
+    assert_ok!(bob.pq_bootstrap_respond(kp));
+    let welcome = assert_some!(bob.pq_take_pending_outbound());
+    // The join resolves the KP's private key from the restored client's store.
+    assert_ok!(restored.pq_bootstrap_bind(welcome));
+    discharge_bind(&restored, &bob, b"bootstrap-bind");
+    assert!(restored.is_fully_established());
+    assert!(bob.is_fully_established());
+}
+
+/// The pre-committed bootstrap KP carries the FROZEN establishment credential. Enough
+/// peer rotations before a deferred A.4 evict that id from the acceptor's
+/// credential-history window — but the acceptor PINS it (eviction-exempt) from the
+/// hash-authenticated KP, so `validate_member` still admits the lazily-created leaf and
+/// the round completes. Without the pin this wedges: `UnknownIdentity` → opaque `Mls`,
+/// unrecoverable (the KP cannot be re-minted — its hash is signed into establishment).
+/// A.5 later retires the pin once both peer PQ leaves have caught up.
+#[test]
+fn test_bootstrap_survives_credential_window_eviction() {
+    let (alice, bob) = establish_confirmed_sessions();
+
+    // Rotate Alice past the window so Bob's `theirs` evicts her establishment id — the
+    // exact credential the bootstrap KP (minted at establishment) still carries. One
+    // commit past the window guarantees the founding element is popped.
+    let mut current = alice.my_principal_state().client_id();
+    for _ in 0..=apq::authentication::CREDENTIAL_HISTORY_WINDOW {
+        let next = make_client().client_id();
+        rotate_round(&alice, &bob, next.clone());
+        current = next;
+    }
+    // The bootstrap was never begun, so its KP still carries the (now-evicted)
+    // establishment credential.
+    let _ = &current;
+
+    let kp = assert_ok!(alice.pq_bootstrap_begin(None));
+    assert_ok!(bob.pq_bootstrap_respond(kp)); // pins the evicted establishment id
+    let welcome = assert_some!(bob.pq_pending_outbound(SideBandSealing::Fresh));
+    assert_ok!(alice.pq_bootstrap_bind(welcome));
+    discharge_bind(&alice, &bob, b"post-eviction-bind");
+    assert!(alice.is_fully_established());
+    assert!(bob.is_fully_established());
+
+    // Messaging still flows on both PQ halves after the round.
+    assert_ok!(alice.prepare_to_encrypt(None));
+    let enc = assert_ok!(alice.encrypt(b"post-eviction".to_vec()));
+    let got = assert_ok!(bob.process_incoming(enc.cipher_text));
+    assert_eq!(
+        assert_some!(assert_some!(got).application_message).app_message_data,
+        b"post-eviction".to_vec()
+    );
+}
+
 #[test]
 fn test_initiate_stores_outbound_welcome() {
     let alice = make_client();
@@ -142,13 +299,19 @@ fn test_is_established_false_before_both_groups_ready() {
 fn test_accept_stores_outbound_welcome() {
     let alice = make_client();
     let bob = make_client();
-    let alice_kp = make_combiner_kp(&alice);
+    let alice_kp = make_classical_kp(&alice);
     let bob_kp = make_combiner_kp(&bob);
 
     let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
     let apq_welcome_a = assert_some!(alice_session.initial_welcome());
 
-    let bob_session = assert_ok!(TwoMlsPqSession::accept(bob, apq_welcome_a, alice_kp, None));
+    let bob_session = assert_ok!(TwoMlsPqSession::accept(
+        bob,
+        apq_welcome_a,
+        alice_kp,
+        commitment_of(&alice_session),
+        None
+    ));
     assert!(bob_session.pending_outbound().is_some());
 }
 
@@ -166,7 +329,7 @@ fn test_full_establishment_sequence_combiner() {
 fn test_routing_available_from_birth_post_after_establishment() {
     let alice = make_client();
     let bob = make_client();
-    let alice_kp = make_combiner_kp(&alice);
+    let alice_kp = make_classical_kp(&alice);
     let bob_kp = make_combiner_kp(&bob);
 
     // Initiator: listening works immediately (send group @ classical epoch 1);
@@ -186,7 +349,13 @@ fn test_routing_available_from_birth_post_after_establishment() {
     // Acceptor: posts immediately — its recv group is the initiator's send
     // group, so its post address is the initiator's listen address verbatim.
     let welcome_a = assert_some!(alice_s.initial_welcome());
-    let bob_s = assert_ok!(TwoMlsPqSession::accept(bob, welcome_a, alice_kp, None));
+    let bob_s = assert_ok!(TwoMlsPqSession::accept(
+        bob,
+        welcome_a,
+        alice_kp,
+        commitment_of(&alice_s),
+        None
+    ));
     let bob_post = assert_some!(assert_ok!(bob_s.send_rendezvous()));
     assert_eq!(
         bob_post.bytes,
@@ -1382,8 +1551,13 @@ fn test_pq_bootstrap_begin_rotating_requires_current_agent() {
         TwoMlsPqError::SessionNotReady
     );
 
-    // After a Phase 8 rotation the bootstrap accepts the handoff id, and the
-    // KP' it emits — generated by the new principal — completes A.4 as usual.
+    // After a Phase 8 rotation the bootstrap accepts the handoff id, and the KP' it
+    // emits — the pre-committed one, per the v20 pin — completes A.4 as usual: the
+    // peer's hash check admits the establishment-credential KP (the commitment
+    // outranks the live-principal equality), and the bind joins the Welcome' because
+    // the KP's private half is SESSION-owned and injected just-in-time — a
+    // store-homed secret would have been dropped by this very client swap. A.5 hands
+    // the PQ leaves to the rotated credential afterward.
     let new_alice = make_client();
     let new_alice_id = new_alice.client_id();
     rotate_round(&alice, &bob, new_alice_id.clone());
@@ -1710,7 +1884,10 @@ fn establish_full() -> (Arc<TwoMlsPqSession>, Arc<TwoMlsPqSession>) {
 
 /// A bootstrap key package naming a principal other than the established peer is
 /// rejected before any PQ group is stood up around it: the new half's added leaf
-/// becomes a sender identity this library reports, so it must be the peer's.
+/// becomes a sender identity this library reports, so it must be the peer's. With a
+/// commitment pinned at establishment (every v20 session), the strictly stronger
+/// `BootstrapKpMismatch` gate fires first — it pins the exact committed bytes,
+/// identity included.
 #[test]
 fn test_bootstrap_kp_from_unknown_principal_rejected() {
     let (_alice, bob) = establish_confirmed_sessions();
@@ -1720,7 +1897,7 @@ fn test_bootstrap_kp_from_unknown_principal_rejected() {
     frame.extend_from_slice(&mallory_pq_kp);
     assert_err!(
         bob.pq_bootstrap_respond(frame),
-        TwoMlsPqError::RemoteIdentityMismatch
+        TwoMlsPqError::BootstrapKpMismatch
     );
     // The turn state is untouched — the peer's real bootstrap still works.
     assert!(!bob.my_pq_turn());
@@ -1938,9 +2115,15 @@ fn test_initiate_fails_when_both_suites_classical() {
 fn test_accept_with_invalid_welcome_bytes_returns_error() {
     let alice = make_client();
     let bob = make_client();
-    let alice_kp = make_combiner_kp(&alice);
+    let alice_kp = make_classical_kp(&alice);
     assert_err!(
-        TwoMlsPqSession::accept(bob, vec![0xFF; 32], alice_kp, None),
+        TwoMlsPqSession::accept(
+            bob,
+            vec![0xFF; 32],
+            alice_kp,
+            vec![0u8; 32], // no A.4 in this test — any 32-byte commitment passes the length gate
+            None
+        ),
         TwoMlsPqError::Mls
     );
 }
@@ -1949,7 +2132,7 @@ fn test_accept_with_invalid_welcome_bytes_returns_error() {
 fn test_session_id_is_same_from_both_sides() {
     let alice = make_client();
     let bob = make_client();
-    let alice_kp = make_combiner_kp(&alice);
+    let alice_kp = make_classical_kp(&alice);
     let bob_kp = make_combiner_kp(&bob);
 
     let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
@@ -1959,6 +2142,7 @@ fn test_session_id_is_same_from_both_sides() {
         Arc::clone(&bob),
         apq_welcome_a,
         alice_kp,
+        commitment_of(&alice_session),
         None
     ));
 
@@ -2039,18 +2223,24 @@ fn test_process_incoming_empty_bytes_returns_error() {
 fn test_create_send_group_with_valid_keypackage_succeeds() {
     let alice = make_client();
     let bob = make_client();
-    let alice_kp = make_combiner_kp(&alice);
+    let alice_kp = make_classical_kp(&alice);
     let bob_kp = make_combiner_kp(&bob);
     let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
     let welcome = assert_some!(alice_session.initial_welcome());
-    assert_ok!(TwoMlsPqSession::accept(bob, welcome, alice_kp, None));
+    assert_ok!(TwoMlsPqSession::accept(
+        bob,
+        welcome,
+        alice_kp,
+        commitment_of(&alice_session),
+        None
+    ));
 }
 
 #[test]
 fn test_join_send_group_with_my_principal_succeeds() {
     let alice = make_client();
     let bob = make_client();
-    let alice_kp = make_combiner_kp(&alice);
+    let alice_kp = make_classical_kp(&alice);
     let bob_kp = make_combiner_kp(&bob);
     let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
     let welcome = assert_some!(alice_session.initial_welcome());
@@ -2058,6 +2248,7 @@ fn test_join_send_group_with_my_principal_succeeds() {
         Arc::clone(&bob),
         welcome,
         alice_kp,
+        commitment_of(&alice_session),
         None
     ));
     assert!(bob_session.has_receive_group());
@@ -2325,7 +2516,7 @@ fn test_archive_before_return_welcome_join_restores_and_joins() {
     // `reply` path the Swift adapter drives.
     let alice = make_client();
     let bob = make_client();
-    let alice_kp = make_combiner_kp(&alice);
+    let alice_kp = make_classical_kp(&alice);
     let bob_kp = make_combiner_kp(&bob);
 
     let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
@@ -2339,6 +2530,7 @@ fn test_archive_before_return_welcome_join_restores_and_joins() {
         Arc::clone(&bob),
         welcome_a,
         alice_kp,
+        commitment_of(&alice_session),
         None
     ));
     let welcome_b = assert_some!(bob_session.pending_outbound());
@@ -2410,7 +2602,7 @@ fn test_archive_preserves_listen_map() {
 fn test_archive_preserves_spawn_token() {
     let alice = make_client();
     let bob = make_client();
-    let alice_kp = make_combiner_kp(&alice);
+    let alice_kp = make_classical_kp(&alice);
     let bob_inv = assert_ok!(crate::key_packages::TwoMlsPqInvitation::restore(
         assert_ok!(bob.generate_invitation(true))
     ));
@@ -2418,8 +2610,15 @@ fn test_archive_preserves_spawn_token() {
     let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
     let welcome_a = assert_some!(alice_session.initial_welcome());
     let token = b"spawn-token".to_vec();
-    let bob_session =
-        assert_ok!(bob_inv.receive(welcome_a, alice_kp, token.clone(), None, None, None));
+    let bob_session = assert_ok!(bob_inv.receive(
+        welcome_a,
+        alice_kp,
+        commitment_of(&alice_session),
+        token.clone(),
+        None,
+        None,
+        None
+    ));
 
     let restored = round_trip(&bob_session);
     assert!(assert_ok!(restored.forwarded(token)).is_none());
@@ -2829,7 +3028,7 @@ fn test_prepare_result_proposal_message_at_establishment_binds_the_dedicated_can
 
     let alice = make_client();
     let bob = make_client();
-    let alice_kp = make_combiner_kp(&alice);
+    let alice_kp = make_classical_kp(&alice);
     let bob_inv = assert_ok!(TwoMlsPqInvitation::restore(assert_ok!(
         bob.generate_invitation(true)
     )));
@@ -2844,6 +3043,7 @@ fn test_prepare_result_proposal_message_at_establishment_binds_the_dedicated_can
     let bob_session = assert_ok!(bob_inv.receive(
         assert_some!(opened.welcome),
         alice_kp,
+        commitment_of(&alice_session),
         b"anchor".to_vec(),
         Some(dedicated_id.bytes.clone()),
         None,
@@ -3076,7 +3276,7 @@ fn test_psk_ledger_resolves_frame_that_crossed_a_commit() {
 fn test_consumed_one_shot_psk_is_forgotten_from_stores() {
     let alice = make_client();
     let bob = make_client();
-    let alice_kp = make_combiner_kp(&alice);
+    let alice_kp = make_classical_kp(&alice);
     let bob_kp = make_combiner_kp(&bob);
     let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
     let welcome_a = assert_some!(alice_session.initial_welcome());
@@ -3084,6 +3284,7 @@ fn test_consumed_one_shot_psk_is_forgotten_from_stores() {
         Arc::clone(&bob),
         welcome_a,
         alice_kp,
+        commitment_of(&alice_session),
         None
     ));
     let welcome_b = assert_some!(bob_session.pending_outbound());
@@ -3213,7 +3414,7 @@ fn frame_staple(receiver: &TwoMlsPqSession, blob: &[u8]) -> Vec<u8> {
 fn test_welcome_staple_rides_until_first_commit_and_repeats_skip() {
     let alice = make_client();
     let bob = make_client();
-    let alice_kp = make_combiner_kp(&alice);
+    let alice_kp = make_classical_kp(&alice);
     let bob_kp = make_combiner_kp(&bob);
 
     // Alice initiates; her welcome_a is delivered separately so Bob can accept.
@@ -3223,6 +3424,7 @@ fn test_welcome_staple_rides_until_first_commit_and_repeats_skip() {
         Arc::clone(&bob),
         welcome_a,
         alice_kp,
+        commitment_of(&alice_s),
         None
     ));
 
@@ -3506,7 +3708,7 @@ fn test_initial_envelope_roundtrip_return_welcome_sealed() {
     use crate::key_packages::TwoMlsPqInvitation;
     let alice = make_client();
     let bob = make_client();
-    let alice_kp = make_combiner_kp(&alice);
+    let alice_kp = make_classical_kp(&alice);
     let bob_inv = assert_ok!(TwoMlsPqInvitation::restore(assert_ok!(
         bob.generate_invitation(true)
     )));
@@ -3543,7 +3745,15 @@ fn test_initial_envelope_roundtrip_return_welcome_sealed() {
     let recovered = welcome_a.clone();
     assert_eq!(recovered.first(), Some(&super::APQ_TAG));
 
-    let bob_s = assert_ok!(bob_inv.receive(recovered, alice_kp, b"tok".to_vec(), None, None, None));
+    let bob_s = assert_ok!(bob_inv.receive(
+        recovered,
+        alice_kp,
+        commitment_of(&alice_s),
+        b"tok".to_vec(),
+        None,
+        None,
+        None
+    ));
     // Bob's return welcome is symmetric-sealed (Bob has the recv group) and opens on
     // Alice's window to the APQWelcome.
     let welcome_b = assert_some!(bob_s.pending_outbound());
@@ -3561,7 +3771,7 @@ fn test_initial_envelope_no_app_payload() {
     use crate::key_packages::TwoMlsPqInvitation;
     let alice = make_client();
     let bob = make_client();
-    let alice_kp = make_combiner_kp(&alice);
+    let alice_kp = make_classical_kp(&alice);
     let bob_inv = assert_ok!(TwoMlsPqInvitation::restore(assert_ok!(
         bob.generate_invitation(true)
     )));
@@ -3573,6 +3783,7 @@ fn test_initial_envelope_no_app_payload() {
     assert_ok!(bob_inv.receive(
         assert_some!(opened.welcome),
         alice_kp,
+        commitment_of(&alice_s),
         b"tok".to_vec(),
         None,
         None,
@@ -3590,7 +3801,7 @@ fn test_receive_under_dedicated_principal() {
     use crate::key_packages::TwoMlsPqInvitation;
     let alice = make_client();
     let bob = make_client();
-    let alice_kp = make_combiner_kp(&alice);
+    let alice_kp = make_classical_kp(&alice);
     let bob_inv = assert_ok!(TwoMlsPqInvitation::restore(assert_ok!(
         bob.generate_invitation(true)
     )));
@@ -3603,6 +3814,7 @@ fn test_receive_under_dedicated_principal() {
     let bob_s = assert_ok!(bob_inv.receive(
         assert_some!(opened.welcome),
         alice_kp,
+        commitment_of(&alice_s),
         b"tok".to_vec(),
         Some(dedicated.clone()),
         None,
@@ -3662,7 +3874,7 @@ fn test_empty_principal_id_rejected() {
     use crate::key_packages::TwoMlsPqInvitation;
     let alice = make_client();
     let bob = make_client();
-    let alice_kp = make_combiner_kp(&alice);
+    let alice_kp = make_classical_kp(&alice);
     let bob_inv = assert_ok!(TwoMlsPqInvitation::restore(assert_ok!(
         bob.generate_invitation(true)
     )));
@@ -3674,6 +3886,7 @@ fn test_empty_principal_id_rejected() {
         bob_inv.receive(
             assert_some!(opened.welcome.clone()),
             alice_kp.clone(),
+            commitment_of(&alice_s),
             b"tok".to_vec(),
             Some(Vec::new()),
             None,
@@ -3684,6 +3897,7 @@ fn test_empty_principal_id_rejected() {
     assert_ok!(bob_inv.receive(
         assert_some!(opened.welcome),
         alice_kp,
+        commitment_of(&alice_s),
         b"tok".to_vec(),
         None,
         None,
@@ -3706,7 +3920,7 @@ fn test_standalone_welcome_surfaces_dedicated_principal() {
     use crate::key_packages::TwoMlsPqInvitation;
     let alice = make_client();
     let bob = make_client();
-    let alice_kp = make_combiner_kp(&alice);
+    let alice_kp = make_classical_kp(&alice);
     let bob_inv = assert_ok!(TwoMlsPqInvitation::restore(assert_ok!(
         bob.generate_invitation(true)
     )));
@@ -3718,6 +3932,7 @@ fn test_standalone_welcome_surfaces_dedicated_principal() {
     let bob_s = assert_ok!(bob_inv.receive(
         assert_some!(opened.welcome),
         alice_kp,
+        commitment_of(&alice_s),
         b"tok".to_vec(),
         Some(dedicated.clone()),
         None,
@@ -3746,7 +3961,7 @@ fn test_dedicated_principal_full_lifecycle() {
     use crate::key_packages::TwoMlsPqInvitation;
     let alice = make_client();
     let bob = make_client();
-    let alice_kp = make_combiner_kp(&alice);
+    let alice_kp = make_classical_kp(&alice);
     let bob_inv = assert_ok!(TwoMlsPqInvitation::restore(assert_ok!(
         bob.generate_invitation(true)
     )));
@@ -3758,6 +3973,7 @@ fn test_dedicated_principal_full_lifecycle() {
     let bob_s = assert_ok!(bob_inv.receive(
         assert_some!(opened.welcome),
         alice_kp,
+        commitment_of(&alice_s),
         b"tok".to_vec(),
         Some(dedicated.clone()),
         None,
@@ -3892,7 +4108,7 @@ fn test_spent_invitation_cannot_open_initial() {
     let alice = make_client();
     let carol = make_client();
     let bob = make_client();
-    let alice_kp = make_combiner_kp(&alice);
+    let alice_kp = make_classical_kp(&alice);
     let bob_inv = assert_ok!(TwoMlsPqInvitation::restore(assert_ok!(
         bob.generate_invitation(false)
     )));
@@ -3908,6 +4124,7 @@ fn test_spent_invitation_cannot_open_initial() {
     assert_ok!(bob_inv.receive(
         assert_some!(opened.welcome),
         alice_kp,
+        commitment_of(&alice_s),
         b"tok".to_vec(),
         None,
         None,
@@ -3958,7 +4175,7 @@ fn test_pre_establishment_sends_acceptor_joins_from_restaple() {
     use crate::key_packages::TwoMlsPqInvitation;
     let alice = make_client();
     let bob = make_client();
-    let alice_kp = make_combiner_kp(&alice);
+    let alice_kp = make_classical_kp(&alice);
     let bob_inv = assert_ok!(TwoMlsPqInvitation::restore(assert_ok!(
         bob.generate_invitation(true)
     )));
@@ -3992,10 +4209,16 @@ fn test_pre_establishment_sends_acceptor_joins_from_restaple() {
     let opened1 = assert_ok!(bob_inv.open_initial(frame1.cipher_text));
     let w1 = assert_some!(opened1.welcome);
     assert_eq!(w1, welcome_a, "the stable prefix is the birth welcome");
-    let kp1 = assert_ok!(crate::key_packages::decode_combiner_key_package(
-        assert_some!(opened1.return_key_package)
+    let kp1 = assert_some!(opened1.return_key_package);
+    let bob_s = assert_ok!(bob_inv.receive(
+        w1,
+        kp1,
+        commitment_of(&alice_s),
+        b"tok".to_vec(),
+        None,
+        None,
+        None
     ));
-    let bob_s = assert_ok!(bob_inv.receive(w1, kp1, b"tok".to_vec(), None, None, None));
     let got1 = assert_some!(assert_ok!(
         bob_s.process_incoming(assert_some!(opened1.stapled_message))
     ));
@@ -4039,7 +4262,7 @@ fn test_birth_captured_replier_restores_send_ready() {
     use crate::key_packages::TwoMlsPqInvitation;
     let alice = make_client();
     let bob = make_client();
-    let alice_kp = make_combiner_kp(&alice);
+    let alice_kp = make_classical_kp(&alice);
     let bob_inv = assert_ok!(TwoMlsPqInvitation::restore(assert_ok!(
         bob.generate_invitation(true)
     )));
@@ -4074,12 +4297,11 @@ fn test_birth_captured_replier_restores_send_ready() {
     // The acceptor joins from the SECOND frame (any single frame suffices) and reads
     // both staples' messages in order of arrival.
     let opened2 = assert_ok!(bob_inv.open_initial(frame2.cipher_text));
-    let kp = assert_ok!(crate::key_packages::decode_combiner_key_package(
-        assert_some!(opened2.return_key_package)
-    ));
+    let kp = assert_some!(opened2.return_key_package);
     let bob_s = assert_ok!(bob_inv.receive(
         assert_some!(opened2.welcome),
         kp,
+        commitment_of(&restored),
         b"tok".to_vec(),
         None,
         None,
@@ -4126,7 +4348,7 @@ fn test_cutover_clears_envelope_state_and_stales_straddling_prepare() {
     use crate::key_packages::TwoMlsPqInvitation;
     let alice = make_client();
     let bob = make_client();
-    let alice_kp = make_combiner_kp(&alice);
+    let alice_kp = make_classical_kp(&alice);
     let bob_inv = assert_ok!(TwoMlsPqInvitation::restore(assert_ok!(
         bob.generate_invitation(true)
     )));
@@ -4141,12 +4363,11 @@ fn test_cutover_clears_envelope_state_and_stales_straddling_prepare() {
     let frame = assert_ok!(alice_s.encrypt(b"pre".to_vec()));
 
     let opened = assert_ok!(bob_inv.open_initial(frame.cipher_text));
-    let kp = assert_ok!(crate::key_packages::decode_combiner_key_package(
-        assert_some!(opened.return_key_package)
-    ));
+    let kp = assert_some!(opened.return_key_package);
     let bob_s = assert_ok!(bob_inv.receive(
         assert_some!(opened.welcome),
         kp,
+        commitment_of(&alice_s),
         b"tok".to_vec(),
         None,
         None,
@@ -4176,7 +4397,7 @@ fn test_pre_establishment_guards() {
     use crate::key_packages::TwoMlsPqInvitation;
     let alice = make_client();
     let bob = make_client();
-    let alice_kp = make_combiner_kp(&alice);
+    let alice_kp = make_classical_kp(&alice);
     let bob_inv = assert_ok!(TwoMlsPqInvitation::restore(assert_ok!(
         bob.generate_invitation(true)
     )));
@@ -4201,6 +4422,7 @@ fn test_pre_establishment_guards() {
     let bob_s = assert_ok!(bob_inv.receive(
         assert_some!(opened.welcome),
         alice_kp,
+        commitment_of(&alice_s),
         b"tok".to_vec(),
         None,
         None,
@@ -4256,7 +4478,7 @@ fn test_spliced_staple_fails_open_at_group_decrypt() {
     let alice = make_client();
     let carol = make_client();
     let bob = make_client();
-    let alice_kp = make_combiner_kp(&alice);
+    let alice_kp = make_classical_kp(&alice);
     let bob_inv = assert_ok!(TwoMlsPqInvitation::restore(assert_ok!(
         bob.generate_invitation(true)
     )));
@@ -4275,6 +4497,7 @@ fn test_spliced_staple_fails_open_at_group_decrypt() {
     let bob_s = assert_ok!(bob_inv.receive(
         welcome_a.clone(),
         alice_kp,
+        commitment_of(&alice_s),
         b"tok".to_vec(),
         None,
         None,
@@ -4316,7 +4539,7 @@ fn test_setters_regenerate_envelope_and_stamp_depends_on_seq() {
     use crate::key_packages::TwoMlsPqInvitation;
     let alice = make_client();
     let bob = make_client();
-    let alice_kp = make_combiner_kp(&alice);
+    let alice_kp = make_classical_kp(&alice);
     let bob_inv = assert_ok!(TwoMlsPqInvitation::restore(assert_ok!(
         bob.generate_invitation(true)
     )));
@@ -4648,11 +4871,17 @@ fn test_has_receive_group_false_for_initiator_before_welcome() {
 fn test_has_receive_group_true_for_acceptor_immediately() {
     let alice = make_client();
     let bob = make_client();
-    let alice_kp = make_combiner_kp(&alice);
+    let alice_kp = make_classical_kp(&alice);
     let bob_kp = make_combiner_kp(&bob);
     let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
     let welcome = assert_some!(alice_session.initial_welcome());
-    let bob_session = assert_ok!(TwoMlsPqSession::accept(bob, welcome, alice_kp, None));
+    let bob_session = assert_ok!(TwoMlsPqSession::accept(
+        bob,
+        welcome,
+        alice_kp,
+        commitment_of(&alice_session),
+        None
+    ));
     assert!(bob_session.has_receive_group());
 }
 
@@ -4854,7 +5083,7 @@ fn test_full_round_is_classical_only_and_propagates() {
 fn test_routine_frame_is_classical_sized() {
     let alice = make_client();
     let bob = make_client();
-    let alice_kp = make_combiner_kp(&alice);
+    let alice_kp = make_classical_kp(&alice);
     let bob_kp = make_combiner_kp(&bob);
 
     let alice_s = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
@@ -4863,6 +5092,7 @@ fn test_routine_frame_is_classical_sized() {
         Arc::clone(&bob),
         welcome_a.clone(),
         alice_kp,
+        commitment_of(&alice_s),
         None
     ));
     let welcome_b = assert_some!(bob_s.pending_outbound());
@@ -5076,9 +5306,15 @@ fn test_welcome_with_swapped_suites_rejected_before_join() {
     // acceptor's expected pair — caught pre-join, not as a late decrypt failure.
     let (classical, pq) = assert_ok!(apq::decode_apq_welcome(&welcome));
     let swapped = apq::encode_apq_welcome(pq, classical);
-    let alice_kp = make_combiner_kp(&alice);
+    let alice_kp = make_classical_kp(&alice);
     assert_err!(
-        TwoMlsPqSession::accept(Arc::clone(&bob), swapped, alice_kp, None),
+        TwoMlsPqSession::accept(
+            Arc::clone(&bob),
+            swapped,
+            alice_kp,
+            commitment_of(&alice_s),
+            None
+        ),
         TwoMlsPqError::CipherSuiteMismatch
     );
 }
@@ -5323,7 +5559,7 @@ fn test_app_binding_survives_archive_restore() {
 
     let alice = make_client();
     let bob = make_client();
-    let alice_kp = make_combiner_kp(&alice);
+    let alice_kp = make_classical_kp(&alice);
     let binding = b"relationship-digest".to_vec();
 
     let bob_inv = assert_ok!(TwoMlsPqInvitation::restore(assert_ok!(
@@ -5341,6 +5577,7 @@ fn test_app_binding_survives_archive_restore() {
     let bob_session = assert_ok!(bob_inv.receive(
         assert_some!(opened.welcome),
         alice_kp,
+        commitment_of(&alice_session),
         b"token".to_vec(),
         None,
         None,
@@ -5442,7 +5679,7 @@ fn test_welcome_with_pq_half_binding_rejected() {
 
     let alice = make_client();
     let bob = make_client();
-    let alice_kp = make_combiner_kp(&alice);
+    let alice_kp = make_classical_kp(&alice);
     let binding = b"relationship-digest".to_vec();
 
     let bob_inv = assert_ok!(crate::key_packages::TwoMlsPqInvitation::restore(
@@ -5500,6 +5737,7 @@ fn test_welcome_with_pq_half_binding_rejected() {
         bob_inv.receive(
             crafted,
             alice_kp.clone(),
+            vec![0u8; 32], // no A.4 in this test — any 32-byte commitment passes the length gate
             b"token".to_vec(),
             None,
             None,
@@ -5517,6 +5755,7 @@ fn test_welcome_with_pq_half_binding_rejected() {
     let bob_session = assert_ok!(bob_inv.receive(
         assert_some!(honest.initial_welcome()),
         alice_kp,
+        commitment_of(&honest),
         b"token".to_vec(),
         None,
         None,

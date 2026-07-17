@@ -383,11 +383,16 @@ is what roots the PQ leaf in the signed identity envelope: the side-band channel
 confidential to the established peer, but a bare MLS key package message carries no anchor
 signature of its own.
 
-> **Spec is ahead of the code here.** The implementation currently transports the full dual
-> combiner key package in the app payload — its PQ half is validated for identity consistency
-> but never consumed (A.4 mints a fresh key package), ~2.6 KB of dead weight per establishment
-> reply. The classical-only + hashed-KP' shape above is the intended design; the code change
-> is tracked separately.
+The implementation matches (v20): `initiate` pre-commits the bootstrap key package
+(`bootstrap_kp_commitment()` exposes the hash for the host's signed payload),
+`receive`/`accept` take the classical return KP plus the commitment,
+`pq_bootstrap_begin` sends the retained pre-committed KP — never a fresh mint — and
+`pq_bootstrap_respond` rejects a KP′ hashing to anything else (`BootstrapKpMismatch`).
+When the commitment is pinned it REPLACES the names-the-established-peer equality: it is
+strictly stronger (it pins the exact committed bytes, identity included), and unlike the
+live-principal check it still admits the committed KP after a Phase 8 rotation that
+completed before A.4 ran — the KP′ then carries the establishment credential, and A.5
+hands the PQ leaves to the rotated one (PQ leaves lag credentials by design).
 
 **One envelope, two shapes (either/or).** The "∥" above is not concatenation. A host app
 payload must be establishment-self-sufficient — it carries the welcome and the return key

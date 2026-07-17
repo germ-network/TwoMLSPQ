@@ -122,6 +122,9 @@ pub(crate) mod archive_wire {
     pub(in crate::session) struct WirePartySequence {
         pub(in crate::session) history: Vec<IdBlob>,
         pub(in crate::session) authorized_next: Vec<IdBlob>,
+        /// Eviction-exempt credentials (a bootstrap leaf's frozen establishment id held
+        /// admissible until A.5 catch-up) — see `apq::authentication::PartySequence`.
+        pub(in crate::session) pinned: Vec<IdBlob>,
     }
 
     /// The staged Upd(self) with the identity it proposes.
@@ -301,11 +304,29 @@ pub(crate) mod archive_wire {
         pub(in crate::session) pq_inflight: Option<WirePqInflight>,
         /// The initiator's retained pre-establishment envelope state (v10): the peer
         /// key package pre-establishment frames are HPKE-sealed to, the host's
-        /// self-sufficient app payload, and the bare-shape return key package. All
-        /// `None` once established (the cutover clears them) and on acceptors.
+        /// self-sufficient app payload, and the bare-shape CLASSICAL return key package
+        /// (a bare MLS KeyPackage message since v20). All `None` once established (the
+        /// cutover clears them) and on acceptors.
         pub(in crate::session) initial_their_kp: Option<WireCombinerKp>,
         pub(in crate::session) initial_app_payload: Option<Vec<u8>>,
-        pub(in crate::session) initial_return_kp: Option<WireCombinerKp>,
+        pub(in crate::session) initial_return_kp: Option<Vec<u8>>,
+        /// The initiator's pre-committed A.4 bootstrap key package (public bytes).
+        /// Present from `initiate` until `pq_bootstrap_begin` consumes it, so a session
+        /// restored between reply and A.4 still opens the round with the KP the
+        /// establishment signature committed to. `None` on acceptors.
+        pub(in crate::session) bootstrap_kp: Option<Vec<u8>>,
+        /// The pre-committed KP's PRIVATE half — session-owned custody (per-client
+        /// `SigningIdentityBlob.pq_kps` would be dropped by a Phase 8 client swap, and
+        /// the signed commitment obligates this session to join the Welcome' built
+        /// around the KP regardless of rotations). Present from `initiate` until the
+        /// `pq_bootstrap_bind` join consumes it. `None` on acceptors. Secret material,
+        /// like the group snapshots: the enclosing archive carries the sealing
+        /// obligation.
+        pub(in crate::session) bootstrap_kp_secret: Option<KeyPackageSecret>,
+        /// The acceptor's pinned `H(initiator's PQ keyPackage)` from the signed
+        /// establishment payload, enforced at `pq_bootstrap_respond`. `None` on
+        /// initiators.
+        pub(in crate::session) expected_bootstrap_kp_commitment: Option<Vec<u8>>,
     }
 }
 
@@ -545,6 +566,7 @@ fn session_from_wire(wire: archive_wire::SessionArchive) -> Result<Arc<TwoMlsPqS
         apq::authentication::PartySequence::from_parts(
             w.history.into_iter().map(|b| b.bytes).collect(),
             w.authorized_next.into_iter().map(|b| b.bytes).collect(),
+            w.pinned.into_iter().map(|b| b.bytes).collect(),
         )
     };
     let (auth_mine, auth_theirs) = (seq(wire.auth_mine), seq(wire.auth_theirs));
@@ -662,7 +684,10 @@ fn session_from_wire(wire: archive_wire::SessionArchive) -> Result<Arc<TwoMlsPqS
             spawn_token: wire.spawn_token,
             initial_their_kp: wire.initial_their_kp.map(combiner_kp_from_wire),
             initial_app_payload: wire.initial_app_payload,
-            initial_return_kp: wire.initial_return_kp.map(combiner_kp_from_wire),
+            initial_return_kp: wire.initial_return_kp,
+            bootstrap_kp: wire.bootstrap_kp,
+            bootstrap_kp_secret: wire.bootstrap_kp_secret,
+            expected_bootstrap_kp_commitment: wire.expected_bootstrap_kp_commitment,
             // Attached post-restore via `install_sink`.
             sink: None,
         }),
@@ -724,16 +749,16 @@ fn build_archive_wire(
         .collect::<Vec<_>>();
     let (auth_mine, auth_theirs) = inner.with_auth(|core| {
         let seq = |s: &apq::authentication::PartySequence| {
-            let (history, authorized_next) = s.to_parts();
+            let (history, authorized_next, pinned) = s.to_parts();
+            let blobs = |ids: Vec<Vec<u8>>| {
+                ids.into_iter()
+                    .map(|bytes| archive_wire::IdBlob { bytes })
+                    .collect()
+            };
             archive_wire::WirePartySequence {
-                history: history
-                    .into_iter()
-                    .map(|bytes| archive_wire::IdBlob { bytes })
-                    .collect(),
-                authorized_next: authorized_next
-                    .into_iter()
-                    .map(|bytes| archive_wire::IdBlob { bytes })
-                    .collect(),
+                history: blobs(history),
+                authorized_next: blobs(authorized_next),
+                pinned: blobs(pinned),
             }
         };
         (seq(&core.mine), seq(&core.theirs))
@@ -873,7 +898,10 @@ fn build_archive_wire(
             pq_inflight,
             initial_their_kp: inner.initial_their_kp.as_ref().map(wire_combiner_kp),
             initial_app_payload: inner.initial_app_payload.clone(),
-            initial_return_kp: inner.initial_return_kp.as_ref().map(wire_combiner_kp),
+            initial_return_kp: inner.initial_return_kp.clone(),
+            bootstrap_kp: inner.bootstrap_kp.clone(),
+            bootstrap_kp_secret: inner.bootstrap_kp_secret.clone(),
+            expected_bootstrap_kp_commitment: inner.expected_bootstrap_kp_commitment.clone(),
         };
     Ok(archive)
 }

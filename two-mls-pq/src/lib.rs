@@ -280,7 +280,31 @@ pub fn version() -> String {
 // misdirected ciphertext, which ML-KEM's implicit rejection would decapsulate to garbage and
 // strand the round on, fails the AEAD tag explicitly and is rejected with the ephemeral and
 // PQ leaf intact. Bonus: S is hybrid-secure (holds if either ML-KEM or the epoch secret does).
-const BINDING_CONTRACT_VERSION: u64 = 19;
+//
+// v20: the establishment return key package is CLASSICAL-ONLY and the A.4 bootstrap KP is
+// pre-committed (protocol-flows.md §A.1, the spec-ahead-of-code note now discharged).
+// `receive`/`accept` take the initiator's bare classical MLS KeyPackage message (the dual
+// combiner blob is gone from establishment — its PQ half fed nothing but a halves-agree
+// check, and A.4 minted a fresh KP anyway) plus a REQUIRED 32-byte
+// `bootstrap_kp_commitment` = SHA-256 of the initiator's PQ keyPackage, which the host
+// carries inside its SIGNED establishment payload. `initiate` now mints that PQ KP up
+// front with SESSION-OWNED custody — public bytes AND the KeyPackageSecret ride the
+// session archive, the secret injected just-in-time into the current client's store at
+// the bind join (the `inject_send_psks` pattern), so neither a restore nor a Phase 8
+// client swap can strand the committed round —
+// (`bootstrap_kp_commitment()` exposes the hash for the host's envelope),
+// `pq_bootstrap_begin` sends the retained KP instead of fresh-minting, and
+// `pq_bootstrap_respond` rejects a KP′ that does not hash to the commitment
+// (`BootstrapKpMismatch`, appended) — binding the ML-KEM key material to the host's
+// signed establishment rather than resting it on classical channel auth alone. When a
+// commitment is pinned, the hash check REPLACES the names-the-established-peer equality
+// (it is strictly stronger — it pins the exact committed bytes, which contain the
+// identity), so a KP′ under a since-rotated principal still lands (PQ leaves lag
+// credentials by design; A.5 catches them up). `set_initial_return_key_package` takes the
+// bare classical bytes. Archive layout changed (pre-release hard cut: old blobs fail to
+// decode and regenerate): `initial_return_kp` is classical bytes, and the retained
+// bootstrap KP + expected commitment ride it.
+const BINDING_CONTRACT_VERSION: u64 = 20;
 
 /// See `BINDING_CONTRACT_VERSION`. Exported so the Swift layer can verify the
 /// binding it was generated with matches the binary it loaded.
@@ -721,14 +745,25 @@ pub enum TwoMlsPqError {
     /// last persisted state recovers the round. Not reachable from an honest peer; how
     /// critical it is depends on what the session is for, which is why it is queryable
     /// (`pq_receive_broken`) rather than only thrown.
+    #[error("bind apply failed with the round secret consumed; receive is broken until restore")]
+    BindApplyFailed,
+    /// The A.4 bootstrap key package does not match the commitment pinned at
+    /// establishment. The acceptor received `H(initiator's PQ keyPackage)` inside the
+    /// signed establishment payload (threaded in via `receive(bootstrap_kp_commitment:)`),
+    /// and the KP′ that arrived on the side-band hashes to something else — a substituted
+    /// or tampered key package, never honest traffic (the initiator sends exactly the KP
+    /// it committed to at `initiate`). Also raised for a malformed commitment supplied to
+    /// `receive` (wrong length — it could never match anything). Rejected before any
+    /// group is stood up, so the session state is untouched and the genuine KP′ still
+    /// completes the round.
     ///
     //
     // Deliberately the LAST variant: uniffi numbers error cases by position, so appending
     // keeps every prior variant's ordinal stable. Keep appending future variants here (the
     // contract bump already forces binding/binary pairing, but there is no reason to
     // renumber the survivors).
-    #[error("bind apply failed with the round secret consumed; receive is broken until restore")]
-    BindApplyFailed,
+    #[error("bootstrap key package does not match the establishment commitment")]
+    BootstrapKpMismatch,
 }
 
 /// SHA-256 over `bytes` — the single hashing primitive behind every digest this

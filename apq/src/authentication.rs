@@ -60,6 +60,10 @@ fn basic_id(identity: &SigningIdentity) -> Result<&[u8], AuthError> {
     }
 }
 
+/// A [`PartySequence`] decomposed for archival: `(history, authorized_next, pinned)` as
+/// raw id lists.
+pub type SequenceParts = (Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<Vec<u8>>);
+
 /// One party's app-defined credential sequence: the canonical history (oldest →
 /// newest, trimmed to [`CREDENTIAL_HISTORY_WINDOW`]) plus the app-authorized
 /// in-flight successors (several candidates may be proposed; the one the peer
@@ -68,6 +72,16 @@ fn basic_id(identity: &SigningIdentity) -> Result<&[u8], AuthError> {
 pub struct PartySequence {
     history: VecDeque<Vec<u8>>,
     authorized_next: Vec<Vec<u8>>,
+    /// Credentials held ADMISSIBLE (and valid as a successor `pred`) regardless of the
+    /// [`CREDENTIAL_HISTORY_WINDOW`] eviction — for a credential that a live leaf still
+    /// carries but the rolling window would otherwise drop. The acute case: a deferred
+    /// A.4 bootstrap leaf carries the peer's frozen ESTABLISHMENT credential, which
+    /// enough peer rotations would evict before that leaf is created / caught up. Pinned
+    /// (older than all `history`) at bootstrap create, retired once A.5 rotates the leaf
+    /// onto the current credential. Only widens ADMISSION (`known_ids`) and lets an
+    /// evicted-but-pinned id serve as a successor `pred`; it never makes a pinned id a
+    /// successor TARGET, so it cannot authorize a downgrade.
+    pinned: Vec<Vec<u8>>,
 }
 
 impl PartySequence {
@@ -92,6 +106,28 @@ impl PartySequence {
 
     fn is_authorized(&self, id: &[u8]) -> bool {
         self.authorized_next.iter().any(|a| a == id)
+    }
+
+    fn is_pinned(&self, id: &[u8]) -> bool {
+        self.pinned.iter().any(|p| p == id)
+    }
+
+    /// Hold `id` admissible past window eviction (idempotent). See the `pinned` field.
+    pub fn pin(&mut self, id: Vec<u8>) {
+        if !self.is_pinned(&id) {
+            self.pinned.push(id);
+        }
+    }
+
+    /// Retire a pin once the leaf carrying it has been rotated off it (idempotent).
+    pub fn unpin(&mut self, id: &[u8]) {
+        self.pinned.retain(|p| p != id);
+    }
+
+    /// The currently-pinned credentials (for retirement: a caller drops any no live leaf
+    /// still carries).
+    pub fn pinned_ids(&self) -> impl Iterator<Item = &[u8]> {
+        self.pinned.iter().map(Vec::as_slice)
     }
 
     /// App-authorize `id` as a permitted next credential (idempotent).
@@ -121,38 +157,58 @@ impl PartySequence {
     /// - same id — the routine Upd;
     /// - `pred` known and `succ` app-authorized — the canonical step;
     /// - both known with `succ` newer — a lagging leaf catching up.
+    ///
+    /// A `pred` that is only PINNED (evicted from `history` but held admissible) counts as
+    /// KNOWN and OLDEST — older than every `history` element — so a leaf still bearing an
+    /// evicted establishment credential can catch up to any current one. A pinned id is
+    /// never a valid `succ` here (it is not in `history` or `authorized_next`), so this
+    /// cannot authorize a downgrade back onto the pinned credential.
     pub fn valid_successor(&self, pred: &[u8], succ: &[u8]) -> bool {
         if pred == succ {
             return true;
         }
-        let Some(pred_pos) = self.position(pred) else {
+        let pred_pos = self.position(pred);
+        if pred_pos.is_none() && !self.is_pinned(pred) {
             return false;
-        };
+        }
         if self.is_authorized(succ) {
             return true;
         }
-        matches!(self.position(succ), Some(succ_pos) if succ_pos > pred_pos)
+        // `succ` must be newer than `pred`. A pinned-but-evicted `pred` is oldest, so any
+        // `history` `succ` is newer than it.
+        match (pred_pos, self.position(succ)) {
+            (_, None) => false,
+            (Some(pp), Some(sp)) => sp > pp,
+            (None, Some(_)) => true, // pred pinned+evicted (oldest) < any history succ
+        }
     }
 
     pub fn known_ids(&self) -> impl Iterator<Item = &[u8]> {
         self.history
             .iter()
             .chain(self.authorized_next.iter())
+            .chain(self.pinned.iter())
             .map(Vec::as_slice)
     }
 
-    /// (history, authorized_next) as raw id lists, for session archival.
-    pub fn to_parts(&self) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+    /// (history, authorized_next, pinned) as raw id lists, for session archival.
+    pub fn to_parts(&self) -> SequenceParts {
         (
             self.history.iter().cloned().collect(),
             self.authorized_next.clone(),
+            self.pinned.clone(),
         )
     }
 
-    pub fn from_parts(history: Vec<Vec<u8>>, authorized_next: Vec<Vec<u8>>) -> Self {
+    pub fn from_parts(
+        history: Vec<Vec<u8>>,
+        authorized_next: Vec<Vec<u8>>,
+        pinned: Vec<Vec<u8>>,
+    ) -> Self {
         Self {
             history: history.into(),
             authorized_next,
+            pinned,
         }
     }
 }

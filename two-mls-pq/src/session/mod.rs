@@ -380,11 +380,41 @@ struct SessionInner {
     /// envelope), so composed envelopes omit the bare sections while it is set.
     /// Initiator-only; cleared at the establishment cutover; rides the archive.
     initial_app_payload: Option<Vec<u8>>,
-    /// The initiator's return-group combiner key package for the bare-section envelope
-    /// shape (no `initial_app_payload` — hosts that deliver establishment material
-    /// unwrapped; see `set_initial_return_key_package`). Initiator-only; cleared at
-    /// the establishment cutover; rides the archive.
-    initial_return_kp: Option<CombinerKeyPackage>,
+    /// The initiator's CLASSICAL return key package (a bare MLS KeyPackage message) for
+    /// the bare-section envelope shape (no `initial_app_payload` — hosts that deliver
+    /// establishment material unwrapped; see `set_initial_return_key_package`). Classical
+    /// only by design (§A.1): the acceptor's send group starts classical-only, and the
+    /// initiator's PQ key package travels later, in the A.4 side-band, hash-bound to
+    /// `bootstrap_kp`. Initiator-only; cleared at the establishment cutover; rides the
+    /// archive.
+    initial_return_kp: Option<Vec<u8>>,
+    /// The initiator's PRE-COMMITTED A.4 bootstrap key package (PQ suite), minted at
+    /// `initiate` so the host can pin `H(bootstrap_kp)` inside its signed establishment
+    /// payload (`bootstrap_kp_commitment()`). `pq_bootstrap_begin` sends exactly these
+    /// bytes — never a fresh mint — so the KP′ the peer builds BSG-PQ around is the one
+    /// the establishment signature committed to. These public bytes ride the archive so
+    /// a session restored between reply and A.4 still opens the round with the committed
+    /// KP. Initiator-only; consumed at `begin` (the retained side-band frame carries it
+    /// from then on).
+    bootstrap_kp: Option<Vec<u8>>,
+    /// The pre-committed KP's PRIVATE half, session-owned: the signed commitment
+    /// obligates this session to JOIN the Welcome' built around `bootstrap_kp`, so the
+    /// secret lives here (riding the archive) rather than in the client's key-package
+    /// store — a Phase 8 rotation swaps the client, and a store-homed secret would
+    /// strand the round (KP′ sent and accepted, Welcome' unjoinable). Injected
+    /// just-in-time into the CURRENT client's store by `pq_bootstrap_bind` immediately
+    /// before the join (the `inject_send_psks` pattern: the mls-rs stores are ephemeral
+    /// plumbing) and consumed on success. Initiator-only.
+    bootstrap_kp_secret: Option<crate::key_package_store::KeyPackageSecret>,
+    /// The acceptor's pinned `H(initiator's PQ keyPackage)`, threaded in from the signed
+    /// establishment payload via `receive`/`accept`. `pq_bootstrap_respond` refuses to
+    /// stand up BSG-PQ around a KP′ that hashes to anything else
+    /// (`BootstrapKpMismatch`); when pinned, this check REPLACES the
+    /// names-the-established-peer equality — it is strictly stronger (it pins the exact
+    /// committed bytes, identity included), and unlike the live-principal equality it
+    /// still admits the committed KP after a Phase 8 rotation (PQ leaves lag
+    /// credentials by design; A.5 catches them up). Acceptor-only; rides the archive.
+    expected_bootstrap_kp_commitment: Option<Vec<u8>>,
     /// The foreign persistence hook this session pushes to after every state-advancing
     /// mutation (see `mutate_and_persist`). `None` opts out of push persistence (tests,
     /// benches, fuzz). Not part of the archive — it is live plumbing supplied at every
@@ -927,16 +957,12 @@ impl SessionInner {
         if self.current_staple.first() != Some(&APQ_TAG) {
             return Err(TwoMlsPqError::SessionNotReady);
         }
-        let return_kp_blob = self
-            .initial_return_kp
-            .as_ref()
-            .map(|kp| crate::key_packages::encode_combiner_key_package(kp.clone()));
         let (app_payload, welcome, return_kp) = match &self.initial_app_payload {
             Some(payload) => (Some(payload.as_slice()), None, None),
             None => (
                 None,
                 Some(self.current_staple.as_slice()),
-                return_kp_blob.as_deref(),
+                self.initial_return_kp.as_deref(),
             ),
         };
         crate::key_packages::seal_initial_envelope(
@@ -1042,6 +1068,9 @@ fn build_session(
             initial_their_kp: None,
             initial_app_payload: None,
             initial_return_kp: None,
+            bootstrap_kp: None,
+            bootstrap_kp_secret: None,
+            expected_bootstrap_kp_commitment: None,
             // Attached post-construction via `install_sink` (which also pushes the baseline
             // checkpoint); a fresh session starts with no persistence hook.
             sink: None,
@@ -1277,6 +1306,37 @@ impl TwoMlsPqSession {
             // current app message.
             let mut inner = session.lock();
             inner.initial_their_kp = Some(their_key_package);
+            // Pre-commit the A.4 bootstrap key package (§A.1): mint it NOW, so the host
+            // can pin H(bootstrap_kp) inside the signed establishment payload it is about
+            // to compose (`bootstrap_kp_commitment()`). Custody is SESSION-OWNED: the
+            // signed commitment obligates this session to produce — and be able to join —
+            // exactly these bytes, so both halves live in session state (public bytes +
+            // the KeyPackageSecret, both riding the archive) rather than in the client's
+            // store, which a Phase 8 rotation swaps out from under the round. The secret
+            // is captured out of the generate and removed from the store (single-homed);
+            // `pq_bootstrap_bind` injects it just-in-time before the Welcome' join, the
+            // same pattern `inject_send_psks` uses for PSKs.
+            {
+                let client = Arc::clone(&inner.client);
+                let pq_store = client.combiner().pq_kp_store();
+                let (generated, captured) =
+                    pq_store.capture(|| client.combiner().generate_pq_key_package());
+                let kp = generated?;
+                // Exactly-one extraction (mirrors `invitation.rs::single_captured`): a
+                // generate inserts exactly one key package, so anything else means the
+                // store-global capture slot recorded a concurrent generate/injection on
+                // this shared client. Fail loudly rather than `pop()` the last insert and
+                // silently pair the signed commitment with the wrong secret (an
+                // unjoinable A.4 round the peer has already pinned).
+                let mut captured = captured.into_iter();
+                let secret = match (captured.next(), captured.next()) {
+                    (Some(secret), None) => secret,
+                    _ => return Err(TwoMlsPqError::Mls),
+                };
+                pq_store.remove_entry(&secret.0);
+                inner.bootstrap_kp = Some(kp);
+                inner.bootstrap_kp_secret = Some(secret);
+            }
             let envelope = inner.compose_initial_envelope(None)?;
             inner.pending_outbound = Some(envelope);
         }
@@ -1296,28 +1356,38 @@ impl TwoMlsPqSession {
     /// `client` must be dedicated to the acceptor role: `accept` clears its key-package store
     /// once the join has consumed the invitation key package (so nothing migrates into the
     /// session archive). Do NOT reuse one `TwoMlsPqPrincipal` for both `initiate` and a direct
-    /// `accept` — `initiate` retains its return-group key package in that same store for the
-    /// peer's return welcome, and this clear would drop it. The normal entry point,
-    /// `TwoMlsPqInvitation::receive`, always builds a fresh invitation-derived client, so this
-    /// only concerns direct callers of `accept`.
+    /// `accept` — `initiate` retains its return-group key package in that same store (for the
+    /// peer's return welcome), and this clear would drop it. (The pre-committed A.4 bootstrap
+    /// KP is immune: its secret is SESSION-owned, held out of the store precisely so no store
+    /// lifecycle — this purge, or a Phase 8 client swap — can strand the committed round.)
+    /// The normal entry point, `TwoMlsPqInvitation::receive`, always builds a fresh
+    /// invitation-derived client, so this only concerns direct callers of `accept`.
     ///
     /// `expected_app_binding` is the app-state binding this welcome must carry (see
     /// `TwoMlsPqInvitation::receive`, which documents the semantics): `Some` requires the
     /// joined group's `AppBinding` to be byte-equal, `None` requires it to carry none —
     /// any other combination is `AppBindingMismatch`, raised before this client's
     /// key-package store is cleared.
+    ///
+    /// `their_classical_key_package` is the initiator's CLASSICAL return key package (a
+    /// bare MLS KeyPackage message — §A.1: the return group starts classical-only), and
+    /// `bootstrap_kp_commitment` is `H(initiator's PQ keyPackage)` from the SIGNED
+    /// establishment payload — the A.4 bootstrap KP′ must hash to it before BSG-PQ is
+    /// built around it (see `pq_bootstrap_respond`).
     #[uniffi::constructor]
     pub fn accept(
         client: Arc<TwoMlsPqPrincipal>,
         welcome: Vec<u8>,
-        their_key_package: CombinerKeyPackage,
+        their_classical_key_package: Vec<u8>,
+        bootstrap_kp_commitment: Vec<u8>,
         expected_app_binding: Option<Vec<u8>>,
     ) -> Result<Arc<Self>> {
         Self::accept_with(
             client,
             None,
             welcome,
-            their_key_package,
+            their_classical_key_package,
+            bootstrap_kp_commitment,
             None,
             expected_app_binding,
         )
@@ -1349,7 +1419,8 @@ impl TwoMlsPqSession {
         client: Arc<TwoMlsPqPrincipal>,
         session_client: Option<Arc<TwoMlsPqPrincipal>>,
         welcome: Vec<u8>,
-        their_key_package: CombinerKeyPackage,
+        their_classical_key_package: Vec<u8>,
+        bootstrap_kp_commitment: Vec<u8>,
         spawn_token: Option<Vec<u8>>,
         expected_app_binding: Option<Vec<u8>>,
     ) -> Result<Arc<Self>> {
@@ -1362,8 +1433,20 @@ impl TwoMlsPqSession {
         {
             return Err(TwoMlsPqError::AppBindingMismatch);
         }
-        validate_combiner_kp(client.combiner().cipher_suite(), &their_key_package)?;
-        let their_parsed = parse_mls_key_package(their_key_package.classical.clone())?;
+        // A commitment of the wrong length could never match any KP′ — reject it here,
+        // before any state is touched, rather than let it surface as a confusing A.4
+        // failure long after establishment.
+        if bootstrap_kp_commitment.len() != 32 {
+            return Err(TwoMlsPqError::BootstrapKpMismatch);
+        }
+        // The return key package is classical-only by design (§A.1): the send group this
+        // side is about to create starts with no PQ half, and the initiator's PQ key
+        // package arrives in A.4, pinned by `bootstrap_kp_commitment`.
+        check_key_package_suite(
+            &their_classical_key_package,
+            client.combiner().cipher_suite().classical,
+        )?;
+        let their_parsed = parse_mls_key_package(their_classical_key_package.clone())?;
         let their_id = their_parsed.client_id;
         // The session id derives from the FOUNDING pair — the invitation identity the
         // peer initiated toward — never the dedicated principal, so both sides compute
@@ -1452,7 +1535,7 @@ impl TwoMlsPqSession {
         }
         let recv_cross_epoch = recv_group.classical.current_epoch();
         let (send_group, classical_welcome) = create_bound_classical_send_group(
-            &their_key_package.classical,
+            &their_classical_key_package,
             group_client.combiner(),
             &mut recv_group.classical,
             app_binding.as_deref(),
@@ -1485,6 +1568,10 @@ impl TwoMlsPqSession {
         // PSK that seeds our send group's PQ inheritance). Record the watermark so the first
         // routine full commit does not redundantly re-bind that same, unadvanced epoch.
         session.lock().last_cross_injected = Some(recv_cross_epoch);
+        // Pin the initiator's A.4 bootstrap KP commitment (from the SIGNED establishment
+        // payload): `pq_bootstrap_respond` refuses to stand up BSG-PQ around a KP′ that
+        // hashes to anything else.
+        session.lock().expected_bootstrap_kp_commitment = Some(bootstrap_kp_commitment);
         // Seed the PSK ledger with the send group's establishment epoch, and capture
         // the establishment epoch's listen address (and the send-PQ header key when the
         // send-PQ half exists — the initiator's does at `initiate`; the acceptor's is
@@ -1581,7 +1668,8 @@ impl TwoMlsPqSession {
 
     /// Attach (or replace) the host's app-layer welcome on this initiated session. The
     /// payload MUST be establishment-self-sufficient — it carries the MLS welcome
-    /// (`initial_welcome`) and the initiator's return key package inside (e.g. a signed
+    /// (`initial_welcome`), the initiator's CLASSICAL return key package, and the
+    /// bootstrap KP commitment (`bootstrap_kp_commitment()`) inside (e.g. a signed
     /// identity envelope) — because composed envelopes then omit the bare sections (the
     /// either/or rule on `seal_initial_envelope`). Regenerates the parked
     /// `pending_outbound` envelope and rides every later pre-establishment `encrypt`.
@@ -1595,14 +1683,29 @@ impl TwoMlsPqSession {
         self.set_initial_field(|inner| inner.initial_app_payload = Some(payload))
     }
 
-    /// Attach the initiator's return-group combiner key package for the BARE envelope
-    /// shape (no self-sufficient `set_initial_app_payload`): pre-establishment
-    /// envelopes then carry `[welcome][return_kp]`, so any single frame is a complete
-    /// establishment vector for the invitation holder. Unused when a host payload is
-    /// attached (the payload carries the key package itself). Same guards, capture
-    /// ordering, and envelope regeneration as `set_initial_app_payload`.
-    pub fn set_initial_return_key_package(&self, key_package: CombinerKeyPackage) -> Result<()> {
+    /// Attach the initiator's CLASSICAL return key package (a bare MLS KeyPackage
+    /// message — §A.1: the acceptor's send group starts classical-only, and the PQ key
+    /// package travels in A.4, pinned by `bootstrap_kp_commitment`) for the BARE
+    /// envelope shape (no self-sufficient `set_initial_app_payload`):
+    /// pre-establishment envelopes then carry `[welcome][return_kp]`, so any single
+    /// frame is a complete establishment vector for the invitation holder. Unused when
+    /// a host payload is attached (the payload carries the key package itself). Same
+    /// guards, capture ordering, and envelope regeneration as
+    /// `set_initial_app_payload`.
+    pub fn set_initial_return_key_package(&self, key_package: Vec<u8>) -> Result<()> {
         self.set_initial_field(|inner| inner.initial_return_kp = Some(key_package))
+    }
+
+    /// `H(bootstrap_kp)` — the SHA-256 commitment to the A.4 bootstrap key package this
+    /// session pre-committed at `initiate`. The host binds it inside its SIGNED
+    /// establishment payload (next to the classical return key package), and the peer
+    /// threads it back through `receive`/`accept`, where `pq_bootstrap_respond`
+    /// enforces it — anchoring the ML-KEM key material to the host's signed
+    /// establishment rather than resting it on classical channel auth alone. `None` on
+    /// acceptor sessions and once `pq_bootstrap_begin` has consumed the retained KP
+    /// (read it at reply time, which is when the envelope is composed).
+    pub fn bootstrap_kp_commitment(&self) -> Option<Vec<u8>> {
+        self.lock().bootstrap_kp.as_deref().map(crate::sha256)
     }
 
     /// True once both directions' PQ halves are live (post-A.4 bootstrap).
