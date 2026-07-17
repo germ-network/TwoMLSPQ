@@ -1014,7 +1014,8 @@ impl TwoMlsPqSession {
 
             // The staple slot self-discriminates: an APQWelcome starts 0x01, an
             // MLSMessage 0x00. Track whether THIS frame advanced the recv group, and any
-            // rotation handoff announced in the commit's authenticated_data.
+            // rotation handoff the commit announces — the new id rides the committer's
+            // leaf credential (diffed before/after the apply below).
             let mut staple_applied = false;
             let mut new_sender: Option<ClientId> = None;
             let mut canonicalized_own: Option<Vec<u8>> = None;
@@ -1336,7 +1337,7 @@ impl TwoMlsPqSession {
             }));
         }
 
-        // Pre-establishment app staple ([0x09][BSG-cl PrivateMessage]): the peer's app
+        // Pre-establishment app staple ([0x09][ASG-cl PrivateMessage]): the peer's app
         // message extracted from a §A.1 envelope's `stapled_message` section (see
         // `InitialFrame`). The ciphertext rides the peer's send group — OUR recv group
         // — so it only decrypts after the join the same envelope's welcome produced;
@@ -1490,9 +1491,9 @@ impl TwoMlsPqSession {
     /// a no-op (the existing staged identity — and its freshly minted keys — is kept); a
     /// different id replaces the staged identity.
     pub fn stage_rotation(&self, new_client_id: Vec<u8>) -> Result<()> {
-        // Empty is reserved: the rotation commit announces the id in authenticated_data,
-        // and empty AD is the "ratchet commit" discriminator — the handoff would be
-        // structurally invisible to the peer.
+        // Empty is reserved: the rotation commit announces the id via the committer's
+        // leaf credential, and an empty credential id is indistinguishable from no
+        // announcement — the handoff would be structurally invisible to the peer.
         if new_client_id.is_empty() {
             return Err(TwoMlsPqError::InvalidClientId);
         }

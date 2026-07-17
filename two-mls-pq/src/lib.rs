@@ -195,7 +195,8 @@ pub fn version() -> String {
 // present, else welcome — identical across one initiator's re-staples; all
 // consequential state keys off the signed, JOINED welcome via the invitation's
 // `processed` ledger — the other sections are unauthenticated hints). The stapled app
-// message is `[0x13][BSG-cl PrivateMessage]`, handed to `process_incoming` AFTER the
+// message is `[0x13][ASG-cl PrivateMessage]` (tag renumbered to 0x09 since; sealed in
+// the initiator's send group), handed to `process_incoming` AFTER the
 // join (application-message-only result). Establishment clears the retained state (the
 // cutover in `process_welcome`). Archive layout versions RESET to the pre-release
 // floor alongside this layout change (SESSION_ARCHIVE and INVITATION both -> 1; the

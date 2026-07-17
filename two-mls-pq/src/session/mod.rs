@@ -876,7 +876,7 @@ impl SessionInner {
         // invitation identity we initiated toward. Authenticity: the cross-party PSK
         // bound into this welcome is derivable only inside OUR send group, so the
         // creator is provably the invitation holder — the id itself is app-layer
-        // meaning, exactly like a rotation commit's authenticated_data announcement.
+        // meaning, exactly like a rotation commit's leaf-credential announcement.
         let creator_id = {
             let classical = &recv_group.classical;
             let mine = classical.current_member_index();
