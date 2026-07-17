@@ -117,6 +117,36 @@ The unavoidably large staples are the APQ welcomes, and only until the first com
   when the first peer proposal is approved and committed) and whose repeats the peer
   skips idempotently.
 
+## Message-frame anatomy
+
+For a fixed 43-byte payload, a steady-state rotation frame (`CURVE25519_CHACHA`,
+awslc) is **1341 B**, opened from its header seal and split on the `u32`-LE section
+prefixes (`benches/sizes.rs` prints this split):
+
+| Section | Bytes | Contents |
+|---------|------:|----------|
+| `staple` (commit) | 651 | the classical rotation commit `MLSMessage` (a `PublicMessage`): its `UpdatePath` (the rotated leaf + one path node), **one** by-value proposal — the 73 B APQ PSK — plus the commit's signature, confirmation, and membership tags |
+| `proposal` (`Upd`) | 395 | `[u32 proposingLen][ClientId][Upd(sender)]` — a full leaf **by value**, ~357 B of it the `Upd` `MLSMessage` |
+| `app` | 254 | the application `PrivateMessage` (43 B payload + ~211 B MLS framing) |
+| framing | 41 | frame tag (1) + three `u32` section prefixes (12) + header-seal nonce and tag (28) |
+
+Two things that look like waste are not:
+
+- **The commit folds by reference, never by value.** An approved peer `Upd` is
+  cached (`process_incoming`) and committed by its ~32-byte `ProposalRef`; the only
+  proposal the commit carries *by value* is the small APQ PSK. `benches/sizes.rs`
+  opens the staple and asserts the by-value proposal bytes stay under 200, so a
+  regression that started inlining the fold — turning that 73 B into a leaf-sized
+  ~360 B — fails the bench immediately. (By hand: `MlsMessage::proposals_by_value()`
+  on an opened staple returns the PSK and nothing leaf-sized.)
+- **The leaf-sized cost is the two groups, not a double-carry.** A rotation touches
+  both send groups: the sender's own via the commit's `UpdatePath` leaf, and the
+  peer's via the by-value `Upd(sender)` in the `proposal` section (which the peer
+  folds by reference on *its* next commit). Each leaf crosses the wire once; the
+  `newSender` invariant is what makes it every message. Shrinking it is a
+  protocol-level choice (rotate less often, or stop mirroring every self-update into
+  the peer's group), not a by-reference fix — the commit is already by reference.
+
 ## Why the tags are odd
 
 All tags are **odd** — the rule that lets a tagged frame and an MLS message be told
