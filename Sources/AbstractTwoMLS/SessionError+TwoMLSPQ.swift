@@ -94,6 +94,8 @@ extension AbstractTwoMLS.SessionError {
 				code = .invalidClientId
 			case .RemoteIdentityMismatch:
 				code = .identityMismatch
+			case .BootstrapKpMismatch:
+				code = .bootstrapKpMismatch
 			case .CredentialRejected:
 				code = .credentialRejected
 			case .ApqInfoMismatch:

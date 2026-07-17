@@ -45,17 +45,24 @@ public enum AbstractTwoMLS {
 		static var supportedSuites: [RawSuites] { get }
 
 		//two-step reply: step one sets up a send group from a remote keyPackage.
-		//Returns the live session plus the PLAINTEXT welcome and this side's
-		//published key package for the return group — the two establishment
-		//artifacts the app binds into its signed identity envelope (the
-		//`appWelcome` handed back in step two). The welcome publishes key
+		//Returns the live session plus the PLAINTEXT welcome, this side's
+		//CLASSICAL return key package, and the bootstrap-KP commitment — the
+		//establishment artifacts the app binds into its signed identity envelope
+		//(the `appWelcome` handed back in step two). The welcome publishes key
 		//material: installSink on the session AFTER step two (the attach), and
 		//gate frame transmission on `dependsOnSeq`/`stateSeq` durability as usual
 		//(the install-time baseline carries everything both steps did).
 		func reply(keyPackageMessage: Data) throws -> (
 			sendGroup: Invitation.Session,
 			welcomeMessage: Data,
-			myKeyPackage: Data
+			//the initiator's CLASSICAL return key package (§A.1: the return group
+			//starts classical-only; the PQ key package travels in A.4, hash-bound)
+			myKeyPackage: Data,
+			//SHA-256 of the initiator's pre-committed A.4 bootstrap PQ key package,
+			//to bind into the SIGNED identity envelope alongside `myKeyPackage`; the
+			//acceptor threads it back into `receive`, where the crate enforces the
+			//A.4 KP′ against it. The classical backend returns empty.
+			bootstrapKpCommitment: Data
 		)
 
 		//step two: attach the identity envelope (`appWelcome`, self-sufficient —
@@ -91,11 +98,14 @@ public enum AbstractTwoMLS {
 		func decodeHeader(ciphertext: Data) throws -> HeaderDecryptResult
 
 		//Unifies the card and anchor receive flows: after validating the decoded
-		//AppWelcome/AnchorWelcome, the app passes back the remote's published key
-		//package and authenticated client id extracted from it; the conformance
-		//binds the two — the key package's credential must match the authenticated
-		//identity. `remoteKeyPackage` is opaque to the abstraction (the PQ combiner
-		//encodes both halves). Returns the live session with NO sink installed —
+		//AppWelcome/AnchorWelcome, the app passes back the remote's CLASSICAL return
+		//key package and the authenticated client id extracted from it, plus the
+		//`bootstrapKpCommitment` it read from the SAME signed envelope; the
+		//conformance binds the key package to the identity (its credential must
+		//match) and threads the commitment into the crate, which enforces the A.4
+		//KP′ against it. `remoteKeyPackage` is a bare classical MLS KeyPackage
+		//message; `bootstrapKpCommitment` is 32 bytes (the classical backend
+		//ignores it). Returns the live session with NO sink installed —
 		//installSink immediately (the baseline snapshot captures everything
 		//receive did, including the staged dedicated principal) before driving it.
 		//`stapled` is the sender's early-delivered app message opened during the
@@ -108,6 +118,7 @@ public enum AbstractTwoMLS {
 		func receive(
 			sendGroupWelcome: Data,
 			remoteKeyPackage: Data,
+			bootstrapKpCommitment: Data,
 			remoteClientId: ClientID,
 			welcomeToken: WelcomeToken,
 			stapledMessage: Data?,

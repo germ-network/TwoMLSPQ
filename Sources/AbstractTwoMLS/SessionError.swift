@@ -105,6 +105,12 @@ extension AbstractTwoMLS {
 			/// The remote key package's credential doesn't match the
 			/// authenticated identity. The invitation is NOT consumed.
 			case identityMismatch
+			/// The A.4 bootstrap key package does not match the commitment the
+			/// establishment payload signed (`H(initiator's PQ keyPackage)`,
+			/// threaded into `receive`). A substituted/tampered KP′, or a
+			/// malformed commitment — never honest traffic; the round is
+			/// rejected before any group is stood up, session state untouched.
+			case bootstrapKpMismatch
 			/// The peer's combiner key package carries no PQ half.
 			case pqUnavailable
 			/// The peer's cipher-suite pair is not the pinned one.
@@ -156,7 +162,9 @@ extension AbstractTwoMLS {
 				case .decryptionFailed:
 					return .retryLater
 				case .staleFrame, .duplicateWelcome, .duplicateSideBand,
-					.unopenableFrame, .malformedFrame:
+					.unopenableFrame, .malformedFrame, .bootstrapKpMismatch:
+					// A.4 KP′ not matching the signed commitment: drop the bad frame,
+					// the session is intact and the genuine re-stapled KP′ still works.
 					return .discardFrame
 				case .epochDesync, .bindDischargeFailed:
 					// The crate words this "re-establish the session" too; the

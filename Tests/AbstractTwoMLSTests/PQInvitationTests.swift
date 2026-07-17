@@ -38,11 +38,15 @@ struct PQInvitationReceiveTests {
 		// The initiator's own published key package (for the bound return group). Uses the
 		// retaining generate path — the initiator's live session joins the return welcome
 		// through its own client store, unlike an invitation-held key package.
-		let initiatorKp = try initiator.generateCombinerKeyPackage()
+		// v20: the return KP is the initiator's CLASSICAL bare KeyPackage (its PQ half
+		// now travels in A.4, hash-bound to `bootstrapKpCommitment` — sourced from the
+		// initiating session, which pre-commits it at `initiate`).
+		let initiatorKp = try initiator.generateKeyPackage(suite: .x25519Chacha())
 
 		let (acceptorSession, stapled) = try invitation.receive(
 			sendGroupWelcome: welcome,
-			remoteKeyPackage: encodeCombinerKeyPackage(keyPackage: initiatorKp),
+			remoteKeyPackage: initiatorKp,
+			bootstrapKpCommitment: try #require(initiatorSession.bootstrapKpCommitment()),
 			remoteClientId: initiator.clientId().bytes,
 			welcomeToken: AbstractTwoMLS.WelcomeToken(TypedDigest(prefix: .sha256, over: welcome)),
 			stapledMessage: nil,
@@ -82,14 +86,14 @@ struct PQInvitationReceiveTests {
 			appBinding: nil
 		)
 		let welcome = try #require(initiatorSession.initialWelcome())
-		let initiatorKp = encodeCombinerKeyPackage(
-			keyPackage: try initiator.generateCombinerKeyPackage()
-		)
+		let initiatorKp = try initiator.generateKeyPackage(suite: .x25519Chacha())
+		let commitment = try #require(initiatorSession.bootstrapKpCommitment())
 		let token = AbstractTwoMLS.WelcomeToken(TypedDigest(prefix: .sha256, over: welcome))
 
 		_ = try invitation.receive(
 			sendGroupWelcome: welcome,
 			remoteKeyPackage: initiatorKp,
+			bootstrapKpCommitment: commitment,
 			remoteClientId: initiator.clientId().bytes,
 			welcomeToken: token,
 			stapledMessage: nil,
@@ -101,6 +105,7 @@ struct PQInvitationReceiveTests {
 			_ = try invitation.receive(
 				sendGroupWelcome: welcome,
 				remoteKeyPackage: initiatorKp,
+				bootstrapKpCommitment: commitment,
 				remoteClientId: initiator.clientId().bytes,
 				welcomeToken: token,
 				stapledMessage: nil,
@@ -126,15 +131,15 @@ struct PQInvitationReceiveTests {
 			appBinding: nil
 		)
 		let welcome = try #require(initiatorSession.initialWelcome())
-		let initiatorKp = encodeCombinerKeyPackage(
-			keyPackage: try initiator.generateCombinerKeyPackage()
-		)
+		let initiatorKp = try initiator.generateKeyPackage(suite: .x25519Chacha())
+		let commitment = try #require(initiatorSession.bootstrapKpCommitment())
 
 		// The key package's credential must match the authenticated remote identity.
 		do {
 			_ = try invitation.receive(
 				sendGroupWelcome: welcome,
 				remoteKeyPackage: initiatorKp,
+				bootstrapKpCommitment: commitment,
 				remoteClientId: .mock(),  // not the initiator's identity
 				welcomeToken: AbstractTwoMLS.WelcomeToken(TypedDigest(prefix: .sha256, over: welcome)),
 				stapledMessage: nil,
@@ -147,6 +152,64 @@ struct PQInvitationReceiveTests {
 			#expect(error.code == .identityMismatch)
 			#expect(error.disposition == .rejectEstablishment)
 		}
+	}
+
+	/// v20: a malformed bootstrap-KP commitment (not 32 bytes — the app read the wrong
+	/// bytes out of the signed envelope) is rejected at `receive` before any invitation
+	/// state is claimed, surfacing the crate's `BootstrapKpMismatch` as
+	/// `.bootstrapKpMismatch`/`.discardFrame`; the invitation stays reusable, so the same
+	/// welcome then establishes with the genuine commitment.
+	@Test func receiveRejectsMalformedBootstrapCommitment() throws {
+		let invitation = try AbstractTwoMLS.PQInvitation(
+			persisted: try AbstractTwoMLS.PQClient(clientId: .mock()).makeInvitation()
+		)
+
+		let initiator = try TwoMlsPqPrincipal(clientId: AbstractTwoMLS.ClientID.mock())
+		let acceptorPair = try decodeCombinerKeyPackage(bytes: invitation.encodedKeyPackage)
+		let initiatorSession = try TwoMlsPqSession.initiate(
+			client: initiator,
+			theirKeyPackage: acceptorPair,
+			appBinding: nil
+		)
+		let welcome = try #require(initiatorSession.initialWelcome())
+		let initiatorKp = try initiator.generateKeyPackage(suite: .x25519Chacha())
+		let token = AbstractTwoMLS.WelcomeToken(TypedDigest(prefix: .sha256, over: welcome))
+
+		do {
+			_ = try invitation.receive(
+				sendGroupWelcome: welcome,
+				remoteKeyPackage: initiatorKp,
+				bootstrapKpCommitment: Data(repeating: 0, count: 31),  // one byte short of a SHA-256
+				remoteClientId: initiator.clientId().bytes,
+				welcomeToken: token,
+				stapledMessage: nil,
+				newClientId: .mock()
+			)
+			Issue.record("expected .bootstrapKpMismatch")
+		} catch {  // receive is throws(SessionError) — error is typed
+			#expect(error.code == .bootstrapKpMismatch)
+			#expect(error.disposition == .discardFrame)
+		}
+
+		// The invitation was not consumed by the rejected receive: the genuine
+		// commitment establishes on the same welcome, and the session round-trips.
+		let (acceptorSession, stapled) = try invitation.receive(
+			sendGroupWelcome: welcome,
+			remoteKeyPackage: initiatorKp,
+			bootstrapKpCommitment: try #require(initiatorSession.bootstrapKpCommitment()),
+			remoteClientId: initiator.clientId().bytes,
+			welcomeToken: token,
+			stapledMessage: nil,
+			newClientId: .mock()
+		)
+		#expect(stapled == nil)
+
+		_ = try acceptorSession.prepareToEncrypt(proposing: nil)
+		let back = try acceptorSession.encrypt(appMessage: "established".utf8Data)
+		let received = try #require(
+			try initiatorSession.processIncoming(ciphertext: back.cipherText)
+		)
+		#expect(received.applicationMessage?.appMessageData == "established".utf8Data)
 	}
 
 	/// An empty dedicated-principal id is rejected BEFORE any invitation state is
@@ -166,15 +229,15 @@ struct PQInvitationReceiveTests {
 			appBinding: nil
 		)
 		let welcome = try #require(initiatorSession.initialWelcome())
-		let initiatorKp = encodeCombinerKeyPackage(
-			keyPackage: try initiator.generateCombinerKeyPackage()
-		)
+		let initiatorKp = try initiator.generateKeyPackage(suite: .x25519Chacha())
+		let commitment = try #require(initiatorSession.bootstrapKpCommitment())
 		let token = AbstractTwoMLS.WelcomeToken(TypedDigest(prefix: .sha256, over: welcome))
 
 		do {
 			_ = try invitation.receive(
 				sendGroupWelcome: welcome,
 				remoteKeyPackage: initiatorKp,
+				bootstrapKpCommitment: commitment,
 				remoteClientId: initiator.clientId().bytes,
 				welcomeToken: token,
 				stapledMessage: nil,
@@ -189,6 +252,7 @@ struct PQInvitationReceiveTests {
 		_ = try invitation.receive(
 			sendGroupWelcome: welcome,
 			remoteKeyPackage: initiatorKp,
+			bootstrapKpCommitment: commitment,
 			remoteClientId: initiator.clientId().bytes,
 			welcomeToken: token,
 			stapledMessage: nil,
