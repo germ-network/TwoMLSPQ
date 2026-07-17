@@ -189,6 +189,10 @@ struct PQInvitationReceiveTests {
 		} catch {  // receive is throws(SessionError) — error is typed
 			#expect(error.code == .bootstrapKpMismatch)
 			#expect(error.disposition == .discardFrame)
+			// The receive-surface mismatch carries an actionable message, not just
+			// the bare code: it names the commitment and that the invitation survives.
+			#expect(error.detail?.contains("commitment") == true)
+			#expect(error.detail?.contains("NOT consumed") == true)
 		}
 
 		// The invitation was not consumed by the rejected receive: the genuine
