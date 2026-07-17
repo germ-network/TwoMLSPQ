@@ -443,7 +443,7 @@ pub struct TwoMlsPqSession {
     inner: Mutex<SessionInner>,
 }
 
-mod frames;
+pub(crate) mod frames;
 pub use frames::fuzz_decode_message_frame;
 use frames::*;
 pub use frames::{pq_frame_kind, OpenedFrame, OpenedFrameKind, PqFrameKind, SideBandSealing};

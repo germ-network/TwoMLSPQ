@@ -6,10 +6,21 @@
 use std::sync::Arc;
 
 use two_mls_pq::{
-    key_packages::{CombinerKeyPackage, TwoMlsPqInvitation, TwoMlsPqPrincipal},
+    key_packages::{
+        CombinerKeyPackage, InitialFrame, OpenedInitial, TwoMlsPqInvitation, TwoMlsPqPrincipal,
+    },
     session::TwoMlsPqSession,
     MlsCipherSuite,
 };
+
+/// Bench-side mirror of the test-only `TwoMlsPqInvitation::open_establishment`: open a §A.1
+/// envelope and require the establishment variant (benches only ever open the reply).
+pub fn open_establishment(inv: &TwoMlsPqInvitation, blob: Vec<u8>) -> InitialFrame {
+    match inv.open_initial(blob).unwrap() {
+        OpenedInitial::Establishment { frame } => frame,
+        OpenedInitial::BootstrapKp { .. } => unreachable!("establishment envelope expected"),
+    }
+}
 
 /// A fresh, unique ClientId for benches. The bytes are opaque — uniqueness is all that
 /// matters, so a counter + timestamp avoids pulling a crypto provider in here.
@@ -52,7 +63,7 @@ pub fn established() -> (Arc<TwoMlsPqSession>, Arc<TwoMlsPqSession>) {
 
     let alice_session = TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None).unwrap();
     let envelope = alice_session.pending_outbound().unwrap();
-    let opened = bob_inv.open_initial(envelope).unwrap();
+    let opened = open_establishment(&bob_inv, envelope);
     let bob_session = bob_inv
         .receive(
             opened.welcome.unwrap(),

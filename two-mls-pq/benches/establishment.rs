@@ -4,7 +4,7 @@ use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
 use two_mls_pq::{key_packages::TwoMlsPqInvitation, session::TwoMlsPqSession};
 
 mod common;
-use common::{classical_kp, client, combiner_kp, suite_label};
+use common::{classical_kp, client, combiner_kp, open_establishment, suite_label};
 
 fn bench_establishment(c: &mut Criterion) {
     let mut group = c.benchmark_group("establishment");
@@ -35,7 +35,7 @@ fn bench_establishment(c: &mut Criterion) {
             |(alice, bob_inv, bob_kp, alice_kp)| {
                 let alice_session = TwoMlsPqSession::initiate(alice, bob_kp, None).unwrap();
                 let envelope = alice_session.pending_outbound().unwrap();
-                let opened = bob_inv.open_initial(envelope).unwrap();
+                let opened = open_establishment(&bob_inv, envelope);
                 let bob_session = bob_inv
                     .receive(
                         opened.welcome.unwrap(),

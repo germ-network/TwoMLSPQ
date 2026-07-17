@@ -851,6 +851,97 @@ impl TwoMlsPqSession {
         })
     }
 
+    /// Part 3 — parallel KP′ delivery. Emit the initiator's pre-committed A.4 KP′ (the same
+    /// verbatim `[0x13][KP′]` frame `pq_bootstrap_respond` consumes) IN PARALLEL with the
+    /// establishment reply, HPKE-sealed to the retained seal target `initial_their_kp` as a
+    /// RAW §A.1 blob (`seal_hpke_blob`: `[u32 kem_len][kem_output][ciphertext]`, no sections,
+    /// no outer tag). It shares that outer shape with the establishment reply — no per-frame
+    /// "carries PQ material" distinguisher; the receiver tells them apart on unpacking, by the
+    /// `0x13` inner leading tag vs. the reply's `ESTABLISHMENT_VECTOR_TAG`. Initiator-only,
+    /// PRE-ESTABLISHMENT only: `initial_their_kp` exists solely in that window (cleared at the
+    /// cutover), and `seal_side_band` — the steady-state carrier — needs a recv group that
+    /// does not exist yet, which is exactly why this frame rides the HPKE envelope instead.
+    ///
+    /// The FIRST emit REGISTERS the A.4 round exactly as `pq_bootstrap_begin` does
+    /// (`pq_inflight = BootstrapInitiated`, the retained frame, the eviction-exempt `mine`
+    /// credential pin) and persists a Checkpoint, so the initiator can process an EARLY
+    /// `Welcome'`: an acceptor that already holds this KP′ when its return welcome goes out
+    /// sends `Welcome'` alongside it, and A.4 completes ~one round trip sooner. EVERY LATER
+    /// pre-cutover emit is a PURE re-seal of the retained frame — fresh HPKE, no state change,
+    /// no persist (register-once, re-seal-per-send pure). After the establishment cutover the
+    /// SAME retained frame flows over the steady-state side-band (`hand_out` re-seals it), so a
+    /// dropped parallel envelope self-heals and `pq_bootstrap_begin` is a no-op afterward (the
+    /// round is registered). Fresh HPKE per call — the re-sends are unlinkable.
+    pub fn pq_bootstrap_envelope(&self) -> Result<Vec<u8>> {
+        // Guard-first (pure reads). Two shapes reach here; the seal target `initial_their_kp`
+        // is required by both (present ONLY for a pre-establishment initiator):
+        //  - REGISTERED re-send (the common per-send path): the round is already open, so
+        //    re-seal its retained `[0x13][KP′]` frame PURELY — fresh HPKE, no state change, no
+        //    persist (register-once, re-seal-per-send pure, like `pq_pending_outbound`). This
+        //    arm RETURNS here, before the persist choke point.
+        //  - FIRST emit: the pre-committed KP is still in hand; fall through to register.
+        {
+            let inner = self.lock();
+            let their_kp = inner
+                .initial_their_kp
+                .as_ref()
+                .ok_or(TwoMlsPqError::SessionNotReady)?;
+            match &inner.pq_inflight {
+                Some(PqInflight::BootstrapInitiated) => {
+                    let retained = inner
+                        .pending_side_band
+                        .as_ref()
+                        .ok_or(TwoMlsPqError::SessionNotReady)?;
+                    return crate::key_packages::seal_hpke_blob(their_kp, retained.frame.clone());
+                }
+                None if inner.bootstrap_kp.is_some() => {}
+                _ => return Err(TwoMlsPqError::SessionNotReady),
+            }
+        }
+        // FIRST emit only — register the A.4 round (persist a Checkpoint), sealing the frame
+        // built from the pre-committed KP.
+        self.mutate_and_persist(crate::BlobKind::Checkpoint, |inner| {
+            let their_kp = inner
+                .initial_their_kp
+                .clone()
+                .ok_or(TwoMlsPqError::SessionNotReady)?;
+            // Re-check under the persist lock: sequential driving is the norm, but if the round
+            // registered between the guard read and here, re-seal the retained frame (the
+            // persist below is then a harmless idempotent checkpoint).
+            let msg = match inner.pending_side_band.as_ref() {
+                Some(retained) => retained.frame.clone(),
+                None => {
+                    let kp = inner
+                        .bootstrap_kp
+                        .as_deref()
+                        .ok_or(TwoMlsPqError::SessionNotReady)?;
+                    let mut m = Vec::with_capacity(1 + kp.len());
+                    m.push(PQ_BOOTSTRAP_KP_TAG);
+                    m.extend_from_slice(kp);
+                    m
+                }
+            };
+            // Seal the verbatim `[0x13][KP′]` frame as a raw HPKE blob FIRST (fallible HPKE):
+            // `mutate_and_persist` persists partial mutations on `Err`, and the pre-committed
+            // KP is one-of-a-kind, so register the round only AFTER the seal succeeds (mirrors
+            // `pq_bootstrap_begin` — a seal failure leaves the KP intact and the call
+            // retriable). `msg` is reused for the registration below, so seal a clone.
+            let envelope = crate::key_packages::seal_hpke_blob(&their_kp, msg.clone())?;
+            if inner.pq_inflight.is_none() {
+                // Same registration `pq_bootstrap_begin` performs, minus the side-band seal
+                // (impossible pre-establishment — the retained frame is `unsealed` and gets
+                // its steady-state seal from `hand_out` after the cutover).
+                let kp = msg.get(1..).ok_or(TwoMlsPqError::Mls)?;
+                let founding = parse_mls_key_package(kp.to_vec())?.client_id.bytes;
+                inner.with_auth(|core| core.mine.pin(founding));
+                inner.bootstrap_kp = None;
+                inner.pending_side_band = Some(RetainedFrame::unsealed(msg));
+                inner.pq_inflight = Some(PqInflight::BootstrapInitiated);
+            }
+            Ok(envelope)
+        })
+    }
+
     /// A.4 responder — stand up the deferred send-group PQ half around the peer's key
     /// package and return the bootstrap frame (tag 0x15) carrying its Welcome.
     /// PQ-groups-only: no classical commit rides here — the new half's APQ-PSK reaches

@@ -304,7 +304,19 @@ pub fn version() -> String {
 // bare classical bytes. Archive layout changed (pre-release hard cut: old blobs fail to
 // decode and regenerate): `initial_return_kp` is classical bytes, and the retained
 // bootstrap KP + expected commitment ride it.
-const BINDING_CONTRACT_VERSION: u64 = 20;
+//
+// v21 (2026-07-17): Part 3 — parallel KP′ delivery. The §A.1 envelope loses its OUTER tag
+// byte: the blob is now the raw `[u32 kem_len][kem_output][ciphertext]` (`seal_hpke_blob`),
+// and discrimination moves INSIDE to the HPKE plaintext's authenticated leading tag —
+// `ESTABLISHMENT_VECTOR_TAG` (0x07, repurposing the retired outer `INITIAL_ENVELOPE_TAG`) for
+// the 4-section establishment reply, `PQ_BOOTSTRAP_KP_TAG` (0x13) for the parallel bootstrap
+// KP. `open_initial`/`decode_initial_plaintext` return `OpenedInitial`
+// (`Establishment`/`BootstrapKp`); `initial_envelope_tag()` is retired (the host routes by
+// channel, not first byte). `pq_bootstrap_envelope` emits the initiator's pre-committed KP′
+// IN PARALLEL with the reply (fresh HPKE per send), so A.4 completes ~one round trip sooner.
+// Wire-format change (the outer tag is gone, the plaintext gained an inner tag) — hence the
+// bump.
+const BINDING_CONTRACT_VERSION: u64 = 21;
 
 /// See `BINDING_CONTRACT_VERSION`. Exported so the Swift layer can verify the
 /// binding it was generated with matches the binary it loaded.

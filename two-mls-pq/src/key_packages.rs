@@ -306,32 +306,29 @@ pub struct HpkeSealed {
     pub ciphertext: Vec<u8>,
 }
 
-/// Leading tag byte of the §A.1 envelope blob (`[tag][u32-LE kem_len][kem_output]
-/// [ciphertext]`) — the one frame kind that travels the invitation channel. Distinct from
-/// every message-path (0x00/0x01/0x03/0x05), side-band (0x13–0x1D), and pre-establishment
-/// staple (0x09) tag so a host can classify the blob by its first byte; `open_incoming` /
-/// `process_incoming` never see it (an envelope reaching them fails loudly).
+/// Inner authenticated leading tag of the §A.1 establishment vector — the FIRST BYTE OF THE
+/// HPKE-SEALED PLAINTEXT, not an outer wire byte. Since contract 21 the envelope blob carries
+/// no outer tag (`[u32-LE kem_len][kem_output][ciphertext]`); the establishment reply and the
+/// parallel bootstrap-KP frame (Part 3) share that outer shape and are told apart only AFTER
+/// HPKE-open, by this leading byte (0x07 = establishment vector) vs. `PQ_BOOTSTRAP_KP_TAG`
+/// (0x13 = bootstrap KP), the way the 0x03 message frame's staple slot self-discriminates on
+/// its first byte. The transport channel — invitation address → HPKE-open, session address →
+/// session frame — already routes the blob to the right opener, so no observable OUTER
+/// discriminator is needed or wanted (`frames.rs`: "header encryption seals every blob, so a
+/// tag is never observed"; an outer tag would only fingerprint which frames carry PQ material).
 ///
-/// This byte is allocated out of the shared tag space but declared here rather than in
-/// `session::frames`, because an envelope is not a session frame. `frames::tests::BANDS`
-/// is where the whole space is visible at once and where the distinctness this doc claims is
-/// actually enforced — asserting it in prose is how 0x15 got claimed twice once already.
-pub const INITIAL_ENVELOPE_TAG: u8 = 0x07;
+/// Allocated out of the shared odd-tag space (it heads the A.1 band) but declared here rather
+/// than in `session::frames`, because the establishment vector is not a session frame.
+/// `frames::tests::BANDS` is where the whole space is visible at once and where the
+/// distinctness this doc claims is actually enforced — asserting it in prose is how 0x15 got
+/// claimed twice once already.
+pub const ESTABLISHMENT_VECTOR_TAG: u8 = 0x07;
 
-/// [`INITIAL_ENVELOPE_TAG`] for hosts that parse the outer frame themselves —
-/// splitting kem/ct for `hpke_open` + `decode_initial_plaintext` keeps the raw
-/// plaintext available for replay routing, which `open_initial` would swallow.
-/// Exported as a function so no host hardcodes the tag byte (the `pq_frame_kind`
-/// convention).
-#[uniffi::export]
-pub fn initial_envelope_tag() -> u8 {
-    INITIAL_ENVELOPE_TAG
-}
-
-/// The opened §A.1 envelope after `TwoMlsPqInvitation::open_initial` (or
-/// `decode_initial_plaintext` on an already-HPKE-opened plaintext). Every section is
-/// optional on the wire (empty = absent); which are populated follows the either/or
-/// rule on `seal_initial_envelope`:
+/// The establishment vector of a §A.1 envelope — the `OpenedInitial::Establishment` payload
+/// after `TwoMlsPqInvitation::open_initial` (or `decode_initial_plaintext` on an
+/// already-HPKE-opened plaintext whose inner leading tag is `ESTABLISHMENT_VECTOR_TAG`).
+/// Every section is optional on the wire (empty = absent); which are populated follows the
+/// either/or rule on `seal_initial_envelope`:
 /// - `app_payload` — the host's app-layer welcome. When present it is establishment-
 ///   self-sufficient (carries the MLS welcome, the initiator's CLASSICAL return key
 ///   package, and the bootstrap KP commitment inside, e.g. a signed identity
@@ -354,10 +351,53 @@ pub struct InitialFrame {
     pub stapled_message: Option<Vec<u8>>,
 }
 
-/// Seal a §A.1 envelope for the invitation channel: compose the four optional sections
-/// and HPKE-seal them to the peer's published KP′ (PQ half). Produced by `initiate` and
-/// by every pre-establishment `encrypt` (which staples the current app message); the
-/// counterpart is `TwoMlsPqInvitation::open_initial`.
+/// The result of opening a §A.1 envelope blob (`TwoMlsPqInvitation::open_initial`, or
+/// `decode_initial_plaintext` on an HPKE-opened plaintext). The envelope carries NO outer
+/// wire tag (contract 21); the inner authenticated leading tag of the HPKE plaintext selects
+/// the variant — the same channel-routes-then-inner-tag-dispatches pattern the whole tag
+/// space follows (see [`ESTABLISHMENT_VECTOR_TAG`]).
+#[derive(Debug, uniffi::Enum)]
+pub enum OpenedInitial {
+    /// Leading tag `ESTABLISHMENT_VECTOR_TAG` (0x07): the establishment reply's four optional
+    /// sections (see [`InitialFrame`]).
+    Establishment { frame: InitialFrame },
+    /// Leading tag `PQ_BOOTSTRAP_KP_TAG` (0x13): the initiator's A.4 bootstrap frame delivered
+    /// IN PARALLEL with the reply (Part 3). The pre-commitment fixed the KP bytes at
+    /// `initiate`, so the initiator ships its A.4 KP′ alongside the establishment reply
+    /// instead of waiting a round trip for A.4's first send. `frame` is the VERBATIM
+    /// `[0x13][KP′ …]` side-band frame `pq_bootstrap_respond` consumes — only the OUTER
+    /// framing differed (the §A.1 HPKE envelope here vs. the header-sealed side-band in
+    /// steady state). The receiver holds it UNTIL the reply establishes the session, then
+    /// feeds it to `pq_bootstrap_respond`, which enforces it against the anchor-signed
+    /// commitment.
+    BootstrapKp { frame: Vec<u8> },
+}
+
+/// HPKE-seal `plaintext` to a published combiner key package's **PQ half** and frame it as the
+/// raw §A.1 envelope blob `[u32-LE kem_output_len][kem_output][ciphertext]` — NO outer tag
+/// (retired at contract 21). Both §A.1 frame kinds use this identical outer shape: the
+/// establishment reply (`seal_initial_envelope`, plaintext led by `ESTABLISHMENT_VECTOR_TAG`)
+/// and the parallel bootstrap-KP frame (`pq_bootstrap_envelope`, plaintext = the verbatim
+/// `[0x13][KP′]` side-band frame). They are told apart only AFTER HPKE-open, by the inner
+/// authenticated leading tag. The fresh HPKE ephemeral per call makes each blob unlinkable
+/// (uniform pre-establishment traffic — every re-send is a distinct envelope).
+pub(crate) fn seal_hpke_blob(
+    their_key_package: &CombinerKeyPackage,
+    plaintext: Vec<u8>,
+) -> Result<Vec<u8>> {
+    let sealed = hpke_seal_to_key_package(their_key_package.clone(), plaintext, None, None)?;
+    let mut out = Vec::with_capacity(4 + sealed.kem_output.len() + sealed.ciphertext.len());
+    out.extend_from_slice(&(sealed.kem_output.len() as u32).to_le_bytes());
+    out.extend_from_slice(&sealed.kem_output);
+    out.extend_from_slice(&sealed.ciphertext);
+    Ok(out)
+}
+
+/// Seal a §A.1 establishment envelope for the invitation channel: compose the four optional
+/// sections behind the inner `ESTABLISHMENT_VECTOR_TAG` and HPKE-seal them to the peer's
+/// published KP′ (PQ half). Produced by `initiate` and by every pre-establishment `encrypt`
+/// (which staples the current app message); the counterpart is
+/// `TwoMlsPqInvitation::open_initial`.
 ///
 /// Either/or rule (frame-size dedup): a host `app_payload` must be establishment-
 /// self-sufficient (it carries the welcome, the classical return key package, and the
@@ -367,10 +407,11 @@ pub struct InitialFrame {
 /// keys off the signed, JOINED welcome (the invitation's `processed` ledger); sections
 /// outside `app_payload` are unauthenticated routing/establishment hints.
 ///
-/// Framing — composed plaintext: four u32-LE length-prefixed sections
-/// `[app_payload][welcome][return_key_package][stapled_message]`, empty = absent, no
-/// trailing bytes. Envelope blob: `[INITIAL_ENVELOPE_TAG][u32-LE kem_output_len]
-/// [kem_output][ciphertext]`.
+/// Framing — HPKE plaintext: `[ESTABLISHMENT_VECTOR_TAG]` then four u32-LE length-prefixed
+/// sections `[app_payload][welcome][return_key_package][stapled_message]`, empty = absent, no
+/// trailing bytes. The leading tag is what tells this apart from the parallel bootstrap-KP
+/// frame (`[0x13][KP′]`) once both are HPKE-opened — the two ride identical raw blobs
+/// (`seal_hpke_blob`) with no outer distinguisher.
 pub(crate) fn seal_initial_envelope(
     their_key_package: &CombinerKeyPackage,
     app_payload: Option<&[u8]>,
@@ -379,52 +420,66 @@ pub(crate) fn seal_initial_envelope(
     stapled_message: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
     let sections = [app_payload, welcome, return_key_package, stapled_message];
-    let mut plaintext =
-        Vec::with_capacity(sections.iter().map(|s| 4 + s.map_or(0, <[u8]>::len)).sum());
+    let mut plaintext = Vec::with_capacity(
+        1 + sections
+            .iter()
+            .map(|s| 4 + s.map_or(0, <[u8]>::len))
+            .sum::<usize>(),
+    );
+    plaintext.push(ESTABLISHMENT_VECTOR_TAG);
     for section in sections {
         let bytes = section.unwrap_or(&[]);
         plaintext.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
         plaintext.extend_from_slice(bytes);
     }
-
-    let sealed = hpke_seal_to_key_package(their_key_package.clone(), plaintext, None, None)?;
-
-    let mut out = Vec::with_capacity(5 + sealed.kem_output.len() + sealed.ciphertext.len());
-    out.push(INITIAL_ENVELOPE_TAG);
-    out.extend_from_slice(&(sealed.kem_output.len() as u32).to_le_bytes());
-    out.extend_from_slice(&sealed.kem_output);
-    out.extend_from_slice(&sealed.ciphertext);
-    Ok(out)
+    seal_hpke_blob(their_key_package, plaintext)
 }
 
-/// Parse an HPKE-opened §A.1 envelope plaintext into its four optional sections — the
-/// attacker-facing decoder shared by `open_initial` and any host that HPKE-opens the
-/// envelope itself (`hpke_open`) and needs the sections (e.g. to key a replay-stable
-/// token off the stable prefix: `app_payload` when present, else `welcome` — the two
-/// sections that are identical across an initiator's re-sealed/re-stapled envelopes).
-/// Rejects truncation, trailing bytes, and an envelope carrying neither an
-/// `app_payload` nor a `welcome` (no establishment vector at all).
+/// Dispatch an HPKE-opened §A.1 plaintext on its inner authenticated leading tag — the
+/// attacker-facing decoder shared by `open_initial` and any host that HPKE-opens the envelope
+/// itself (`hpke_open`). `ESTABLISHMENT_VECTOR_TAG` (0x07) → the four optional establishment
+/// sections (see [`InitialFrame`]); `PQ_BOOTSTRAP_KP_TAG` (0x13) → the parallel bootstrap-KP
+/// frame, returned VERBATIM (`[0x13][KP′]`, the exact bytes `pq_bootstrap_respond` consumes).
+/// Any other leading byte is `Mls`.
+///
+/// For a replay-stable token, a host keys off the establishment vector's stable prefix:
+/// `app_payload` when present, else `welcome` — the two sections identical across an
+/// initiator's re-sealed/re-stapled envelopes (the bootstrap-KP frame is itself stable
+/// per-round, but the fresh HPKE outer makes every emitted blob distinct). Rejects
+/// truncation, trailing bytes, and an establishment vector carrying NOTHING (no `app_payload`
+/// and no `welcome`).
 #[uniffi::export]
-pub fn decode_initial_plaintext(plaintext: Vec<u8>) -> Result<InitialFrame> {
-    let mut rest = plaintext.as_slice();
-    let mut sections: [Option<Vec<u8>>; 4] = [const { None }; 4];
-    for slot in sections.iter_mut() {
-        let bytes = take_bytes(&mut rest).ok_or(TwoMlsPqError::Mls)?;
-        *slot = (!bytes.is_empty()).then_some(bytes);
+pub fn decode_initial_plaintext(plaintext: Vec<u8>) -> Result<OpenedInitial> {
+    let (&tag, body) = plaintext.split_first().ok_or(TwoMlsPqError::Mls)?;
+    match tag {
+        ESTABLISHMENT_VECTOR_TAG => {
+            let mut rest = body;
+            let mut sections: [Option<Vec<u8>>; 4] = [const { None }; 4];
+            for slot in sections.iter_mut() {
+                let bytes = take_bytes(&mut rest).ok_or(TwoMlsPqError::Mls)?;
+                *slot = (!bytes.is_empty()).then_some(bytes);
+            }
+            if !rest.is_empty() {
+                return Err(TwoMlsPqError::Mls);
+            }
+            let [app_payload, welcome, return_key_package, stapled_message] = sections;
+            if app_payload.is_none() && welcome.is_none() {
+                return Err(TwoMlsPqError::Mls);
+            }
+            Ok(OpenedInitial::Establishment {
+                frame: InitialFrame {
+                    app_payload,
+                    welcome,
+                    return_key_package,
+                    stapled_message,
+                },
+            })
+        }
+        crate::session::frames::PQ_BOOTSTRAP_KP_TAG => {
+            Ok(OpenedInitial::BootstrapKp { frame: plaintext })
+        }
+        _ => Err(TwoMlsPqError::Mls),
     }
-    if !rest.is_empty() {
-        return Err(TwoMlsPqError::Mls);
-    }
-    let [app_payload, welcome, return_key_package, stapled_message] = sections;
-    if app_payload.is_none() && welcome.is_none() {
-        return Err(TwoMlsPqError::Mls);
-    }
-    Ok(InitialFrame {
-        app_payload,
-        welcome,
-        return_key_package,
-        stapled_message,
-    })
 }
 
 /// HPKE-seal `plaintext` to a published combiner key package's **PQ half** init key (spec
@@ -891,26 +946,29 @@ impl TwoMlsPqInvitation {
         Ok(plaintext.to_vec())
     }
 
-    /// Open an initiator envelope (the §A.1 blob produced by `initiate` and by every
-    /// pre-establishment `encrypt`), returning its parsed sections (see [`InitialFrame`]).
-    /// Decrypt-only and **state-free** — it does NOT consume a single-use invitation's
-    /// key package (consumption happens in `receive`), so a host can open a frame to
-    /// validate it before deciding to join, and re-opens are harmless. Fails
-    /// `InvitationSpent` once a single-use invitation is consumed (its KP′ material, and
-    /// thus the opener, is gone); `DecryptionFailed`/`Mls` on a malformed or wrong-key
-    /// blob. The counterpart is the free function `seal_initial_envelope`.
+    /// Open a §A.1 envelope blob (produced by `initiate`, by every pre-establishment
+    /// `encrypt`, or by `pq_bootstrap_envelope`), dispatching on the inner authenticated
+    /// leading tag into [`OpenedInitial`]. Decrypt-only and **state-free** — it does NOT
+    /// consume a single-use invitation's key package (consumption happens in `receive`), so a
+    /// host can open a frame to validate it before deciding to join, and re-opens are
+    /// harmless. Fails `InvitationSpent` once a single-use invitation is consumed (its KP′
+    /// material, and thus the opener, is gone); `DecryptionFailed`/`Mls` on a malformed or
+    /// wrong-key blob. The counterpart is the free function `seal_hpke_blob`
+    /// (via `seal_initial_envelope` / `pq_bootstrap_envelope`).
+    ///
+    /// The blob carries NO outer tag (`[u32-LE kem_len][kem_output][ciphertext]`); the host
+    /// already knows to open it because it arrived on the invitation channel. Which §A.1 frame
+    /// it is — establishment vector or parallel bootstrap KP — is decided only after
+    /// HPKE-open, by the plaintext's leading byte.
     ///
     /// Every envelope from one initiator is freshly HPKE-sealed (different outer bytes)
     /// and — pre-establishment — may staple a different app message, so a replay-stable
     /// token must be computed over the decrypted STABLE PREFIX: the `app_payload`
     /// section when present, else the `welcome` section (see `decode_initial_plaintext`).
-    pub fn open_initial(&self, blob: Vec<u8>) -> Result<InitialFrame> {
-        // Split the envelope `[INITIAL_ENVELOPE_TAG][u32 kem_len][kem_output][ciphertext]`,
-        // then HPKE-open and parse the sections.
-        let (&tag, mut rest) = blob.split_first().ok_or(TwoMlsPqError::Mls)?;
-        if tag != INITIAL_ENVELOPE_TAG {
-            return Err(TwoMlsPqError::Mls);
-        }
+    pub fn open_initial(&self, blob: Vec<u8>) -> Result<OpenedInitial> {
+        // The blob is `[u32-LE kem_len][kem_output][ciphertext]` — no outer tag (contract 21).
+        // HPKE-open, then dispatch on the plaintext's inner leading tag.
+        let mut rest = blob.as_slice();
         let kem_output = take_bytes(&mut rest).ok_or(TwoMlsPqError::Mls)?;
         let ciphertext = rest.to_vec();
         let plaintext = self.hpke_open(kem_output, ciphertext, None, None)?;
@@ -932,6 +990,31 @@ impl TwoMlsPqInvitation {
     /// cross-lock ordering and no rollback to reason about.
     fn lock(&self) -> std::sync::MutexGuard<'_, InvitationInner> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// Test-only openers that flatten [`OpenedInitial`] to the variant a fixture expects, so the
+/// crate's establishment tests read the same whether or not Part 3's inner-tag dispatch is in
+/// play. A wrong variant maps to `Err(Mls)` so the call site's `assert_ok!` surfaces it (the
+/// crate denies explicit `panic!`). Shared across `test_utils`, the `key_packages` tests, and
+/// the `session` tests.
+#[cfg(test)]
+impl TwoMlsPqInvitation {
+    /// Open a §A.1 blob and require the establishment variant, returning its `InitialFrame`.
+    pub(crate) fn open_establishment(&self, blob: Vec<u8>) -> Result<InitialFrame> {
+        match self.open_initial(blob)? {
+            OpenedInitial::Establishment { frame } => Ok(frame),
+            OpenedInitial::BootstrapKp { .. } => Err(TwoMlsPqError::Mls),
+        }
+    }
+
+    /// Open a §A.1 blob and require the parallel bootstrap-KP variant, returning the verbatim
+    /// `[0x13][KP′]` frame.
+    pub(crate) fn open_bootstrap_kp(&self, blob: Vec<u8>) -> Result<Vec<u8>> {
+        match self.open_initial(blob)? {
+            OpenedInitial::BootstrapKp { frame } => Ok(frame),
+            OpenedInitial::Establishment { .. } => Err(TwoMlsPqError::Mls),
+        }
     }
 }
 
@@ -1952,7 +2035,7 @@ mod tests {
             Some(binding.clone())
         ));
         let envelope = assert_some!(alice_session.pending_outbound());
-        let opened = assert_ok!(bob_inv.open_initial(envelope));
+        let opened = assert_ok!(bob_inv.open_establishment(envelope));
         let bob_session = assert_ok!(bob_inv.receive(
             assert_some!(opened.welcome),
             alice_kp,
@@ -2007,7 +2090,7 @@ mod tests {
         // Drop the initial envelope; send a pre-establishment app frame instead.
         assert_ok!(alice_session.prepare_to_encrypt(None));
         let frame = assert_ok!(alice_session.encrypt(b"bound-first".to_vec()));
-        let opened = assert_ok!(bob_inv.open_initial(frame.cipher_text));
+        let opened = assert_ok!(bob_inv.open_establishment(frame.cipher_text));
         let welcome = assert_some!(opened.welcome);
 
         // Wrong expectation rejects without claiming anything…

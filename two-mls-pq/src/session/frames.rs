@@ -10,8 +10,9 @@ use super::*;
 // Every wire blob is discriminated by its first byte, so these values are ONE global
 // space — but they are declared in three places, because each tag lives with the thing it
 // tags: `APQ_TAG` (0x01) and `APQ_PRIVATE_MESSAGE_TAG` (0x05) in the `apq` crate,
-// `INITIAL_ENVELOPE_TAG` (0x07) in `key_packages` (it rides the invitation channel and is
-// not a session frame), and the rest here. Ownership is local; allocation is global. That
+// `ESTABLISHMENT_VECTOR_TAG` (0x07) in `key_packages` (the inner leading tag of the §A.1
+// establishment vector — a byte of the HPKE-sealed plaintext, not a session frame nor an
+// observed wire byte), and the rest here. Ownership is local; allocation is global. That
 // split is the hazard: a
 // collision is a silent wire misclassification rather than a compile error, and the file
 // you read when adding a session frame is not the file that declares the envelope tag.
@@ -69,9 +70,10 @@ use super::*;
 pub(crate) const MESSAGE_FRAME_TAG: u8 = 0x03;
 
 // ── Band: A.1 establishment (0x07–0x11, 2 of 6 used) ────────────────────────────────
-// 0x07 is `key_packages::INITIAL_ENVELOPE_TAG` — declared there, not here, because an
-// envelope is not a session frame. It heads this band; the staple below packs in behind it,
-// and the room past 0x09 is where a hybrid nested envelope would go.
+// 0x07 is `key_packages::ESTABLISHMENT_VECTOR_TAG` — declared there, not here, because it is
+// an inner HPKE-plaintext leading tag (the establishment vector), not a session frame. It
+// heads this band; the staple below packs in behind it, and the room past 0x09 is where a
+// hybrid nested envelope would go.
 
 /// §A.1 pre-establishment app staple: `[tag][ASG-cl PrivateMessage]` — the initiator's
 /// app message riding a §A.1 envelope's `stapled_message` section before its recv group
@@ -407,7 +409,7 @@ mod pq_frame_kind_tests {
             0x14,
             0x1A,
             PRE_ESTABLISHMENT_APP_TAG,
-            crate::key_packages::INITIAL_ENVELOPE_TAG,
+            crate::key_packages::ESTABLISHMENT_VECTOR_TAG,
             0x0B,
             0x1F,
             0x33,
@@ -460,8 +462,8 @@ mod pq_frame_kind_tests {
             end: 0x11,
             tags: &[
                 (
-                    crate::key_packages::INITIAL_ENVELOPE_TAG,
-                    "key_packages::INITIAL_ENVELOPE_TAG",
+                    crate::key_packages::ESTABLISHMENT_VECTOR_TAG,
+                    "key_packages::ESTABLISHMENT_VECTOR_TAG",
                 ),
                 (PRE_ESTABLISHMENT_APP_TAG, "PRE_ESTABLISHMENT_APP_TAG"),
             ],
