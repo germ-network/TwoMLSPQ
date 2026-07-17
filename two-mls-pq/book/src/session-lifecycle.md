@@ -12,8 +12,8 @@
    so the app-layer welcome that identifies Alice is hidden on the invitation channel
    (see [Header Encryption](./header-encryption.md)).
 2. **`TwoMlsPqInvitation::open_initial(envelope) -> { app_payload, welcome }`** then
-   **`receive(welcome, their_kp, spawn_token, new_client_id, expected_remote,
-   expected_app_binding)`** — Bob
+   **`receive(welcome, their_classical_kp, bootstrap_kp_commitment, spawn_token,
+   new_client_id, expected_remote, expected_app_binding)`** — Bob
    opens the envelope
    (the invitation holds the KP′ material), validates the app-layer welcome, and joins
    Group_A as his receive group (PQ half first, re-deriving the APQ-PSK, then the
@@ -46,8 +46,10 @@ the session initiator owes the bootstrap; completing an operation passes the tur
 the peer (`my_pq_turn()`), and only one operation may be in flight at a time.
 
 - **Bootstrap** (`0x11`/`0x13`/`0x15`) — stands up Group_B's deferred PQ half off the
-  critical path: Alice sends her PQ key package; Bob creates Group_B.pq around it and
-  returns its Welcome; Alice joins and binds. Both send groups are then complete APQ
+  critical path: Alice sends her PQ key package — the one PRE-COMMITTED at `initiate`
+  (`bootstrap_kp_commitment()` put its hash inside the signed establishment payload, and
+  Bob's `receive` pinned it) — Bob verifies the hash (`BootstrapKpMismatch` otherwise),
+  creates Group_B.pq around it and returns its Welcome; Alice joins and binds. Both send groups are then complete APQ
   groups (`is_fully_established()`). The bind is structurally the PQ ratchet's (below),
   differing only in where its injected secret comes from — an exporter off the newly
   joined group rather than a KEM exchange — and it doubles as the round's receipt: that
@@ -177,8 +179,9 @@ under it (Establishment, above).
 A published key package is backed by a self-contained **`TwoMlsPqInvitation`** (the
 signing identity plus the key package's private material) rather than a live client;
 one invitation services many welcomes, deduplicating repeats per remote
-(`DuplicateWelcome`). `receive(welcome, their_kp, spawn_token)` takes an opaque,
-caller-chosen, replay-stable token for the initial frame and records
+(`DuplicateWelcome`). `receive(welcome, their_classical_kp, bootstrap_kp_commitment,
+spawn_token)` takes an opaque, caller-chosen, replay-stable token for the initial frame
+and records
 `token → the spawned session's receive group` in a **forward table**:
 
 - **`forward_group_id(spawn_token)`** — `Some` means this exact initial frame was

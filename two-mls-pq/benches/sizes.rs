@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 mod common;
-use common::{client, combiner_kp, suite_label};
+use common::{classical_kp, client, suite_label};
 use two_mls_pq::{key_packages::TwoMlsPqInvitation, session::TwoMlsPqSession};
 
 fn main() {
@@ -18,7 +18,7 @@ fn main() {
     // Bob's return is a sealed APQ welcome.
     let alice = client();
     let bob = client();
-    let alice_kp = combiner_kp(&alice);
+    let alice_kp = classical_kp(&alice);
 
     let bob_inv = TwoMlsPqInvitation::restore(bob.generate_invitation(true).unwrap()).unwrap();
     let bob_kp = bob_inv.combiner_key_package();
@@ -29,11 +29,12 @@ fn main() {
 
     // §A.1 pre-establishment app frames (v15): each send is a fresh envelope
     // re-stapling the establishment sections plus the app message. Bare shape
-    // (welcome + return-KP sections) vs self-sufficient host payload (which replaces
-    // the bare sections — here a thin wrapper over the welcome; a real identity
-    // envelope also carries the return KP + signatures).
+    // (welcome + CLASSICAL return-KP sections — v20: the PQ KP travels in A.4,
+    // hash-bound) vs self-sufficient host payload (which replaces the bare sections —
+    // here a thin wrapper over the welcome; a real identity envelope also carries the
+    // return KP + the bootstrap KP commitment + signatures).
     alice_s
-        .set_initial_return_key_package(combiner_kp(&alice))
+        .set_initial_return_key_package(classical_kp(&alice))
         .unwrap();
     alice_s.prepare_to_encrypt(None).unwrap();
     let pre_est_bare = alice_s.encrypt(payload.to_vec()).unwrap().cipher_text;
@@ -46,6 +47,7 @@ fn main() {
         .receive(
             opened.welcome.unwrap(),
             alice_kp,
+            alice_s.bootstrap_kp_commitment().unwrap(),
             b"sizes".to_vec(),
             None,
             None,
@@ -112,7 +114,7 @@ fn main() {
     let (pq_ek, pq_ct, pq_bind, pq_commit_len, cl_commit_len, staple_len) = {
         let a = client();
         let b = client();
-        let a_kp = combiner_kp(&a);
+        let a_kp = classical_kp(&a);
         let b_inv = TwoMlsPqInvitation::restore(b.generate_invitation(true).unwrap()).unwrap();
         let b_kp = b_inv.combiner_key_package();
         let a_s = TwoMlsPqSession::initiate(Arc::clone(&a), b_kp, None).unwrap();
@@ -122,6 +124,7 @@ fn main() {
             .receive(
                 opened.welcome.unwrap(),
                 a_kp,
+                a_s.bootstrap_kp_commitment().unwrap(),
                 b"sizes-pq".to_vec(),
                 None,
                 None,

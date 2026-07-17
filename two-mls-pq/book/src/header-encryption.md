@@ -354,7 +354,7 @@ orientation and the crate's constructor names — Alice builds `Group_A` ≡ ASG
    replay-stable across re-sends, and a re-sent envelope has a fresh HPKE ephemeral
    (different outer bytes, identical plaintext), which is exactly why `open_initial`
    returns the plaintext and the host keys the token on it. Then
-   `receive(welcome, their_kp, spawn_token)` joins.
+   `receive(welcome, their_classical_kp, bootstrap_kp_commitment, spawn_token)` joins.
 3. **Bob `receive`/`accept`** — joins Group_A, builds Group_B classical; captures
    `HeaderKey(Group_B, e₀)` into his window. His send key is
    `HeaderKey(Group_A, join epoch)` — derivable immediately.

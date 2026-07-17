@@ -32,10 +32,18 @@ pub fn combiner_kp(client: &TwoMlsPqPrincipal) -> CombinerKeyPackage {
     client.generate_combiner_key_package().unwrap()
 }
 
+/// The initiator's CLASSICAL return key package (§A.1: the return group starts
+/// classical-only; the PQ KP travels in A.4, hash-bound).
+pub fn classical_kp(client: &TwoMlsPqPrincipal) -> Vec<u8> {
+    client
+        .generate_key_package(MlsCipherSuite::x25519_chacha())
+        .unwrap()
+}
+
 pub fn established() -> (Arc<TwoMlsPqSession>, Arc<TwoMlsPqSession>) {
     let alice = client();
     let bob = client();
-    let alice_kp = combiner_kp(&alice);
+    let alice_kp = classical_kp(&alice);
 
     // Production establishment path (mirrors `src/test_utils.rs`): Bob publishes an
     // invitation; Alice's first frame is the §A.1 envelope, which Bob opens and joins.
@@ -49,6 +57,7 @@ pub fn established() -> (Arc<TwoMlsPqSession>, Arc<TwoMlsPqSession>) {
         .receive(
             opened.welcome.unwrap(),
             alice_kp,
+            alice_session.bootstrap_kp_commitment().unwrap(),
             b"bench-establish".to_vec(),
             None,
             None,

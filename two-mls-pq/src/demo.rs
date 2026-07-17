@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use crate::{
     key_packages::parse_mls_key_package,
-    test_utils::{make_client, make_combiner_kp},
+    test_utils::{commitment_of, make_classical_kp, make_client, make_combiner_kp},
     MlsCipherSuite, PrincipalState, TwoMlsPqSession,
 };
 
@@ -61,10 +61,13 @@ fn demo_e2e_full_session() {
     );
     println!("    bob.clientId   = {} bytes", bob.client_id().bytes.len());
 
-    // Step 2 — combiner key packages (classical + ML-KEM-768 halves).
-    let alice_kp = make_combiner_kp(&alice);
+    // Step 2 — Bob's combiner key package (classical + ML-KEM-768 halves; the published
+    // shape Alice initiates to) and Alice's CLASSICAL return key package (§A.1: Bob's
+    // send group starts classical-only, so the establishment reply carries only the
+    // classical KP; Alice's PQ KP travels in A.4, hash-bound to the commitment below).
+    let alice_kp = make_classical_kp(&alice);
     let bob_kp = make_combiner_kp(&bob);
-    println!("[2] combiner key packages generated (classical + pq halves)");
+    println!("[2] key packages generated (bob: combiner; alice: classical return)");
 
     // Step 3 — parsing / routing signal.
     let bob_classical = assert_ok!(parse_mls_key_package(bob_kp.classical.clone()));
@@ -86,6 +89,7 @@ fn demo_e2e_full_session() {
         Arc::clone(&bob),
         welcome_a,
         alice_kp,
+        commitment_of(&alice_session),
         None
     ));
     let welcome_b = assert_some!(bob_session.pending_outbound());

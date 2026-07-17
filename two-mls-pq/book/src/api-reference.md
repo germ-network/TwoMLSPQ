@@ -59,11 +59,17 @@ The receiving side of a published key package — no live client required.
   `archive()` getter is off the FFI (see `TwoMlsPqSession` below for why). `state_seq()`
   reports the current push sequence.
 - `client_id()`, `combiner_key_package()` — what to publish.
-- `receive(welcome, their_key_package, spawn_token, new_client_id, expected_remote,
+- `receive(welcome, their_classical_key_package, bootstrap_kp_commitment, spawn_token,
+  new_client_id, expected_remote,
   expected_app_binding) -> TwoMlsPqSession` — establish from a remote initiator's welcome; rejects a
   re-delivered welcome (byte-identical, via the processed-welcome ledger) and a
   repeat remote (both `DuplicateWelcome`), and, for a single-use invitation whose key
   package has already been consumed, any further welcome (`InvitationSpent`).
+  `their_classical_key_package` is the initiator's CLASSICAL return key package (a bare
+  MLS KeyPackage message — §A.1: the return group starts classical-only).
+  `bootstrap_kp_commitment` is `H(initiator's PQ keyPackage)` from the signed
+  establishment payload, exactly 32 bytes: `pq_bootstrap_respond` refuses a bootstrap
+  KP′ hashing to anything else (`BootstrapKpMismatch`).
   `spawn_token` is an opaque, replay-stable identifier for the initial frame, keying
   the forward table.
   `new_client_id` is an optional **dedicated per-session principal**: when `Some`, the
@@ -124,8 +130,8 @@ for the session's lifetime — pass a **digest** of the app's immutable relation
 identity, not raw identifiers, and never empty (empty is reserved as invalid; `None` is
 the unbound state) — the crate never interprets the bytes (see
 [Group Rules](./group-rules.md) rule 8);
-`accept(client, welcome, their_key_package, expected_app_binding)` —
-the plaintext-welcome path (tests/embedded); `restore(core, checkpoint)` —
+`accept(client, welcome, their_classical_key_package, bootstrap_kp_commitment,
+expected_app_binding)` — the plaintext-welcome path (tests/embedded); `restore(core, checkpoint)` —
 self-contained restore from the two pushed blobs: they carry the session's signing
 identity, so restore rebuilds the exact client internally (no client argument),
 byte-exact in ClientId and signing keys, and the restored groups still sign with the keys

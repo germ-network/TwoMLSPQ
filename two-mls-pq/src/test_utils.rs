@@ -24,10 +24,23 @@ pub(crate) fn make_combiner_kp(client: &TwoMlsPqPrincipal) -> CombinerKeyPackage
     assert_ok!(client.generate_combiner_key_package())
 }
 
+/// The initiator's CLASSICAL return key package (a bare MLS KeyPackage message) — what
+/// `receive`/`accept` take since the return KP went classical-only (§A.1). Retaining,
+/// like the combiner generate, so the return-group join can resolve its private key.
+pub(crate) fn make_classical_kp(client: &TwoMlsPqPrincipal) -> Vec<u8> {
+    assert_ok!(client.generate_key_package(crate::MlsCipherSuite::x25519_chacha()))
+}
+
+/// The initiator session's A.4 bootstrap KP commitment, as the host would carry it in
+/// the signed establishment payload and the acceptor would thread it into `receive`.
+pub(crate) fn commitment_of(session: &TwoMlsPqSession) -> Vec<u8> {
+    assert_some!(session.bootstrap_kp_commitment())
+}
+
 pub(crate) fn establish_sessions() -> (Arc<TwoMlsPqSession>, Arc<TwoMlsPqSession>) {
     let alice = make_client();
     let bob = make_client();
-    let alice_kp = make_combiner_kp(&alice);
+    let alice_kp = make_classical_kp(&alice);
 
     // The production establishment path: Bob publishes an invitation (whose KP Alice
     // initiates to and which opens the §A.1 envelope). Alice's first frame is the sealed
@@ -43,6 +56,7 @@ pub(crate) fn establish_sessions() -> (Arc<TwoMlsPqSession>, Arc<TwoMlsPqSession
     let bob_session = assert_ok!(bob_inv.receive(
         assert_some!(opened.welcome),
         alice_kp,
+        commitment_of(&alice_session),
         b"establish".to_vec(),
         None,
         None,
