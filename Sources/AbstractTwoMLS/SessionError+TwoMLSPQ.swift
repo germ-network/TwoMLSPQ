@@ -59,6 +59,11 @@ extension AbstractTwoMLS.SessionError {
 		switch error {
 		case let pq as TwoMlsPqError:
 			let code: Code
+			// Most crate cases are self-describing via `code`; a few carry a
+			// surface-aware `detail` because the SAME crate variant means
+			// different things (and calls for different handling) depending on
+			// which door threw it.
+			var detail: String? = nil
 			switch pq {
 			case .Mls, .PskBinding:
 				code = .internalError
@@ -94,6 +99,24 @@ extension AbstractTwoMLS.SessionError {
 				code = .invalidClientId
 			case .RemoteIdentityMismatch:
 				code = .identityMismatch
+			case .BootstrapKpMismatch:
+				code = .bootstrapKpMismatch
+				switch surface {
+				case .receive:
+					// Establishment door: the commitment the host threaded in from
+					// the signed AppWelcome is not a valid H(A.4 key package).
+					detail = "bootstrap-KP commitment is not H(the initiator's PQ "
+						+ "key package): a malformed or mis-read 32-byte value, or a "
+						+ "tampered AppWelcome. The invitation is NOT consumed — "
+						+ "re-read the commitment from the signed envelope and retry."
+				default:
+					// A.4 side-band: a KP′ that hashes to something other than the
+					// commitment the signed envelope pinned.
+					detail = "A.4 bootstrap key package (KP′) does not hash to the "
+						+ "commitment the signed establishment envelope carried — a "
+						+ "substituted or tampered KP′. Discard the frame; the genuine "
+						+ "re-stapled KP′ still applies, session state untouched."
+				}
 			case .CredentialRejected:
 				code = .credentialRejected
 			case .ApqInfoMismatch:
@@ -109,7 +132,7 @@ extension AbstractTwoMLS.SessionError {
 			case .BindDischargeFailed:
 				code = .bindDischargeFailed
 			}
-			self.init(code: code, underlying: pq)
+			self.init(code: code, underlying: pq, detail: detail)
 
 		case let encoding as LinearEncodingError:
 			self.init(

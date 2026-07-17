@@ -536,7 +536,7 @@ struct InitiatorIdentityBindingDemo {
 	@Test func createGroupRejectsMismatchedRemoteIdentity() throws {
 		let acceptor = try ClientWrapper<AbstractTwoMLS.PQClient>()
 		let initiator = try AbstractTwoMLS.PQClient(clientId: .mock())
-		let (sendGroup, _, _) = try initiator.reply(
+		let (sendGroup, _, _, _) = try initiator.reply(
 			keyPackageMessage: acceptor.currentInvitation.encodedKeyPackage
 		)
 		do {
@@ -669,6 +669,10 @@ struct GroupIdSurfaceDemo {
 struct MockAppWelcome: Codable, Sendable {
 	let mySendGroupWelcome: Data
 	let myKeyPackage: Data
+	//v20: SHA-256 of the initiator's pre-committed A.4 bootstrap PQ key package;
+	//the app carries it in the SAME signed envelope as `myKeyPackage` and threads
+	//it back into `receive` (the classical backend returns/ignores empty).
+	let bootstrapKpCommitment: Data
 }
 
 //test helper for a generic 2-steps
@@ -686,14 +690,15 @@ extension AbstractTwoMLS.Client {
 		}
 
 		//APQ: the sendWelcome should be an APQWelcome
-		let (sendGroup, sendWelcome, myKeyPackage) = try reply(
+		let (sendGroup, sendWelcome, myKeyPackage, bootstrapKpCommitment) = try reply(
 			keyPackageMessage: encodedRemoteKpkg
 		)
 
 		//construct the TwoMLS group and encrypted, combined welcome
 		let mockAppWelcome = MockAppWelcome(
 			mySendGroupWelcome: sendWelcome,
-			myKeyPackage: myKeyPackage
+			myKeyPackage: myKeyPackage,
+			bootstrapKpCommitment: bootstrapKpCommitment
 		)
 		let (localSendGroup, encryptedCombinedWelcome) = try createTwoMLSGroup(
 			remoteAgentId: remoteClientId,
@@ -739,6 +744,7 @@ extension AbstractTwoMLS.Invitation {
 		return try receive(
 			sendGroupWelcome: decoded.mySendGroupWelcome,
 			remoteKeyPackage: decoded.myKeyPackage,
+			bootstrapKpCommitment: decoded.bootstrapKpCommitment,
 			remoteClientId: remoteClientId,
 			welcomeToken: welcomeToken,
 			stapledMessage: stapledPrivateMessage,

@@ -145,7 +145,15 @@ import TwoMLSPQ
 //     Session/invitation archives follow the crate's pre-release hard cut: a v0.4.1 blob
 //     fails CLOSED as ArchiveInvalid (.discardArtifact) and the session/invitation must be
 //     regenerated — availability loss only, no stale-PQ splice.
-private let expectedBindingContract: UInt64 = 19
+//   - v20 (TwoMLSPQ 0.6.0): the establishment return key package is CLASSICAL-only and the
+//     A.4 bootstrap KP is pre-committed, hash-bound. `receive`/`accept` take the bare
+//     classical return KP plus a required 32-byte `bootstrapKpCommitment` (SHA-256 of the
+//     initiator's PQ keyPackage, carried in the host's SIGNED establishment payload);
+//     `initiate` pre-commits that KP (`bootstrapKpCommitment()` exposes the hash) and
+//     `pqBootstrapRespond` rejects a KP′ hashing to anything else (new `BootstrapKpMismatch`
+//     error). `setInitialReturnKeyPackage` takes classical bytes. Archive layout changed
+//     (pre-release hard cut, as v0.5.0).
+private let expectedBindingContract: UInt64 = 20
 
 enum TwoMLSPQBindingContract {
 	static let verified: Void = {
@@ -852,6 +860,7 @@ extension AbstractTwoMLS {
 		public func receive(
 			sendGroupWelcome: Data,
 			remoteKeyPackage: Data,
+			bootstrapKpCommitment: Data,
 			remoteClientId: AbstractTwoMLS.ClientID,
 			welcomeToken: WelcomeToken,
 			stapledMessage: Data?,
@@ -869,13 +878,13 @@ extension AbstractTwoMLS {
 					detail: "dedicated principal id must be non-empty")
 			}
 
-			let pair = try decodeCombinerKeyPackage(bytes: remoteKeyPackage)
-
+			// v20: `remoteKeyPackage` is the initiator's CLASSICAL return key package (a
+			// bare MLS KeyPackage message), not a combiner blob — its PQ half now travels
+			// in A.4, hash-bound to `bootstrapKpCommitment`.
 			// Bind the key package to the authenticated identity from the validated
-			// welcome (also checks the pair's two halves agree on one credential).
-			// M4: the crate's own RemoteIdentityMismatch (via base.receive) maps to
+			// welcome. The crate's own RemoteIdentityMismatch (via base.receive) maps to
 			// the SAME `.identityMismatch` — one code, both origins.
-			let parsed = try parseCombinerKeyPackage(kp: pair)
+			let parsed = try parseMlsKeyPackage(bytes: remoteKeyPackage)
 			guard parsed.clientId.bytes == remoteClientId else {
 				throw AbstractTwoMLS.SessionError(
 					code: .identityMismatch,
@@ -910,7 +919,8 @@ extension AbstractTwoMLS {
 			let session = PQSession(
 				try base.receive(
 					welcome: sendGroupWelcome,
-					theirKeyPackage: pair,
+					theirClassicalKeyPackage: remoteKeyPackage,
+					bootstrapKpCommitment: bootstrapKpCommitment,
 					spawnToken: welcomeToken.wireFormat,
 					newClientId: nil,
 					expectedRemote: remoteClientId,
@@ -1010,7 +1020,8 @@ extension AbstractTwoMLS {
 		) throws(AbstractTwoMLS.SessionError) -> (
 			sendGroup: PQSession,
 			welcomeMessage: Data,
-			myKeyPackage: Data
+			myKeyPackage: Data,
+			bootstrapKpCommitment: Data
 		) {
 			return try mapPQErrors(.client) {
 			let pair = try decodeCombinerKeyPackage(bytes: keyPackageMessage)
@@ -1019,24 +1030,32 @@ extension AbstractTwoMLS {
 			let session = try TwoMlsPqSession.initiate(
 				client: base, theirKeyPackage: pair, appBinding: nil)
 			// `welcomeMessage` is the PLAINTEXT APQWelcome (contract 15): the app binds
-			// it — together with `myKeyPackage` — into its signed identity envelope
-			// (AnchorWelcome) and hands the result back via `createTwoMLSGroup`, which
-			// attaches it as the session's establishment-self-sufficient app payload.
-			// The crate re-staples that payload on the wire envelope of the initial
-			// frame AND of every pre-establishment app message, so any single frame
-			// establishes the acceptor.
+			// it — together with `myKeyPackage` and `bootstrapKpCommitment` — into its
+			// signed identity envelope (AnchorWelcome) and hands the result back via
+			// `createTwoMLSGroup`, which attaches it as the session's
+			// establishment-self-sufficient app payload. The crate re-staples that
+			// payload on the wire envelope of the initial frame AND of every
+			// pre-establishment app message, so any single frame establishes the
+			// acceptor.
 			guard let welcome = session.initialWelcome() else {
 				throw AbstractTwoMLS.SessionError(
 					code: .internalError,
 					detail: "PQClient.reply — initiate produced no welcome")
 			}
-			// The return-group key package uses the retaining generate path: this live
-			// session joins the acceptor's return welcome through its own client store
-			// (an invitation-held key package would be purged from the client).
-			let myKeyPackage = encodeCombinerKeyPackage(
-				keyPackage: try base.generateCombinerKeyPackage()
-			)
-			return (PQSession(session), welcome, myKeyPackage)
+			// The return-group key package is CLASSICAL-only (§A.1: the acceptor's send
+			// group starts classical-only; our PQ key package travels in A.4). The
+			// retaining generate path parks its private half in this live session's own
+			// client store so the return-welcome join can resolve it (an invitation-held
+			// key package would be purged from the client).
+			let myKeyPackage = try base.generateKeyPackage(suite: .x25519Chacha())
+			// The pre-committed A.4 bootstrap KP's hash, minted at `initiate` — Some on
+			// a fresh initiating session (consumed only at `pqBootstrapBegin`).
+			guard let commitment = session.bootstrapKpCommitment() else {
+				throw AbstractTwoMLS.SessionError(
+					code: .internalError,
+					detail: "PQClient.reply — initiate produced no bootstrap commitment")
+			}
+			return (PQSession(session), welcome, myKeyPackage, commitment)
 			}
 		}
 
