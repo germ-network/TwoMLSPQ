@@ -77,6 +77,37 @@ fn main() {
     alice_s.prepare_to_encrypt(Some(new_id)).unwrap();
     let rotation = alice_s.encrypt(payload.to_vec()).unwrap().cipher_text;
 
+    // Section split of the steady-state frame. Open the seal on the receiver and
+    // read the `[0x03][u32 staple][staple][u32 proposal][proposal][u32 app][app]`
+    // sections; the whole staple section is the commit `MLSMessage` (a
+    // `PublicMessage`). GUARD: the commit must fold a peer proposal by REFERENCE —
+    // its only by-value proposal is the small APQ PSK; a leaf-sized `Upd` inlined
+    // here (instead of referenced) would blow past the threshold.
+    let (rot_staple, rot_proposal, rot_app, rot_bv_n, rot_bv_bytes) = {
+        use mls_rs::mls_rs_codec::MlsSize;
+        use mls_rs::MlsMessage;
+        let plain = bob_s
+            .open_incoming(rotation.clone())
+            .unwrap()
+            .unwrap()
+            .frame;
+        let rd = |b: &[u8], at: usize| {
+            u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]) as usize
+        };
+        let staple_len = rd(&plain, 1);
+        let prop_at = 5 + staple_len;
+        let prop_len = rd(&plain, prop_at);
+        let app_len = rd(&plain, prop_at + 4 + prop_len);
+        let commit = MlsMessage::from_bytes(&plain[5..5 + staple_len]).unwrap();
+        let bv = commit.proposals_by_value();
+        let bv_bytes: usize = bv.iter().map(|p| p.mls_encoded_len()).sum();
+        assert!(
+            bv_bytes < 200,
+            "commit inlined a leaf-sized proposal ({bv_bytes} B) — the fold must be by reference"
+        );
+        (staple_len, prop_len, app_len, bv.len(), bv_bytes)
+    };
+
     // PQ ratchet (book: Protocol Flows §A.3) — fresh session pair.
     let (pq_ek, pq_ct, pq_bind, pq_commit_len, cl_commit_len, staple_len) = {
         let a = client();
@@ -150,6 +181,20 @@ fn main() {
         no_commit.len() - payload.len(),
         folding.len() - payload.len(),
         rotation.len() - payload.len(),
+    );
+    println!("--- rotation frame (0x03) section split ---");
+    println!(
+        "  staple(commit) : {:>4} B  ({} proposal(s) by value = {} B; peer Upd folded by reference)",
+        rot_staple, rot_bv_n, rot_bv_bytes
+    );
+    println!(
+        "  proposal(Upd)  : {:>4} B  (by value once; peer folds it by reference next round)",
+        rot_proposal
+    );
+    println!("  app            : {:>4} B", rot_app);
+    println!(
+        "  framing        : {:>4} B\n",
+        rotation.len() - rot_staple - rot_proposal - rot_app
     );
 
     {
