@@ -1,13 +1,18 @@
 # Wire Format
 
-Every outbound blob is a tagged frame — there are no bare MLS messages on the wire.
+Session-path blobs are tagged frames — no bare MLS messages ride the wire. The §A.1
+**invitation-channel envelope is the exception**: it is a raw HPKE blob with **no outer tag**
+(`[u32-LE kem_output_len][kem_output][ciphertext]`), because the transport channel already
+routes it to the HPKE opener and an outer discriminator would only fingerprint which frames
+carry PQ material. Discrimination moves INSIDE, to the authenticated leading tag of the
+HPKE plaintext (see "The §A.1 envelope" below).
 
 | Tag | Value | Meaning |
 |-----|-------|---------|
 | `APQ_TAG` | `0x01` | APQ Welcome (invitation channel; also the message frame's staple-slot welcome form) |
 | `MESSAGE_FRAME_TAG` | `0x03` | The message frame: `[staple][proposal][app]` — the only message-path frame |
 | `APQ_PRIVATE_MESSAGE_TAG` | `0x05` | Draft-02 §7 `APQPrivateMessage` — the staple slot's bind form. Declared in `apq` |
-| `INITIAL_ENVELOPE_TAG` | `0x07` | §A.1 envelope — the one frame on the invitation channel. Declared in `key_packages` |
+| `ESTABLISHMENT_VECTOR_TAG` | `0x07` | Inner leading tag of the §A.1 establishment vector (an HPKE-plaintext byte, not an outer wire tag). Declared in `key_packages` |
 | `PRE_ESTABLISHMENT_APP_TAG` | `0x09` | §A.1 app staple, envelope-interior only: `[0x09][BSG-cl PrivateMessage]` |
 | `PQ_BOOTSTRAP_KP_TAG` | `0x13` | Bootstrap: PQ key package for the deferred send-group half |
 | `PQ_BOOTSTRAP_WELCOME_TAG` | `0x15` | Bootstrap: the new PQ group's Welcome (PQ-groups-only; no classical commit) |
@@ -23,10 +28,30 @@ its round's next leg.
 The table is the prose half of the registry; `frames::tests::BANDS` is the executable
 half, and the two must agree. The space spans **three declaration sites**, because each tag
 lives with the thing it tags: `APQ_TAG` and `APQ_PRIVATE_MESSAGE_TAG` in the `apq` crate,
-`INITIAL_ENVELOPE_TAG` in `key_packages` (an envelope is not a session frame), and the rest
-in `session::frames`. Ownership is local; allocation is global — which is exactly how
-`0x15` once got claimed twice, by a reader of `frames.rs` for whom the envelope tag was
-invisible.
+`ESTABLISHMENT_VECTOR_TAG` in `key_packages` (an inner HPKE-plaintext tag, not a session
+frame), and the rest in `session::frames`. Ownership is local; allocation is global — which
+is exactly how `0x15` once got claimed twice, by a reader of `frames.rs` for whom the
+establishment-vector tag was invisible.
+
+## The §A.1 envelope
+
+The envelope blob has **no outer tag** — `[u32-LE kem_output_len][kem_output][ciphertext]`,
+a raw HPKE seal. The two §A.1 frame kinds share this identical outer shape and are told apart
+only AFTER HPKE-open, by the authenticated leading tag of the plaintext:
+
+- `ESTABLISHMENT_VECTOR_TAG` (`0x07`) → the establishment reply — four u32-LE
+  length-prefixed sections `[app_payload][welcome][return_key_package][stapled_message]`.
+- `PQ_BOOTSTRAP_KP_TAG` (`0x13`) → the parallel-delivered A.4 bootstrap KP frame, carried
+  verbatim (`[0x13][KP′]`) — the same side-band frame steady-state A.4 uses, only its outer
+  framing differs (HPKE envelope here vs. header-sealed side-band later).
+
+This is the same discipline the whole tag space follows: the transport path limits which keys
+the receiver decrypts with, then the inner authenticated tag guides parsing — like the `0x03`
+message frame's staple slot self-discriminating on its first byte (`0x01` welcome vs. `0x00`
+commit). An outer tag would be observable and would fingerprint which frames carry PQ
+material; there is nothing it could disambiguate that the channel does not already. The
+initiator re-seals under a fresh HPKE ephemeral on every send (reply and bootstrap KP alike),
+so a stable inner KP′ never produces a linkable blob.
 
 The space is **banded**. Each band owns a contiguous range of odd bytes, is packed from its
 start, and keeps its remaining room at the end:
@@ -34,7 +59,7 @@ start, and keeps its remaining room at the end:
 | Band | Range | Used | Contents |
 |------|-------|------|----------|
 | Message path | `0x01`–`0x05` | 3 / 3 | APQWelcome, message frame, APQPrivateMessage staple form. Full, and closed by design — the message path has exactly these shapes |
-| A.1 establishment | `0x07`–`0x11` | 2 / 6 | envelope (invitation channel), pre-establishment staple. The hybrid nested envelope would land in the room |
+| A.1 establishment | `0x07`–`0x11` | 2 / 6 | establishment-vector inner tag, pre-establishment staple. The hybrid nested envelope would land in the room |
 | PQ side-band | `0x13`–`0x31` | 6 / 16 | exactly what `pq_frame_kind` classifies, in lifecycle order: bootstrap, ratchet, re-key |
 
 Banding is what makes "the side-band is `0x13`–`0x31`" a claim that survives growth. It was

@@ -362,6 +362,7 @@ sequenceDiagram
 
     Alice->>Bob: One HPKE envelope [ app payload ∥ APQ Welcome = { Welcome' [ASG-PQ], Welcome(PSK) [ASG-cl] } ],<br/>sealed to the PQ EK in Bob's KP'. The signed app payload carries: the welcome pair, Alice's CLASSICAL<br/>return KP (for Bob's Add(Alice) into BSG-cl), and H(Alice's KP') — the PQ keyPackage itself travels<br/>in A.4 and must verify against this signed hash
     Alice->>Bob: App messages [ASG-cl] — each re-wrapped in a fresh HPKE envelope to Bob's KP' (as the initial frame above),<br/>re-stapling the APQ Welcome — any single one is a complete establishment vector (Bob can join and read it),<br/>so the initial frame need not survive. Alice has no receiving group to header-seal against until she joins BSG-cl —<br/>after that she header-seals, re-stapling the Welcome until her first commit
+    Alice-->>Bob: (parallel, v21) A.4 bootstrap KP frame [0x13][KP'] in its OWN fresh HPKE envelope, coin-flipped onto the outbox with the reply.<br/>Same raw-blob outer shape as the reply (no outer tag); Bob holds it in memory until establishment, then feeds pq_bootstrap_respond (A.4)
 
     Note over Bob: Join Alice's send group (both halves)
     Bob->>Bob: Process Welcome' → join ASG-PQ, then Welcome(PSK) → join ASG-cl
@@ -401,6 +402,25 @@ package *inside* the signed envelope — and when one is present the composer om
 without an identity envelope. Exactly one of the two shapes is on the wire. Note also that
 step 8's "app payload" is that signed identity envelope; the "app messages" of step 9 are the
 ordinary application ciphertexts stapled to each pre-establishment frame — different things.
+
+**Envelope framing & parallel KP′ delivery (v21).** The §A.1 envelope is a RAW HPKE blob with
+**no outer tag** — `[u32-LE kem_output_len][kem_output][ciphertext]` — because the invitation
+channel already routes it to the HPKE opener and an outer tag would only fingerprint which
+frames carry PQ material. The HPKE plaintext LEADS with an authenticated tag that selects the
+frame kind: `ESTABLISHMENT_VECTOR_TAG` (`0x07`) for the reply's four sections
+(`[app_payload][welcome][return_key_package][stapled_message]`), or `PQ_BOOTSTRAP_KP_TAG`
+(`0x13`) for the verbatim A.4 bootstrap KP. This is the same discipline the tag space follows
+throughout — transport limits which keys decrypt, then the inner authenticated tag guides
+parsing (like the `0x03` message frame's `0x01`/`0x00` staple slot). Because the KP bytes are
+pre-committed at `initiate` (`pq_bootstrap_envelope`), the initiator ships that KP frame IN
+PARALLEL with the reply — its own fresh HPKE blob, coin-flipped onto the outbox — so an
+acceptor already holding the KP′ when its return welcome goes out sends `Welcome'` alongside it
+and A.4 completes ~one round trip sooner. The first emit registers the A.4 round exactly as
+`pq_bootstrap_begin` does; every later pre-establishment send re-seals the retained frame under
+a fresh HPKE ephemeral (unlinkable) without advancing state. The acceptor holds an
+early-arriving KP frame in memory, unarchived, and applies it only after the AppWelcome
+verifies and the hash matches — the apply gate is structural (`pq_bootstrap_respond` cannot run
+before `receive` creates the session). See A.4.
 
 ### A.2 Classical ratchet (granular) — classical-only commits
 
@@ -535,6 +555,20 @@ sequenceDiagram
     Bob-)Bob: Derive the same S from [BSG-PQ] — same epoch, same domain — then from the staple<br/>apply pq_message to [ASG-PQ], then t_message to [ASG-cl]
     Note over Alice,Bob: Both send groups are now full APQ groups. Bob's dedicated principal was<br/>adopted at establishment (A.1) — if a rotation has since been canonicalized in the classical<br/>ratchet (A.2), the new PQ leaves simply carry the current credential (catch-up). BSG-PQ binds<br/>into BSG-cl at the next PQ ratchet (A.3, run by Bob on his send group) — classical never blocks<br/>on PQ, so this defers freshness, not liveness. Turn flips — Bob is now the initiator.
 ```
+
+**Parallel pre-delivery (v21).** The KP′ of step 1 is the one pre-committed at establishment
+(`initiate` mints it; A.1's signed payload carries its hash), so it need not wait for the
+round to open post-establishment. The initiator ships it IN PARALLEL with the A.1 reply, in
+its own fresh HPKE envelope (`pq_bootstrap_envelope`) — same raw-blob outer shape as the reply,
+told apart by the inner `0x13` tag. An acceptor that already holds the KP′ when its return
+welcome goes out runs step 2 immediately and sends `Welcome'` (step 3) alongside the return
+welcome, so A.4 completes ~one round trip sooner. Emitting the parallel frame registers the
+round on the initiator (so `pq_bootstrap_begin` becomes a no-op and an early `Welcome'` is
+already expected); the acceptor holds an early KP frame in memory, unarchived, applying it only
+after the AppWelcome verifies and the hash matches — the apply gate is structural
+(`pq_bootstrap_respond` cannot run before `receive` creates the session). If the parallel frame
+is dropped, the round self-heals: the initiator re-sends it pre-establishment and falls back to
+the steady-state side-band (step 1 above) after the cutover.
 
 **Why the bind leg exists.** Without it A.4 is the only two-leg operation, and the turn has to
 pass at Bob's *send* rather than at an apply — so Bob is expected to open the next A.3 round while

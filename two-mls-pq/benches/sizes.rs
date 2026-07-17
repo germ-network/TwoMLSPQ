@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 mod common;
-use common::{classical_kp, client, suite_label};
+use common::{classical_kp, client, open_establishment, suite_label};
 use two_mls_pq::{key_packages::TwoMlsPqInvitation, session::TwoMlsPqSession};
 
 fn main() {
@@ -25,7 +25,7 @@ fn main() {
 
     let alice_s = TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None).unwrap();
     let envelope_a = alice_s.pending_outbound().unwrap();
-    let opened = bob_inv.open_initial(envelope_a.clone()).unwrap();
+    let opened = open_establishment(&bob_inv, envelope_a.clone());
 
     // §A.1 pre-establishment app frames (v15): each send is a fresh envelope
     // re-stapling the establishment sections plus the app message. Bare shape
@@ -119,7 +119,7 @@ fn main() {
         let b_kp = b_inv.combiner_key_package();
         let a_s = TwoMlsPqSession::initiate(Arc::clone(&a), b_kp, None).unwrap();
         let envelope = a_s.pending_outbound().unwrap();
-        let opened = b_inv.open_initial(envelope).unwrap();
+        let opened = open_establishment(&b_inv, envelope);
         let b_s = b_inv
             .receive(
                 opened.welcome.unwrap(),

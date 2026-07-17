@@ -173,7 +173,7 @@ fn test_receive_rejects_malformed_commitment() {
     let bob_kp = bob_inv.combiner_key_package();
     let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
     let envelope = assert_some!(alice_session.pending_outbound());
-    let opened = assert_ok!(bob_inv.open_initial(envelope));
+    let opened = assert_ok!(bob_inv.open_establishment(envelope));
     let welcome = assert_some!(opened.welcome);
     assert_err!(
         bob_inv.receive(
@@ -3037,7 +3037,8 @@ fn test_prepare_result_proposal_message_at_establishment_binds_the_dedicated_can
         bob_inv.combiner_key_package(),
         None
     ));
-    let opened = assert_ok!(bob_inv.open_initial(assert_some!(alice_session.pending_outbound())));
+    let opened =
+        assert_ok!(bob_inv.open_establishment(assert_some!(alice_session.pending_outbound())));
 
     let dedicated_id = make_client().client_id();
     let bob_session = assert_ok!(bob_inv.receive(
@@ -3723,10 +3724,12 @@ fn test_initial_envelope_roundtrip_return_welcome_sealed() {
     app.extend_from_slice(&welcome_a);
     assert_ok!(alice_s.set_initial_app_payload(app.clone()));
     let envelope = assert_some!(alice_s.pending_outbound());
-    assert_eq!(
+    // The frame is the opaque HPKE blob (no outer tag since contract 21): it does not begin
+    // with the plaintext welcome's tag, and the welcome bytes never appear in the ciphertext.
+    assert_ne!(
         envelope.first(),
-        Some(&crate::key_packages::INITIAL_ENVELOPE_TAG),
-        "the initial frame is the tagged opaque envelope, not the plaintext welcome"
+        Some(&super::APQ_TAG),
+        "the initial frame is the opaque HPKE envelope, not the plaintext welcome"
     );
     assert!(
         !envelope.windows(4).any(|w| w == &welcome_a[..4]),
@@ -3736,7 +3739,7 @@ fn test_initial_envelope_roundtrip_return_welcome_sealed() {
     // Bob opens the envelope: the payload round-trips; the bare sections are omitted
     // (a present payload IS the establishment vector); the host recovers the welcome
     // from its own payload framing.
-    let opened = assert_ok!(bob_inv.open_initial(envelope));
+    let opened = assert_ok!(bob_inv.open_establishment(envelope));
     assert_eq!(opened.app_payload, Some(app));
     assert_eq!(
         opened.welcome, None,
@@ -3778,7 +3781,7 @@ fn test_initial_envelope_no_app_payload() {
     let bob_kp = bob_inv.combiner_key_package();
 
     let alice_s = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
-    let opened = assert_ok!(bob_inv.open_initial(assert_some!(alice_s.pending_outbound())));
+    let opened = assert_ok!(bob_inv.open_establishment(assert_some!(alice_s.pending_outbound())));
     assert_eq!(opened.app_payload, None);
     assert_ok!(bob_inv.receive(
         assert_some!(opened.welcome),
@@ -3789,6 +3792,204 @@ fn test_initial_envelope_no_app_payload() {
         None,
         None,
     ));
+}
+
+/// Part 3: the parallel bootstrap-KP frame — the verbatim `[0x13][KP′]` side-band frame
+/// sealed as a RAW HPKE blob (`seal_hpke_blob`, no outer tag, no sections) — HPKE-opens and
+/// dispatches to `OpenedInitial::BootstrapKp`, returning the frame byte-for-byte. This is the
+/// shape the initiator ships in parallel with the reply; the inner 0x13 leading tag is what
+/// tells it apart from an establishment vector after opening.
+#[test]
+fn test_bootstrap_kp_envelope_roundtrips() {
+    use crate::key_packages::TwoMlsPqInvitation;
+    let bob = make_client();
+    let bob_inv = assert_ok!(TwoMlsPqInvitation::restore(assert_ok!(
+        bob.generate_invitation(true)
+    )));
+    let bob_kp = bob_inv.combiner_key_package();
+
+    // The verbatim 0x13 A.4 frame; the envelope never interprets it past the leading tag.
+    let mut kp_frame = vec![super::PQ_BOOTSTRAP_KP_TAG];
+    kp_frame.extend_from_slice(b"opaque-a4-bootstrap-frame");
+    let sealed = assert_ok!(crate::key_packages::seal_hpke_blob(
+        &bob_kp,
+        kp_frame.clone()
+    ));
+    // `open_bootstrap_kp` requires the 0x13 dispatch (an establishment vector → `Err`), so a
+    // clean open proves the inner-tag dispatch AND the verbatim round-trip.
+    assert_eq!(assert_ok!(bob_inv.open_bootstrap_kp(sealed)), kp_frame);
+}
+
+/// Negative control: an establishment vector with EVERY section absent is rejected — a valid
+/// reply must carry at least an `app_payload` or a `welcome` (see `decode_initial_plaintext`).
+#[test]
+fn test_all_empty_initial_envelope_rejected() {
+    use crate::key_packages::TwoMlsPqInvitation;
+    let bob = make_client();
+    let bob_inv = assert_ok!(TwoMlsPqInvitation::restore(assert_ok!(
+        bob.generate_invitation(true)
+    )));
+    let sealed = assert_ok!(crate::key_packages::seal_initial_envelope(
+        &bob_inv.combiner_key_package(),
+        None,
+        None,
+        None,
+        None,
+    ));
+    assert!(bob_inv.open_initial(sealed).is_err());
+}
+
+/// Part 3 end-to-end: the initiator delivers its A.4 KP′ IN PARALLEL with the establishment
+/// reply, and A.4 completes with NO separate post-establishment `pq_bootstrap_begin` round.
+/// The acceptor opens the early bootstrap-only envelope, HOLDS the KP′ until the reply
+/// establishes its session, then feeds it to `pq_bootstrap_respond` and sends `Welcome'`
+/// alongside its return welcome; the initiator — whose emit registered the A.4 round and
+/// carried it through the establishment cutover — binds the early `Welcome'`. Proves the
+/// verbatim carriage into `respond` and that the round registration survives the cutover.
+#[test]
+fn test_parallel_bootstrap_completes_a4_without_a_begin_round() {
+    use crate::key_packages::TwoMlsPqInvitation;
+    let alice = make_client();
+    let bob = make_client();
+    let alice_kp = make_classical_kp(&alice);
+    let bob_inv = assert_ok!(TwoMlsPqInvitation::restore(assert_ok!(
+        bob.generate_invitation(true)
+    )));
+    let bob_kp = bob_inv.combiner_key_package();
+
+    let alice_s = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
+    // Read the commitment BEFORE emitting: the emit consumes the pre-committed KP and quiets
+    // the accessor (in the app the host reads it at reply time, before the parallel send).
+    let commitment = commitment_of(&alice_s);
+
+    // Alice emits the parallel bootstrap envelope + her reply (coin-flipped on the wire).
+    let env_kp = assert_ok!(alice_s.pq_bootstrap_envelope());
+    let env_reply = assert_some!(alice_s.pending_outbound());
+
+    // Bob opens the parallel envelope and HOLDS the KP′ (dispatched by its inner 0x13 tag).
+    let held_kp = assert_ok!(bob_inv.open_bootstrap_kp(env_kp));
+
+    // Bob opens the reply and establishes.
+    let opened_reply = assert_ok!(bob_inv.open_establishment(env_reply));
+    let bob_s = assert_ok!(bob_inv.receive(
+        assert_some!(opened_reply.welcome),
+        alice_kp,
+        commitment,
+        b"tok".to_vec(),
+        None,
+        None,
+        None,
+    ));
+
+    // Bob feeds the held KP′ to respond — standing up its deferred send-PQ half — and can
+    // now send Welcome' alongside its return welcome (the latency win).
+    assert_ok!(bob_s.pq_bootstrap_respond(held_kp));
+    let welcome_prime = assert_some!(bob_s.pq_take_pending_outbound());
+    let return_welcome = assert_some!(bob_s.pending_outbound());
+
+    // Alice establishes off the return welcome, then binds the EARLY Welcome' — her emit
+    // registered the A.4 round, so no separate `pq_bootstrap_begin` was ever called.
+    assert_ok!(alice_s.process_incoming(return_welcome));
+    assert!(alice_s.is_established());
+    assert_ok!(alice_s.pq_bootstrap_bind(welcome_prime));
+    discharge_bind(&alice_s, &bob_s, b"parallel-bind");
+
+    assert!(alice_s.is_fully_established());
+    assert!(bob_s.is_fully_established());
+    assert!(bob_s.epochs().pq_epoch > 0);
+}
+
+/// Part 3 delta #3 — retriability of an EARLY `Welcome'`. Registering the A.4 round at emit
+/// (pre-establishment) makes it reachable for a reordered `Welcome'` to arrive before the
+/// initiator has joined its classical half. Binding it then is a NON-CORRUPTING, retriable
+/// failure (guard-first — the pre-committed secret is never spent), and the SAME welcome
+/// binds intact once the return welcome establishes the session.
+#[test]
+fn test_parallel_bootstrap_welcome_before_establishment_is_retriable() {
+    use crate::key_packages::TwoMlsPqInvitation;
+    let alice = make_client();
+    let bob = make_client();
+    let alice_kp = make_classical_kp(&alice);
+    let bob_inv = assert_ok!(TwoMlsPqInvitation::restore(assert_ok!(
+        bob.generate_invitation(true)
+    )));
+    let bob_kp = bob_inv.combiner_key_package();
+
+    let alice_s = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
+    let commitment = commitment_of(&alice_s);
+    let env_kp = assert_ok!(alice_s.pq_bootstrap_envelope());
+    let env_reply = assert_some!(alice_s.pending_outbound());
+    let held_kp = assert_ok!(bob_inv.open_bootstrap_kp(env_kp));
+    let bob_s = assert_ok!(bob_inv.receive(
+        assert_some!(assert_ok!(bob_inv.open_establishment(env_reply)).welcome),
+        alice_kp,
+        commitment,
+        b"tok".to_vec(),
+        None,
+        None,
+        None,
+    ));
+    assert_ok!(bob_s.pq_bootstrap_respond(held_kp));
+    let welcome_prime = assert_some!(bob_s.pq_take_pending_outbound());
+    let return_welcome = assert_some!(bob_s.pending_outbound());
+
+    // Bind BEFORE establishing (no classical half yet): a non-corrupting, retriable error.
+    assert!(alice_s.pq_bootstrap_bind(welcome_prime.clone()).is_err());
+    assert!(!alice_s.is_fully_established());
+
+    // Establish, then the SAME welcome binds — the retry is intact.
+    assert_ok!(alice_s.process_incoming(return_welcome));
+    assert_ok!(alice_s.pq_bootstrap_bind(welcome_prime));
+    discharge_bind(&alice_s, &bob_s, b"retried-bind");
+    assert!(alice_s.is_fully_established());
+    assert!(bob_s.is_fully_established());
+}
+
+/// Part 3 — register-once, re-seal-per-send PURE. The first `pq_bootstrap_envelope` registers
+/// the A.4 round (one Checkpoint); every later pre-cutover emit re-seals the SAME retained KP′
+/// under a FRESH HPKE ephemeral (distinct ciphertext, unlinkable) WITHOUT advancing state — so
+/// no extra Checkpoint is pushed. Both envelopes open to the identical verbatim `[0x13][KP′]`.
+#[test]
+fn test_parallel_bootstrap_envelope_reseals_fresh_without_extra_checkpoint() {
+    use crate::key_packages::TwoMlsPqInvitation;
+    let alice = make_client();
+    let bob = make_client();
+    let bob_inv = assert_ok!(TwoMlsPqInvitation::restore(assert_ok!(
+        bob.generate_invitation(true)
+    )));
+    let bob_kp = bob_inv.combiner_key_package();
+    let alice_s = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
+
+    let sink = Arc::new(RecordingSink::default());
+    // `install_sink` pushes exactly one baseline Checkpoint.
+    assert_ok!(alice_s.install_sink(sink.clone()));
+    assert_eq!(sink.kinds(), vec![crate::BlobKind::Checkpoint]);
+
+    // First emit REGISTERS the round → one more Checkpoint.
+    let env1 = assert_ok!(alice_s.pq_bootstrap_envelope());
+    assert_eq!(
+        sink.kinds(),
+        vec![crate::BlobKind::Checkpoint, crate::BlobKind::Checkpoint],
+        "the first emit registers the A.4 round with a Checkpoint"
+    );
+
+    // Second emit is a PURE re-seal → fresh ciphertext, NO extra Checkpoint.
+    let env2 = assert_ok!(alice_s.pq_bootstrap_envelope());
+    assert_ne!(
+        env1, env2,
+        "fresh HPKE per send — the re-seals are unlinkable"
+    );
+    assert_eq!(
+        sink.kinds().len(),
+        2,
+        "re-seal-per-send is pure — no extra Checkpoint"
+    );
+
+    // Both envelopes carry the identical verbatim `[0x13][KP′]` frame.
+    let f1 = assert_ok!(bob_inv.open_bootstrap_kp(env1));
+    let f2 = assert_ok!(bob_inv.open_bootstrap_kp(env2));
+    assert_eq!(f1, f2);
+    assert_eq!(f1.first(), Some(&super::PQ_BOOTSTRAP_KP_TAG));
 }
 
 /// Establishment-time principal selection: `receive(new_client_id: Some)` creates the
@@ -3808,7 +4009,7 @@ fn test_receive_under_dedicated_principal() {
     let bob_kp = bob_inv.combiner_key_package();
 
     let alice_s = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
-    let opened = assert_ok!(bob_inv.open_initial(assert_some!(alice_s.pending_outbound())));
+    let opened = assert_ok!(bob_inv.open_establishment(assert_some!(alice_s.pending_outbound())));
 
     let dedicated = crate::test_utils::test_client_id();
     let bob_s = assert_ok!(bob_inv.receive(
@@ -3881,7 +4082,7 @@ fn test_empty_principal_id_rejected() {
     let bob_kp = bob_inv.combiner_key_package();
 
     let alice_s = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
-    let opened = assert_ok!(bob_inv.open_initial(assert_some!(alice_s.pending_outbound())));
+    let opened = assert_ok!(bob_inv.open_establishment(assert_some!(alice_s.pending_outbound())));
     assert!(matches!(
         bob_inv.receive(
             assert_some!(opened.welcome.clone()),
@@ -3927,7 +4128,7 @@ fn test_standalone_welcome_surfaces_dedicated_principal() {
     let bob_kp = bob_inv.combiner_key_package();
 
     let alice_s = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
-    let opened = assert_ok!(bob_inv.open_initial(assert_some!(alice_s.pending_outbound())));
+    let opened = assert_ok!(bob_inv.open_establishment(assert_some!(alice_s.pending_outbound())));
     let dedicated = crate::test_utils::test_client_id();
     let bob_s = assert_ok!(bob_inv.receive(
         assert_some!(opened.welcome),
@@ -3968,7 +4169,7 @@ fn test_dedicated_principal_full_lifecycle() {
     let bob_kp = bob_inv.combiner_key_package();
 
     let alice_s = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
-    let opened = assert_ok!(bob_inv.open_initial(assert_some!(alice_s.pending_outbound())));
+    let opened = assert_ok!(bob_inv.open_establishment(assert_some!(alice_s.pending_outbound())));
     let dedicated = crate::test_utils::test_client_id();
     let bob_s = assert_ok!(bob_inv.receive(
         assert_some!(opened.welcome),
@@ -4091,11 +4292,11 @@ fn test_initial_envelope_resend_same_plaintext() {
     );
     // …but each opens to an app_payload the host can key a stable token on.
     assert_eq!(
-        assert_ok!(bob_inv.open_initial(e1)).app_payload,
+        assert_ok!(bob_inv.open_establishment(e1)).app_payload,
         Some(b"p".to_vec())
     );
     assert_eq!(
-        assert_ok!(bob_inv.open_initial(e2)).app_payload,
+        assert_ok!(bob_inv.open_establishment(e2)).app_payload,
         Some(b"p".to_vec())
     );
 }
@@ -4120,7 +4321,7 @@ fn test_spent_invitation_cannot_open_initial() {
         bob_kp.clone(),
         None
     ));
-    let opened = assert_ok!(bob_inv.open_initial(assert_some!(alice_s.pending_outbound())));
+    let opened = assert_ok!(bob_inv.open_establishment(assert_some!(alice_s.pending_outbound())));
     assert_ok!(bob_inv.receive(
         assert_some!(opened.welcome),
         alice_kp,
@@ -4200,13 +4401,12 @@ fn test_pre_establishment_sends_acceptor_joins_from_restaple() {
     assert_ok!(alice_s.prepare_to_encrypt(None));
     let frame2 = assert_ok!(alice_s.encrypt(b"hello-2".to_vec()));
     assert_ne!(frame1.cipher_text, frame2.cipher_text);
-    assert_eq!(
-        frame1.cipher_text.first(),
-        Some(&crate::key_packages::INITIAL_ENVELOPE_TAG)
-    );
+    // Each pre-establishment frame is a fresh opaque HPKE envelope (no outer tag since
+    // contract 21): distinct bytes per send (above), and not the plaintext welcome.
+    assert_ne!(frame1.cipher_text.first(), Some(&super::APQ_TAG));
 
     // Frame 1 alone is a complete establishment vector: welcome + return KP + staple.
-    let opened1 = assert_ok!(bob_inv.open_initial(frame1.cipher_text));
+    let opened1 = assert_ok!(bob_inv.open_establishment(frame1.cipher_text));
     let w1 = assert_some!(opened1.welcome);
     assert_eq!(w1, welcome_a, "the stable prefix is the birth welcome");
     let kp1 = assert_some!(opened1.return_key_package);
@@ -4229,7 +4429,7 @@ fn test_pre_establishment_sends_acceptor_joins_from_restaple() {
 
     // Frame 2: same welcome → the content-keyed ledger routes to the spawned session
     // (a second `receive` would reject it as DuplicateWelcome); its staple delivers.
-    let opened2 = assert_ok!(bob_inv.open_initial(frame2.cipher_text));
+    let opened2 = assert_ok!(bob_inv.open_establishment(frame2.cipher_text));
     let w2 = assert_some!(opened2.welcome);
     let owner = assert_some!(bob_inv.processed_welcome_group_id(w2));
     assert_eq!(
@@ -4296,7 +4496,7 @@ fn test_birth_captured_replier_restores_send_ready() {
 
     // The acceptor joins from the SECOND frame (any single frame suffices) and reads
     // both staples' messages in order of arrival.
-    let opened2 = assert_ok!(bob_inv.open_initial(frame2.cipher_text));
+    let opened2 = assert_ok!(bob_inv.open_establishment(frame2.cipher_text));
     let kp = assert_some!(opened2.return_key_package);
     let bob_s = assert_ok!(bob_inv.receive(
         assert_some!(opened2.welcome),
@@ -4319,7 +4519,7 @@ fn test_birth_captured_replier_restores_send_ready() {
     );
     // Frame 1 arrives late (out of order): same welcome routes via the ledger; its
     // staple still decrypts (mls-rs generation skipping).
-    let opened1 = assert_ok!(bob_inv.open_initial(frame1.cipher_text));
+    let opened1 = assert_ok!(bob_inv.open_establishment(frame1.cipher_text));
     assert_some!(bob_inv.processed_welcome_group_id(assert_some!(opened1.welcome)));
     assert_eq!(
         assert_some!(
@@ -4362,7 +4562,7 @@ fn test_cutover_clears_envelope_state_and_stales_straddling_prepare() {
     assert_ok!(alice_s.prepare_to_encrypt(None));
     let frame = assert_ok!(alice_s.encrypt(b"pre".to_vec()));
 
-    let opened = assert_ok!(bob_inv.open_initial(frame.cipher_text));
+    let opened = assert_ok!(bob_inv.open_establishment(frame.cipher_text));
     let kp = assert_some!(opened.return_key_package);
     let bob_s = assert_ok!(bob_inv.receive(
         assert_some!(opened.welcome),
@@ -4418,7 +4618,7 @@ fn test_pre_establishment_guards() {
     // Establish, then: setters are pre-establishment-only on the initiator…
     assert_ok!(alice_s.prepare_to_encrypt(None));
     let frame = assert_ok!(alice_s.encrypt(b"pre".to_vec()));
-    let opened = assert_ok!(bob_inv.open_initial(frame.cipher_text));
+    let opened = assert_ok!(bob_inv.open_establishment(frame.cipher_text));
     let bob_s = assert_ok!(bob_inv.receive(
         assert_some!(opened.welcome),
         alice_kp,
@@ -4492,7 +4692,7 @@ fn test_spliced_staple_fails_open_at_group_decrypt() {
     ));
     assert_ok!(alice_s.prepare_to_encrypt(None));
     let frame_a = assert_ok!(alice_s.encrypt(b"real".to_vec()));
-    let opened_a = assert_ok!(bob_inv.open_initial(frame_a.cipher_text));
+    let opened_a = assert_ok!(bob_inv.open_establishment(frame_a.cipher_text));
     let welcome_a = assert_some!(opened_a.welcome);
     let bob_s = assert_ok!(bob_inv.receive(
         welcome_a.clone(),
@@ -4510,7 +4710,7 @@ fn test_spliced_staple_fails_open_at_group_decrypt() {
     assert_ok!(carol_s.prepare_to_encrypt(None));
     let frame_c = assert_ok!(carol_s.encrypt(b"carol".to_vec()));
     let carol_staple =
-        assert_some!(assert_ok!(bob_inv.open_initial(frame_c.cipher_text)).stapled_message);
+        assert_some!(assert_ok!(bob_inv.open_establishment(frame_c.cipher_text)).stapled_message);
     let forged = assert_ok!(crate::key_packages::seal_initial_envelope(
         &bob_inv.combiner_key_package(),
         None,
@@ -4521,7 +4721,7 @@ fn test_spliced_staple_fails_open_at_group_decrypt() {
 
     // The welcome routes to Alice's spawned session — where the spliced staple fails
     // group decrypt and is dropped fail-open, mutating nothing.
-    let opened_forged = assert_ok!(bob_inv.open_initial(forged));
+    let opened_forged = assert_ok!(bob_inv.open_establishment(forged));
     assert_some!(bob_inv.processed_welcome_group_id(assert_some!(opened_forged.welcome)));
     let seq = bob_s.state_seq();
     assert_err!(
@@ -4555,7 +4755,7 @@ fn test_setters_regenerate_envelope_and_stamp_depends_on_seq() {
     // Bare shape first: the return KP rides.
     assert_ok!(alice_s.set_initial_return_key_package(alice_kp));
     let seq_after_kp = alice_s.state_seq();
-    let opened = assert_ok!(bob_inv.open_initial(assert_some!(alice_s.pending_outbound())));
+    let opened = assert_ok!(bob_inv.open_establishment(assert_some!(alice_s.pending_outbound())));
     assert_some!(opened.welcome);
     assert_some!(opened.return_key_package);
     assert!(opened.app_payload.is_none());
@@ -4570,7 +4770,7 @@ fn test_setters_regenerate_envelope_and_stamp_depends_on_seq() {
     let mut payload = b"identity:".to_vec();
     payload.extend_from_slice(&welcome);
     assert_ok!(alice_s.set_initial_app_payload(payload.clone()));
-    let opened = assert_ok!(bob_inv.open_initial(assert_some!(alice_s.pending_outbound())));
+    let opened = assert_ok!(bob_inv.open_establishment(assert_some!(alice_s.pending_outbound())));
     assert_eq!(opened.app_payload, Some(payload));
     assert!(
         opened.welcome.is_none(),
@@ -4813,12 +5013,11 @@ fn test_prepare_to_encrypt_before_established_is_noop_round() {
     let session = assert_ok!(TwoMlsPqSession::initiate(alice, bob_kp, None));
     let prep = assert_ok!(session.prepare_to_encrypt(None));
     assert!(prep.proposal_message.is_empty() && !prep.did_commit);
-    assert_eq!(
-        assert_ok!(session.encrypt(b"first".to_vec()))
-            .cipher_text
-            .first(),
-        Some(&crate::key_packages::INITIAL_ENVELOPE_TAG)
-    );
+    // The replier can send first: encrypt emits a §A.1 envelope — an opaque HPKE blob (no
+    // outer tag since contract 21), not the plaintext welcome.
+    let frame = assert_ok!(session.encrypt(b"first".to_vec()));
+    assert!(!frame.cipher_text.is_empty());
+    assert_ne!(frame.cipher_text.first(), Some(&super::APQ_TAG));
 }
 
 #[test]
@@ -5573,7 +5772,7 @@ fn test_app_binding_survives_archive_restore() {
         Some(binding.clone())
     ));
     let envelope = assert_some!(alice_session.pending_outbound());
-    let opened = assert_ok!(bob_inv.open_initial(envelope));
+    let opened = assert_ok!(bob_inv.open_establishment(envelope));
     let bob_session = assert_ok!(bob_inv.receive(
         assert_some!(opened.welcome),
         alice_kp,

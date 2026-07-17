@@ -52,7 +52,7 @@ pub(crate) fn establish_sessions() -> (Arc<TwoMlsPqSession>, Arc<TwoMlsPqSession
 
     let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
     let envelope = assert_some!(alice_session.pending_outbound());
-    let opened = assert_ok!(bob_inv.open_initial(envelope));
+    let opened = assert_ok!(bob_inv.open_establishment(envelope));
     let bob_session = assert_ok!(bob_inv.receive(
         assert_some!(opened.welcome),
         alice_kp,
