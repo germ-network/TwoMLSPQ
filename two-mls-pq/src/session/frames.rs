@@ -62,8 +62,8 @@ use super::*;
 // `staple` is the sender's latest send-group classical commit, re-stapled on every frame
 // until superseded — or the send group's APQWelcome until the first commit exists. The
 // slot self-discriminates by first byte (an APQWelcome starts 0x01, an MLSMessage 0x00).
-// A rotation is not a frame kind: it is a commit whose authenticated_data carries the new
-// ClientId (ratchet commits have empty AD). Per A.2 the sender commits in its OWN send
+// A rotation is not a frame kind: it is a commit whose updated leaf credential carries the
+// new ClientId (the receiver diffs the leaf across the apply). Per A.2 the sender commits in its OWN send
 // group; the receiver applies the stapled commit to its recv group idempotently and stages
 // the stapled Upd for app approval.
 pub(crate) const MESSAGE_FRAME_TAG: u8 = 0x03;
@@ -73,7 +73,7 @@ pub(crate) const MESSAGE_FRAME_TAG: u8 = 0x03;
 // envelope is not a session frame. It heads this band; the staple below packs in behind it,
 // and the room past 0x09 is where a hybrid nested envelope would go.
 
-/// §A.1 pre-establishment app staple: `[tag][BSG-cl PrivateMessage]` — the initiator's
+/// §A.1 pre-establishment app staple: `[tag][ASG-cl PrivateMessage]` — the initiator's
 /// app message riding a §A.1 envelope's `stapled_message` section before its recv group
 /// exists (the 0x03 message frame is structurally unavailable then: its proposal section
 /// is mandatory and there is no recv group to propose into). Travels ONLY inside the

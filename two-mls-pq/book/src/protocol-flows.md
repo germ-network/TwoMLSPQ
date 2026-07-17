@@ -139,7 +139,7 @@ Independently, we have an exchange of large PQ key messages, carried as dedicate
     2. Alice and Bob take turns initiating PQ operations. Alice is first, and makes a variation of PQ re-keying to bootstrap Bob’s group:
         1. (In place of a proposal) Alice sends a PQ keyPackage to Bob
         2. (In place of a commit) Bob constructs the PQ half of his send group from it and replies with a Welcome (for that group)
-        3. The operation ends when Alice joins via the Welcome, and Bob is now the initiator
+        3. Alice joins via the Welcome and closes the round with a bind, exactly as the PQ ratchet's — the only difference is where S comes from (a group exporter off the joined group's birth epoch rather than a KEM exchange). The bind rides her next classical commit as the staple; Bob takes the turn on applying it
     
     (Bob’s dedicated principal is selected at session establishment, not here. Alice started with a principal she generated to talk to Bob’s invitation principal; Bob accepts under a principal dedicated to Alice — his send group is created directly under it, and Alice adopts it when she joins his group. The PQ bootstrap and re-key only carry already-canonical credentials onto the PQ leaves.)
 
@@ -163,7 +163,7 @@ sequenceDiagram
     KeyDir->>Alice: Returns Bob's delegate key + keyPackages (incl. the APQ keyPackage)
 
     Alice->>Alice: Creates an APQ group from Bob's APQ keyPackage = Alice's send group
-    Alice->>Bob: One HPKE envelope [ app payload ∥ APQ Welcome (Alice's send group) ],<br/>sealed to the PQ EK in Bob's APQ keyPackage
+    Alice->>Bob: One HPKE envelope [ app payload ∥ APQ Welcome (Alice's send group) ],<br/>sealed to the PQ EK in Bob's APQ keyPackage. The signed app payload carries the welcome,<br/>Alice's CLASSICAL return keyPackage (all Bob needs — his send group starts classical-only),<br/>and a hash of Alice's PQ keyPackage (which travels later, in the PQ bootstrap side-band)
 
     Alice->>Bob: App messages in Alice's send group — each a fresh HPKE envelope to Bob's keyPackage (as the initial frame),<br/>re-stapling the APQ Welcome — any single one lets Bob join and read it. Once Alice joins Bob's send group she<br/>header-seals instead, still re-stapling the Welcome until her first commit supersedes it
 
@@ -207,7 +207,9 @@ sequenceDiagram
     Bob-)Bob: Constructs the PQ half of his send group from Alice's keyPackage,<br/>under his current — already dedicated — principal (no credential change here)
     Bob-)Alice: (in place of a Commit) Welcome (for that PQ half), as a side-band frame
     Alice-)Alice: Joins the PQ half of Bob's send group via the Welcome
-    Note over Alice,Bob: Bob is now the initiator. His dedicated principal was selected<br/>at session establishment (see above), not in this step.
+    Alice-)Bob: Closes the round with a bind, exactly as the PQ ratchet's — S comes from a group exporter<br/>off the joined group's birth epoch rather than a KEM exchange. The bind rides her next<br/>classical COMMIT as the APQPrivateMessage staple (granular detail in A.4)
+    Bob-)Bob: Derives the same S, applies both halves from the staple → Bob is now the initiator
+    Note over Alice,Bob: The turn flips when Bob APPLIES the stapled bind — the initiator relinquishes at its<br/>terminal send, the responder takes the turn on applying it. Bob's dedicated principal<br/>was selected at session establishment (see above), not in this step.
 ```
 
 ## PQ Ratchet
@@ -220,9 +222,9 @@ sequenceDiagram
 
     Note over Alice,Bob: PQ ratchet (Alice is the initiator this round)
     Alice-)Bob: PQ EK (encapsulation key), as a side-band frame
-    Bob-)Bob: Encapsulates to the EK → fresh shared secret S + ciphertext CT
-    Bob-)Alice: CT, as a side-band frame
-    Alice-)Alice: Decapsulates CT → S, imports S as a PSK → partial commit in her PQ group (pq epoch advances)
+    Bob-)Bob: Picks a fresh random secret S and SEALS it to the EK — under a key bound to the KEM shared<br/>secret and a repeatable export of Alice's PQ group at its current epoch → [enc][sealed S]
+    Bob-)Alice: [enc][sealed S], as a side-band frame
+    Alice-)Alice: Opens S — the AEAD tag is the receipt (a stale or misdirected ciphertext fails here, her ephemeral<br/>and PQ leaf intact) — imports S as a PSK → partial commit in her PQ group (pq epoch advances)
     Alice-)Alice: Discards the DK and S — folded in, so nothing waits holding it
     Alice-)Alice: (at her next classical COMMIT) classical commit imports a PSK from the PQ group<br/>(no update path, so no PQ ciphertext — staple-able)
     Alice-)Bob: Ordinary message frame, stapling an APQPrivateMessage: the PQ partial commit + the classical commit
@@ -240,13 +242,15 @@ sequenceDiagram
 
     Note over Alice,Bob: PQ re-key (run on cadence, or to carry a credential the classical ratchet
     Note over Alice,Bob: has already canonicalized onto the PQ leaves).
-    Note over Alice,Bob: Runs in isolation on the PQ groups, so the classical ratchet is not blocked
+    Note over Alice,Bob: The round's ONE large updatePath commit runs in isolation on the PQ group,
+    Note over Alice,Bob: so the classical ratchet is not blocked
     Alice-)Bob: Proposal to update Alice's leafNode in the PQ half of Bob's send group, as a side-band frame
-    Bob-)Bob: Full Commit in the PQ half of Bob's send group (injects a PSK from the opposite send group's PQ half)
-    Bob-)Alice: Bob's Commit + a corresponding Proposal for the PQ half of Alice's send group, as a side-band frame
-    Alice-)Alice: Applies Bob's Commit, then full-commits Bob's Proposal<br/>in the PQ half of her send group (injects a PSK from the opposite send group's PQ half)
-    Alice-)Bob: Alice's Commit, as a side-band frame
-    Bob-)Bob: Applies Alice's Commit → Bob is now the initiator
+    Bob-)Bob: Full Commit in the PQ half of Bob's send group — the round's one updatePath commit, which<br/>also replaces Bob's own leaf (injects a PSK from the opposite send group's PQ half only<br/>if it has advanced since he last bound it)
+    Bob-)Alice: Bob's Commit, as a side-band frame — re-sent until the ack answers it
+    Alice-)Alice: Applies Bob's Commit, then acks: a pathless partial commit in the PQ half of her own send group,<br/>importing a secret exported from the just-rekeyed group at its NEW epoch (deriving it proves the apply)
+    Alice-)Bob: The ack rides Alice's next classical COMMIT as the APQPrivateMessage staple — not a side-band frame
+    Bob-)Bob: Applies both halves from the staple → Bob is now the initiator
+    Note over Alice,Bob: One round re-keys ONE group — the turn alternation brings the other group's round next.<br/>The turn flips when Bob applies the stapled ack.
 ```
 
 ---
@@ -356,7 +360,7 @@ sequenceDiagram
     Alice->>Alice: Export apq_psk from ASG-PQ (Safe Extensions, component 0xFF01)
     Alice->>Alice: [ASG-cl] Add(Bob KP) + PSK=apq_psk + Commit → ASG-cl epoch 1 (PQ-seeded)
 
-    Alice->>Bob: One HPKE envelope [ app payload ∥ APQ Welcome = { Welcome' [ASG-PQ], Welcome(PSK) [ASG-cl] } ],<br/>sealed to the PQ EK in Bob's KP'
+    Alice->>Bob: One HPKE envelope [ app payload ∥ APQ Welcome = { Welcome' [ASG-PQ], Welcome(PSK) [ASG-cl] } ],<br/>sealed to the PQ EK in Bob's KP'. The signed app payload carries: the welcome pair, Alice's CLASSICAL<br/>return KP (for Bob's Add(Alice) into BSG-cl), and H(Alice's KP') — the PQ keyPackage itself travels<br/>in A.4 and must verify against this signed hash
     Alice->>Bob: App messages [ASG-cl] — each re-wrapped in a fresh HPKE envelope to Bob's KP' (as the initial frame above),<br/>re-stapling the APQ Welcome — any single one is a complete establishment vector (Bob can join and read it),<br/>so the initial frame need not survive. Alice has no receiving group to header-seal against until she joins BSG-cl —<br/>after that she header-seals, re-stapling the Welcome until her first commit
 
     Note over Bob: Join Alice's send group (both halves)
@@ -368,6 +372,30 @@ sequenceDiagram
     Bob->>Bob: [BSG-cl] Create group + Add(Alice) seeded with PSK from ASG-cl → BSG-cl epoch 1,<br/>created under the dedicated principal
     Note over Alice,Bob: BSG-PQ is deferred so Bob can send app messages immediately (see A.4).<br/>Alice adopts Bob's dedicated principal when she joins BSG-cl.
 ```
+
+**The return key package is classical-only; the PQ key package travels in A.4, hash-bound.**
+Bob's send group is created classical-only (BSG-PQ is deferred to A.4), so the establishment
+envelope needs to carry only Alice's classical return key package. Alice's PQ key package for
+BSG-PQ is delivered where it is consumed — A.4's first side-band leg — and the signed app
+payload binds it in advance: it carries a hash of the PQ key package, and Bob verifies the
+key package A.4 delivers against that hash before constructing BSG-PQ around it. The binding
+is what roots the PQ leaf in the signed identity envelope: the side-band channel is
+confidential to the established peer, but a bare MLS key package message carries no anchor
+signature of its own.
+
+> **Spec is ahead of the code here.** The implementation currently transports the full dual
+> combiner key package in the app payload — its PQ half is validated for identity consistency
+> but never consumed (A.4 mints a fresh key package), ~2.6 KB of dead weight per establishment
+> reply. The classical-only + hashed-KP' shape above is the intended design; the code change
+> is tracked separately.
+
+**One envelope, two shapes (either/or).** The "∥" above is not concatenation. A host app
+payload must be establishment-self-sufficient — it carries the welcome and the return key
+package *inside* the signed envelope — and when one is present the composer omits the bare
+`welcome`/`return_key_package` sections; the bare shape (no app payload) exists for hosts
+without an identity envelope. Exactly one of the two shapes is on the wire. Note also that
+step 8's "app payload" is that signed identity envelope; the "app messages" of step 9 are the
+ordinary application ciphertexts stapled to each pre-establishment frame — different things.
 
 ### A.2 Classical ratchet (granular) — classical-only commits
 
@@ -402,9 +430,9 @@ sequenceDiagram
 
     Alice-)Alice: Generate fresh PQ EK, DK
     Alice-)Bob: PQ EK (fresh encapsulation key), as a dedicated side-band frame
-    Bob-)Bob: Encapsulate to EK → (S, CT)
-    Bob-)Alice: CT, as a dedicated side-band frame
-    Alice-)Alice: Decapsulate CT → S
+    Bob-)Bob: Pick a fresh random S, encapsulate to EK, and SEAL S under a key bound to the KEM shared<br/>secret + a repeatable export of [ASG-PQ] at its current epoch → [enc][sealed S]
+    Bob-)Alice: [enc][sealed S], as a dedicated side-band frame
+    Alice-)Alice: Open S — the AEAD tag is the explicit receipt: a stale or misdirected ciphertext fails HERE,<br/>with EK/DK and her PQ leaf intact (ML-KEM decapsulation alone returns garbage, not an error)
 
     Alice-)Alice: [ASG-PQ] PSK=S + Commit' (no updatePath — PARTIAL, so it stays small) → pq_epoch++<br/>(psk_id carries the 0x52 injected-secret domain byte)
     Alice-)Alice: Discard DK and S — the secret is folded in, so nothing waits holding it

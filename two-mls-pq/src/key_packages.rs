@@ -338,7 +338,8 @@ pub fn initial_envelope_tag() -> u8 {
 /// - `welcome` — the bare MLS `APQWelcome_A` to hand to `receive` (no app payload).
 /// - `return_key_package` — the initiator's return-group combiner key package as one
 ///   opaque [`encode_combiner_key_package`] blob (decode before handing to `receive`).
-/// - `stapled_message` — a pre-establishment app message (`[0x09][BSG-cl ciphertext]`),
+/// - `stapled_message` — a pre-establishment app message (`[0x09][ASG-cl ciphertext]` —
+///   sealed in the initiator's send group),
 ///   re-stapled on every initiator frame until establishment; hand it to the spawned
 ///   session's `process_incoming` AFTER the join (fail-open: it is an optional early
 ///   delivery — the sender re-sends until its first commit).
@@ -696,8 +697,9 @@ impl TwoMlsPqInvitation {
         // --- Lock-free validations: pure, side-effect-free, so a rejection here touches
         // nothing and needs no lock. ---
         //
-        // Empty ids are reserved (the rotation-AD discriminator can never announce
-        // one) — reject rather than mint an unannounceable principal.
+        // Empty ids are reserved (no leaf credential carries one, so no rotation
+        // commit could ever announce it) — reject rather than mint an unannounceable
+        // principal.
         if new_client_id.as_deref().is_some_and(<[u8]>::is_empty) {
             return Err(TwoMlsPqError::InvalidClientId);
         }
