@@ -430,7 +430,7 @@ sequenceDiagram
 
     Alice-)Alice: Generate fresh PQ EK, DK
     Alice-)Bob: PQ EK (fresh encapsulation key), as a dedicated side-band frame
-    Bob-)Bob: Pick a fresh random S; encapsulate to EK; SEAL S under a key bound to the KEM shared<br/>secret + a repeatable export of [ASG-PQ] at its current epoch → [enc][sealed S]
+    Bob-)Bob: Pick a fresh random S, encapsulate to EK, and SEAL S under a key bound to the KEM shared<br/>secret + a repeatable export of [ASG-PQ] at its current epoch → [enc][sealed S]
     Bob-)Alice: [enc][sealed S], as a dedicated side-band frame
     Alice-)Alice: Open S — the AEAD tag is the explicit receipt: a stale or misdirected ciphertext fails HERE,<br/>with EK/DK and her PQ leaf intact (ML-KEM decapsulation alone returns garbage, not an error)
 
