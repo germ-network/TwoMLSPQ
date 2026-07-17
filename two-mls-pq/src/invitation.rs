@@ -136,10 +136,11 @@ pub(crate) type DecodedArchive = (
 
 impl CombinerInvitation {
     /// Encode to an opaque blob: `[version][classical u16 BE][pq u16 BE]` header, then the
-    /// MLS-codec fields.
+    /// MLS-codec fields. The suite bytes come from the declared suite's wire encoding
+    /// (`TwoMlsSuite::to_wire` — the one authority `decode` validates against).
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut out = vec![INVITATION_VERSION];
-        out.extend_from_slice(&crate::providers::APQ_SUITE.to_wire());
+        out.extend_from_slice(&crate::suite::TwoMlsSuite::CURRENT.to_wire());
         self.mls_encode(&mut out)
             .map_err(|_| TwoMlsPqError::ArchiveInvalid)?;
         Ok(out)

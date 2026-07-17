@@ -6,20 +6,16 @@
 use std::sync::Arc;
 
 use two_mls_pq::{
-    key_packages::{
-        CombinerKeyPackage, InitialFrame, OpenedInitial, TwoMlsPqInvitation, TwoMlsPqPrincipal,
-    },
+    key_packages::{CombinerKeyPackage, InitialFrame, TwoMlsPqInvitation, TwoMlsPqPrincipal},
     session::TwoMlsPqSession,
     MlsCipherSuite,
 };
 
-/// Bench-side mirror of the test-only `TwoMlsPqInvitation::open_establishment`: open a §A.1
-/// envelope and require the establishment variant (benches only ever open the reply).
+/// Open a §A.1 envelope and require the establishment variant (benches only ever open the
+/// reply) — the crate's shared harness flattener (`benchmark_util` exposes it), so the
+/// `OpenedInitial` dispatch has exactly one copy.
 pub fn open_establishment(inv: &TwoMlsPqInvitation, blob: Vec<u8>) -> InitialFrame {
-    match inv.open_initial(blob).unwrap() {
-        OpenedInitial::Establishment { frame } => frame,
-        OpenedInitial::BootstrapKp { .. } => unreachable!("establishment envelope expected"),
-    }
+    inv.open_establishment(blob).unwrap()
 }
 
 /// A fresh, unique ClientId for benches. The bytes are opaque — uniqueness is all that

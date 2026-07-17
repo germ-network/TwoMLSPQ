@@ -932,7 +932,13 @@ fn encode_archive(
     use mls_rs::mls_rs_codec::{MlsEncode, MlsSize};
     let mut out = Zeroizing::new(Vec::with_capacity(5 + wire.mls_encoded_len()));
     out.push(SESSION_ARCHIVE_VERSION);
-    out.extend_from_slice(&suite.to_wire());
+    // Header suite bytes: the declared suite's wire id (`TwoMlsSuite::to_wire`, the one
+    // encoding authority `decode_wire` validates against). The session's stored pair is
+    // definitionally the declared suite's pair (every session is constructed via
+    // `crypto_config`); the debug_assert names that invariant rather than letting the
+    // two silently diverge under a future multi-suite edit.
+    debug_assert_eq!(suite.to_wire(), crate::suite::TwoMlsSuite::CURRENT.to_wire());
+    out.extend_from_slice(&crate::suite::TwoMlsSuite::CURRENT.to_wire());
     wire.mls_encode(&mut out)
         .map_err(|_| TwoMlsPqError::ArchiveInvalid)?;
     Ok(out.to_vec())

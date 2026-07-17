@@ -572,7 +572,8 @@ its own fresh HPKE envelope (`pq_bootstrap_envelope`) — same raw-blob outer sh
 told apart by the inner `0x13` tag. An acceptor that already holds the KP′ when its return
 welcome goes out runs step 2 immediately and sends `Welcome'` (step 3) alongside the return
 welcome, so A.4 completes ~one round trip sooner. Emitting the parallel frame registers the
-round on the initiator (so `pq_bootstrap_begin` becomes a no-op and an early `Welcome'` is
+round on the initiator (so `pq_bootstrap_begin` becomes idempotent — it re-seals and returns
+the retained frame instead of registering again — and an early `Welcome'` is
 already expected); the acceptor holds an early KP frame in memory, unarchived, applying it only
 after the AppWelcome verifies and the hash matches — the apply gate is structural
 (`pq_bootstrap_respond` cannot run before `receive` creates the session). If the parallel frame

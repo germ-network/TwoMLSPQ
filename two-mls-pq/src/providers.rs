@@ -28,6 +28,10 @@ use crate::{Result, TwoMlsPqError};
 mod selected {
     pub(crate) type Classical = mls_rs_crypto_cryptokit::CryptoKitProvider;
     pub(crate) type Pq = mls_rs_crypto_cryptokit::CryptoKitMlKemProvider;
+    // ML-KEM-768 BY TYPE — unlike the awslc branch, this cannot follow the declared
+    // suite's `hpke` facet at runtime. `tests::pq_kem_type_pin_matches_declared_suite`
+    // is the tripwire: a new `TwoMlsSuite` variant with a different PQ KEM must update
+    // this alias by hand.
     pub(crate) type PqKem = mls_rs_crypto_cryptokit::ml_kem::MlKem768Kem;
 
     pub(crate) fn classical() -> Classical {
@@ -123,4 +127,20 @@ pub(crate) fn header_aead_suite(
     classical()
         .cipher_suite_provider(crate::suite::TwoMlsSuite::CURRENT.header_aead())
         .ok_or(TwoMlsPqError::Mls)
+}
+
+#[cfg(test)]
+mod tests {
+    /// Tripwire for the cryptokit backend's compile-time KEM pin: its `selected::PqKem`
+    /// is ML-KEM-768 BY TYPE (`MlKem768Kem`), not derived from the declared suite the way
+    /// the awslc branch's `MlKemKem::new(pq_cipher_suite())` is. If this fires, a new
+    /// `TwoMlsSuite` variant changed the `hpke` facet — update the cryptokit `PqKem`
+    /// alias to match, or the two backends silently run different A.3 ratchet KEMs.
+    #[test]
+    fn pq_kem_type_pin_matches_declared_suite() {
+        assert_eq!(
+            crate::suite::TwoMlsSuite::CURRENT.hpke(),
+            mls_rs::CipherSuite::ML_KEM_768,
+        );
+    }
 }

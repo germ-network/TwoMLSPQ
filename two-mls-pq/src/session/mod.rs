@@ -1701,9 +1701,14 @@ impl TwoMlsPqSession {
     /// establishment payload (next to the classical return key package), and the peer
     /// threads it back through `receive`/`accept`, where `pq_bootstrap_respond`
     /// enforces it — anchoring the ML-KEM key material to the host's signed
-    /// establishment rather than resting it on classical channel auth alone. `None` on
-    /// acceptor sessions and once `pq_bootstrap_begin` has consumed the retained KP
-    /// (read it at reply time, which is when the envelope is composed).
+    /// establishment rather than resting it on classical channel auth alone.
+    ///
+    /// `None` on acceptor sessions and once EITHER consumer of the retained KP has run:
+    /// `pq_bootstrap_begin`, or the Part 3 parallel `pq_bootstrap_envelope` (whose FIRST
+    /// emit registers the round and consumes the KP). **Read it before emitting**: it is
+    /// available from `initiate`, the signed reply must carry it, and the parallel frame
+    /// ships alongside that reply — compose-the-reply-then-emit is the only order that
+    /// works, and this accessor going quiet afterwards is the tell if the order slips.
     pub fn bootstrap_kp_commitment(&self) -> Option<Vec<u8>> {
         self.lock().bootstrap_kp.as_deref().map(crate::sha256)
     }

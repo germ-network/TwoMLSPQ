@@ -41,9 +41,10 @@ use mls_rs::CipherSuite;
 
 /// The named suites TwoMLS can run. One variant today; a future suite is a new
 /// variant, not a new constant — every facet accessor is `match`-exhaustive, so
-/// adding one forces each derived decision to be made explicitly.
+/// adding one forces each derived decision to be made explicitly. (Deliberately
+/// NOT `#[non_exhaustive]`: the attribute would be inert on a crate-private type,
+/// and the exhaustive in-crate matching is the whole forcing-function.)
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[non_exhaustive]
 pub(crate) enum TwoMlsSuite {
     /// Curve25519/ChaCha classical · ML-KEM-768 PQ · ChaCha20-Poly1305 header
     /// AEAD · SHA-256 digest.

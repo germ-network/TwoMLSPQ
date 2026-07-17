@@ -620,22 +620,25 @@ impl MlsCipherSuite {
         self.value
     }
 
-    /// True if this suite is the post-quantum (ML-KEM-768) component of a Combiner pair — the
-    /// PQ half TwoMLS handles. Use `is_combiner_classical` to identify the classical half
-    /// before routing — do not route a Combiner classical KP to mls-rs-uniffi-ios.
+    /// True if this suite is the post-quantum component of the declared Combiner pair
+    /// (`TwoMlsSuite::CURRENT.pair().pq` — ML-KEM-768 today), the PQ half TwoMLS handles.
+    /// Use `is_combiner_classical` to identify the classical half before routing — do not
+    /// route a Combiner classical KP to mls-rs-uniffi-ios. Reads the declared suite, not a
+    /// local constant, so these routing predicates track a future suite variant.
     ///
     /// (Renamed from `is_supported` in binding contract v4: the name always meant "is the PQ
     /// combiner suite", not "is a supported suite".)
     pub fn is_combiner_pq(&self) -> bool {
-        self.value == Self::ML_KEM_768
+        self.value == u16::from(crate::suite::TwoMlsSuite::CURRENT.pair().pq)
     }
 
-    /// True if this suite is the classical component of a Combiner pair (0x0003).
-    /// When a key package with this suite is paired with an ML-KEM-768 key package,
-    /// both belong to TwoMLS as a `CombinerKeyPackage` — do not route the classical
-    /// half to mls-rs-uniffi-ios independently.
+    /// True if this suite is the classical component of the declared Combiner pair
+    /// (`TwoMlsSuite::CURRENT.pair().classical` — 0x0003 today). When a key package with
+    /// this suite is paired with the declared PQ key package, both belong to TwoMLS as a
+    /// `CombinerKeyPackage` — do not route the classical half to mls-rs-uniffi-ios
+    /// independently.
     pub fn is_combiner_classical(&self) -> bool {
-        self.value == Self::DHKEM_X25519_CHACHA
+        self.value == u16::from(crate::suite::TwoMlsSuite::CURRENT.pair().classical)
     }
 }
 
