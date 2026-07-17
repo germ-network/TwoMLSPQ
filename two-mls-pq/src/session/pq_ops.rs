@@ -53,6 +53,42 @@ pub(in crate::session) fn require_peer_update(
     }
 }
 
+/// Retire any bootstrap pin (a frozen establishment credential held admissible past
+/// window eviction — see `PartySequence::pin`) that NO live PQ-half leaf still carries.
+/// The initiator pins its OWN establishment id in `mine` (to join the Welcome' whose
+/// added leaf still bears it) and the responder pins the peer's in `theirs` (to admit
+/// that leaf) — both catch up over separate A.5 rounds (a leaf in BSG-PQ and one in
+/// ASG-PQ), so BOTH sequences are pruned here. Sound: a credential a leaf still bears
+/// stays pinned, so an in-progress catch-up never loses admissibility. Cheap: at most two
+/// 2-party PQ halves, only on A.5 applies.
+pub(in crate::session) fn retire_stale_pins(inner: &SessionInner) {
+    let mut carried: Vec<Vec<u8>> = Vec::new();
+    for group in [inner.send_group.as_ref(), inner.recv_group.as_ref()] {
+        let Some(pq) = group.and_then(|g| g.pq.as_ref()) else {
+            continue;
+        };
+        for idx in 0u32..2 {
+            if let Ok(id) = sender_client_id(pq, idx) {
+                carried.push(id);
+            }
+        }
+    }
+    inner.with_auth(|core| {
+        let prune = |seq: &mut apq::authentication::PartySequence| {
+            let stale: Vec<Vec<u8>> = seq
+                .pinned_ids()
+                .filter(|p| !carried.iter().any(|c| c.as_slice() == *p))
+                .map(<[u8]>::to_vec)
+                .collect();
+            for id in &stale {
+                seq.unpin(id);
+            }
+        };
+        prune(&mut core.mine);
+        prune(&mut core.theirs);
+    });
+}
+
 #[uniffi::export]
 impl TwoMlsPqSession {
     /// Initiator step 1 — generate an ML-KEM ephemeral and return the encapsulation-key message
@@ -481,6 +517,9 @@ impl TwoMlsPqSession {
             if let Some(psk) = &cross_psk {
                 inner.forget_psk(psk.storage_id());
             }
+            // The peer's leaf in our send-PQ just caught up: retire a bootstrap pin no live
+            // PQ leaf still carries (see `retire_stale_pins`).
+            retire_stale_pins(inner);
             inner.pq_inflight = Some(PqInflight::RekeyResponded);
             // REPLACES our previous frame; the initiator's stapled ack answers it, and the
             // staple arm's clear is what empties the slot — no retirement stamp (this is a
@@ -623,6 +662,10 @@ impl TwoMlsPqSession {
             // COMMIT as an APQPrivateMessage staple, and the staple's re-send until
             // superseded heals a lost one.
             inner.commit_pq_and_owe_bind(&s)?;
+            // The peer's leaf in our recv mirror caught up applying its Commit' above:
+            // retire a bootstrap pin no live PQ leaf still carries (see
+            // `retire_stale_pins`).
+            retire_stale_pins(inner);
             // Our Upd' is spent — the Commit' we just applied answered it (the ordinary
             // "my part is done" clear; the ack travels the staple, not this slot).
             inner.pending_side_band = None;
@@ -781,6 +824,12 @@ impl TwoMlsPqSession {
                 .ok_or(TwoMlsPqError::SessionNotReady)?;
             let mut msg = vec![PQ_BOOTSTRAP_KP_TAG];
             msg.extend_from_slice(kp);
+            // Our OWN establishment credential, carried by this KP. Pin it eviction-exempt
+            // in `mine` so the bind can join the Welcome' whose added leaf still bears it —
+            // enough of our own rotations before A.4 would otherwise evict it from `mine`
+            // and fail the self-leaf validation on join. Retired symmetrically once A.5
+            // catches this leaf up (`retire_stale_pins`).
+            let founding = parse_mls_key_package(kp.to_vec())?.client_id.bytes;
             // Side-band frame. Pre-A.4 our recv-PQ (Group_B.pq) is the group the bootstrap
             // is creating, so `seal_side_band` falls back to the classical seal for exactly
             // this frame; the peer opens it from its classical window.
@@ -789,6 +838,7 @@ impl TwoMlsPqSession {
             // is in hand to carry the round; the commitment accessor goes quiet (the host
             // read it at reply time).
             inner.bootstrap_kp = None;
+            inner.with_auth(|core| core.mine.pin(founding));
             // Retain for re-send (see `pq_ratchet_begin`). A lost KP' is the worst of the
             // three to strand: without A.4 the session never reaches full establishment,
             // and this frame is what the peer's deferred send-PQ half is built around.
@@ -866,6 +916,16 @@ impl TwoMlsPqSession {
             // The new PQ half resolves PSKs from the CURRENT client's stores (A.4 runs on
             // the principal a Phase 8 rotation may have installed) — track them.
             inner.track_psk_stores(&client);
+            // Pin the peer's ESTABLISHMENT credential (carried in the hash-authenticated
+            // bootstrap KP) as eviction-exempt in `theirs`. This leaf is created lazily, so
+            // enough peer rotations before A.4 could have evicted the frozen id from the
+            // credential-history window — `create_group_with_member`'s `validate_member`
+            // would then fail `UnknownIdentity` with the committed round unrecoverable. The
+            // id was validly authenticated at establishment (the anchor-bound classical
+            // session it created); the pin is retired once A.5 rotates this leaf onto the
+            // current credential (`pq_rekey_respond`).
+            let founding = parse_mls_key_package(kp.clone())?.client_id;
+            inner.with_auth(|core| core.theirs.pin(founding.bytes.clone()));
             let frame = {
                 let send = inner
                     .send_group

@@ -122,6 +122,9 @@ pub(crate) mod archive_wire {
     pub(in crate::session) struct WirePartySequence {
         pub(in crate::session) history: Vec<IdBlob>,
         pub(in crate::session) authorized_next: Vec<IdBlob>,
+        /// Eviction-exempt credentials (a bootstrap leaf's frozen establishment id held
+        /// admissible until A.5 catch-up) — see `apq::authentication::PartySequence`.
+        pub(in crate::session) pinned: Vec<IdBlob>,
     }
 
     /// The staged Upd(self) with the identity it proposes.
@@ -563,6 +566,7 @@ fn session_from_wire(wire: archive_wire::SessionArchive) -> Result<Arc<TwoMlsPqS
         apq::authentication::PartySequence::from_parts(
             w.history.into_iter().map(|b| b.bytes).collect(),
             w.authorized_next.into_iter().map(|b| b.bytes).collect(),
+            w.pinned.into_iter().map(|b| b.bytes).collect(),
         )
     };
     let (auth_mine, auth_theirs) = (seq(wire.auth_mine), seq(wire.auth_theirs));
@@ -745,16 +749,16 @@ fn build_archive_wire(
         .collect::<Vec<_>>();
     let (auth_mine, auth_theirs) = inner.with_auth(|core| {
         let seq = |s: &apq::authentication::PartySequence| {
-            let (history, authorized_next) = s.to_parts();
+            let (history, authorized_next, pinned) = s.to_parts();
+            let blobs = |ids: Vec<Vec<u8>>| {
+                ids.into_iter()
+                    .map(|bytes| archive_wire::IdBlob { bytes })
+                    .collect()
+            };
             archive_wire::WirePartySequence {
-                history: history
-                    .into_iter()
-                    .map(|bytes| archive_wire::IdBlob { bytes })
-                    .collect(),
-                authorized_next: authorized_next
-                    .into_iter()
-                    .map(|bytes| archive_wire::IdBlob { bytes })
-                    .collect(),
+                history: blobs(history),
+                authorized_next: blobs(authorized_next),
+                pinned: blobs(pinned),
             }
         };
         (seq(&core.mine), seq(&core.theirs))

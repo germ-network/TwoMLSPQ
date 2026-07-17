@@ -223,6 +223,48 @@ fn test_precommitted_bootstrap_kp_survives_restore() {
     assert!(bob.is_fully_established());
 }
 
+/// The pre-committed bootstrap KP carries the FROZEN establishment credential. Enough
+/// peer rotations before a deferred A.4 evict that id from the acceptor's
+/// credential-history window — but the acceptor PINS it (eviction-exempt) from the
+/// hash-authenticated KP, so `validate_member` still admits the lazily-created leaf and
+/// the round completes. Without the pin this wedges: `UnknownIdentity` → opaque `Mls`,
+/// unrecoverable (the KP cannot be re-minted — its hash is signed into establishment).
+/// A.5 later retires the pin once both peer PQ leaves have caught up.
+#[test]
+fn test_bootstrap_survives_credential_window_eviction() {
+    let (alice, bob) = establish_confirmed_sessions();
+
+    // Rotate Alice past the window so Bob's `theirs` evicts her establishment id — the
+    // exact credential the bootstrap KP (minted at establishment) still carries. One
+    // commit past the window guarantees the founding element is popped.
+    let mut current = alice.my_principal_state().client_id();
+    for _ in 0..=apq::authentication::CREDENTIAL_HISTORY_WINDOW {
+        let next = make_client().client_id();
+        rotate_round(&alice, &bob, next.clone());
+        current = next;
+    }
+    // The bootstrap was never begun, so its KP still carries the (now-evicted)
+    // establishment credential.
+    let _ = &current;
+
+    let kp = assert_ok!(alice.pq_bootstrap_begin(None));
+    assert_ok!(bob.pq_bootstrap_respond(kp)); // pins the evicted establishment id
+    let welcome = assert_some!(bob.pq_pending_outbound(SideBandSealing::Fresh));
+    assert_ok!(alice.pq_bootstrap_bind(welcome));
+    discharge_bind(&alice, &bob, b"post-eviction-bind");
+    assert!(alice.is_fully_established());
+    assert!(bob.is_fully_established());
+
+    // Messaging still flows on both PQ halves after the round.
+    assert_ok!(alice.prepare_to_encrypt(None));
+    let enc = assert_ok!(alice.encrypt(b"post-eviction".to_vec()));
+    let got = assert_ok!(bob.process_incoming(enc.cipher_text));
+    assert_eq!(
+        assert_some!(assert_some!(got).application_message).app_message_data,
+        b"post-eviction".to_vec()
+    );
+}
+
 #[test]
 fn test_initiate_stores_outbound_welcome() {
     let alice = make_client();
