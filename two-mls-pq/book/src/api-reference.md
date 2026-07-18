@@ -99,6 +99,14 @@ The receiving side of a published key package — no live client required.
 - `processed_welcome_group_id(welcome) -> Option<MlsGroupId>` — the content-keyed
   counterpart: resolve a re-delivered welcome by the digest of its exact bytes, no
   host token convention needed.
+- `bootstrap_kp_group_id(kp_frame) -> Option<MlsGroupId>` — resolve a §A.1 bootstrap-KP
+  frame (`[0x13][KP′]`, the `BootstrapKp` variant `open_initial` opens) to the session
+  that owes A.4 for it, keyed on `H(KP′)` against the commitment `receive` pinned. Lets a
+  KP′ delivered as an envelope (rather than a rendezvous side-band frame) self-route even
+  when a reusable invitation has spawned many sessions; `None` for a KP′ no session
+  pinned. (A KP′ whose session already finished A.4 still resolves — the table is not
+  pruned — and the duplicate is caught at `pq_bootstrap_respond`.) Route the frame to
+  that session's `pq_bootstrap_respond`.
 - `open_initial(blob) -> OpenedInitial` — open the initiator's
   first frame (the §A.1 envelope `initiate` produced), dispatching on the plaintext's inner
   tag to `Establishment { frame }` (the app-layer welcome and the MLS `welcome` to pass to

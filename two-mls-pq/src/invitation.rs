@@ -27,7 +27,9 @@ use crate::{Result, TwoMlsPqError};
 // returns to the floor; blobs from every prior cut wear bytes 2–4 and fail the header
 // check, and the layout is disjoint enough from the retired v1 shape that a decode
 // cannot alias.
-const INVITATION_VERSION: u8 = 1;
+// v2 adds the bootstrap-commitment routing table (`bootstrap_commitments`) to the archive, so a
+// v1 blob decodes short and fails — a pre-release hard cut, regenerate the invitation.
+const INVITATION_VERSION: u8 = 2;
 
 /// The spawned-group forward table: an opaque caller-supplied spawn token → the spawned
 /// session's receive-group classical (message-half) id. The token is whatever the caller
@@ -40,6 +42,14 @@ pub(crate) type SpawnedGroups = BTreeMap<Vec<u8>, Vec<u8>>;
 /// assumed to arrive exactly once — a re-delivered welcome resolves here (content-keyed,
 /// no host token convention needed) instead of erroring or re-spawning.
 pub(crate) type ProcessedWelcomes = BTreeMap<Vec<u8>, Vec<u8>>;
+
+/// The bootstrap-commitment routing table: `H(initiator's PQ bootstrap key package)` — the same
+/// 32-byte commitment `receive` was given and pinned — → the spawned session's receive-group
+/// classical (message-half) id. Lets a KP′ that arrives as a §A.1 bootstrap envelope (contract 21,
+/// carrying no session id) self-route to the session that owes A.4: `bootstrap_kp_group_id` hashes
+/// the framed KP′ and resolves it here. Content-keyed like `processed`; distinct so the two
+/// preimages (welcome bytes vs. bootstrap KP) never collide.
+pub(crate) type BootstrapCommitments = BTreeMap<Vec<u8>, Vec<u8>>;
 
 // In its own module because the derive-generated impls reference the std `Result`, which the
 // crate-local `Result` alias imported above would shadow.
@@ -97,6 +107,7 @@ mod wire {
         pub(super) consumed: Vec<Vec<u8>>,
         pub(super) spawned: Vec<SpawnedEntry>,
         pub(super) processed: Vec<ProcessedEntry>,
+        pub(super) bootstrap_commitments: Vec<BootstrapCommitmentEntry>,
     }
 
     /// One spawned-group forward-table entry: an opaque spawn token → the spawned
@@ -118,10 +129,20 @@ mod wire {
         #[mls_codec(with = "mls_rs_codec::byte_vec")]
         pub(super) classical: Vec<u8>,
     }
+
+    /// One bootstrap-commitment routing entry: `H(initiator's PQ bootstrap key package)` → the
+    /// spawned session's receive-group classical (message-half) id.
+    #[derive(MlsSize, MlsEncode, MlsDecode)]
+    pub(super) struct BootstrapCommitmentEntry {
+        #[mls_codec(with = "mls_rs_codec::byte_vec")]
+        pub(super) commitment: Vec<u8>,
+        #[mls_codec(with = "mls_rs_codec::byte_vec")]
+        pub(super) classical: Vec<u8>,
+    }
 }
 
 pub(crate) use wire::CombinerInvitation;
-use wire::{InvitationArchive, ProcessedEntry, SpawnedEntry};
+use wire::{BootstrapCommitmentEntry, InvitationArchive, ProcessedEntry, SpawnedEntry};
 
 /// The decoded parts of an invitation archive: the invitation, the consumed-remote set, the
 /// spawned-group forward table, the processed-welcome ledger, and the per-invitation mutation
@@ -131,6 +152,7 @@ pub(crate) type DecodedArchive = (
     BTreeSet<Vec<u8>>,
     SpawnedGroups,
     ProcessedWelcomes,
+    BootstrapCommitments,
     u64,
 );
 
@@ -174,6 +196,7 @@ pub(crate) fn encode_archive(
     consumed: &BTreeSet<Vec<u8>>,
     spawned: &SpawnedGroups,
     processed: &ProcessedWelcomes,
+    bootstrap_commitments: &BootstrapCommitments,
     state_seq: u64,
 ) -> Result<Vec<u8>> {
     InvitationArchive {
@@ -191,6 +214,13 @@ pub(crate) fn encode_archive(
             .iter()
             .map(|(digest, classical)| ProcessedEntry {
                 digest: digest.clone(),
+                classical: classical.clone(),
+            })
+            .collect(),
+        bootstrap_commitments: bootstrap_commitments
+            .iter()
+            .map(|(commitment, classical)| BootstrapCommitmentEntry {
+                commitment: commitment.clone(),
                 classical: classical.clone(),
             })
             .collect(),
@@ -218,7 +248,19 @@ pub(crate) fn decode_archive(bytes: &[u8]) -> Result<DecodedArchive> {
         .into_iter()
         .map(|e| (e.digest, e.classical))
         .collect();
-    Ok((invitation, consumed, spawned, processed, archive.state_seq))
+    let bootstrap_commitments = archive
+        .bootstrap_commitments
+        .into_iter()
+        .map(|e| (e.commitment, e.classical))
+        .collect();
+    Ok((
+        invitation,
+        consumed,
+        spawned,
+        processed,
+        bootstrap_commitments,
+        archive.state_seq,
+    ))
 }
 
 /// Generate a combiner key package on `client` and capture its private material into a
@@ -319,8 +361,8 @@ mod tests {
         let inv = assert_ok!(generate_combiner_invitation(client.combiner(), true));
         let mut framed = assert_ok!(inv.encode());
         // Pin the current cut (update alongside the const's changelog comment):
-        // the pre-release floor.
-        assert_eq!(framed[0], 1);
+        // v2 added the bootstrap-commitment routing table.
+        assert_eq!(framed[0], 2);
         assert_eq!(framed[0], INVITATION_VERSION);
 
         // A pre-floor-reset blob (the v0.3.0-era AppBinding cut wore byte 4):
@@ -340,6 +382,7 @@ mod tests {
             consumed: Vec::new(),
             spawned: Vec::new(),
             processed: Vec::new(),
+            bootstrap_commitments: Vec::new(),
         }
         .mls_encode_to_vec()
         .map_err(|_| TwoMlsPqError::ArchiveInvalid));

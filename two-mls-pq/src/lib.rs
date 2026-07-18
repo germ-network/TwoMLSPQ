@@ -333,7 +333,17 @@ pub fn version() -> String {
 // `CipherSuiteMismatch` stays where the suite is READABLE: KP validation, APQInfo at
 // join, invitation/archive decode). This binds the CLASSICAL half too, which the HPKE
 // operation alone never touches — downgrade binding at zero wire bytes.
-const BINDING_CONTRACT_VERSION: u64 = 22;
+//
+// v23 (2026-07-18): the invitation gains a bootstrap-commitment routing table so a KP′
+// delivered as a §A.1 bootstrap envelope (contract 21) self-routes to its session by
+// content. `receive` records `H(bootstrap KP) -> spawned group id` (the same commitment it
+// was already given), and the new `bootstrap_kp_group_id(kp_frame)` resolves the framed KP′
+// against it — the content-keyed counterpart of `forward_group_id`/`processed_welcome_group_id`
+// (appended, so a stale binding load-fails). Lets the invitation-channel bootstrap path work
+// for reusable invitations (one transport address, many sessions) without a rendezvous
+// side-band; `pq_bootstrap_begin` is unchanged. Invitation archive layout changed
+// (`INVITATION_VERSION` 1 -> 2, pre-release hard cut: a v1 blob decodes short and regenerates).
+const BINDING_CONTRACT_VERSION: u64 = 23;
 
 /// See `BINDING_CONTRACT_VERSION`. Exported so the Swift layer can verify the
 /// binding it was generated with matches the binary it loaded.

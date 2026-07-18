@@ -5,7 +5,7 @@ use zeroize::Zeroizing;
 
 use crate::invitation::{
     combiner_from_invitation, decode_archive, encode_archive, generate_combiner_invitation,
-    CombinerInvitation, ProcessedWelcomes, SpawnedGroups,
+    BootstrapCommitments, CombinerInvitation, ProcessedWelcomes, SpawnedGroups,
 };
 use crate::key_package_store::{
     CombinerClient, KeyPackageSecret, MlsClient, PqMlsClient, SyntheticKeyPackageStore,
@@ -136,6 +136,7 @@ impl TwoMlsPqPrincipal {
             &BTreeSet::new(),
             &SpawnedGroups::new(),
             &ProcessedWelcomes::new(),
+            &BootstrapCommitments::new(),
             // A freshly generated invitation starts at seq 0 (no mutations yet); a sink is
             // attached later via `install_sink`, which pushes the baseline at this seq.
             0,
@@ -622,6 +623,11 @@ struct InvitationInner {
     /// exactly once; a re-delivered welcome resolves here (content-keyed — no host token
     /// convention required, unlike `spawned`) instead of erroring or re-spawning. Persisted.
     processed: ProcessedWelcomes,
+    /// The bootstrap-commitment routing table: `H(initiator's PQ bootstrap key package)` → the
+    /// spawned session's receive-group classical id. A KP′ that arrives as a §A.1 bootstrap
+    /// envelope (carrying no session id) self-routes here via `bootstrap_kp_group_id` instead of
+    /// needing a rendezvous side-band. Content-keyed like `processed`. Persisted.
+    bootstrap_commitments: BootstrapCommitments,
     /// Per-invitation monotonic mutation counter, bumped once per state-advancing call (a
     /// successful `receive`). Serialized in the archive so it continues across a restore and
     /// stamps each pushed blob. `u64` so it cannot overflow; the bump is a `checked_add` that
@@ -644,6 +650,7 @@ impl InvitationInner {
             &self.consumed,
             &self.spawned,
             &self.processed,
+            &self.bootstrap_commitments,
             self.state_seq,
         )
     }
@@ -686,13 +693,15 @@ impl TwoMlsPqInvitation {
     /// it (mirrors the session's `restore`).
     #[uniffi::constructor]
     pub fn restore(archive: Vec<u8>) -> Result<Arc<Self>> {
-        let (invitation, consumed, spawned, processed, state_seq) = decode_archive(&archive)?;
+        let (invitation, consumed, spawned, processed, bootstrap_commitments, state_seq) =
+            decode_archive(&archive)?;
         Ok(Arc::new(Self {
             inner: Mutex::new(InvitationInner {
                 invitation,
                 consumed,
                 spawned,
                 processed,
+                bootstrap_commitments,
                 state_seq,
                 // Attached post-construction via `install_sink` (same as the session's
                 // restore path); a fresh invitation starts with no persistence hook.
@@ -840,6 +849,10 @@ impl TwoMlsPqInvitation {
         }
         let session_client = new_client_id.map(TwoMlsPqPrincipal::new).transpose()?;
         let welcome_digest = crate::sha256(&welcome);
+        // Retain the commitment for the routing table below — `accept_with` moves the parameter,
+        // and it is the exact key a bootstrap-KP envelope self-routes on (`bootstrap_kp_group_id`
+        // hashes the framed KP′ to this same value).
+        let bootstrap_commitment = bootstrap_kp_commitment.clone();
 
         // --- One critical section: every check, the join, and the commit run under a single
         // lock acquisition. Crucially, none of the invitation's fields are mutated until the
@@ -894,6 +907,9 @@ impl TwoMlsPqInvitation {
         inner
             .spawned
             .insert(spawn_token, gid.classical.bytes.clone());
+        inner
+            .bootstrap_commitments
+            .insert(bootstrap_commitment, gid.classical.bytes.clone());
         inner.processed.insert(welcome_digest, gid.classical.bytes);
         // Single-use consume: drop the captured material so a later `receive` sees it spent. A
         // last-resort invitation retains it for reuse.
@@ -938,6 +954,31 @@ impl TwoMlsPqInvitation {
         self.lock()
             .processed
             .get(&crate::sha256(&welcome))
+            .map(|classical| MlsGroupId {
+                bytes: classical.clone(),
+            })
+    }
+
+    /// Resolve a §A.1 bootstrap-KP frame against the bootstrap-commitment table: `Some` names the
+    /// receive group (classical, message-half id) of the session that owes A.4 for this exact KP′
+    /// — route the frame to that session's `pq_bootstrap_respond`. `None` means no spawned session
+    /// ever pinned this KP′ (unknown or garbage — discard). Note the table is NOT pruned on A.4
+    /// completion (the invitation cannot observe session state), so a KP′ whose session already
+    /// answered still resolves here; the duplicate is a benign no-op at `pq_bootstrap_respond`
+    /// (`DuplicateSideBand`), not a `None`. Lets a KP′ delivered as a bootstrap envelope
+    /// (contract 21, no session id of its own) self-route without a rendezvous side-band. `frame`
+    /// is the verbatim `[0x13][KP′]`; the hash is taken over the untagged KP — the SAME preimage
+    /// the acceptor pinned at `receive` and `pq_bootstrap_respond` re-checks, so a frame that
+    /// resolves here can never `BootstrapKpMismatch` there. Content-keyed counterpart of
+    /// `forward_group_id`/`processed_welcome_group_id`.
+    pub fn bootstrap_kp_group_id(&self, kp_frame: Vec<u8>) -> Option<MlsGroupId> {
+        let (&tag, kp) = kp_frame.split_first()?;
+        if tag != crate::session::frames::PQ_BOOTSTRAP_KP_TAG {
+            return None;
+        }
+        self.lock()
+            .bootstrap_commitments
+            .get(&crate::sha256(kp))
             .map(|classical| MlsGroupId {
                 bytes: classical.clone(),
             })
@@ -1613,6 +1654,130 @@ mod tests {
         let gid = assert_some!(restored.forward_group_id(token));
         assert_eq!(gid.bytes, recv.classical.bytes);
         assert!(restored.forward_group_id(b"other".to_vec()).is_none());
+    }
+
+    #[test]
+    fn test_invitation_bootstrap_kp_routing_resolves_and_survives_restore() {
+        use crate::session::TwoMlsPqSession;
+        use crate::test_utils::{commitment_of, make_classical_kp, make_client};
+        use std::sync::Arc;
+
+        let alice = make_client();
+        let bob = make_client();
+        let alice_kp = make_classical_kp(&alice);
+
+        let bob_inv = assert_ok!(super::TwoMlsPqInvitation::restore(assert_ok!(
+            bob.generate_invitation(true)
+        )));
+        let bob_kp = bob_inv.combiner_key_package();
+
+        let alice_session = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
+        let welcome_a = assert_some!(alice_session.initial_welcome());
+        // Read the commitment BEFORE emitting the envelope — the emit consumes the
+        // pre-committed KP and quiets the accessor.
+        let commitment = commitment_of(&alice_session);
+
+        // The KP′ frame Alice would ship in parallel: her pre-committed bootstrap envelope,
+        // opened by Bob's invitation to the verbatim `[0x13][KP′]`.
+        let kp_frame = assert_ok!(
+            bob_inv.open_bootstrap_kp(assert_ok!(alice_session.pq_bootstrap_envelope()))
+        );
+
+        // Before `receive`, no session pinned this KP′ — nothing to route to.
+        assert!(bob_inv.bootstrap_kp_group_id(kp_frame.clone()).is_none());
+
+        let bob_session = assert_ok!(bob_inv.receive(
+            welcome_a,
+            alice_kp,
+            commitment,
+            b"token".to_vec(),
+            None,
+            None,
+            None
+        ));
+        let recv = assert_some!(bob_session.receive_group_id());
+
+        // Now the KP′ self-routes to the spawned session's receive group.
+        let gid = assert_some!(bob_inv.bootstrap_kp_group_id(kp_frame.clone()));
+        assert_eq!(gid.bytes, recv.classical.bytes);
+
+        // The routed frame is ACCEPTED by that session — the table key is `H(KP′)`, so a
+        // resolved frame always passes `pq_bootstrap_respond`'s own commitment check.
+        assert_ok!(bob_session.pq_bootstrap_respond(kp_frame.clone()));
+        // And the table is not pruned on completion: the same KP′ still resolves (the
+        // duplicate is a benign no-op at the session, not a routing miss).
+        assert_some!(bob_inv.bootstrap_kp_group_id(kp_frame.clone()));
+        assert_err!(
+            bob_session.pq_bootstrap_respond(kp_frame.clone()),
+            crate::TwoMlsPqError::DuplicateSideBand
+        );
+
+        // A KP′ nobody pinned, and a non-0x13 frame, both resolve to nothing.
+        let mut unknown = vec![crate::session::frames::PQ_BOOTSTRAP_KP_TAG];
+        unknown.extend_from_slice(&[0u8; 64]);
+        assert!(bob_inv.bootstrap_kp_group_id(unknown).is_none());
+        assert!(bob_inv
+            .bootstrap_kp_group_id(vec![0x01, 0x02, 0x03])
+            .is_none());
+        assert!(bob_inv.bootstrap_kp_group_id(Vec::new()).is_none());
+
+        // The routing table survives the archive round-trip.
+        let restored = assert_ok!(super::TwoMlsPqInvitation::restore(assert_ok!(
+            bob_inv.archive()
+        )));
+        let gid = assert_some!(restored.bootstrap_kp_group_id(kp_frame));
+        assert_eq!(gid.bytes, recv.classical.bytes);
+    }
+
+    #[test]
+    fn test_invitation_bootstrap_kp_routing_disambiguates_two_sessions() {
+        use crate::session::TwoMlsPqSession;
+        use crate::test_utils::{commitment_of, make_classical_kp, make_client};
+        use std::sync::Arc;
+
+        let bob = make_client();
+        let bob_inv = assert_ok!(super::TwoMlsPqInvitation::restore(assert_ok!(
+            bob.generate_invitation(true) // reusable: one invitation, many sessions
+        )));
+
+        // Two independent initiators reply to the SAME reusable invitation.
+        let mut expected = Vec::new(); // (kp_frame, spawned classical group id)
+        for i in 0..2u8 {
+            let alice = make_client();
+            let alice_kp = make_classical_kp(&alice);
+            let bob_kp = bob_inv.combiner_key_package();
+            let alice_session =
+                assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
+            let welcome = assert_some!(alice_session.initial_welcome());
+            let commitment = commitment_of(&alice_session); // read BEFORE the envelope consumes the KP
+            let kp_frame = assert_ok!(
+                bob_inv.open_bootstrap_kp(assert_ok!(alice_session.pq_bootstrap_envelope()))
+            );
+            let bob_session = assert_ok!(bob_inv.receive(
+                welcome,
+                alice_kp,
+                commitment,
+                vec![b'a' + i], // distinct spawn token per pairing
+                None,
+                None,
+                None
+            ));
+            let recv = assert_some!(bob_session.receive_group_id());
+            expected.push((kp_frame, recv.classical.bytes));
+        }
+
+        // Each KP′ resolves to ITS OWN session, never the other — the whole point of the table.
+        let (frame0, gid0) = &expected[0];
+        let (frame1, gid1) = &expected[1];
+        assert_ne!(gid0, gid1);
+        assert_eq!(
+            &assert_some!(bob_inv.bootstrap_kp_group_id(frame0.clone())).bytes,
+            gid0
+        );
+        assert_eq!(
+            &assert_some!(bob_inv.bootstrap_kp_group_id(frame1.clone())).bytes,
+            gid1
+        );
     }
 
     #[test]
