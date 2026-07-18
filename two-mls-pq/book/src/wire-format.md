@@ -30,8 +30,8 @@ half, and the two must agree. The space spans **three declaration sites**, becau
 lives with the thing it tags: `APQ_TAG` and `APQ_PRIVATE_MESSAGE_TAG` in the `apq` crate,
 `ESTABLISHMENT_VECTOR_TAG` in `key_packages` (an inner HPKE-plaintext tag, not a session
 frame), and the rest in `session::frames`. Ownership is local; allocation is global — which
-is exactly how `0x15` once got claimed twice, by a reader of `frames.rs` for whom the
-establishment-vector tag was invisible.
+is exactly how `0x15` could be claimed twice, by a reader of `frames.rs` for whom the
+establishment-vector tag is invisible.
 
 ## The §A.1 envelope
 
@@ -53,6 +53,20 @@ material; there is nothing it could disambiguate that the channel does not alrea
 initiator re-seals under a fresh HPKE ephemeral on every send (reply and bootstrap KP alike),
 so a stable inner KP′ never produces a linkable blob.
 
+**The seal binds the declared suite via untransmitted AAD (contract 22).** Both sides derive
+`[framing version (1)][classical u16 BE][pq u16 BE]` — the declared suite's wire bytes
+(`envelope_framing_aad()`) — and pass it as the HPKE `aad`; it never travels (RFC 9180 `aad`
+is a seal/open input, not part of the ciphertext, so only byte-equality matters). A peer whose
+declared pair or framing version differs fails the AEAD tag as `DecryptionFailed` —
+deliberately opaque, the header seal's "indistinguishable by construction" contract — which
+downgrade-binds the WHOLE pair, classical half included (the HPKE operation alone only ever
+touches the PQ half), at zero wire and zero plaintext bytes. The suite needs no *signaling*
+here: each half of a posted `APQKeyPackage` names its cipher suite in the KeyPackage's
+cleartext framing, and the suite of an inbound envelope is defined by which posted KP (→
+which invitation) it was sealed to. Hosts on the split `hpke_open` +
+`decode_initial_plaintext` path must supply `envelope_framing_aad()`; `open_initial` derives
+it internally. See [Cipher Suites](./cipher-suites.md) for the declared suite and its facets.
+
 The space is **banded**. Each band owns a contiguous range of odd bytes, is packed from its
 start, and keeps its remaining room at the end:
 
@@ -62,12 +76,11 @@ start, and keeps its remaining room at the end:
 | A.1 establishment | `0x07`–`0x11` | 2 / 6 | establishment-vector inner tag, pre-establishment staple. The hybrid nested envelope would land in the room |
 | PQ side-band | `0x13`–`0x31` | 6 / 16 | exactly what `pq_frame_kind` classifies, in lifecycle order: bootstrap, ratchet, re-key |
 
-Banding is what makes "the side-band is `0x13`–`0x31`" a claim that survives growth. It was
-bought by a renumber: the tags were allocation-ordered, so appending A.4's bind past the end
-left the side-band non-contiguous and silently falsified five range shorthands across the
-code and this book. A range in prose should at least not be a lie. (The bands themselves
-have since shifted once — the message path FILLED when the bind became the staple's third
-form, which is exactly the case where the bands below move.)
+Banding is what makes "the side-band is `0x13`–`0x31`" a claim that survives growth: a new
+flow appends at the end of its band, into reserved room, so the range shorthands across the
+code and this book stay true instead of being silently falsified by an out-of-band append.
+A range in prose should at least not be a lie. Only a band that FILLS forces the bands below
+it to move — the message path is the one full band, its three shapes leaving no room.
 
 The room is free in both directions that could have cost something. On the wire, header
 encryption seals every blob, so a tag is never observed and a sparse space fingerprints
@@ -83,8 +96,8 @@ reserved byte is *in* `0x13`–`0x31`, so "in range ⟺ classified" would wave t
 that quietly started routing.
 
 Note the side-band's lifecycle order does **not** match the spec's section numbers (A.4
-bootstrap precedes A.3 ratchet) — the section numbers are historical, and renumbering them
-is a separate change.
+bootstrap precedes A.3 ratchet): the classifier is ordered by lifecycle, the section
+numbers by their own scheme.
 
 Each multi-section frame uses a `u32`-LE length prefix per embedded field. Hosts
 classify PQ side-band frames via the exported `pq_frame_kind` (never by matching raw
@@ -181,7 +194,7 @@ apart from their first byte alone. An `MLSMessage` begins with its two-byte
 is also what makes the message frame's staple slot self-discriminating (welcome
 `0x01` vs. commit `0x00`) without a separate discriminator byte. The entire even space stays
 unused and in reserve. Extending the protocol is *not* "take the next unused odd value" —
-that is what broke contiguity once already; it is "append at the end of the right band, into
+that is what would break contiguity; it is "append at the end of the right band, into
 the room the band already reserves." Only a band that fills forces the bands below it to
 move.
 
@@ -200,22 +213,18 @@ them.
 - **AppDataUpdate** — a custom proposal (type `0x0008`) that rides both commits of every
   FULL commit, attesting the new epochs of both halves. Receivers verify the two copies
   agree and match the actual post-commit epochs before any app data is decrypted.
-- **Combiner key package (v2)** — the `CombinerKeyPackage` payload adopts the draft's §7
+- **Combiner key package** — the `CombinerKeyPackage` payload adopts the draft's §7
   `APQKeyPackage { t_key_package, pq_key_package }` TLS encoding inside Germ's version
-  framing. A v1 (pre-conformance) key package is rejected outright.
+  framing. A key package that does not carry this encoding is rejected outright.
 
-The conformance cutover is a hard version bump — `COMBINER_KEY_PACKAGE_VERSION = 2`,
-`SESSION_ARCHIVE_VERSION = 8`, `BINDING_CONTRACT_VERSION = 12` — because every occupied
-leaf must now advertise the new extension (`0xF0A1`) and proposal (`0x0008`) types, and
-a leaf that cannot support them is rejected rather than silently degraded.
+Every occupied leaf must advertise the `APQInfo` extension (`0xF0A1`) and the
+`AppDataUpdate` proposal (`0x0008`) types; a leaf that cannot support them is rejected
+rather than silently degraded.
 
 ## Invariants
 
-The tag values are part of the on-wire protocol; pre-release, a renumber is allowed
-(this format renumbered the PQ side-band from `0x0B–0x17` and deleted the retired
-`0x07` reservation along with the old `BUNDLED`/`PARTIAL`/`STAPLED_WELCOME` frames —
-stale frames from older builds fail loudly in the decoders; the whole space was renumbered
-again into the bands above). When adding a message type, append it at the **end of its
+The tag values are part of the on-wire protocol; pre-release, a renumber is allowed. When
+adding a message type, append it at the **end of its
 band** — into the room, so nothing else moves — **add a row to `frames::tests::BANDS`** and
 to the table above, add matching `encode_*`/`decode_*` helpers following the `u32`-LE
 length-prefix pattern, and extend `pq_frame_kind` if it is a side-band frame — hosts

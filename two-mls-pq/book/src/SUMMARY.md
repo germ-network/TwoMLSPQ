@@ -12,4 +12,3 @@
 - [API Reference](./api-reference.md)
 - [Walkthrough: Alice & Bob](./walkthrough.md)
 - [Benchmarks](./benchmarks.md)
-- [Planned Features](./planned-features.md)

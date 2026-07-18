@@ -3,7 +3,7 @@
 > **Status: implemented.** Two key families — message-path frames sealed under the
 > classical half (`HeaderKey`), PQ side-band frames under the PQ half (`HeaderKeyPQ`),
 > each keyed by its own ratchet's epoch — plus the **initiator's first frame**, which
-> `initiate` now HPKE-envelopes in-library (`[app_payload ∥ APQWelcome_A]` sealed to the
+> the library HPKE-envelopes (`[app_payload ∥ APQWelcome_A]` sealed to the
 > peer's KP′) so the app-layer welcome is covered too; the peer opens it with
 > `TwoMlsPqInvitation::open_initial`. Every outbound blob is opaque. The only remaining
 > refinement is the *hybrid* nested envelope (open question #2) — the first-frame
@@ -147,8 +147,9 @@ SealedFrame   = [12-byte random nonce][AEAD ct+tag]   ; steady state (symmetric)
 EnvelopeFrame = [kem_output][AEAD ct+tag]             ; establishment only (HPKE)
 ```
 
-- The AEAD is a **single configured choice for the whole header layer**
-  (`providers::HEADER_AEAD_SUITE`, ChaCha20-Poly1305 today), *not* inherited from the
+- The AEAD is a **single choice for the whole header layer** (the declared suite's
+  header-AEAD facet, `providers::header_aead_suite()`, ChaCha20-Poly1305 today), *not*
+  inherited from the
   group whose exporter produced the key. Both families — message-path (classical
   exporter) and PQ side-band (PQ exporter) — seal with this one AEAD; the two-family
   split only chooses which group half derives the key. The key length
@@ -223,10 +224,10 @@ HeaderKeyPQ(G, e) = exportSecret(label = "germ.network.twomlspq.headerKey.pq.v1"
   random nonces the birthday margin (~2⁴⁸ frames per key) is far beyond any
   realistic per-epoch volume, so no mid-epoch rotation is needed.
 
-> **Rejected simplification — one classical family for both streams.** An earlier cut
-> sealed the side-band under the classical family too (the classical recv-group key is
+> **Rejected simplification — one classical family for both streams.** Sealing the
+> side-band under the classical family too (the classical recv-group key is
 > always available post-establishment, so it needs no second window or pre-A.4
-> fallback). It was replaced because it couples the side-band's outer-seal availability
+> fallback) is rejected because it couples the side-band's outer-seal availability
 > to the *async* classical cadence: a side-band frame in flight can be overtaken by
 > classical epoch advances driven by unrelated message traffic and, once they exceed
 > the classical retention window, become unopenable — a delivery-robustness dependency
@@ -240,7 +241,7 @@ HeaderKeyPQ(G, e) = exportSecret(label = "germ.network.twomlspq.headerKey.pq.v1"
 - **Message-path frames** (0x01 standalone welcomes and 0x03 message frames —
   `encrypt`'s output, welcome-or-commit staple included): seal under
   `HeaderKey(recv_group, current classical epoch)`.
-- **PQ side-band frames** (0x11–0x1F): seal under `HeaderKeyPQ(recv_group,
+- **PQ side-band frames** (0x13–0x1D): seal under `HeaderKeyPQ(recv_group,
   current pq_epoch)` — the opposite PQ group at its `pq_epoch`. This covers every
   side-band frame however it reaches the host: those surfaced by
   `pq_take_pending_outbound` (the responder's 0x19, 0x13, 0x1F, and both binds — 0x1B and
@@ -308,7 +309,7 @@ authenticates only under a classical key and a side-band frame only under a PQ k
 the inner tag; there is no ambiguity. Each trial is one ChaCha20-Poly1305 open — DoS
 cost is bounded and linear in the combined (small) window. On success it classifies
 the opened frame's leading tag into `OpenedFrameKind` (`Message` for 0x01/0x03,
-`PqSideBand { PqFrameKind }` for 0x11–0x1F) and returns `OpenedFrame { kind, frame }`;
+`PqSideBand { PqFrameKind }` for 0x13–0x1D) and returns `OpenedFrame { kind, frame }`;
 the host routes `frame` by `kind`. On exhaustion it returns `Ok(None)` — "unknown,
 drop it", which trial decryption makes literal: an out-of-window frame and garbage are
 indistinguishable, by construction. An opened-but-unrecognized tag is
@@ -338,8 +339,8 @@ Alice initiates; Bob accepts (send groups per the [Session
 Lifecycle](./session-lifecycle.md); this matches [Protocol Flows](./protocol-flows.md) §A.1
 orientation and the crate's constructor names — Alice builds `Group_A` ≡ ASG).
 
-1. **Alice `initiate(client, their_kp, app_payload)`** — builds Group_A; captures
-   `HeaderKey(Group_A, e₀)` into her receive window (piggybacked on the existing
+1. **Alice `initiate(client, their_kp)` + `set_initial_app_payload`** — builds Group_A;
+   captures `HeaderKey(Group_A, e₀)` into her receive window (piggybacked on the existing
    `record_listen_rendezvous` call). It composes `[app_payload ∥ APQWelcome_A]` and
    HPKE-seals it to Bob's KP′ inside the library, so `pending_outbound()` returns **one
    opaque envelope** — the first frame's metadata, *including the app-layer welcome that
@@ -347,8 +348,9 @@ orientation and the crate's constructor names — Alice builds `Group_A` ≡ ASG
    itself. (The `current_staple` — the message-frame staple form the peer idempotently
    skips — keeps the *plaintext* `APQWelcome_A`; only `pending_outbound` is the
    envelope.)
-2. **Bob's host** opens it with `TwoMlsPqInvitation::open_initial(blob) -> { app_payload,
-   welcome }` (the invitation holds the KP′ private material; the call is decrypt-only
+2. **Bob's host** opens it with `TwoMlsPqInvitation::open_initial(blob) -> OpenedInitial`
+   (the establishment variant carries `{ app_payload, welcome, … }`; the invitation holds
+   the KP′ private material; the call is decrypt-only
    and does **not** consume a single-use invitation). It validates the app-layer welcome
    and computes the spawn token over the **decrypted** frame — the token must be
    replay-stable across re-sends, and a re-sent envelope has a fresh HPKE ephemeral
@@ -373,17 +375,17 @@ after consumption use last-resort invitations.
 
 Direct `accept()` keeps its plaintext-welcome signature (a test/embedded entry point
 for callers that already hold a plaintext welcome); the normal path is
-`initiate(…, app_payload)` → `TwoMlsPqInvitation::open_initial` → `receive`.
+`initiate(…)` (+ `set_initial_app_payload`) → `TwoMlsPqInvitation::open_initial` → `receive`.
 
 ### Host routing and the API
 
-The host used to route PQ side-band frames to `pq_*` entry points by the leading tag
-byte, which header encryption hides. The wire boundary moved one step:
+Header encryption hides the leading tag byte, so the host cannot route a raw blob to the
+`pq_*` entry points by its first byte; the wire boundary sits one step in:
 
 - **`open_incoming(blob) -> Option<OpenedFrame { kind, frame }>`** — the session
   method: one trial-decrypt pass over the receive window, returning the plaintext
   frame plus its `kind` (`OpenedFrameKind::Message` for 0x01/0x03,
-  `PqSideBand { PqFrameKind }` for 0x11–0x1F), or `None` if no window key opens it.
+  `PqSideBand { PqFrameKind }` for 0x13–0x1D), or `None` if no window key opens it.
   The host routes `frame` by `kind` to `process_incoming` / `pq_ratchet_*` /
   `pq_rekey_*` / `pq_bootstrap_*`; those entry points keep their plaintext-frame
   signatures (and additionally auto-open a sealed blob, per the receive rule).
@@ -393,14 +395,10 @@ byte, which header encryption hides. The wire boundary moved one step:
   the initiator's HPKE envelope), `pq_take_pending_outbound()`, and the direct returns
   of `pq_ratchet_begin` / `pq_bootstrap_begin` / `pq_rekey_begin`. The exported
   `hpke_seal_to_key_package` / `hpke_open` pair stays for other stacks; the main path
-  now uses `initiate(…, app_payload)` / `open_initial`.
+  uses `initiate(…)` / `set_initial_app_payload` / `open_initial`.
 - **Archive**: both receive windows (`recv_header_keys`, `recv_header_keys_pq`) ride
   in the session archive as parallel `(epoch, key)` lists, entries validated to 32
-  bytes on restore. `SESSION_ARCHIVE_VERSION` bumped to 4; pre-release, so old
-  archives simply fail to decode and regenerate.
-- **Contract**: `BINDING_CONTRACT_VERSION` bumped to 8 — the FFI gains `open_incoming`
-  / `OpenedFrame` / `OpenedFrameKind` (v7) and the `initiate` `app_payload` parameter,
-  `open_initial`, and `InitialFrame` (v8); every outbound blob is now opaque.
+  bytes on restore.
 
 ### What this layer does and does not provide
 
@@ -422,10 +420,10 @@ is safe here because every candidate key is honestly derived and secret; the
 partitioning-oracle failure mode requires attacker-chosen keys, which this scheme
 never has.
 
-## What shipped (implementation)
+## Implementation
 
-1. `providers.rs`: `HEADER_AEAD_SUITE` (the single configured header-AEAD cipher suite)
-   and `header_aead_suite()` beside `pq_envelope_suite()` — the `CipherSuiteProvider`
+1. `providers.rs`: `header_aead_suite()` (the declared suite's header-AEAD facet) beside
+   `pq_envelope_suite()` — the `CipherSuiteProvider`
    whose `aead_seal`/`aead_open`/`random_bytes`/`aead_key_size`/`aead_nonce_size` back
    the seal.
 2. `session.rs`: `header_key(group)` and `header_key_pq(pq_group)` (length =
@@ -440,15 +438,14 @@ never has.
    `seal_side_band`); `pq_ratchet_begin` guarded on the recv group; `open_incoming`
    with `OpenedFrameKind`; `process_incoming` and the `pq_*` receivers `open_or_raw`
    their input.
-3. First frame: `initiate` gains `app_payload: Option<Vec<u8>>` and HPKE-envelopes
-   `[app_payload ∥ APQWelcome_A]` to the peer's KP′ (`key_packages::seal_initial_envelope`),
+3. First frame: `set_initial_app_payload` attaches the app-layer welcome, and the library
+   HPKE-envelopes `[app_payload ∥ APQWelcome_A]` to the peer's KP′
+   (`key_packages::seal_initial_envelope`),
    returning it via `pending_outbound`; `TwoMlsPqInvitation::open_initial(blob) ->
-   InitialFrame { app_payload, welcome }` opens it (decrypt-only; does not consume the
+   OpenedInitial` opens it (decrypt-only; does not consume the
    invitation). `current_staple` keeps the plaintext welcome.
 4. Archive: `recv_header_keys` and `recv_header_keys_pq` as `(epoch, key)` entries,
-   32-byte validated on restore; `SESSION_ARCHIVE_VERSION` → 4,
-   `BINDING_CONTRACT_VERSION` → 8 (the `initiate` signature and `open_initial` /
-   `InitialFrame` are the FFI change; header encryption itself was 7).
+   32-byte validated on restore.
 5. Tests: sealed frames carry no plaintext framing; cross-commit crossing; restored
    session opens an in-flight frame (message *and* side-band); garbage → `None`;
    sealed side-band opens and classifies + full A.3/A.4/A.5 through sealed frames;

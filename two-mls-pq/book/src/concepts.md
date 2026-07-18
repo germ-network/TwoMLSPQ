@@ -56,9 +56,9 @@ the client and find your groups again" path — you restore an invitation
 (`TwoMlsPqInvitation.restore(archive)`) or a session
 (`TwoMlsPqSession.restore(core, checkpoint)`).
 
-Push, not pull, closes a soundness gap. The old pull `archive()` was a *move, not a
-copy* — using the live object after snapshotting it, then restoring, rewound the sender
-ratchet and re-derived AEAD keys/nonces against a real transcript (security review
+Push, not pull, closes a soundness gap. A pull `archive()` is a *move, not a
+copy* — using the live object after snapshotting it, then restoring, rewinds the sender
+ratchet and re-derives AEAD keys/nonces against a real transcript (security review
 finding H1). Pushing after every mutation keeps the persisted state always current
 without the app ever holding a stale-yet-live snapshot. The pull getter survives only as
 an in-crate test/fuzz helper, off the FFI.

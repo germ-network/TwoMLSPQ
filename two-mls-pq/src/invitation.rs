@@ -136,23 +136,24 @@ pub(crate) type DecodedArchive = (
 
 impl CombinerInvitation {
     /// Encode to an opaque blob: `[version][classical u16 BE][pq u16 BE]` header, then the
-    /// MLS-codec fields.
+    /// MLS-codec fields. The suite bytes come from the declared suite's wire encoding
+    /// (`TwoMlsSuite::to_wire` — the one authority `decode` validates against).
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut out = vec![INVITATION_VERSION];
-        out.extend_from_slice(&crate::providers::APQ_SUITE.to_wire());
+        out.extend_from_slice(&crate::suite::TwoMlsSuite::CURRENT.to_wire());
         self.mls_encode(&mut out)
             .map_err(|_| TwoMlsPqError::ArchiveInvalid)?;
         Ok(out)
     }
 
     /// Decode a blob produced by [`encode`](Self::encode). Rejects a wrong version or a
-    /// cipher-suite pair that differs from this build's pinned suite (an archive from another
+    /// cipher-suite pair that is not this build's declared suite (an archive from another
     /// build/suite).
     pub fn decode(bytes: &[u8]) -> Result<Self> {
+        use crate::suite::TwoMlsSuite;
         let mut rest = match bytes {
             [INVITATION_VERSION, s0, s1, s2, s3, rest @ ..]
-                if apq::ApqCipherSuite::from_wire([*s0, *s1, *s2, *s3])
-                    == crate::providers::APQ_SUITE =>
+                if TwoMlsSuite::from_wire([*s0, *s1, *s2, *s3]) == Some(TwoMlsSuite::CURRENT) =>
             {
                 rest
             }

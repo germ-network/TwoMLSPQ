@@ -932,7 +932,16 @@ fn encode_archive(
     use mls_rs::mls_rs_codec::{MlsEncode, MlsSize};
     let mut out = Zeroizing::new(Vec::with_capacity(5 + wire.mls_encoded_len()));
     out.push(SESSION_ARCHIVE_VERSION);
-    out.extend_from_slice(&suite.to_wire());
+    // Header suite bytes: the declared suite's wire id (`TwoMlsSuite::to_wire`, the one
+    // encoding authority `decode_wire` validates against). The session's stored pair is
+    // definitionally the declared suite's pair (every session is constructed via
+    // `crypto_config`); the debug_assert names that invariant rather than letting the
+    // two silently diverge under a future multi-suite edit.
+    debug_assert_eq!(
+        suite.to_wire(),
+        crate::suite::TwoMlsSuite::CURRENT.to_wire()
+    );
+    out.extend_from_slice(&crate::suite::TwoMlsSuite::CURRENT.to_wire());
     wire.mls_encode(&mut out)
         .map_err(|_| TwoMlsPqError::ArchiveInvalid)?;
     Ok(out.to_vec())
@@ -953,13 +962,13 @@ pub(super) fn encode_core(inner: &mut SessionInner) -> Result<Vec<u8>> {
 /// Decode + header-validate a single archive blob into its wire struct.
 fn decode_wire(archive: &Archive) -> Result<archive_wire::SessionArchive> {
     use mls_rs::mls_rs_codec::MlsDecode;
-    // Header: [version][classical u16 BE][pq u16 BE]. The archived suite pair must equal this
-    // build's pinned suite — fail loudly across builds rather than misinterpret the group
-    // snapshots (equality also confirms a coherent APQ pair).
+    // Header: [version][classical u16 BE][pq u16 BE]. The archived suite pair must be this
+    // build's declared suite — fail loudly across builds rather than misinterpret the group
+    // snapshots (a recognized `TwoMlsSuite` variant is a coherent APQ pair by construction).
     let mut rest = match archive.bytes.as_slice() {
         [SESSION_ARCHIVE_VERSION, s0, s1, s2, s3, rest @ ..]
-            if apq::ApqCipherSuite::from_wire([*s0, *s1, *s2, *s3])
-                == crate::providers::APQ_SUITE =>
+            if crate::suite::TwoMlsSuite::from_wire([*s0, *s1, *s2, *s3])
+                == Some(crate::suite::TwoMlsSuite::CURRENT) =>
         {
             rest
         }

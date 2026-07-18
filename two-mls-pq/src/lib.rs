@@ -6,6 +6,7 @@ pub mod key_packages;
 mod providers;
 mod psk;
 pub mod session;
+mod suite;
 #[cfg(test)]
 #[macro_use]
 mod test_macros;
@@ -316,7 +317,23 @@ pub fn version() -> String {
 // IN PARALLEL with the reply (fresh HPKE per send), so A.4 completes ~one round trip sooner.
 // Wire-format change (the outer tag is gone, the plaintext gained an inner tag) — hence the
 // bump.
-const BINDING_CONTRACT_VERSION: u64 = 21;
+//
+// v22 (2026-07-17): the TwoMLS suite becomes ONE up-front declaration (`TwoMlsSuite`,
+// internal) whose facets drive every crypto choice — the group pair (`APQ_SUITE`), the
+// §A.1/A.4 envelope HPKE (PQ half), the header-encryption AEAD (classical half's
+// ChaCha20-Poly1305; no longer an "independent variable"), and the protocol digest
+// (classical half's SHA-256). The §A.1 envelope HPKE now BINDS the declared suite via
+// AAD that is derived locally on both sides and NEVER transmitted:
+// `[framing version (1)][classical u16 BE][pq u16 BE]` (`envelope_framing_aad()`,
+// appended, replacing the retired `initial_envelope_tag()` in spirit — hosts on the
+// split `hpke_open` + `decode_initial_plaintext` path must now pass it as `aad`). The
+// blob shape is byte-for-byte unchanged; the cut is cryptographic: a v21 seal
+// (`aad = None`) fails a v22 open's AEAD tag and vice versa (`DecryptionFailed` —
+// deliberately opaque, the header-seal `try_open` contract; the crisp
+// `CipherSuiteMismatch` stays where the suite is READABLE: KP validation, APQInfo at
+// join, invitation/archive decode). This binds the CLASSICAL half too, which the HPKE
+// operation alone never touches — downgrade binding at zero wire bytes.
+const BINDING_CONTRACT_VERSION: u64 = 22;
 
 /// See `BINDING_CONTRACT_VERSION`. Exported so the Swift layer can verify the
 /// binding it was generated with matches the binary it loaded.
@@ -603,22 +620,25 @@ impl MlsCipherSuite {
         self.value
     }
 
-    /// True if this suite is the post-quantum (ML-KEM-768) component of a Combiner pair — the
-    /// PQ half TwoMLS handles. Use `is_combiner_classical` to identify the classical half
-    /// before routing — do not route a Combiner classical KP to mls-rs-uniffi-ios.
+    /// True if this suite is the post-quantum component of the declared Combiner pair
+    /// (`TwoMlsSuite::CURRENT.pair().pq` — ML-KEM-768 today), the PQ half TwoMLS handles.
+    /// Use `is_combiner_classical` to identify the classical half before routing — do not
+    /// route a Combiner classical KP to mls-rs-uniffi-ios. Reads the declared suite, not a
+    /// local constant, so these routing predicates track a future suite variant.
     ///
     /// (Renamed from `is_supported` in binding contract v4: the name always meant "is the PQ
     /// combiner suite", not "is a supported suite".)
     pub fn is_combiner_pq(&self) -> bool {
-        self.value == Self::ML_KEM_768
+        self.value == u16::from(crate::suite::TwoMlsSuite::CURRENT.pair().pq)
     }
 
-    /// True if this suite is the classical component of a Combiner pair (0x0003).
-    /// When a key package with this suite is paired with an ML-KEM-768 key package,
-    /// both belong to TwoMLS as a `CombinerKeyPackage` — do not route the classical
-    /// half to mls-rs-uniffi-ios independently.
+    /// True if this suite is the classical component of the declared Combiner pair
+    /// (`TwoMlsSuite::CURRENT.pair().classical` — 0x0003 today). When a key package with
+    /// this suite is paired with the declared PQ key package, both belong to TwoMLS as a
+    /// `CombinerKeyPackage` — do not route the classical half to mls-rs-uniffi-ios
+    /// independently.
     pub fn is_combiner_classical(&self) -> bool {
-        self.value == Self::DHKEM_X25519_CHACHA
+        self.value == u16::from(crate::suite::TwoMlsSuite::CURRENT.pair().classical)
     }
 }
 
@@ -778,13 +798,15 @@ pub enum TwoMlsPqError {
     BootstrapKpMismatch,
 }
 
-/// SHA-256 over `bytes` — the single hashing primitive behind every digest this
-/// crate emits (proposal digests, ordering contexts, session ids; the same function
-/// the cipher suite's `hash` resolves to). One implementation, so the "both sides
-/// derive the same value" invariants cannot split across call sites.
+/// The protocol digest over `bytes` — the single hashing primitive behind every
+/// digest this crate emits (proposal digests, ordering contexts, session ids).
+/// A facet of the declared suite (`TwoMlsSuite::CURRENT.digest`, SHA-256 today),
+/// dispatched infallibly. One implementation, so the "both sides derive the same
+/// value" invariants cannot split across call sites. The name stays `sha256`
+/// while the current suite's hash is SHA-256; a suite whose digest differs
+/// renames it.
 pub(crate) fn sha256(bytes: &[u8]) -> Vec<u8> {
-    use sha2::{Digest, Sha256};
-    Sha256::digest(bytes).to_vec()
+    crate::suite::TwoMlsSuite::CURRENT.digest(bytes)
 }
 
 /// Derive the session identifier for a pair of clients.
