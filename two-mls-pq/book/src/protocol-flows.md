@@ -360,7 +360,7 @@ sequenceDiagram
 
     Alice->>Bob: One HPKE envelope [ app payload ∥ APQ Welcome = { Welcome' [ASG-PQ], Welcome(PSK) [ASG-cl] } ],<br/>sealed to the PQ EK in Bob's KP'. The signed app payload carries: the welcome pair, Alice's CLASSICAL<br/>return KP (for Bob's Add(Alice) into BSG-cl), and H(Alice's KP') — the PQ keyPackage itself travels<br/>in A.4 and must verify against this signed hash
     Alice->>Bob: App messages [ASG-cl] — each re-wrapped in a fresh HPKE envelope to Bob's KP' (as the initial frame above),<br/>re-stapling the APQ Welcome — any single one is a complete establishment vector (Bob can join and read it),<br/>so the initial frame need not survive. Alice has no receiving group to header-seal against until she joins BSG-cl —<br/>after that she header-seals, re-stapling the Welcome until her first commit
-    Alice-->>Bob: (parallel, v21) A.4 bootstrap KP frame [0x13][KP'] in its OWN fresh HPKE envelope, coin-flipped onto the outbox with the reply.<br/>Same raw-blob outer shape as the reply (no outer tag); Bob holds it in memory until establishment, then feeds pq_bootstrap_respond (A.4)
+    Alice-->>Bob: (parallel) A.4 bootstrap KP frame [0x13][KP'] in its OWN fresh HPKE envelope, coin-flipped onto the outbox with the reply.<br/>Same raw-blob outer shape as the reply (no outer tag) — Bob holds it in memory until establishment, then feeds pq_bootstrap_respond (A.4)
 
     Note over Bob: Join Alice's send group (both halves)
     Bob->>Bob: Process Welcome' → join ASG-PQ, then Welcome(PSK) → join ASG-cl
