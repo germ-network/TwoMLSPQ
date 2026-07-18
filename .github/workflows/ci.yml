@@ -292,10 +292,10 @@ jobs:
       - name: Assert vendored binding is in sync
         run: git diff --exit-code Sources/TwoMLSPQBinding/two_mls_pq.swift
 
-      # This package vends only the concrete TwoMLSPQ product — no Swift tests here (the
-      # abstract-surface suite lives in the AbstractTwoMLS consumer package, alongside the
-      # protocol conformances). Verify the library compiles against the local xcframework.
-      - name: Build TwoMLSPQ (local xcframework)
+      # The concrete/FFI-level suites (raw-FFI invitation flows + the total TwoMlsPqError →
+      # SessionError mapping) run here against the local xcframework; the abstract-surface
+      # suite lives in the AbstractTwoMLS consumer package, alongside the protocol conformances.
+      - name: Test TwoMLSPQ (local xcframework)
         env:
           TWOMLSPQ_LOCAL_XCFRAMEWORK: "1"
-        run: swift build
+        run: swift test

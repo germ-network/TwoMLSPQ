@@ -6,8 +6,10 @@ set -euo pipefail
 # SAME build, and compiles the library against the local framework (no release, no checksum
 # wait). Requires a macOS 26 host + Xcode toolchain (cryptokit ML-KEM-768).
 #
-# This package vends only the concrete TwoMLSPQ product; the abstract-surface Swift tests live
-# in the AbstractTwoMLS consumer package (with the conformances). Extra args pass to `swift build`.
+# This package vends the concrete TwoMLSPQ product and runs the concrete/FFI-level Swift tests
+# (raw-FFI invitation flows + the TwoMlsPqError → SessionError mapping); the abstract-surface
+# suite lives in the AbstractTwoMLS consumer package (with the conformances). Extra args pass
+# to `swift test`.
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
@@ -23,6 +25,6 @@ cp bindings/two_mls_pq.swift Sources/TwoMLSPQBinding/two_mls_pq.swift
 
 export TWOMLSPQ_LOCAL_XCFRAMEWORK=1
 
-# 3. Compile the library against the local framework (a build check — no Swift tests in this
-#    package; the abstract-surface suite lives in the AbstractTwoMLS consumer package).
-swift build "$@"
+# 3. Run the concrete/FFI-level suites against the local framework (SwiftPM resolves the
+#    macOS binaryTarget framework's rpath for the test bundle — no dlopen dance needed).
+swift test "$@"

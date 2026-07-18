@@ -73,6 +73,18 @@ let package = Package(
 			dependencies: ["TwoMLSPQrs"]
 		),
 		twoMLSPQrs,
+		// The concrete/FFI-level suites: raw-FFI invitation flows and the total
+		// TwoMlsPqError → SessionError mapping (`@testable` for the internal error bridge +
+		// `import TwoMLSPQBinding` for the raw crate cases). The abstract-surface suites live
+		// in the AbstractTwoMLS package, which owns the protocols + conformances.
+		.testTarget(
+			name: "TwoMLSPQTests",
+			dependencies: [
+				"TwoMLSPQ",
+				"TwoMLSPQBinding",
+				.product(name: "CommProtocol", package: "autonomous-comm-protocol"),
+			]
+		),
 	],
 	swiftLanguageModes: [.v6]
 )
