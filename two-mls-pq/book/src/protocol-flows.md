@@ -578,6 +578,14 @@ after the AppWelcome verifies and the hash matches — the apply gate is structu
 is dropped, the round self-heals: the initiator re-sends it pre-establishment and falls back to
 the steady-state side-band (step 1 above) after the cutover.
 
+**Routing the parallel frame on the acceptor.** The envelope carries no session id, and one
+reusable invitation spawns many sessions, so the acceptor cannot route the KP′ by transport
+address. It self-routes by content: the invitation keeps a commitment table (`H(KP′) → spawned
+group id`, populated at `receive` from the commitment it was already given), and
+`bootstrap_kp_group_id(kp_frame)` hashes the framed KP′ to resolve the owning session — the
+bootstrap-KP counterpart of `forward_group_id`/`processed_welcome_group_id`. Because the table
+key is `H(KP′)`, a frame that resolves can never fail `pq_bootstrap_respond`'s own hash check.
+
 **Why the bind leg exists.** Without it A.4 is the only two-leg operation, and the turn has to
 pass at Bob's *send* rather than at an apply — so Bob is expected to open the next A.3 round while
 his own Welcome' is still unconfirmed, and the two operations contend. The bind makes A.4 a
