@@ -170,10 +170,11 @@ import TwoMLSPQ
 //     The acceptor's `decodeHeader` dispatches `OpenedInitial.bootstrapKp` — resolving the
 //     owed session through the invitation's new `bootstrapKpGroupId(kpFrame:)` (a
 //     `H(KP′)->group` table populated at `receive`) — into the EXISTING `.forward` disposition,
-//     and `forwarded` answers it with `pqBootstrapRespond` (a `DuplicateSideBand`, when the
-//     side-band won the race, is swallowed). The parked `Welcome'` rides the acceptor's next
-//     `pendingSideBand` hand-out. Invitation archive layout changed (INVITATION_VERSION 1→2,
-//     pre-release hard cut) — a stale invitation blob fails to decode and must be regenerated.
+//     and `forwarded` answers it with `pqBootstrapRespond`, failing open (respond errors are
+//     swallowed — the parallel envelope is best-effort, the side-band path is authoritative;
+//     `DuplicateSideBand` when the side-band won the race is the common one). The parked
+//     `Welcome'` rides the acceptor's next `pendingSideBand` hand-out. Invitation archive layout
+//     changed (INVITATION_VERSION 1→2, pre-release hard cut) — a stale blob fails to decode.
 private let expectedBindingContract: UInt64 = 23
 
 enum TwoMLSPQBindingContract {
@@ -502,15 +503,15 @@ extension AbstractTwoMLS {
 				// session and routed it here. Stand up our send group's deferred PQ half
 				// around it; the Welcome' parks in the side-band slot and rides our next
 				// `pendingSideBand(sealing:)` hand-out (no PQInbound — the parked reply is
-				// drained by the ordinary re-send path, not `advance`). A KP′ we already
-				// answered — the side-band `pqBootstrapBegin` won the race — is a benign
-				// `DuplicateSideBand`, swallowed. There is no app message to deliver.
+				// drained by the ordinary re-send path, not `advance`). There is no app
+				// message to deliver. FAIL OPEN like the establishment branch above: this
+				// parallel envelope is a best-effort optimization, and the side-band
+				// `pqBootstrapBegin`/`ingest` path is the AUTHORITATIVE A.4 carrier that
+				// surfaces a genuine failure — so `DuplicateSideBand` (the common case: the
+				// side-band already answered), a frame the app mis-routed here, and an
+				// unrecoverable round are all swallowed rather than misgraded as fatal.
 				if case .bootstrapKp(let kpFrame)? = opened {
-					do {
-						try base.pqBootstrapRespond(kpMsg: kpFrame)
-					} catch TwoMLSPQ.TwoMlsPqError.DuplicateSideBand {
-						// already answered via the side-band — idempotent no-op
-					}
+					try? base.pqBootstrapRespond(kpMsg: kpFrame)
 					return nil
 				}
 				guard case .establishment(let frame)? = opened,
