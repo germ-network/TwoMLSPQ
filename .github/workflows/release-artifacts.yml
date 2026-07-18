@@ -10,11 +10,15 @@ name: Release artifacts
 # the tag — main is deliberately NOT written (it may be branch-protected, and its fallback
 # lagging one release is harmless: in-repo dev/CI use the TWOMLSPQ_LOCAL_XCFRAMEWORK build and
 # external consumers resolve the tag). The retag is a force-update, but it lands BEFORE the
-# assets are uploaded, so no consumer can resolve a usable-but-wrong tag. Idempotent: a manual
-# re-dispatch on an already-pinned tag makes no diff and just re-uploads.
+# assets are uploaded, so no consumer can resolve a usable-but-wrong tag.
+#
+# Idempotent: a re-dispatch on an ALREADY-pinned tag is a genuine no-op — build, pin, and
+# upload are all skipped. Rebuilding is deliberately not done there, because the zip embeds
+# mtimes (not byte-reproducible), so a rebuild would produce a different checksum than the one
+# already pinned in Package.swift and uploaded — replacing the asset would break the pin.
 #
 # Invoked automatically from release.yml when changesets publishes; dispatchable by hand to
-# (re)build and (re)pin an existing tag.
+# build and pin a tag that is not yet pinned.
 
 on:
   workflow_call:
@@ -46,12 +50,30 @@ jobs:
           # force-moved to it.
           fetch-depth: 0
 
+      # Decide up front whether this tag is already pinned. If Package.swift's fallback url
+      # already points at THIS tag's zip, the tag was finalized in a prior run — skip
+      # everything (a rebuild would not be byte-identical and would break the existing pin).
+      - name: Check whether the tag is already pinned
+        id: pinned
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/TwoMLSPQ.xcframework.zip"
+          if grep -qF "$url" Package.swift; then
+            echo "Package.swift already pins ${TAG} — nothing to build, pin, or upload"
+            echo "already=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "already=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Install Rust toolchain
+        if: steps.pinned.outputs.already != 'true'
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios,aarch64-apple-darwin
 
       - name: Cache cargo registry
+        if: steps.pinned.outputs.already != 'true'
         uses: actions/cache@v4
         with:
           path: |
@@ -64,10 +86,12 @@ jobs:
       # (see the script header for why dynamic + framework). Writes buildIos/ + bindings/ at
       # the repo root.
       - name: Build XCFramework (cryptokit)
+        if: steps.pinned.outputs.already != 'true'
         run: ./scripts/buildIosDynamic.sh
 
       - name: Compute SwiftPM checksum
         id: checksum
+        if: steps.pinned.outputs.already != 'true'
         run: |
           # Run from rust/ (no Package.swift there) so compute-checksum never loads the
           # manifest — it only needs to hash the archive.
@@ -76,8 +100,10 @@ jobs:
           printf '%s\n' "$sum" | tee "$GITHUB_WORKSPACE/TwoMLSPQ.xcframework.zip.checksum"
 
       # Pin the fallback binaryTarget (url + checksum) and the vendored binding to THIS build,
-      # then move the tag to the pin commit. No-op when already pinned (manual re-dispatch).
+      # then move the tag to the pin commit. Only reached when the tag is not yet pinned, so
+      # the rewrite is always a real change.
       - name: Pin Package.swift + binding and move the tag
+        if: steps.pinned.outputs.already != 'true'
         env:
           TAG: ${{ inputs.tag }}
           SUM: ${{ steps.checksum.outputs.value }}
@@ -103,17 +129,16 @@ jobs:
           # Re-sync the vendored binding from THIS build so the tagged tree ships a matched
           # binding/binary pair.
           cp bindings/two_mls_pq.swift Sources/TwoMLSPQ/two_mls_pq.swift
-          if git diff --quiet -- Package.swift Sources/TwoMLSPQ/two_mls_pq.swift; then
-            echo "Package.swift + binding already pinned to this build — leaving the tag in place"
-          else
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git commit -am "Release ${TAG}: pin xcframework (${SUM}) + binding"
-            git tag -f "${TAG}"
-            git push origin --force "refs/tags/${TAG}"
-          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Stage exactly the two files we pinned — never a stray tracked change swept up by -a.
+          git commit Package.swift Sources/TwoMLSPQ/two_mls_pq.swift \
+            -m "Release ${TAG}: pin xcframework (${SUM}) + binding"
+          git tag -f "${TAG}"
+          git push origin --force "refs/tags/${TAG}"
 
       - name: Upload artifacts to release
+        if: steps.pinned.outputs.already != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
