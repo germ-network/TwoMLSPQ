@@ -13,11 +13,11 @@ HPKE plaintext (see "The §A.1 envelope" below).
 | `MESSAGE_FRAME_TAG` | `0x03` | The message frame: `[staple][proposal][app]` — the only message-path frame |
 | `APQ_PRIVATE_MESSAGE_TAG` | `0x05` | Draft-02 §7 `APQPrivateMessage` — the staple slot's bind form. Declared in `apq` |
 | `ESTABLISHMENT_VECTOR_TAG` | `0x07` | Inner leading tag of the §A.1 establishment vector (an HPKE-plaintext byte, not an outer wire tag). Declared in `key_packages` |
-| `PRE_ESTABLISHMENT_APP_TAG` | `0x09` | §A.1 app staple, envelope-interior only: `[0x09][BSG-cl PrivateMessage]` |
+| `PRE_ESTABLISHMENT_APP_TAG` | `0x09` | §A.1 app staple, envelope-interior only: `[0x09][ASG-cl PrivateMessage]` (sealed in the initiator's send group) |
 | `PQ_BOOTSTRAP_KP_TAG` | `0x13` | Bootstrap: PQ key package for the deferred send-group half |
 | `PQ_BOOTSTRAP_WELCOME_TAG` | `0x15` | Bootstrap: the new PQ group's Welcome (PQ-groups-only; no classical commit) |
 | `PQ_EK_TAG` | `0x17` | PQ ratchet: ML-KEM encapsulation key |
-| `PQ_CT_TAG` | `0x19` | PQ ratchet: ML-KEM ciphertext |
+| `PQ_CT_TAG` | `0x19` | PQ ratchet: ML-KEM ciphertext **plus** the AEAD-sealed injected secret — `[u32-LE enc_len][enc][sealed]`, not a bare KEM ciphertext (the seal makes ML-KEM implicit rejection an explicit failure) |
 | `PQ_REKEY_UPD_TAG` | `0x1B` | PQ re-key: initiator's `Upd'` proposal |
 | `PQ_REKEY_COMMIT_TAG` | `0x1D` | PQ re-key: the responder's `Commit'` |
 
@@ -133,10 +133,11 @@ slot could not tell from a bare commit. The receiver processes staples
 the receive group's epoch are cheap skips; a commit *ahead* of the receive group
 surfaces `EpochDesync` before the app ciphertext is touched.
 
-**Rotation is not a frame kind.** A principal rotation is a commit whose
-authenticated data carries the new `ClientId` (ratchet commits have empty AD — that
-is the whole discriminator). It rides the same message frame, stages the same
-routine proposal, and folds any queued peer proposal it finds cached.
+**Rotation is not a frame kind.** A principal rotation is a commit whose updated leaf
+credential carries the new `ClientId`; the receiver detects it by diffing the committer's
+leaf credential across the apply (the AS validated the succession during processing), not
+by any frame tag or authenticated-data byte. It rides the same message frame, stages the
+same routine proposal, and folds any queued peer proposal it finds cached.
 
 ## Why re-stapling stays cheap
 

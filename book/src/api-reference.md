@@ -195,9 +195,13 @@ invitation's forward table).
 
 PQ side-band (see [Session Lifecycle](./session-lifecycle.md)): `my_pq_turn`,
 `pq_take_pending_outbound`, `pq_bootstrap_begin(rotating)` / `pq_bootstrap_respond` /
-`pq_bootstrap_apply`, and `pq_ratchet_begin` /
-`pq_ratchet_respond` / `pq_ratchet_bind` / `pq_ratchet_apply` and
-`pq_rekey_begin(rotating)` / `pq_rekey_respond` / `pq_rekey_apply`. The `rotating`
+`pq_bootstrap_bind`, and `pq_ratchet_begin` /
+`pq_ratchet_respond` / `pq_ratchet_bind`, and
+`pq_rekey_begin(rotating)` / `pq_rekey_respond` / `pq_rekey_apply`. The A.3 ratchet and
+A.4 bootstrap have no separate `apply` call: the initiator ingests the responder's reply
+and stages the owed bind with `pq_ratchet_bind` / `pq_bootstrap_bind`, and that bind then
+rides the next message frame's staple, which the peer applies through `process_incoming`
+(the v18 "a bind is the staple" model). The `rotating`
 parameters carry the principal credential handoff and must name the session's current
 principal.
 
@@ -242,8 +246,16 @@ All failures map to the flat `TwoMlsPqError` enum (`Mls`, `InvalidKeyPackage`,
 `InvitationSpent`, `ArchiveInvalid`, `UnsupportedCipherSuite`, `CipherSuiteMismatch`,
 `EpochDesync`, `UnexpectedWelcome`, `InvalidClientId`, `RemoteIdentityMismatch`,
 `CredentialRejected`, `ApqInfoMismatch`, `AppBindingMismatch`,
-`SinkAlreadyInstalled`).
-mls-rs error types never cross the FFI boundary. `InvalidClientId` rejects an empty
+`SinkAlreadyInstalled`, `DuplicateSideBand`, `BootstrapKpMismatch`,
+`BindDischargeFailed`, `BindApplyFailed`).
+mls-rs error types never cross the FFI boundary. The two PQ-bind failures carry
+recovery semantics a caller must branch on: `BindDischargeFailed` is fatal — the classical
+commit discharging an owed bind failed, so the host re-establishes the session — while
+`BindApplyFailed` (paired with the queryable `pq_receive_broken()`) marks receive-side PQ
+state as broken but leaves sending intact, and a restore from the last persisted state
+heals it. `DuplicateSideBand` is a benign no-op (a re-delivered side-band frame);
+`BootstrapKpMismatch` rejects an A.4 bootstrap key package whose hash does not match the
+commitment `receive` was given. `InvalidClientId` rejects an empty
 principal id supplied to `receive(new_client_id:)` or `stage_rotation` — empty is
 reserved (it is the ratchet-commit authenticated-data discriminator, so an empty id
 could never be announced to the peer). `RemoteIdentityMismatch` is an establishment
