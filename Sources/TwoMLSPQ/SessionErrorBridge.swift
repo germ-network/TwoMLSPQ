@@ -1,6 +1,6 @@
 //
-//  SessionError+TwoMLSPQ.swift
-//  AbstractTwoMLS
+//  SessionError+TwoMLSPQBinding.swift
+//  TwoMLSPQ
 //
 //  Total translation of the TwoMLSPQ backend's error families into the
 //  abstract SessionError. This is the ONLY file allowed to name TwoMlsPqError;
@@ -9,7 +9,7 @@
 
 import CommProtocol
 import Foundation
-import TwoMLSPQ
+import TwoMLSPQBinding
 
 /// The wrapper surface an error escaped from — disambiguates the crate's
 /// overloaded `SessionNotReady`, which means "you misrouted a frame" at the
@@ -38,7 +38,7 @@ enum PQErrorSurface {
 	case invitation
 	case client
 
-	var sessionNotReadyCode: AbstractTwoMLS.SessionError.Code {
+	var sessionNotReadyCode: SessionError.Code {
 		switch self {
 		case .processIncoming, .forwarded, .ingest:
 			return .misroutedFrame
@@ -48,11 +48,11 @@ enum PQErrorSurface {
 	}
 }
 
-extension AbstractTwoMLS.SessionError {
+extension SessionError {
 	/// Translate one backend error at a known surface. Exhaustive over
 	/// `TwoMlsPqError`'s 25 cases — a binding bump that adds a case fails
 	/// compilation HERE, which is part of the re-sync ritual (see the contract
-	/// ladder in AbstractTwoMLS+TwoMLSPQ.swift). LinearEncodingError (from the
+	/// ladder in PQSession.swift). LinearEncodingError (from the
 	/// digest lifts) and everything else — including the fileprivate
 	/// UniffiInternalError / rustPanic — fall through to `.internalError`.
 	init(pqError error: any Error, at surface: PQErrorSurface) {
@@ -155,12 +155,12 @@ extension AbstractTwoMLS.SessionError {
 func mapPQErrors<T>(
 	_ surface: PQErrorSurface,
 	_ body: () throws -> T
-) throws(AbstractTwoMLS.SessionError) -> T {
+) throws(SessionError) -> T {
 	do {
 		return try body()
-	} catch let already as AbstractTwoMLS.SessionError {
+	} catch let already as SessionError {
 		throw already
 	} catch {
-		throw AbstractTwoMLS.SessionError(pqError: error, at: surface)
+		throw SessionError(pqError: error, at: surface)
 	}
 }
