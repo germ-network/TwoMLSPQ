@@ -1,16 +1,33 @@
-/target
-/buildIos
-/buildIosFramework
-/bindings
-# SwiftPM scratch dir left by `swift package compute-checksum` (buildIosDynamic.sh)
-/.build
+# Rust
+/rust/target
 Cargo.lock
-*.xcframework
 *.a
 *.dylib
 *.d
 **/*.rs.bk
+
+# UniFFI binding + xcframework build outputs (never committed; released as assets)
+/buildIos
+/buildIosFramework
+/bindings
+*.xcframework
+
+# Swift / SwiftPM / Xcode
+.build/
+/Packages
+/LocalBinary
+xcuserdata/
+DerivedData/
+.swiftpm/configuration/registries.json
+.swiftpm/xcode/package.xcworkspace/contents.xcworkspacedata
+.netrc
+
+# mdBook output
+/book/book
+
+# Node / changesets
+node_modules
+
+# Misc
 .DS_Store
 .idea/
-/two-mls-pq/book/book
-node_modules

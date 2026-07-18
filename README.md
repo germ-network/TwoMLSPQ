@@ -2,66 +2,83 @@
 
 Germ Network's implementation of 1:1 encrypted messaging sessions built on two asymmetric MLS send groups (Distributed MLS — draft-xue-distributed-mls).
 
+This repository holds the whole stack: the Rust/UniFFI core under [`rust/`](rust/), and
+the hand-written Swift wrapper (**AbstractTwoMLS**) that consumes it — `Package.swift`,
+[`Sources/`](Sources/), and [`Tests/`](Tests/) — at the top level. A wire change and its
+Swift adapter land in one PR, tested against a **local** xcframework build; there is no
+publish-a-release-to-test-an-integration step.
+
 ## Documentation
 
 The full guide — concepts, the Combiner construction, cipher suites, the session
 lifecycle, wire format, PSK binding, and the API reference — is an mdBook under
-[`two-mls-pq/book`](two-mls-pq/book/src/introduction.md). The chapters are plain Markdown,
-so you can read them directly on GitHub, or build the rendered site locally:
+[`book`](book/src/introduction.md). The chapters are plain Markdown, so you can read them
+directly on GitHub, or build the rendered site locally:
 
 ```sh
 cargo install mdbook   # once
-just book              # build → two-mls-pq/book/book/
+just book              # build → book/book/
 just book-serve        # serve at http://localhost:3000
 ```
 
 ## Structure
 
 ```
-apq/              APQ Combiner layer (the {classical, pq} group pair, APQ-PSK, establishment)
-two-mls-pq/       Core library (session orchestration, wire format, UniFFI surface)
-uniffi-bindgen/   UniFFI binding generator
-scripts/          iOS build tooling
-bindings/         Generated Swift output (after build)
-buildIos/         XCFramework output (after build)
+Package.swift            Swift package manifest (env-gated binaryTarget — see below)
+Sources/AbstractTwoMLS/  Hand-written Swift wrapper (the vended library)
+Sources/TwoMLSPQ/        Vendored UniFFI binding (two_mls_pq.swift) — re-synced from bindings/
+Tests/                   Swift tests
+book/                    mdBook guide + API reference
+scripts/                 iOS build tooling (buildIosDynamic.sh)
+rust/                    Cargo workspace (the terminal dependency):
+  apq/                   APQ Combiner layer (the {classical, pq} group pair, APQ-PSK, establishment)
+  two-mls-pq/            Core library (session orchestration, wire format, UniFFI surface)
+  uniffi-bindgen/        UniFFI binding generator
+  fuzz/                  Fuzz targets
+bindings/                Generated Swift output (after a build; git-ignored)
+buildIos/                XCFramework output (after a build; git-ignored)
 ```
 
-## Building
+## Building the Rust core
 
-There is no default crypto provider — every build must select exactly one provider
-feature, so a bare `cargo build` fails with a `compile_error!`. Use `awslc` for portable
-development and CI: it runs the full suite, including every real ML-KEM-768 path, on any
-platform. See the CryptoKit section below for the shipped Apple configuration.
+Cargo runs from the workspace at `rust/` (its `.cargo/config.toml` and `rust-toolchain.toml`
+are discovered from the working directory). There is no default crypto provider — every
+build must select exactly one provider feature, so a bare `cargo build` fails with a
+`compile_error!`. Use `awslc` for portable development and CI: it runs the full suite,
+including every real ML-KEM-768 path, on any platform. See the CryptoKit section below for
+the shipped Apple configuration.
 
 ```sh
+cd rust
 cargo build  --features awslc                                          # compile
 cargo test   --features awslc,benchmark_util                           # run tests
 cargo clippy --all-targets --features awslc,benchmark_util -- -D warnings   # lint
 cargo fmt --all -- --check                                             # format check
 ```
 
-## Swift Bindings (debug)
+(The `just` recipes — `just check`, `just test`, `just lint` — wrap these and `cd rust`
+for you.)
 
-Generates the Swift source and header from the debug dylib. Useful for inspecting the generated API without a full release build.
+## Swift bindings (debug)
+
+Generates the Swift source and header from the debug dylib. Useful for inspecting the
+generated API without a full release build (writes to repo-root `bindings/`):
 
 ```sh
+cd rust
 cargo build --package two-mls-pq --features cryptokit
 cargo run --package uniffi-bindgen -- generate \
     target/debug/libtwo_mls_pq.dylib \
-    --library --language swift --out-dir bindings
+    --library --language swift --out-dir ../bindings
 ```
 
-Or via the justfile:
-
-```sh
-just bindgen
-```
+Or via the justfile: `just bindgen`.
 
 ## CryptoKit / ML-KEM-768 tests (macOS 26+)
 
 The crates are crypto-provider agnostic: `apq` compiles no provider at all, and
-`two-mls-pq` pins one per build feature (see `two-mls-pq/src/providers.rs`). Exactly one
-provider feature must be selected — there is no default:
+`two-mls-pq` pins one per build feature (see `rust/two-mls-pq/src/providers.rs`). Exactly
+one provider feature must be selected — there is no default:
 
 - `cryptokit` — Apple CryptoKit for both halves (classical suites + native `MLKEM768`
   via `mls-rs-crypto-cryptokit`, `post-quantum` feature). The shipped configuration.
@@ -73,10 +90,8 @@ provider feature must be selected — there is no default:
   macOS test run includes cross-provider interop tests).
 
 ```sh
+cd rust
 cargo test --features awslc,benchmark_util   # any platform
-```
-
-```sh
 cargo test -p two-mls-pq --features cryptokit
 ```
 
@@ -103,68 +118,48 @@ SwiftPM checksum as its last line:
 bash scripts/buildIosDynamic.sh
 ```
 
-Outputs `buildIos/TwoMLSPQ.xcframework` (and `.zip`) plus `bindings/two_mls_pq.swift` and
-`bindings/two_mls_pqFFI.h`. It builds with the `cryptokit` provider (real ML-KEM-768), so
-it requires a **macOS 26+ host with a matching Xcode toolchain**; if `xcodebuild` can't
-find a full Xcode, point `DEVELOPER_DIR` at your `Xcode.app`. The required Rust targets are
-installed automatically via rustup.
+The script runs cargo from `rust/` but writes its outputs — `buildIos/TwoMLSPQ.xcframework`
+(and `.zip`) plus `bindings/two_mls_pq.swift` and `bindings/two_mls_pqFFI.h` — to the repo
+root, where the Swift package consumes them. It builds with the `cryptokit` provider (real
+ML-KEM-768), so it requires a **macOS 26+ host with a matching Xcode toolchain**; if
+`xcodebuild` can't find a full Xcode, point `DEVELOPER_DIR` at your `Xcode.app`. The
+required Rust targets are installed automatically via rustup.
 
-> The older `scripts/buildIos.sh` (and `just build-ios`) produces a *static*
-> `MLSrs.xcframework` via a `-library`/`-headers` xcframework. It predates the
-> coexistence requirement and is **not** the supported release flow — it is retained only
-> as a vestigial artifact.
+## Swift package: local build-and-test loop
+
+`Package.swift`'s `TwoMLSPQrs` binary target is environment-switched, so in-repo work never
+waits on a release:
+
+- **In-repo dev/CI** — set `TWOMLSPQ_LOCAL_XCFRAMEWORK=1` and the manifest consumes the
+  **local** `buildIos/TwoMLSPQ.xcframework`.
+- **External consumers** (the app resolving a git tag) — unset, and the manifest pins the
+  released `url` + `checksum`, which the release workflow rewrites per release.
+
+The loop that replaces release-to-test:
+
+```sh
+bash scripts/buildIosDynamic.sh                       # build the local xcframework + bindings
+cp bindings/two_mls_pq.swift Sources/TwoMLSPQ/        # re-sync the vendored binding in-tree
+TWOMLSPQ_LOCAL_XCFRAMEWORK=1 swift test               # build + test against the local build
+```
+
+Keep `Sources/TwoMLSPQ/two_mls_pq.swift` re-synced from the SAME build as the binary: uniffi
+embeds a checksum contract verified at init, and the `binding_contract_version()` ↔
+`expectedBindingContract` canary (in `Sources/AbstractTwoMLS/AbstractTwoMLS+TwoMLSPQ.swift`)
+guards a stale-binding/fresh-binary mismatch.
 
 ## Release Process
 
-1. Run the dynamic build script and note the checksum it prints last:
-   ```sh
-   bash scripts/buildIosDynamic.sh
-   ```
+Releases are Changesets-driven (one version for the whole repo; the tag `vX.Y.Z` is the
+xcframework version the app resolves). Add a `.changeset/*.md` describing the change. When the
+"Prepare next release" PR merges, changesets bumps the version and tags the release; the
+finalize job then builds the xcframework, computes the checksum, **pins** `Package.swift`'s
+fallback `url` + `checksum` and the vendored binding to that build on a commit reachable via
+the tag, **repoints the tag** to it, and uploads the assets (`TwoMLSPQ.xcframework.zip`,
+`two_mls_pq.swift`, `two_mls_pqFFI.h`, and the `.checksum`).
 
-2. Tag the commit the script was run from:
-   ```sh
-   git tag 0.x.y
-   git push origin 0.x.y
-   ```
+Because in-repo dev/CI build locally (the env override above), the checksum chicken-and-egg
+never blocks development — only the tagged commit carries the pinned checksum, and the retag
+lands before any asset is uploaded, so no consumer can resolve a half-finalized tag.
 
-3. Create a GitHub release from that tag and upload:
-   - `buildIos/TwoMLSPQ.xcframework.zip`
-   - `bindings/two_mls_pqFFI.h`
-   - `bindings/two_mls_pq.swift`
-
-   Include the checksum in the release notes, along with the binding↔binary pairing
-   warning and the `binding_contract_version()` value (currently **3**): a Swift binding
-   and the binary it was generated from must ship as a matched pair, or the app aborts at
-   first use.
-
-   Releases: https://github.com/germ-network/TwoMLSPQ/releases
-
-## Integrating into the Demo App
-
-The demo app is at https://github.com/germ-network/AbstractTwoMLS.
-
-After publishing a release:
-
-1. Copy the generated header and Swift binding into the app's `Sources/TwoMLSPQ/`:
-   ```sh
-   cp bindings/two_mls_pqFFI.h bindings/two_mls_pq.swift /path/to/AbstractTwoMLS/Sources/TwoMLSPQ/
-   ```
-   Then bump the app's `expectedBindingContract` to match `binding_contract_version()`, so
-   a stale binding/binary pairing fails fast instead of misreading FFI buffers.
-
-2. Update `Package.swift` in the app with the new release URL and checksum:
-   ```swift
-   .binaryTarget(
-       name: "TwoMLSPQ",
-       url: "https://github.com/germ-network/TwoMLSPQ/releases/download/0.x.y/TwoMLSPQ.xcframework.zip",
-       checksum: "<checksum printed by build script>"
-   )
-   ```
-
-For local development, point `Package.swift` directly at the built framework (add `buildIos/` to `.gitignore`):
-   ```swift
-   .binaryTarget(
-       name: "TwoMLSPQ",
-       path: "../TwoMLSPQ/buildIos/TwoMLSPQ.xcframework"
-   )
-   ```
+Releases: https://github.com/germ-network/TwoMLSPQ/releases

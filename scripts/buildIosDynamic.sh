@@ -19,14 +19,20 @@
 # device/archive (embedded-framework code-signing). See ROADMAP Phase 0.3/0.4.
 set -euo pipefail
 
+# Repo root (this script lives in scripts/) and the Rust workspace subdir. cargo/rustup run
+# from the workspace so its .cargo/config.toml + rust-toolchain.toml + target/ all resolve;
+# the binding + xcframework OUTPUTS stay at the repo root where the Swift package consumes them.
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+WORKSPACE="$ROOT/rust"
+
 CARGO="$HOME/.cargo/bin/cargo"
 RUSTUP="$HOME/.cargo/bin/rustup"
 CRATE="two-mls-pq"
 LIB_NAME="libtwo_mls_pq"              # cargo output: <LIB_NAME>.dylib
 MODULE="two_mls_pqFFI"               # framework + clang module name
 FRAMEWORK="TwoMLSPQ"                 # xcframework name
-BINDINGS_DIR="./bindings"
-BUILD_DIR="./buildIos"
+BINDINGS_DIR="$ROOT/bindings"
+BUILD_DIR="$ROOT/buildIos"
 FW_DIR="$BUILD_DIR/frameworks"
 INSTALL_NAME="@rpath/${MODULE}.framework/${MODULE}"
 
@@ -60,6 +66,12 @@ exec "$REAL_SWIFT" "\$@"
 SHIM
 chmod +x "$SHIM_DIR/swift"
 export PATH="$SHIM_DIR:$PATH"
+
+# From here, run inside the Rust workspace so cargo/rustup discover rust/.cargo/config.toml,
+# rust/rust-toolchain.toml, and rust/target/. The `target/…` dylib paths below resolve to
+# rust/target relative to this cwd, while BINDINGS_DIR/BUILD_DIR stay absolute at the repo
+# root, so the generated bindings and xcframework land where the Swift package consumes them.
+cd "$WORKSPACE"
 
 # Ensure all required targets are installed
 "$RUSTUP" target add "${TARGETS[@]}" || true
