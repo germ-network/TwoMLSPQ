@@ -114,9 +114,12 @@ jobs:
       - name: Check licenses and advisories
         uses: EmbarkStudios/cargo-deny-action@v2
         with:
-          # --manifest-path points cargo-deny at the relocated workspace (it reads deny.toml
-          # from the manifest's directory, rust/).
-          arguments: --all-features --manifest-path rust/Cargo.toml
+          # Point cargo-deny at the relocated workspace via the action's own input (it also
+          # reads deny.toml from the manifest's directory, rust/). Do NOT also pass
+          # --manifest-path in `arguments` — the action adds its own, and cargo-deny rejects
+          # the flag twice.
+          manifest-path: rust/Cargo.toml
+          arguments: --all-features
           command: check
           command-arguments: "licenses advisories sources"
 
