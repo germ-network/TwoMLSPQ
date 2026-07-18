@@ -1,11 +1,27 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Static-library xcframework build (the FUTURE static-packaging seed; NOT the shipped flow).
+# The supported release is the dynamic framework bundle — scripts/buildIosDynamic.sh (+ its
+# Swift twin scripts/buildIos.swift). This static `-library`/`-headers` xcframework is kept
+# only as the starting point for once-the-app-drops-legacy static packaging; it predates the
+# coexistence requirement and the cryptokit-bridge shim/purge, so it is not currently wired
+# into CI or the justfile.
+#
+# Paths mirror the dynamic script: cargo runs in the workspace (rust/) so its
+# .cargo/config.toml + rust-toolchain.toml resolve; bindings + xcframework land at the repo
+# root. `target/…` below is relative to the workspace cwd (= rust/target).
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+WORKSPACE="$ROOT/rust"
+
 CARGO="$HOME/.cargo/bin/cargo"
 RUSTUP="$HOME/.cargo/bin/rustup"
 FRAMEWORK="MLSrs"
-BINDINGS_DIR="./bindings"
-BUILD_DIR="./buildIos"
+BINDINGS_DIR="$ROOT/bindings"
+BUILD_DIR="$ROOT/buildIos"
+
+cd "$WORKSPACE"
 
 # Ensure all required targets are installed
 "$RUSTUP" target add \
@@ -24,7 +40,7 @@ rm -f  "$BUILD_DIR/libtwo_mls_pq_sim_combined.a" || true
 mkdir -p "$BUILD_DIR"
 
 # Debug build + generate Swift bindings. The shipped configuration is CryptoKit for
-# both halves (see two-mls-pq/src/providers.rs).
+# both halves (see rust/two-mls-pq/src/providers.rs).
 "$CARGO" build --features two-mls-pq/cryptokit
 "$CARGO" run -p uniffi-bindgen --bin uniffi-bindgen \
     generate --library ./target/debug/libtwo_mls_pq.dylib \
