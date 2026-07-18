@@ -1,4 +1,4 @@
-/target
+/rust/target
 /buildIos
 /buildIosFramework
 /bindings
@@ -12,5 +12,5 @@ Cargo.lock
 **/*.rs.bk
 .DS_Store
 .idea/
-/two-mls-pq/book/book
+/book/book
 node_modules
