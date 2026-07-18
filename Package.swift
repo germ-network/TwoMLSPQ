@@ -27,53 +27,63 @@ let twoMLSPQrs: Target =
 	)
 
 let package = Package(
-	name: "AbstractTwoMLS",
+	name: "TwoMLSPQ",
 	// Import/link floors. The PQ backend's ML-KEM paths additionally require
 	// OS 26 (CryptoKit ML-KEM-768) at RUNTIME — that floor applies only to
 	// calling the PQ API, not to importing or linking this package.
 	platforms: [.iOS(.v17), .macOS(.v15)],
 	products: [
-		// Vend ONLY the abstraction. The concrete UniFFI wrapper (`TwoMLSPQ`) stays an
-		// internal target (it still links transitively): uniffi stamps its interface
-		// classes `@unchecked Sendable` (Rust Send+Sync, lock-serialized — memory-safe
-		// but with no ordering guarantees), so exposing it would hand consumers a
-		// freely-shareable session handle and defeat the deliberately non-Sendable
-		// wrapper types, which are the only supported session handles.
+		// The forward-looking PUBLIC product: the concrete PQ types (`PQSession`,
+		// `PQInvitation`, `PQClient`, …), their value/currency types, and the UniFFI
+		// binding. The backward-compat shim PROTOCOLS live in the separate
+		// `AbstractTwoMLS` package (which depends on and re-exports this), keeping this
+		// product's surface clear of the legacy-shim abstraction.
 		.library(
-			name: "AbstractTwoMLS",
-			targets: ["AbstractTwoMLS"]
+			name: "TwoMLSPQ",
+			targets: ["TwoMLSPQ"]
 		)
 	],
 	dependencies: [
+		// Not the shim protocol — a type dependency. `TypedDigest`/`DataIdentifier` are
+		// load-bearing shared crypto vocabulary (the proposal digest's `.wireFormat` is
+		// signed into the cross-party agent handoff), so the concrete types name them.
 		.package(
 			url: "https://github.com/germ-network/autonomous-comm-protocol.git",
 			from: "1.2.0"
 		)
 	],
 	targets: [
-		// Abstraction layer. Hosts the protocol surface (and, later, the conformances
-		// mapping each concrete implementation onto it).
+		// The public product: the hand-written concrete PQ types + value/currency types,
+		// top-level in this module. Depends on the internal binding target below (so the raw
+		// UniFFI interface types stay out of this surface) + CommProtocol for `TypedDigest`.
 		.target(
-			name: "AbstractTwoMLS",
+			name: "TwoMLSPQ",
 			dependencies: [
-				"TwoMLSPQ",
+				"TwoMLSPQBinding",
 				.product(name: "CommProtocol", package: "autonomous-comm-protocol"),
 			]
 		),
-		// PQ implementation — UniFFI wrapper for the TwoMLSPQ framework. Owns its own
-		// `RustBuffer` (from `two_mls_pqFFI`).
+		// The generated UniFFI binding (`two_mls_pq.swift`, owning its own `RustBuffer` from
+		// `two_mls_pqFFI`). An INTERNAL target — not vended — so its `@unchecked Sendable`
+		// interface classes never reach a public consumer; the `TwoMLSPQ` wrapper types are
+		// the only supported handles. Kept a distinct module so its generated `PrincipalState`/
+		// `SideBandSealing`/… don't collide with the wrapper's currency types of the same name.
 		.target(
-			name: "TwoMLSPQ",
+			name: "TwoMLSPQBinding",
 			dependencies: ["TwoMLSPQrs"]
 		),
 		twoMLSPQrs,
+		// The concrete/FFI-level suites: raw-FFI invitation flows and the total
+		// TwoMlsPqError → SessionError mapping (`@testable` for the internal error bridge +
+		// `import TwoMLSPQBinding` for the raw crate cases). The abstract-surface suites live
+		// in the AbstractTwoMLS package, which owns the protocols + conformances.
 		.testTarget(
-			name: "AbstractTwoMLSTests",
-			// TwoMLSPQ is named explicitly: the tests exercise the concrete
-			// backend directly (in-package target imports are unaffected by the
-			// product narrowing above — external consumers can import only
-			// AbstractTwoMLS).
-			dependencies: ["AbstractTwoMLS", "TwoMLSPQ"]
+			name: "TwoMLSPQTests",
+			dependencies: [
+				"TwoMLSPQ",
+				"TwoMLSPQBinding",
+				.product(name: "CommProtocol", package: "autonomous-comm-protocol"),
+			]
 		),
 	],
 	swiftLanguageModes: [.v6]

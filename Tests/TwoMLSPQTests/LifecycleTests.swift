@@ -1,8 +1,8 @@
 //
-//  AbstractTwoMLSTests.swift
-//  AbstractTwoMLS
+//  LifecycleTests.swift
+//  TwoMLSPQ
 //
-//  Created by Mark @ Germ on 6/30/26.
+
 //
 //  Deep lifecycle test: the same flow as APIDemo.apiDemo, but checking each step's
 //  expected state through the TwoMLSPQ session's internal accessors (epochs, turn,
@@ -13,12 +13,13 @@ import CommProtocol
 import Foundation
 import Testing
 
-@testable import AbstractTwoMLS
+import TwoMLSPQBinding
+
 @testable import TwoMLSPQ
 
 struct LifecycleTests {
-	let local: ClientWrapper<AbstractTwoMLS.PQClient>
-	let remote: ClientWrapper<AbstractTwoMLS.PQClient>
+	let local: ClientWrapper
+	let remote: ClientWrapper
 
 	init() throws {
 		local = try .init()
@@ -26,11 +27,16 @@ struct LifecycleTests {
 	}
 
 	@Test func testExchange() async throws {
-		// -- Step 1: initiator forms its APQ send group and seals the AppWelcome.
-		let (localSession, encryptedCombinedWelcome) = try local.client.reply(
-			remoteClientId: remote.clientId,
-			encodedRemoteKpkg: remote.currentInvitation.encodedKeyPackage
-		)
+		// -- Step 1: initiator forms its APQ send group and mints the plaintext welcome.
+		// The concrete `reply` returns the PLAINTEXT APQWelcome (contract 15) plus the
+		// return-group key package and the A.4 bootstrap commitment — the app seals the
+		// welcome into its signed identity envelope and hands it back via
+		// createTwoMLSGroup; this bare harness delivers it plaintext (as PQInvitationTests
+		// does), so there is no sealed §A.1 envelope to inspect here.
+		let (localSession, welcome, myKeyPackage, bootstrapKpCommitment) =
+			try local.client.reply(
+				keyPackageMessage: remote.currentInvitation.encodedKeyPackage
+			)
 		let localBase = localSession.base
 
 		// Send group live at epoch 1 with a full PQ half; no recv group yet.
@@ -39,19 +45,10 @@ struct LifecycleTests {
 		#expect(!localBase.isFullyEstablished())
 		#expect(localBase.myPqTurn())
 		#expect(localBase.epochs() == ApqEpochs(pqEpoch: 1, classicalEpoch: 1))
-		// createTwoMLSGroup (in the reply harness) attached the AppWelcome and
-		// consumed the parked §A.1 envelope via pendingOutbound (take-once)…
-		#expect(localBase.pendingOutbound() == nil)
-		// …and it travels as the crate's opaque §A.1 envelope. Contract 21 dropped
-		// the outer tag, so the blob is the raw `[u32-LE kem-len][kem_output]
-		// [ciphertext]`; assert that shape (a well-formed kem-length prefix bounding
-		// the kem_output, with ciphertext after) rather than a now-absent tag byte.
-		let envelopeKemLen = Int(
-			encryptedCombinedWelcome.prefix(4).withUnsafeBytes {
-				$0.loadUnaligned(as: UInt32.self)
-			}.littleEndian)
-		#expect(envelopeKemLen > 0)
-		#expect(encryptedCombinedWelcome.count > 4 + envelopeKemLen)
+		// The §A.1 bootstrap envelope is parked at initiate and NOT consumed by this
+		// plaintext harness (no createTwoMLSGroup) — it stays available as the take-once
+		// outbound, and A.4's `begin(.finishBootstrap)` (step 5) carries the same KP′.
+		#expect(localBase.pendingOutbound() != nil)
 
 		// Routing: listening works from birth — addresses derive from our send
 		// group's classical half, one per epoch. Nowhere to post yet: the post
@@ -65,9 +62,14 @@ struct LifecycleTests {
 		#expect(try localBase.sendRendezvous() == nil)
 
 		// -- Step 2: the invitation receives — recv group up, send group classical-only.
-		let (remoteSession, stapled) = try remote.currentInvitation.receiveReply(
-			ciphertext: encryptedCombinedWelcome,
-			expecting: try local.clientId
+		let (remoteSession, stapled) = try remote.currentInvitation.receive(
+			sendGroupWelcome: welcome,
+			remoteKeyPackage: myKeyPackage,
+			bootstrapKpCommitment: bootstrapKpCommitment,
+			remoteClientId: try local.clientId,
+			welcomeToken: WelcomeToken(TypedDigest(prefix: .sha256, over: welcome)),
+			stapledMessage: nil,
+			newClientId: .mock()
 		)
 		#expect(stapled == nil)
 		let remoteBase = remoteSession.base
@@ -141,7 +143,7 @@ struct LifecycleTests {
 
 		// The encrypt result reports the true APQ pair, not a duplicated single
 		// epoch: remote's send group is classical-only pre-A.4, so pqEpoch is 0.
-		#expect(updFrame.epochs == AbstractTwoMLS.APQEpochs(pqEpoch: 0, classicalEpoch: 1))
+		#expect(updFrame.epochs == APQEpochs(pqEpoch: 0, classicalEpoch: 1))
 		let updDecrypted = try #require(
 			try localSession.processIncoming(ciphertext: updFrame.cipherText))
 		let offered = try #require(updDecrypted.proposal)
@@ -157,7 +159,7 @@ struct LifecycleTests {
 		// matches the session's own epoch view at send time.
 		#expect(
 			commitFrame.epochs
-				== AbstractTwoMLS.APQEpochs(pqEpoch: 1, classicalEpoch: 2))
+				== APQEpochs(pqEpoch: 1, classicalEpoch: 2))
 		#expect(commitFrame.epochs.pqEpoch == localBase.epochs().pqEpoch)
 		#expect(commitFrame.epochs.classicalEpoch == localBase.epochs().classicalEpoch)
 

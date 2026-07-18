@@ -1,11 +1,11 @@
 //
 //  ErrorContractTests.swift
-//  AbstractTwoMLS
+//  TwoMLSPQ
 //
 //  Pins the SessionError contract: the abstract surface throws ONE type; every
 //  backend error maps to a stable code with the documented disposition; and the
 //  translation is total over the 22 TwoMlsPqError cases (a binding bump that
-//  adds a case fails compilation in SessionError+TwoMLSPQ.swift, and this
+//  adds a case fails compilation in SessionErrorBridge.swift, and this
 //  totality test catches a silent remapping of an existing one).
 //
 
@@ -13,15 +13,16 @@ import CommProtocol
 import Foundation
 import Testing
 
-@testable import AbstractTwoMLS  // internal SessionError(pqError:at:) + PQErrorSurface
-@testable import TwoMLSPQ  // public TwoMlsPqError cases
+import TwoMLSPQBinding  // public TwoMlsPqError cases
+
+@testable import TwoMLSPQ  // internal SessionError(pqError:at:) + PQErrorSurface
 
 struct ErrorContractTests {
 
 	// MARK: Code -> Disposition table (exhaustive; a new code forces a row)
 
 	@Test func codeDispositionTable() {
-		typealias E = AbstractTwoMLS.SessionError
+		typealias E = SessionError
 		let table: [(E.Code, E.Disposition)] = [
 			(.decryptionFailed, .retryLater),
 			(.staleFrame, .discardFrame),
@@ -64,7 +65,7 @@ struct ErrorContractTests {
 	/// Every crate case, mapped at a neutral surface. `SessionNotReady` is
 	/// surface-dependent and covered separately below.
 	@Test func everyCrateCaseMaps() {
-		let expected: [(TwoMlsPqError, AbstractTwoMLS.SessionError.Code)] = [
+		let expected: [(TwoMlsPqError, SessionError.Code)] = [
 			(.Mls, .internalError),
 			(.PskBinding, .internalError),
 			(.InvalidKeyPackage, .invalidKeyPackage),
@@ -89,7 +90,7 @@ struct ErrorContractTests {
 		]
 		#expect(expected.count == 21)  // + SessionNotReady (per-surface) = 22 cases
 		for (crate, code) in expected {
-			let mapped = AbstractTwoMLS.SessionError(pqError: crate, at: .client)
+			let mapped = SessionError(pqError: crate, at: .client)
 			#expect(mapped.code == code, "\(crate) -> \(mapped.code)")
 			#expect(mapped.underlying is TwoMlsPqError)
 		}
@@ -100,12 +101,12 @@ struct ErrorContractTests {
 	@Test func sessionNotReadyIsSurfaceDependent() {
 		let misrouted: [PQErrorSurface] = [.processIncoming, .forwarded, .ingest]
 		for surface in misrouted {
-			let e = AbstractTwoMLS.SessionError(pqError: TwoMlsPqError.SessionNotReady, at: surface)
+			let e = SessionError(pqError: TwoMlsPqError.SessionNotReady, at: surface)
 			#expect(e.code == .misroutedFrame, "\(surface)")
 		}
 		let sequencing: [PQErrorSurface] = [.prepareToEncrypt, .encrypt, .pqOperation, .receive]
 		for surface in sequencing {
-			let e = AbstractTwoMLS.SessionError(pqError: TwoMlsPqError.SessionNotReady, at: surface)
+			let e = SessionError(pqError: TwoMlsPqError.SessionNotReady, at: surface)
 			#expect(e.code == .sequenceViolation, "\(surface)")
 		}
 	}
@@ -114,83 +115,8 @@ struct ErrorContractTests {
 	/// (this absorbs the fileprivate UniffiInternalError / rustPanic too).
 	@Test func unknownErrorsAreInternal() {
 		struct Weird: Error {}
-		let e = AbstractTwoMLS.SessionError(pqError: Weird(), at: .encrypt)
+		let e = SessionError(pqError: Weird(), at: .encrypt)
 		#expect(e.code == .internalError)
 		#expect(e.disposition == .fatal)
-	}
-}
-
-// MARK: - Behavioral pins for the new persistence surfaces
-
-struct ErrorContractBehaviorTests {
-	let local: ClientWrapper<AbstractTwoMLS.PQClient>
-	let remote: ClientWrapper<AbstractTwoMLS.PQClient>
-
-	init() throws {
-		local = try .init()
-		remote = try .init()
-	}
-
-	private func establishPair() throws -> (
-		AbstractTwoMLS.PQSession, AbstractTwoMLS.PQSession
-	) {
-		let (localSession, sealed) = try local.client.reply(
-			remoteClientId: remote.clientId,
-			encodedRemoteKpkg: remote.currentInvitation.encodedKeyPackage
-		)
-		let (remoteSession, _) = try remote.currentInvitation.receiveReply(
-			ciphertext: sealed,
-			expecting: try local.clientId
-		)
-		try remoteSession.send(to: localSession)
-		return (localSession, remoteSession)
-	}
-
-	@Test func doubleInstallIsCallerBug() throws {
-		let (_, remoteSession) = try establishPair()
-		try remoteSession.installSink(RecordingSink())
-		do {
-			try remoteSession.installSink(RecordingSink())
-			Issue.record("expected .sinkAlreadyInstalled")
-		} catch {
-			#expect(error.code == .sinkAlreadyInstalled)
-			#expect(error.disposition == .callerBug)
-		}
-	}
-
-	@Test func corruptedCheckpointRestoreIsDiscardArtifact() throws {
-		do {
-			_ = try AbstractTwoMLS.PQSession(
-				persisted: .init(core: nil, checkpoint: Data("garbage".utf8)))
-			Issue.record("expected .archiveInvalid")
-		} catch {
-			#expect(error.code == .archiveInvalid)
-			#expect(error.disposition == .discardArtifact)
-		}
-	}
-
-	@Test func misroutedSideBandIntoProcessIncoming() throws {
-		let (localSession, remoteSession) = try establishPair()
-		// Drive local to owe the A.4 bootstrap and take its side-band frame.
-		let localPQ = localSession as any AbstractTwoMLS.PQRatchetingSession
-		let outbound = try localPQ.begin(.finishBootstrap, rotating: nil)
-		// Feeding a PQ side-band frame to the message door is a routing bug.
-		do {
-			_ = try remoteSession.processIncoming(ciphertext: outbound.payload)
-			Issue.record("expected .misroutedFrame")
-		} catch {
-			#expect(error.code == .misroutedFrame)
-		}
-	}
-
-	@Test func encryptWithoutPrepareIsSequenceViolation() throws {
-		let (localSession, _) = try establishPair()
-		do {
-			_ = try localSession.encrypt(appMessage: Data("no prepare".utf8))
-			Issue.record("expected .sequenceViolation")
-		} catch {
-			#expect(error.code == .sequenceViolation)
-			#expect(error.disposition == .callerBug)
-		}
 	}
 }

@@ -1,32 +1,32 @@
 //
 //  PQInvitationTests.swift
-//  AbstractTwoMLS
+//  TwoMLSPQ
 //
 //  Exercises the two-step receive path of the PQ conformance: the acceptor runs
 //  entirely through the abstract PQInvitation, while the initiator drives the raw
 //  TwoMLSPQ FFI directly (PQClient.reply is not wired yet).
 //
 
-import AbstractTwoMLS
 import CommProtocol
 import Foundation
 import Testing
 
-@testable import TwoMLSPQ
+import TwoMLSPQ
+import TwoMLSPQBinding
 
 struct PQInvitationReceiveTests {
 
 	@Test func receiveEstablishesSession() throws {
 		// Acceptor: abstract client publishes an invitation, restored from its archive.
-		let invitation = try AbstractTwoMLS.PQInvitation(
-			persisted: try AbstractTwoMLS.PQClient(clientId: .mock()).makeInvitation()
+		let invitation = try PQInvitation(
+			persisted: try PQClient(clientId: .mock()).makeInvitation()
 		)
 
 		// Initiator (raw FFI): decode the acceptor's opaque published key package
 		// and form the send group. These tests deliver the PLAINTEXT welcome
 		// (`initialWelcome`) with no app envelope and no staple — the bare two-step
 		// receive path; the enveloped/stapled §A.1 flow is ReplierFirstDemo's.
-		let initiator = try TwoMlsPqPrincipal(clientId: AbstractTwoMLS.ClientID.mock())
+		let initiator = try TwoMlsPqPrincipal(clientId: ClientID.mock())
 		let acceptorPair = try decodeCombinerKeyPackage(bytes: invitation.encodedKeyPackage)
 		let initiatorSession = try TwoMlsPqSession.initiate(
 			client: initiator,
@@ -48,7 +48,7 @@ struct PQInvitationReceiveTests {
 			remoteKeyPackage: initiatorKp,
 			bootstrapKpCommitment: try #require(initiatorSession.bootstrapKpCommitment()),
 			remoteClientId: initiator.clientId().bytes,
-			welcomeToken: AbstractTwoMLS.WelcomeToken(TypedDigest(prefix: .sha256, over: welcome)),
+			welcomeToken: WelcomeToken(TypedDigest(prefix: .sha256, over: welcome)),
 			stapledMessage: nil,
 			newClientId: .mock()
 		)
@@ -74,11 +74,11 @@ struct PQInvitationReceiveTests {
 	}
 
 	@Test func receiveRejectsDuplicateRemote() throws {
-		let invitation = try AbstractTwoMLS.PQInvitation(
-			persisted: try AbstractTwoMLS.PQClient(clientId: .mock()).makeInvitation()
+		let invitation = try PQInvitation(
+			persisted: try PQClient(clientId: .mock()).makeInvitation()
 		)
 
-		let initiator = try TwoMlsPqPrincipal(clientId: AbstractTwoMLS.ClientID.mock())
+		let initiator = try TwoMlsPqPrincipal(clientId: ClientID.mock())
 		let acceptorPair = try decodeCombinerKeyPackage(bytes: invitation.encodedKeyPackage)
 		let initiatorSession = try TwoMlsPqSession.initiate(
 			client: initiator,
@@ -88,7 +88,7 @@ struct PQInvitationReceiveTests {
 		let welcome = try #require(initiatorSession.initialWelcome())
 		let initiatorKp = try initiator.generateKeyPackage(suite: .x25519Chacha())
 		let commitment = try #require(initiatorSession.bootstrapKpCommitment())
-		let token = AbstractTwoMLS.WelcomeToken(TypedDigest(prefix: .sha256, over: welcome))
+		let token = WelcomeToken(TypedDigest(prefix: .sha256, over: welcome))
 
 		_ = try invitation.receive(
 			sendGroupWelcome: welcome,
@@ -119,11 +119,11 @@ struct PQInvitationReceiveTests {
 	}
 
 	@Test func receiveRejectsMismatchedIdentity() throws {
-		let invitation = try AbstractTwoMLS.PQInvitation(
-			persisted: try AbstractTwoMLS.PQClient(clientId: .mock()).makeInvitation()
+		let invitation = try PQInvitation(
+			persisted: try PQClient(clientId: .mock()).makeInvitation()
 		)
 
-		let initiator = try TwoMlsPqPrincipal(clientId: AbstractTwoMLS.ClientID.mock())
+		let initiator = try TwoMlsPqPrincipal(clientId: ClientID.mock())
 		let acceptorPair = try decodeCombinerKeyPackage(bytes: invitation.encodedKeyPackage)
 		let initiatorSession = try TwoMlsPqSession.initiate(
 			client: initiator,
@@ -141,7 +141,7 @@ struct PQInvitationReceiveTests {
 				remoteKeyPackage: initiatorKp,
 				bootstrapKpCommitment: commitment,
 				remoteClientId: .mock(),  // not the initiator's identity
-				welcomeToken: AbstractTwoMLS.WelcomeToken(TypedDigest(prefix: .sha256, over: welcome)),
+				welcomeToken: WelcomeToken(TypedDigest(prefix: .sha256, over: welcome)),
 				stapledMessage: nil,
 				newClientId: .mock()
 			)
@@ -160,11 +160,11 @@ struct PQInvitationReceiveTests {
 	/// `.bootstrapKpMismatch`/`.discardFrame`; the invitation stays reusable, so the same
 	/// welcome then establishes with the genuine commitment.
 	@Test func receiveRejectsMalformedBootstrapCommitment() throws {
-		let invitation = try AbstractTwoMLS.PQInvitation(
-			persisted: try AbstractTwoMLS.PQClient(clientId: .mock()).makeInvitation()
+		let invitation = try PQInvitation(
+			persisted: try PQClient(clientId: .mock()).makeInvitation()
 		)
 
-		let initiator = try TwoMlsPqPrincipal(clientId: AbstractTwoMLS.ClientID.mock())
+		let initiator = try TwoMlsPqPrincipal(clientId: ClientID.mock())
 		let acceptorPair = try decodeCombinerKeyPackage(bytes: invitation.encodedKeyPackage)
 		let initiatorSession = try TwoMlsPqSession.initiate(
 			client: initiator,
@@ -173,7 +173,7 @@ struct PQInvitationReceiveTests {
 		)
 		let welcome = try #require(initiatorSession.initialWelcome())
 		let initiatorKp = try initiator.generateKeyPackage(suite: .x25519Chacha())
-		let token = AbstractTwoMLS.WelcomeToken(TypedDigest(prefix: .sha256, over: welcome))
+		let token = WelcomeToken(TypedDigest(prefix: .sha256, over: welcome))
 
 		do {
 			_ = try invitation.receive(
@@ -221,11 +221,11 @@ struct PQInvitationReceiveTests {
 	/// used to run after `base.receive`, so this failure orphaned the established
 	/// session and burned the welcome — retry got `DuplicateWelcome`.)
 	@Test func receiveRejectsEmptyDedicatedPrincipalBeforeConsuming() throws {
-		let invitation = try AbstractTwoMLS.PQInvitation(
-			persisted: try AbstractTwoMLS.PQClient(clientId: .mock()).makeInvitation()
+		let invitation = try PQInvitation(
+			persisted: try PQClient(clientId: .mock()).makeInvitation()
 		)
 
-		let initiator = try TwoMlsPqPrincipal(clientId: AbstractTwoMLS.ClientID.mock())
+		let initiator = try TwoMlsPqPrincipal(clientId: ClientID.mock())
 		let acceptorPair = try decodeCombinerKeyPackage(bytes: invitation.encodedKeyPackage)
 		let initiatorSession = try TwoMlsPqSession.initiate(
 			client: initiator,
@@ -235,7 +235,7 @@ struct PQInvitationReceiveTests {
 		let welcome = try #require(initiatorSession.initialWelcome())
 		let initiatorKp = try initiator.generateKeyPackage(suite: .x25519Chacha())
 		let commitment = try #require(initiatorSession.bootstrapKpCommitment())
-		let token = AbstractTwoMLS.WelcomeToken(TypedDigest(prefix: .sha256, over: welcome))
+		let token = WelcomeToken(TypedDigest(prefix: .sha256, over: welcome))
 
 		do {
 			_ = try invitation.receive(

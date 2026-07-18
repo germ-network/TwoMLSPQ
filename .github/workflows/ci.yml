@@ -287,26 +287,15 @@ jobs:
       # contract; the binding_contract_version canary guards it). Re-sync, then fail if the
       # tracked copy drifted from what this build generates.
       - name: Re-sync vendored binding
-        run: cp bindings/two_mls_pq.swift Sources/TwoMLSPQ/two_mls_pq.swift
+        run: cp bindings/two_mls_pq.swift Sources/TwoMLSPQBinding/two_mls_pq.swift
 
       - name: Assert vendored binding is in sync
-        run: git diff --exit-code Sources/TwoMLSPQ/two_mls_pq.swift
+        run: git diff --exit-code Sources/TwoMLSPQBinding/two_mls_pq.swift
 
-      - name: Build tests (local xcframework)
+      # The concrete/FFI-level suites (raw-FFI invitation flows + the total TwoMlsPqError →
+      # SessionError mapping) run here against the local xcframework; the abstract-surface
+      # suite lives in the AbstractTwoMLS consumer package, alongside the protocol conformances.
+      - name: Test TwoMLSPQ (local xcframework)
         env:
           TWOMLSPQ_LOCAL_XCFRAMEWORK: "1"
-        run: swift build --build-tests
-
-      # SwiftPM does not stage a dynamic binaryTarget's framework into the test bundle's
-      # @rpath (PackageFrameworks/), so dlopen fails at test load. Symlink the macOS slice in.
-      - name: Stage framework for @rpath
-        run: |
-          PF=.build/out/Products/Debug/PackageFrameworks
-          mkdir -p "$PF"
-          ln -sf "$PWD/buildIos/TwoMLSPQ.xcframework/macos-arm64/two_mls_pqFFI.framework" \
-            "$PF/two_mls_pqFFI.framework"
-
-      - name: Swift test (local xcframework)
-        env:
-          TWOMLSPQ_LOCAL_XCFRAMEWORK: "1"
-        run: swift test --skip-build
+        run: swift test
