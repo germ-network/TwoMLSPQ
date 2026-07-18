@@ -151,12 +151,15 @@ guards a stale-binding/fresh-binary mismatch.
 ## Release Process
 
 Releases are Changesets-driven (one version for the whole repo; the tag `vX.Y.Z` is the
-xcframework version the app resolves). Add a `.changeset/*.md` describing the change; the
-release workflow builds the xcframework, computes the checksum, rewrites `Package.swift`'s
-pinned `url` + `checksum`, re-syncs the committed binding, tags, and uploads the assets
-(`TwoMLSPQ.xcframework.zip`, `two_mls_pq.swift`, `two_mls_pqFFI.h`, and the `.checksum`).
+xcframework version the app resolves). Add a `.changeset/*.md` describing the change. When the
+"Prepare next release" PR merges, changesets bumps the version and tags the release; the
+finalize job then builds the xcframework, computes the checksum, **pins** `Package.swift`'s
+fallback `url` + `checksum` and the vendored binding to that build on a commit reachable via
+the tag, **repoints the tag** to it, and uploads the assets (`TwoMLSPQ.xcframework.zip`,
+`two_mls_pq.swift`, `two_mls_pqFFI.h`, and the `.checksum`).
 
 Because in-repo dev/CI build locally (the env override above), the checksum chicken-and-egg
-never blocks development — only the tagged release commit carries the pinned checksum.
+never blocks development — only the tagged commit carries the pinned checksum, and the retag
+lands before any asset is uploaded, so no consumer can resolve a half-finalized tag.
 
 Releases: https://github.com/germ-network/TwoMLSPQ/releases

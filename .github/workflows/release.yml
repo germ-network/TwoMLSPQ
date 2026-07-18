@@ -49,10 +49,10 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  # Build + upload the release artifacts (XCFramework, Swift bindings, checksum)
-  # whenever the changesets step above published a release. Chained here — rather
-  # than an `on: release` trigger — because releases created with the workflow's
-  # own GITHUB_TOKEN do not fire other workflows.
+  # Build the XCFramework, PIN Package.swift + the vendored binding to it (moving the
+  # tag to the pin commit), and upload the assets — whenever the changesets step above
+  # published a release. Chained here — rather than an `on: release` trigger — because
+  # releases created with the workflow's own GITHUB_TOKEN do not fire other workflows.
   artifacts:
     name: Release artifacts
     needs: release
