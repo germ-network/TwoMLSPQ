@@ -158,20 +158,23 @@ import TwoMLSPQ
 //     HPKE plaintext's authenticated leading tag. `decodeInitialPlaintext` / `openInitial`
 //     now return `OpenedInitial` (`.establishment(frame:)` / `.bootstrapKp(frame:)`);
 //     `initialEnvelopeTag()` is retired (route by transport channel, not first byte).
-//     `decodeEnvelopeFrame` no longer reads a tag; the header path requires the
-//     establishment variant. (The parallel `pqBootstrapEnvelope` is NOT adopted — we keep
-//     the sequential side-band bootstrap, so no BootstrapKp envelope ever reaches us.)
+//     `decodeEnvelopeFrame` no longer reads a tag. (The parallel `pqBootstrapEnvelope` is
+//     wired at v23 below; through v22 only establishment envelopes rode the header channel.)
 // v22 (TwoMLSPQ 0.7.0): one declared TwoMLS suite drives every crypto choice, and the §A.1
 //     seal binds it via an UNTRANSMITTED AAD. Both sides derive `[framingVersion][suite
 //     pair]` locally, so the split-open path must pass `envelopeFramingAad()` to `hpkeOpen`
 //     or the AEAD tag fails. No new FFI types — `TwoMlsSuite` is crate-internal.
-// v23 (consolidated repo): a parallel-delivered §A.1 bootstrap KP′ is routed to its session by
-//     content. The invitation gains `bootstrapKpGroupId(kpFrame:)`, which resolves a framed
-//     `[0x13][KP′]` against a commitment→group table populated at `receive`. ADDITIVE from
-//     this side while the parallel `pqBootstrapEnvelope` stays unadopted (Phase 7 wires it
-//     into `.forward`/`forwarded`); the mandatory change is only this canary. Invitation
-//     archive layout changed (INVITATION_VERSION 1→2, pre-release hard cut) — a stale
-//     invitation blob fails to decode and must be regenerated.
+// v23 (consolidated repo): the parallel A.4 delivery is now ADOPTED end to end. An initiator
+//     ships its pre-committed KP′ as a §A.1 bootstrap envelope via `bootstrapEnvelope()`
+//     (alongside the establishment reply; `begin(.finishBootstrap)` stays valid + idempotent).
+//     The acceptor's `decodeHeader` dispatches `OpenedInitial.bootstrapKp` — resolving the
+//     owed session through the invitation's new `bootstrapKpGroupId(kpFrame:)` (a
+//     `H(KP′)->group` table populated at `receive`) — into the EXISTING `.forward` disposition,
+//     and `forwarded` answers it with `pqBootstrapRespond`, failing open (respond errors are
+//     swallowed — the parallel envelope is best-effort, the side-band path is authoritative;
+//     `DuplicateSideBand` when the side-band won the race is the common one). The parked
+//     `Welcome'` rides the acceptor's next `pendingSideBand` hand-out. Invitation archive layout
+//     changed (INVITATION_VERSION 1→2, pre-release hard cut) — a stale blob fails to decode.
 private let expectedBindingContract: UInt64 = 23
 
 enum TwoMLSPQBindingContract {
@@ -495,8 +498,23 @@ extension AbstractTwoMLS {
 				// plumbing, and the honest pipeline hands over bytes `decodeHeader`
 				// already parsed — surfacing a parse failure as an error would
 				// misgrade garbage as fatal (the session itself is untouched).
-				guard case .establishment(let frame)? = try? decodeInitialPlaintext(
-					plaintext: headerDecrypted),
+				let opened = try? decodeInitialPlaintext(plaintext: headerDecrypted)
+				// Part 3: `decodeHeader` resolved a parallel A.4 bootstrap KP′ to this
+				// session and routed it here. Stand up our send group's deferred PQ half
+				// around it; the Welcome' parks in the side-band slot and rides our next
+				// `pendingSideBand(sealing:)` hand-out (no PQInbound — the parked reply is
+				// drained by the ordinary re-send path, not `advance`). There is no app
+				// message to deliver. FAIL OPEN like the establishment branch above: this
+				// parallel envelope is a best-effort optimization, and the side-band
+				// `pqBootstrapBegin`/`ingest` path is the AUTHORITATIVE A.4 carrier that
+				// surfaces a genuine failure — so `DuplicateSideBand` (the common case: the
+				// side-band already answered), a frame the app mis-routed here, and an
+				// unrecoverable round are all swallowed rather than misgraded as fatal.
+				if case .bootstrapKp(let kpFrame)? = opened {
+					try? base.pqBootstrapRespond(kpMsg: kpFrame)
+					return nil
+				}
+				guard case .establishment(let frame)? = opened,
 					let stablePrefix = frame.appPayload ?? frame.welcome
 				else {
 					return nil
@@ -603,6 +621,22 @@ extension AbstractTwoMLS {
 						rotating: rotating?.pqClientId)
 				)
 			}
+			}
+		}
+
+		public func bootstrapEnvelope() throws(AbstractTwoMLS.SessionError) -> Data? {
+			// Initiator-only, pre-establishment. The crate returns `SessionNotReady`
+			// when there is no pre-committed KP to ship (an acceptor, or a session past
+			// the cutover) — map that to "nothing to ship" rather than an error; a real
+			// seal failure still surfaces. The first call registers the A.4 round and
+			// consumes the KP, re-calls re-seal the same frame, so calling it repeatedly
+			// (or keeping `begin(.finishBootstrap)` too) is safe.
+			do {
+				return try base.pqBootstrapEnvelope()
+			} catch TwoMLSPQ.TwoMlsPqError.SessionNotReady {
+				return nil
+			} catch {
+				throw AbstractTwoMLS.SessionError(pqError: error, at: .pqOperation)
 			}
 		}
 
@@ -836,15 +870,35 @@ extension AbstractTwoMLS {
 				aad: envelopeFramingAad()
 			)
 			// Contract 21: `decodeInitialPlaintext` returns `OpenedInitial`, dispatching
-			// on the plaintext's inner tag. We only send establishment envelopes on the
-			// invitation channel (the A.4 bootstrap KP rides the side-band, not a
-			// parallel envelope), so a `.bootstrapKp` here is malformed.
-			guard case .establishment(let frame) = try decodeInitialPlaintext(
-				plaintext: decrypted)
-			else {
+			// on the plaintext's inner tag — the establishment reply and the Part 3
+			// parallel A.4 bootstrap KP′ share the outer §A.1 shape.
+			let opened = try decodeInitialPlaintext(plaintext: decrypted)
+			// Part 3: the initiator shipped its pre-committed KP′ as a §A.1 bootstrap
+			// envelope IN PARALLEL with the reply. It carries no session id, but the
+			// invitation pinned `H(KP′) -> spawned group` at `receive`, so it self-routes:
+			// resolve the owed session and hand the frame through the SAME `.forward` path
+			// the establishment replay uses — the spawned session's `forwarded` answers
+			// A.4 via `pqBootstrapRespond`. A frame that resolves to nothing is early (no
+			// session owes it yet) or bogus.
+			if case .bootstrapKp(let kpFrame) = opened {
+				guard let group = base.bootstrapKpGroupId(kpFrame: kpFrame) else {
+					throw AbstractTwoMLS.SessionError(
+						code: .malformedFrame,
+						detail: "§A.1 bootstrap-KP envelope resolves to no pinned session")
+				}
+				return .forward(
+					groupId: try DataIdentifier(
+						prefix: .bits256, checkedData: group.bytes),
+					// The envelope PLAINTEXT: `forwarded(headerDecrypted:)` re-parses it
+					// to the verbatim `[0x13][KP′]` frame and answers A.4.
+					mlsMessageData: decrypted)
+			}
+			guard case .establishment(let frame) = opened else {
+				// `OpenedInitial` has only the two cases; this stays exhaustive so a new
+				// variant is a compile-visible decision, not a silent misroute.
 				throw AbstractTwoMLS.SessionError(
 					code: .malformedFrame,
-					detail: "§A.1 bootstrap-KP envelope on the header channel")
+					detail: "§A.1 envelope: unrecognized initial variant")
 			}
 			// The digest doubles as the FFI's opaque spawn token — computed over the
 			// STABLE PREFIX (the app payload; the bare welcome for payload-less

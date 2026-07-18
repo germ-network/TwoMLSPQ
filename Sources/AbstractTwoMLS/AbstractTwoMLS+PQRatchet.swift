@@ -156,6 +156,19 @@ extension AbstractTwoMLS {
 		/// new credential for the A.4/A.5 handoff.
 		func begin(_ kind: PQOperationKind, rotating: ClientID?) throws -> PQOutbound
 
+		/// The Part 3 parallel A.4 delivery: this initiator's pre-committed KP′
+		/// sealed as a §A.1 bootstrap envelope, to ship ALONGSIDE the establishment
+		/// reply — the acceptor is already reading the invitation channel, so it can
+		/// answer A.4 (and staple `Welcome'` onto its return welcome) one round trip
+		/// sooner than waiting for the side-band. `nil` when there is nothing to ship:
+		/// an acceptor session, a session already past establishment, or a backend
+		/// without A.4. `begin(.finishBootstrap)` stays valid and idempotent afterward
+		/// — both carry the SAME pre-committed KP′, only the outer framing differs — so
+		/// keeping the steady-state side-band kickoff alongside this is safe. Read any
+		/// bootstrap-KP commitment BEFORE calling: the first call registers the A.4
+		/// round and consumes the KP (re-calls re-seal the same frame, fresh HPKE).
+		func bootstrapEnvelope() throws -> Data?
+
 		/// Hand out the reply a responding `ingest` parked (CT after an EK,
 		/// Welcome' after a KP', Commit' after an Upd'), CONSUMING it — the
 		/// retained copy included, so a re-staple driver should prefer
