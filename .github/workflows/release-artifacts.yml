@@ -43,8 +43,8 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml') }}
+            rust/target
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('rust/**/Cargo.toml', 'rust/rust-toolchain.toml') }}
 
       # The shipped configuration: CryptoKit backing both halves, dynamic
       # framework bundles (see the script header for why dynamic + framework).

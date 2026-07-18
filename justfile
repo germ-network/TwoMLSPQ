@@ -45,6 +45,12 @@ bindgen:
 build-ios:
     bash scripts/buildIosDynamic.sh
 
+# Local build-and-test loop (macOS 26): build the xcframework, re-sync the vendored binding,
+# and run the Swift tests against the LOCAL build — no release needed. Extra args pass through
+# to `swift test` (e.g. `just swift-test --filter LifecycleTests`).
+swift-test *ARGS:
+    bash scripts/swiftTestLocal.sh {{ARGS}}
+
 # Requires `cargo install mdbook` (and optionally mdbook-mermaid; see book/book.toml).
 book:
     mdbook build book

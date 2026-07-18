@@ -5,13 +5,17 @@ on:
     branches: [main]
     paths:
       - "**/*.rs"
-      - "**/Cargo.toml"
-      - "Cargo.lock"
-      - "rust-toolchain.toml"
-      - ".cargo/**"
-      - "deny.toml"
+      - "rust/**/Cargo.toml"
+      - "rust/Cargo.lock"
+      - "rust/rust-toolchain.toml"
+      - "rust/.cargo/**"
+      - "rust/deny.toml"
       - ".github/workflows/ci.yml"
-      - "two-mls-pq/book/**"
+      - "book/**"
+      - "Package.swift"
+      - "Sources/**"
+      - "Tests/**"
+      - "scripts/**"
   pull_request:
   # Manual runs, so a branch can get a full CI pass before a PR exists.
   workflow_dispatch:
@@ -24,6 +28,11 @@ jobs:
   lint:
     name: Lint
     runs-on: ubuntu-latest
+    # The Cargo workspace lives in rust/; its .cargo/config.toml + rust-toolchain.toml are
+    # discovered from the cwd, so all cargo/taplo steps run there.
+    defaults:
+      run:
+        working-directory: rust
     steps:
       - uses: actions/checkout@v4
 
@@ -36,8 +45,8 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml') }}
+            rust/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('rust/**/Cargo.toml', 'rust/rust-toolchain.toml') }}
 
       - name: Install taplo
         run: |
@@ -94,7 +103,7 @@ jobs:
           chmod +x /usr/local/bin/mdbook
 
       - name: Build book
-        run: mdbook build two-mls-pq/book
+        run: mdbook build book
 
   deny:
     name: Deny
@@ -105,13 +114,18 @@ jobs:
       - name: Check licenses and advisories
         uses: EmbarkStudios/cargo-deny-action@v2
         with:
-          arguments: --all-features
+          # --manifest-path points cargo-deny at the relocated workspace (it reads deny.toml
+          # from the manifest's directory, rust/).
+          arguments: --all-features --manifest-path rust/Cargo.toml
           command: check
           command-arguments: "licenses advisories sources"
 
   test:
     name: Test
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust
     steps:
       - uses: actions/checkout@v4
 
@@ -124,8 +138,8 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml') }}
+            rust/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('rust/**/Cargo.toml', 'rust/rust-toolchain.toml') }}
 
       # The FULL suite — including every PQ (ML-KEM-768) path — on the portable aws-lc
       # provider. The macos-cryptokit job runs the same suite on Apple CryptoKit.
@@ -135,6 +149,9 @@ jobs:
   bindgen-check:
     name: UniFFI bindgen check
     runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: rust
     steps:
       - uses: actions/checkout@v4
 
@@ -147,8 +164,8 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml') }}
+            rust/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('rust/**/Cargo.toml', 'rust/rust-toolchain.toml') }}
 
       # awslc here: the UniFFI surface is provider-independent, and macos-latest may lag
       # behind the macOS 26 SDK the cryptokit bridge needs (see macos-cryptokit).
@@ -166,6 +183,9 @@ jobs:
   msrv:
     name: MSRV (1.85, awslc)
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust
     steps:
       - uses: actions/checkout@v4
 
@@ -178,8 +198,8 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-msrv-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml') }}
+            rust/target
+          key: ${{ runner.os }}-cargo-msrv-${{ hashFiles('rust/**/Cargo.toml', 'rust/rust-toolchain.toml') }}
 
       # Catches accidental use of newer-than-1.85 language/stdlib features across both
       # crates and the aws-lc dependency subtree (whose tightest member pins exactly 1.85).
@@ -191,6 +211,9 @@ jobs:
     # CryptoKit's ML-KEM-768 primitives require macOS 26, so pin the runner explicitly
     # rather than relying on the macos-latest migration.
     runs-on: macos-26
+    defaults:
+      run:
+        working-directory: rust
     steps:
       - uses: actions/checkout@v4
 
@@ -203,8 +226,8 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-cryptokit-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml') }}
+            rust/target
+          key: ${{ runner.os }}-cargo-cryptokit-${{ hashFiles('rust/**/Cargo.toml', 'rust/rust-toolchain.toml') }}
 
       # --all-features also proves the cryptokit-beats-awslc precedence in providers.rs
       # (the combination a dev's `just lint` uses on an Apple machine).
@@ -231,3 +254,56 @@ jobs:
       # Linux/awslc peer wire-compatible with an Apple/CryptoKit peer.
       - name: Cross-provider interop (cryptokit <-> awslc)
         run: cargo test -p apq --test provider_interop
+
+  swift:
+    name: Swift package (macOS)
+    # The atomic wire+adapter gate: build the cryptokit xcframework LOCALLY from rust/, sync
+    # the vendored binding, and run the Swift tests against that build — no release needed to
+    # test an integration change. macOS 26 for the CryptoKit ML-KEM-768 bridge.
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: ${{ runner.os }}-cargo-swift-${{ hashFiles('rust/**/Cargo.toml', 'rust/rust-toolchain.toml') }}
+
+      # Builds all Apple slices, generates bindings/, assembles buildIos/TwoMLSPQ.xcframework.
+      - name: Build dynamic xcframework
+        run: bash scripts/buildIosDynamic.sh
+
+      # The committed binding must match the freshly built binary (uniffi embeds a checksum
+      # contract; the binding_contract_version canary guards it). Re-sync, then fail if the
+      # tracked copy drifted from what this build generates.
+      - name: Re-sync vendored binding
+        run: cp bindings/two_mls_pq.swift Sources/TwoMLSPQ/two_mls_pq.swift
+
+      - name: Assert vendored binding is in sync
+        run: git diff --exit-code Sources/TwoMLSPQ/two_mls_pq.swift
+
+      - name: Build tests (local xcframework)
+        env:
+          TWOMLSPQ_LOCAL_XCFRAMEWORK: "1"
+        run: swift build --build-tests
+
+      # SwiftPM does not stage a dynamic binaryTarget's framework into the test bundle's
+      # @rpath (PackageFrameworks/), so dlopen fails at test load. Symlink the macOS slice in.
+      - name: Stage framework for @rpath
+        run: |
+          PF=.build/out/Products/Debug/PackageFrameworks
+          mkdir -p "$PF"
+          ln -sf "$PWD/buildIos/TwoMLSPQ.xcframework/macos-arm64/two_mls_pqFFI.framework" \
+            "$PF/two_mls_pqFFI.framework"
+
+      - name: Swift test (local xcframework)
+        env:
+          TWOMLSPQ_LOCAL_XCFRAMEWORK: "1"
+        run: swift test --skip-build
