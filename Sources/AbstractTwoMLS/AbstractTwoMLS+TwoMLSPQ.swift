@@ -165,7 +165,14 @@ import TwoMLSPQ
 //     seal binds it via an UNTRANSMITTED AAD. Both sides derive `[framingVersion][suite
 //     pair]` locally, so the split-open path must pass `envelopeFramingAad()` to `hpkeOpen`
 //     or the AEAD tag fails. No new FFI types — `TwoMlsSuite` is crate-internal.
-private let expectedBindingContract: UInt64 = 22
+// v23 (consolidated repo): a parallel-delivered §A.1 bootstrap KP′ is routed to its session by
+//     content. The invitation gains `bootstrapKpGroupId(kpFrame:)`, which resolves a framed
+//     `[0x13][KP′]` against a commitment→group table populated at `receive`. ADDITIVE from
+//     this side while the parallel `pqBootstrapEnvelope` stays unadopted (Phase 7 wires it
+//     into `.forward`/`forwarded`); the mandatory change is only this canary. Invitation
+//     archive layout changed (INVITATION_VERSION 1→2, pre-release hard cut) — a stale
+//     invitation blob fails to decode and must be regenerated.
+private let expectedBindingContract: UInt64 = 23
 
 enum TwoMLSPQBindingContract {
 	static let verified: Void = {

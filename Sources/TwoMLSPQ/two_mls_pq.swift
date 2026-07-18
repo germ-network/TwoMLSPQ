@@ -1046,6 +1046,22 @@ public func FfiConverterTypeMlsCipherSuite_lower(_ value: MlsCipherSuite) -> UIn
 public protocol TwoMlsPqInvitationProtocol: AnyObject, Sendable {
     
     /**
+     * Resolve a §A.1 bootstrap-KP frame against the bootstrap-commitment table: `Some` names the
+     * receive group (classical, message-half id) of the session that owes A.4 for this exact KP′
+     * — route the frame to that session's `pq_bootstrap_respond`. `None` means no spawned session
+     * ever pinned this KP′ (unknown or garbage — discard). Note the table is NOT pruned on A.4
+     * completion (the invitation cannot observe session state), so a KP′ whose session already
+     * answered still resolves here; the duplicate is a benign no-op at `pq_bootstrap_respond`
+     * (`DuplicateSideBand`), not a `None`. Lets a KP′ delivered as a bootstrap envelope
+     * (contract 21, no session id of its own) self-route without a rendezvous side-band. `frame`
+     * is the verbatim `[0x13][KP′]`; the hash is taken over the untagged KP — the SAME preimage
+     * the acceptor pinned at `receive` and `pq_bootstrap_respond` re-checks, so a frame that
+     * resolves here can never `BootstrapKpMismatch` there. Content-keyed counterpart of
+     * `forward_group_id`/`processed_welcome_group_id`.
+     */
+    func bootstrapKpGroupId(kpFrame: Data)  -> MlsGroupId?
+    
+    /**
      * The principal's ClientId.
      */
     func clientId()  -> ClientId
@@ -1251,6 +1267,29 @@ public static func restore(archive: Data)throws  -> TwoMlsPqInvitation  {
 }
     
 
+    
+    /**
+     * Resolve a §A.1 bootstrap-KP frame against the bootstrap-commitment table: `Some` names the
+     * receive group (classical, message-half id) of the session that owes A.4 for this exact KP′
+     * — route the frame to that session's `pq_bootstrap_respond`. `None` means no spawned session
+     * ever pinned this KP′ (unknown or garbage — discard). Note the table is NOT pruned on A.4
+     * completion (the invitation cannot observe session state), so a KP′ whose session already
+     * answered still resolves here; the duplicate is a benign no-op at `pq_bootstrap_respond`
+     * (`DuplicateSideBand`), not a `None`. Lets a KP′ delivered as a bootstrap envelope
+     * (contract 21, no session id of its own) self-route without a rendezvous side-band. `frame`
+     * is the verbatim `[0x13][KP′]`; the hash is taken over the untagged KP — the SAME preimage
+     * the acceptor pinned at `receive` and `pq_bootstrap_respond` re-checks, so a frame that
+     * resolves here can never `BootstrapKpMismatch` there. Content-keyed counterpart of
+     * `forward_group_id`/`processed_welcome_group_id`.
+     */
+open func bootstrapKpGroupId(kpFrame: Data) -> MlsGroupId?  {
+    return try!  FfiConverterOptionTypeMlsGroupId.lift(try! rustCall() {
+    uniffi_two_mls_pq_fn_method_twomlspqinvitation_bootstrap_kp_group_id(
+            self.uniffiCloneHandle(),
+        FfiConverterData.lower(kpFrame),$0
+    )
+})
+}
     
     /**
      * The principal's ClientId.
@@ -5938,6 +5977,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_mlsciphersuite_value() != 46029) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_two_mls_pq_checksum_method_twomlspqinvitation_bootstrap_kp_group_id() != 1447) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqinvitation_client_id() != 2420) {
