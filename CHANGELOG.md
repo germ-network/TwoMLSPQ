@@ -1,5 +1,51 @@
 # @germ-network/two-mls-pq
 
+## 0.7.0
+
+### Minor Changes
+
+- [#79](https://github.com/germ-network/TwoMLSPQ/pull/79) [`1c8c068`](https://github.com/germ-network/TwoMLSPQ/commit/1c8c068f40eb8aed7540095bffc51d420132da08) Thanks [@germ-mark](https://github.com/germ-mark)! - Parallel A.4 KP′ delivery, and the §A.1 envelope drops its outer tag (contract 21).
+
+  The initiator can now ship its pre-committed A.4 bootstrap key package IN PARALLEL with
+  the establishment reply via `pq_bootstrap_envelope`, instead of waiting a full round trip
+  for A.4's first side-band leg. Because the KP bytes are fixed at `initiate` (contract 20),
+  an acceptor that already holds the KP′ when its return welcome goes out can respond and
+  send `Welcome'` alongside it — A.4 completes ~one round trip sooner. The first emit
+  registers the round exactly as `pq_bootstrap_begin` does; every later pre-establishment
+  send re-seals the retained frame under a fresh HPKE ephemeral (unlinkable) without
+  advancing state.
+
+  To carry the KP frame and the reply under one indistinguishable shape, the §A.1 envelope
+  loses its OUTER tag byte: the blob is now the raw `[u32-LE kem_output_len][kem_output]
+[ciphertext]`, and discrimination moves INSIDE to the HPKE plaintext's authenticated
+  leading tag — `ESTABLISHMENT_VECTOR_TAG` (0x07, repurposing the retired outer
+  `INITIAL_ENVELOPE_TAG`) for the reply's four sections, `PQ_BOOTSTRAP_KP_TAG` (0x13) for
+  the bootstrap KP. `open_initial` / `decode_initial_plaintext` now return `OpenedInitial`
+  (`Establishment` / `BootstrapKp`); `initial_envelope_tag()` is retired (the host routes by
+  transport channel, not first byte). Wire-format change — the outer tag is gone and the
+  plaintext gained an inner tag — hence `BINDING_CONTRACT_VERSION` 20 → 21.
+
+- [#80](https://github.com/germ-network/TwoMLSPQ/pull/80) [`06a5cd4`](https://github.com/germ-network/TwoMLSPQ/commit/06a5cd4e08a1d7647765f2d91c5bc44092b42720) Thanks [@germ-mark](https://github.com/germ-mark)! - One declared TwoMLS suite drives every crypto choice, and the §A.1 envelope binds it via
+  untransmitted AAD (contract 22).
+
+  The scattered suite constants collapse into one up-front declaration (the internal
+  `TwoMlsSuite` enum): the group pair (`APQ_SUITE`), the §A.1/A.4 envelope HPKE (PQ half),
+  the header-encryption AEAD (classical half's ChaCha20-Poly1305 — no longer an
+  "independent variable"), and the protocol digest (classical half's SHA-256) are all
+  facets read from `TwoMlsSuite::CURRENT`. Behavior-preserving: every facet equals the
+  previously pinned value.
+
+  The §A.1 envelope HPKE now BINDS the declared suite: both sides derive
+  `[framing version (1)][classical u16 BE][pq u16 BE]` locally and pass it as the HPKE
+  `aad` — it never travels the wire (the posted `APQKeyPackage` already names the pair
+  publicly, and the opener's invitation defines the suite of every inbound envelope). The
+  blob shape is byte-for-byte unchanged; the cut is cryptographic: a contract-21 seal
+  (`aad = None`) fails a contract-22 open's AEAD tag and vice versa (`DecryptionFailed`,
+  deliberately opaque). This downgrade-binds the CLASSICAL half too — which the HPKE
+  operation alone never touches — at zero wire bytes. New export `envelope_framing_aad()`
+  for hosts on the split `hpke_open` + `decode_initial_plaintext` path;
+  `BINDING_CONTRACT_VERSION` 21 → 22.
+
 ## 0.6.0
 
 ### Minor Changes
