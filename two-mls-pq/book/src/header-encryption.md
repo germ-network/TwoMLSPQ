@@ -3,7 +3,7 @@
 > **Status: implemented.** Two key families — message-path frames sealed under the
 > classical half (`HeaderKey`), PQ side-band frames under the PQ half (`HeaderKeyPQ`),
 > each keyed by its own ratchet's epoch — plus the **initiator's first frame**, which
-> `initiate` now HPKE-envelopes in-library (`[app_payload ∥ APQWelcome_A]` sealed to the
+> the library HPKE-envelopes (`[app_payload ∥ APQWelcome_A]` sealed to the
 > peer's KP′) so the app-layer welcome is covered too; the peer opens it with
 > `TwoMlsPqInvitation::open_initial`. Every outbound blob is opaque. The only remaining
 > refinement is the *hybrid* nested envelope (open question #2) — the first-frame
@@ -241,7 +241,7 @@ HeaderKeyPQ(G, e) = exportSecret(label = "germ.network.twomlspq.headerKey.pq.v1"
 - **Message-path frames** (0x01 standalone welcomes and 0x03 message frames —
   `encrypt`'s output, welcome-or-commit staple included): seal under
   `HeaderKey(recv_group, current classical epoch)`.
-- **PQ side-band frames** (0x11–0x1F): seal under `HeaderKeyPQ(recv_group,
+- **PQ side-band frames** (0x13–0x1D): seal under `HeaderKeyPQ(recv_group,
   current pq_epoch)` — the opposite PQ group at its `pq_epoch`. This covers every
   side-band frame however it reaches the host: those surfaced by
   `pq_take_pending_outbound` (the responder's 0x19, 0x13, 0x1F, and both binds — 0x1B and
@@ -309,7 +309,7 @@ authenticates only under a classical key and a side-band frame only under a PQ k
 the inner tag; there is no ambiguity. Each trial is one ChaCha20-Poly1305 open — DoS
 cost is bounded and linear in the combined (small) window. On success it classifies
 the opened frame's leading tag into `OpenedFrameKind` (`Message` for 0x01/0x03,
-`PqSideBand { PqFrameKind }` for 0x11–0x1F) and returns `OpenedFrame { kind, frame }`;
+`PqSideBand { PqFrameKind }` for 0x13–0x1D) and returns `OpenedFrame { kind, frame }`;
 the host routes `frame` by `kind`. On exhaustion it returns `Ok(None)` — "unknown,
 drop it", which trial decryption makes literal: an out-of-window frame and garbage are
 indistinguishable, by construction. An opened-but-unrecognized tag is
@@ -339,8 +339,8 @@ Alice initiates; Bob accepts (send groups per the [Session
 Lifecycle](./session-lifecycle.md); this matches [Protocol Flows](./protocol-flows.md) §A.1
 orientation and the crate's constructor names — Alice builds `Group_A` ≡ ASG).
 
-1. **Alice `initiate(client, their_kp, app_payload)`** — builds Group_A; captures
-   `HeaderKey(Group_A, e₀)` into her receive window (piggybacked on the existing
+1. **Alice `initiate(client, their_kp)` + `set_initial_app_payload`** — builds Group_A;
+   captures `HeaderKey(Group_A, e₀)` into her receive window (piggybacked on the existing
    `record_listen_rendezvous` call). It composes `[app_payload ∥ APQWelcome_A]` and
    HPKE-seals it to Bob's KP′ inside the library, so `pending_outbound()` returns **one
    opaque envelope** — the first frame's metadata, *including the app-layer welcome that
@@ -348,8 +348,9 @@ orientation and the crate's constructor names — Alice builds `Group_A` ≡ ASG
    itself. (The `current_staple` — the message-frame staple form the peer idempotently
    skips — keeps the *plaintext* `APQWelcome_A`; only `pending_outbound` is the
    envelope.)
-2. **Bob's host** opens it with `TwoMlsPqInvitation::open_initial(blob) -> { app_payload,
-   welcome }` (the invitation holds the KP′ private material; the call is decrypt-only
+2. **Bob's host** opens it with `TwoMlsPqInvitation::open_initial(blob) -> OpenedInitial`
+   (the establishment variant carries `{ app_payload, welcome, … }`; the invitation holds
+   the KP′ private material; the call is decrypt-only
    and does **not** consume a single-use invitation). It validates the app-layer welcome
    and computes the spawn token over the **decrypted** frame — the token must be
    replay-stable across re-sends, and a re-sent envelope has a fresh HPKE ephemeral
@@ -374,7 +375,7 @@ after consumption use last-resort invitations.
 
 Direct `accept()` keeps its plaintext-welcome signature (a test/embedded entry point
 for callers that already hold a plaintext welcome); the normal path is
-`initiate(…, app_payload)` → `TwoMlsPqInvitation::open_initial` → `receive`.
+`initiate(…)` (+ `set_initial_app_payload`) → `TwoMlsPqInvitation::open_initial` → `receive`.
 
 ### Host routing and the API
 
@@ -384,7 +385,7 @@ Header encryption hides the leading tag byte, so the host cannot route a raw blo
 - **`open_incoming(blob) -> Option<OpenedFrame { kind, frame }>`** — the session
   method: one trial-decrypt pass over the receive window, returning the plaintext
   frame plus its `kind` (`OpenedFrameKind::Message` for 0x01/0x03,
-  `PqSideBand { PqFrameKind }` for 0x11–0x1F), or `None` if no window key opens it.
+  `PqSideBand { PqFrameKind }` for 0x13–0x1D), or `None` if no window key opens it.
   The host routes `frame` by `kind` to `process_incoming` / `pq_ratchet_*` /
   `pq_rekey_*` / `pq_bootstrap_*`; those entry points keep their plaintext-frame
   signatures (and additionally auto-open a sealed blob, per the receive rule).
@@ -394,7 +395,7 @@ Header encryption hides the leading tag byte, so the host cannot route a raw blo
   the initiator's HPKE envelope), `pq_take_pending_outbound()`, and the direct returns
   of `pq_ratchet_begin` / `pq_bootstrap_begin` / `pq_rekey_begin`. The exported
   `hpke_seal_to_key_package` / `hpke_open` pair stays for other stacks; the main path
-  uses `initiate(…, app_payload)` / `open_initial`.
+  uses `initiate(…)` / `set_initial_app_payload` / `open_initial`.
 - **Archive**: both receive windows (`recv_header_keys`, `recv_header_keys_pq`) ride
   in the session archive as parallel `(epoch, key)` lists, entries validated to 32
   bytes on restore.
@@ -437,8 +438,9 @@ never has.
    `seal_side_band`); `pq_ratchet_begin` guarded on the recv group; `open_incoming`
    with `OpenedFrameKind`; `process_incoming` and the `pq_*` receivers `open_or_raw`
    their input.
-3. First frame: `initiate` takes `app_payload: Option<Vec<u8>>` and HPKE-envelopes
-   `[app_payload ∥ APQWelcome_A]` to the peer's KP′ (`key_packages::seal_initial_envelope`),
+3. First frame: `set_initial_app_payload` attaches the app-layer welcome, and the library
+   HPKE-envelopes `[app_payload ∥ APQWelcome_A]` to the peer's KP′
+   (`key_packages::seal_initial_envelope`),
    returning it via `pending_outbound`; `TwoMlsPqInvitation::open_initial(blob) ->
    OpenedInitial` opens it (decrypt-only; does not consume the
    invitation). `current_staple` keeps the plaintext welcome.

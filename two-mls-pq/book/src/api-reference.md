@@ -123,9 +123,11 @@ The receiving side of a published key package — no live client required.
 
 ## `TwoMlsPqSession`
 
-Constructors: `initiate(client, their_key_package, app_payload, app_binding)` —
-`app_payload` is the host's opaque app-layer welcome (or `None`), composed with the MLS
-welcome and HPKE-enveloped to the peer's KP′ so `pending_outbound` is one opaque blob the
+Constructors: `initiate(client, their_key_package, app_binding)` — the host's opaque
+app-layer welcome is attached AFTER construction with `set_initial_app_payload` (it
+typically signs over the welcome and the return key package, so it cannot exist before
+`initiate` returns); the library composes it with the MLS welcome and HPKE-envelopes it to
+the peer's KP′ so `pending_outbound` is one opaque blob the
 peer opens with `TwoMlsPqInvitation::open_initial`; `app_binding` is the optional
 app-state binding welded into the send group's GroupContext at this moment and immutable
 for the session's lifetime — pass a **digest** of the app's immutable relationship
