@@ -46,26 +46,31 @@ implement, and why the epochs must line up as they do. A single **turn** alterna
 the session initiator owes the bootstrap; completing an operation passes the turn to
 the peer (`my_pq_turn()`), and only one operation may be in flight at a time.
 
-- **Bootstrap** (`0x11`/`0x13`/`0x15`) — stands up Group_B's deferred PQ half off the
-  critical path: Alice sends her PQ key package — the one PRE-COMMITTED at `initiate`
-  (`bootstrap_kp_commitment()` put its hash inside the signed establishment payload, and
-  Bob's `receive` pinned it) — Bob verifies the hash (`BootstrapKpMismatch` otherwise),
-  creates Group_B.pq around it and returns its Welcome; Alice joins and binds. Both send groups are then complete APQ
-  groups (`is_fully_established()`). The bind is structurally the PQ ratchet's (below),
-  differing only in where its injected secret comes from — an exporter off the newly
-  joined group rather than a KEM exchange — and it doubles as the round's receipt: that
-  secret is derivable only from inside Group_B.pq, so a bind that applies at all proves
-  Alice joined.
-- **PQ ratchet** (`0x17`/`0x19`/`0x1B`) — injects fresh ML-KEM
+- **Bootstrap** (`0x13`/`0x15`, then a stapled bind) — stands up Group_B's deferred PQ half
+  off the critical path: Alice sends her PQ key package (`0x13`) — the one PRE-COMMITTED at
+  `initiate` (`bootstrap_kp_commitment()` put its hash inside the signed establishment
+  payload, and Bob's `receive` pinned it) — Bob verifies the hash (`BootstrapKpMismatch`
+  otherwise), creates Group_B.pq around it and returns its Welcome (`0x15`); Alice joins and
+  binds. Both send groups are then complete APQ groups (`is_fully_established()`). The
+  round's closing bind is not a side-band frame — it rides the next message frame's staple.
+  The bind is structurally the PQ ratchet's (below), differing only in where its injected
+  secret comes from — an exporter off the newly joined group rather than a KEM exchange —
+  and it doubles as the round's receipt: that secret is derivable only from inside
+  Group_B.pq, so a bind that applies at all proves Alice joined.
+- **PQ ratchet** (`0x17`/`0x19`, then a stapled bind) — injects fresh ML-KEM
   entropy into a send group's PQ half via a pathless PSK commit and re-binds the
-  exported APQ-PSK into the classical half in the same round.
-- **PQ re-key** (`0x1D`/`0x1F`) — updatePath commits run on the two send groups'
-  PQ halves **alone**, so the classical ratchet is never blocked behind a large
+  exported APQ-PSK into the classical half in the same round. The initiator sends its
+  ML-KEM encapsulation key (`0x17`), the responder its ciphertext plus the AEAD-sealed
+  injected secret (`0x19`), and the closing bind rides the next message frame's staple.
+- **PQ re-key** (`0x1B`/`0x1D`, then a stapled bind) — updatePath commits run on the two
+  send groups' PQ halves **alone**, so the classical ratchet is never blocked behind a large
   ML-KEM updatePath: the initiator proposes `Upd'(self)` into the PQ half of the
-  peer's send group (`pq_rekey_begin`), the responder commits it and counter-proposes
-  (`pq_rekey_respond`), and each `Commit'` cross-injects a PSK exported from the PQ
-  half of the *opposite* send group (`pq_rekey_apply`). The bumped `pq_epoch`
-  reconciles into the classical half at the next PQ ratchet bind.
+  peer's send group (`pq_rekey_begin`, `0x1B`), the responder commits it with its own
+  `Commit'` (`pq_rekey_respond`, `0x1D`) — whose updatePath rotates the committer's leaf and
+  which cross-injects a PSK exported from the PQ half of the *opposite* send group. The
+  round's third leg is not a side-band frame: the initiator acks with a pathless partial
+  commit stapled onto its next classical commit (`pq_rekey_apply`), a FULL commit whose
+  `AppDataUpdate` reconciles the bumped `pq_epoch` **in-round**.
 
 ## Routing
 
@@ -96,9 +101,13 @@ Sending is two-phase so CommProtocol can bind a per-round proposal hash:
   agent handoff binds the rotation Upd's digest) applies its own digest to
   `proposal_message`: bytes and hash come from the same critical section, so no later
   prepare can interpose a different Upd.
-  - `proposing: None` → routine round. Our own send group commits only when a
-    queued, app-approved remote proposal is pending — then `did_commit: true` and
-    the cross-party PSK refreshes.
+  - `proposing: None` → routine round. Our own send group commits in two cases, both
+    gated on the peer having applied our previous commit: when a queued, app-approved
+    remote proposal is pending (it folds the proposal — `did_commit: true`, and the
+    cross-party PSK refreshes *if* the peer's send group has advanced since the last
+    binding), **or** when an owed PQ bind must be discharged (a proposal-less,
+    updatePath-only commit — `did_commit: true` with nothing folded, so PQ liveness never
+    waits on app approval policy). A round with neither pending commits nothing.
   - `proposing: Some(new_client_id)` → this round's Upd proposes the named staged
     rotation candidate (after `stage_rotation`; see Principal key rotation below).
 - **`encrypt(app_message)`** — binds the pending `proposal_hash` into the message's
@@ -201,8 +210,8 @@ and records
   `DuplicateWelcome` before claiming or reserving anything.
 
 The invitation pushes these to its `ArchiveSink` after every `receive` — the consumed
-set, the forward table, and the processed-welcome ledger — so all three guards survive a
-restore. The token is opaque
+set, the forward table, the processed-welcome ledger, and the bootstrap-commitment routing
+table (contract 23) — so all four survive a restore. The token is opaque
 to this crate — the caller picks the convention (Germ's adapter digests the envelope's
 STABLE PREFIX — the app payload, else the bare welcome — so every pre-establishment
 re-staple from the same initiator resolves to the same token).

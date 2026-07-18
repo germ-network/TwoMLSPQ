@@ -42,7 +42,7 @@ a host may skip `open_incoming` for the message path. The initiator's initial we
 
 | Field | Where | What an observer learns |
 |---|---|---|
-| frame tag (`0x01`–`0x1F`) | first byte of every tagged frame | frame kind: establishment vs. rotation vs. PQ side-band activity (bootstrap, ratchet, re-key) |
+| frame tag (`0x01`–`0x1D`) | first byte of every tagged frame | frame kind: establishment vs. rotation vs. PQ side-band activity (bootstrap, ratchet, re-key) |
 | `group_id` | every `MLSMessage` | a stable per-direction session identifier — links every message of a direction across epochs, undoing the per-epoch rendezvous rotation for anyone who stores ciphertexts |
 | `epoch` | every `MLSMessage` | commit cadence, message ordering, session age |
 | `content_type` | every PrivateMessage | application vs. proposal vs. commit |
@@ -244,16 +244,14 @@ HeaderKeyPQ(G, e) = exportSecret(label = "germ.network.twomlspq.headerKey.pq.v1"
 - **PQ side-band frames** (0x13–0x1D): seal under `HeaderKeyPQ(recv_group,
   current pq_epoch)` — the opposite PQ group at its `pq_epoch`. This covers every
   side-band frame however it reaches the host: those surfaced by
-  `pq_take_pending_outbound` (the responder's 0x19, 0x13, 0x1F, and both binds — 0x1B and
-  0x15 — which are initiator frames despite being surfaced rather than returned) **and
-  the initiator frames returned directly by `pq_ratchet_begin` (0x17),
-  `pq_bootstrap_begin` (0x11), and `pq_rekey_begin` (0x1D)** — the latter are easy
-  to miss because they bypass `EncryptResult`; leaving them plaintext would
-  fingerprint every PQ exchange by its first frame. No chicken-and-egg blocks it: each
-  BIND commits the *initiator's* send-PQ but seals under the never-advanced receive-PQ
-  (for A.4's bind that is the group it has just joined, at the same birth epoch it
-  exported its secret from); REKEY_UPD carries only a proposal; each REKEY_COMMIT seals
-  under the confirmed epoch.
+  `pq_take_pending_outbound` (the responder replies — `pq_ratchet_respond`'s 0x19,
+  `pq_bootstrap_respond`'s 0x15, and `pq_rekey_respond`'s 0x1D) **and the initiator
+  frames returned directly by `pq_ratchet_begin` (0x17), `pq_bootstrap_begin` (0x13),
+  and `pq_rekey_begin` (0x1B)** — the latter are easy to miss because they bypass
+  `EncryptResult`, and leaving them plaintext would fingerprint every PQ exchange by its
+  first frame. The round's closing BIND is **not** a side-band frame: it rides the next
+  message frame's staple and is sealed with the rest of that frame under the classical
+  `HeaderKey` (below), so it never lands in this slot.
   - *Pre-A.4 fallback:* the one side-band frame whose recv-PQ group doesn't exist yet
     is the initiator's `BOOTSTRAP_KP` — its recv-PQ (Group_B.pq) is the very group the
     bootstrap creates. `seal_side_band` falls back to the **classical** `HeaderKey`
@@ -295,7 +293,7 @@ group, which is my send group):
 - **`recv_header_keys_pq`** — `HeaderKeyPQ(send_group.pq, e)` for recent `pq_epoch`s of
   my send-PQ group. Captured by `record_pq_header_key` wherever the send-PQ group is
   created or its `pq_epoch` advances (`initiate` / `pq_bootstrap_respond` create it;
-  `pq_ratchet_bind`, `pq_rekey_respond`, `pq_rekey_apply` advance it). This window has
+  `pq_bootstrap_bind`, `pq_ratchet_bind`, `pq_rekey_respond`, `pq_rekey_apply` advance it). This window has
   **no rendezvous coupling** — the PQ side-band keeps no routing addresses of its own
   (routing stays classical). Retention is a plain keep-newest `PQ_HEADER_WINDOW = 4`;
   the side-band is turn-based with one op in flight, so `pq_epoch` moves slowly and a
@@ -432,8 +430,8 @@ never has.
    fallback) / `try_open` (both windows) / `open_or_raw`; `record_listen_rendezvous`
    captures the classical header key into `recv_header_keys`, and `record_pq_header_key`
    captures the PQ header key into `recv_header_keys_pq` at each `pq_epoch` advance
-   (`initiate`, `pq_bootstrap_respond`, `pq_ratchet_bind`, `pq_rekey_respond`,
-   `pq_rekey_apply`); seal at every outbound exit (`encrypt` / `pending_outbound`
+   (`initiate`, `pq_bootstrap_respond`, `pq_bootstrap_bind`, `pq_ratchet_bind`,
+   `pq_rekey_respond`, `pq_rekey_apply`); seal at every outbound exit (`encrypt` / `pending_outbound`
    classical; the `pq_*_begin` returns and `pq_take_pending_outbound` via
    `seal_side_band`); `pq_ratchet_begin` guarded on the recv group; `open_incoming`
    with `OpenedFrameKind`; `process_incoming` and the `pq_*` receivers `open_or_raw`

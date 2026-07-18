@@ -138,8 +138,9 @@ unrepresentable.
 
 ## The CommProtocol boundary
 
-TwoMLSPQ receives a principal's signing keys (what CommProtocol calls an *agent*'s keys)
-and returns key packages, ciphertexts, and
+TwoMLSPQ receives a principal's opaque `ClientId` (the identity bytes of what CommProtocol
+calls an *agent*) — not its signing keys, which it mints internally — and returns key
+packages, ciphertexts, and
 structured results (`DecryptResult`, `PrepareEncryptResult`, …). Everything above —
 DIDs, anchor signatures, key discovery from a PDS, sequencing/ordering of proposals,
 transport — belongs to CommProtocol. Keeping that line sharp is why the API is
