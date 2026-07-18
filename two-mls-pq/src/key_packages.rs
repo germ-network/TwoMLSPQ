@@ -1020,7 +1020,8 @@ impl TwoMlsPqInvitation {
         let mut rest = blob.as_slice();
         let kem_output = take_bytes(&mut rest).ok_or(TwoMlsPqError::Mls)?;
         let ciphertext = rest.to_vec();
-        let plaintext = self.hpke_open(kem_output, ciphertext, None, Some(envelope_framing_aad()))?;
+        let plaintext =
+            self.hpke_open(kem_output, ciphertext, None, Some(envelope_framing_aad()))?;
         decode_initial_plaintext(plaintext)
     }
 }

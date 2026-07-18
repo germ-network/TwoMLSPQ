@@ -937,7 +937,10 @@ fn encode_archive(
     // definitionally the declared suite's pair (every session is constructed via
     // `crypto_config`); the debug_assert names that invariant rather than letting the
     // two silently diverge under a future multi-suite edit.
-    debug_assert_eq!(suite.to_wire(), crate::suite::TwoMlsSuite::CURRENT.to_wire());
+    debug_assert_eq!(
+        suite.to_wire(),
+        crate::suite::TwoMlsSuite::CURRENT.to_wire()
+    );
     out.extend_from_slice(&crate::suite::TwoMlsSuite::CURRENT.to_wire());
     wire.mls_encode(&mut out)
         .map_err(|_| TwoMlsPqError::ArchiveInvalid)?;

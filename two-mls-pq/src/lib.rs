@@ -5,8 +5,8 @@ mod key_package_store;
 pub mod key_packages;
 mod providers;
 mod psk;
-mod suite;
 pub mod session;
+mod suite;
 #[cfg(test)]
 #[macro_use]
 mod test_macros;
