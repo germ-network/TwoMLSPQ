@@ -299,7 +299,7 @@ public struct PQPrepareEncryptResult {
 	}
 }
 
-public struct PQSenderMessage {
+public struct PQSenderMessage: Sendable {
 	public let appMessageData: Data
 	public let senderClientId: ClientID
 	public let epoch: UInt64
@@ -311,7 +311,7 @@ public struct PQSenderMessage {
 	}
 }
 
-public struct PQQueuedRemoteProposal {
+public struct PQQueuedRemoteProposal: Sendable {
 	public let digest: TypedDigest
 	public let sender: ClientID
 	public let proposing: ClientID
@@ -325,7 +325,7 @@ public struct PQQueuedRemoteProposal {
 	}
 }
 
-public struct PQCommitResult {
+public struct PQCommitResult: Sendable {
 	public let newSender: ClientID?
 	public let newRecipient: ClientID
 
@@ -335,7 +335,7 @@ public struct PQCommitResult {
 	}
 }
 
-public struct PQDecryptResult {
+public struct PQDecryptResult: Sendable {
 	public let applicationMessage: PQSenderMessage?
 	public let proposal: PQQueuedRemoteProposal?
 	public let remoteCommit: PQCommitResult?
