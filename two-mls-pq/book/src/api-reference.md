@@ -224,7 +224,7 @@ re-staples an already-persisted commit, so its `depends_on_seq` is already durab
 imposes no wait; the durability gate covers only key-material frames (routine frames rely
 on MLS's per-message `reuse_guard`, by design). `state_seq()` reports the current sequence
 for the frames — the establishment envelope, PQ side-band — whose return type carries none.
-In-library desync recovery is not planned — see [Planned Features](./planned-features.md).
+In-library desync recovery is not planned — recovery is a re-establishment at the host layer.
 
 ## Errors
 
