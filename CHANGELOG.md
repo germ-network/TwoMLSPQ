@@ -1,5 +1,46 @@
 # @germ-network/two-mls-pq
 
+## 0.8.0
+
+### Minor Changes
+
+- [#82](https://github.com/germ-network/TwoMLSPQ/pull/82) [`3fd6574`](https://github.com/germ-network/TwoMLSPQ/commit/3fd65741d4ea5bf599c6079cfda99e059eda7b6d) Thanks [@germ-mark](https://github.com/germ-mark)! - Route a parallel-delivered A.4 bootstrap KP′ to its session by content (contract 23).
+
+  A KP′ shipped as a §A.1 bootstrap envelope (contract 21) carries no session id, and a
+  reusable invitation spawns many sessions, so it cannot be routed by transport address.
+  The invitation now keeps a commitment→group table — populated at `receive` from the
+  `H(bootstrap KP)` commitment it was already given — and the new
+  `bootstrap_kp_group_id(kp_frame)` resolves a framed `[0x13][KP′]` against it, the
+  bootstrap-KP counterpart of `forward_group_id`/`processed_welcome_group_id`. The hash
+  stays in Rust, so a frame that resolves can never fail `pq_bootstrap_respond`'s own
+  commitment check. `pq_bootstrap_begin` (the rendezvous side-band path) is unchanged.
+
+  Invitation archive layout changed (`INVITATION_VERSION` 1 → 2, pre-release hard cut): a
+  stale invitation blob fails to decode and must be regenerated.
+
+- [#84](https://github.com/germ-network/TwoMLSPQ/pull/84) [`9fd7d73`](https://github.com/germ-network/TwoMLSPQ/commit/9fd7d73607206a0273b4dce0db634b85382e2ebb) Thanks [@germ-mark](https://github.com/germ-mark)! - Consolidate the AbstractTwoMLS Swift package into this repository.
+
+  The hand-written Swift wrapper that was maintained in a separate repo now lives here
+  (`Package.swift`, `Sources/`, `Tests/`), with the Rust/UniFFI core relocated under `rust/`.
+  A wire change and its Swift adapter land in one PR, tested against a LOCAL xcframework build:
+  `Package.swift`'s `TwoMLSPQrs` binary target reads the local `buildIos/` build when
+  `TWOMLSPQ_LOCAL_XCFRAMEWORK` is set and falls back to the pinned release url+checksum
+  otherwise. The release tag `vX.Y.Z` remains the xcframework version the app resolves. The
+  shipped packaging is unchanged (dynamic framework bundles); the legacy classical MLSrs target
+  is dropped from this repo (the adopting app still links it on its own).
+
+- [#85](https://github.com/germ-network/TwoMLSPQ/pull/85) [`c21369b`](https://github.com/germ-network/TwoMLSPQ/commit/c21369bfcc9cf9dd94506df50b77bf5d5979ecf3) Thanks [@germ-mark](https://github.com/germ-mark)! - Adopt the parallel A.4 bootstrap delivery in the Swift wrapper.
+
+  An initiator now ships its pre-committed KP′ as a §A.1 bootstrap envelope via the new
+  `PQRatchet.bootstrapEnvelope()` — alongside the establishment reply, so the acceptor can
+  answer A.4 one round trip sooner off the invitation channel it already reads.
+  `begin(.finishBootstrap)` stays valid and idempotent (both carry the same KP′, only the
+  outer framing differs). The acceptor's `decodeHeader` self-routes an
+  `OpenedInitial.bootstrapKp` to the owed session through the invitation's `bootstrapKpGroupId`
+  table and answers it in `forwarded` via `pqBootstrapRespond` (a `DuplicateSideBand`, when the
+  side-band won the race, is a benign no-op); the parked `Welcome'` rides the acceptor's next
+  `pendingSideBand` hand-out. No crate or contract change — the binding stays at contract 23.
+
 ## 0.7.0
 
 ### Minor Changes
