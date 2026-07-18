@@ -153,7 +153,19 @@ import TwoMLSPQ
 //     `pqBootstrapRespond` rejects a KP′ hashing to anything else (new `BootstrapKpMismatch`
 //     error). `setInitialReturnKeyPackage` takes classical bytes. Archive layout changed
 //     (pre-release hard cut, as v0.5.0).
-private let expectedBindingContract: UInt64 = 20
+// v21 (TwoMLSPQ 0.7.0): the §A.1 envelope drops its OUTER tag — the blob is now the raw
+//     `[u32-LE kem-len][kem_output][ciphertext]`, and discrimination moved INSIDE to the
+//     HPKE plaintext's authenticated leading tag. `decodeInitialPlaintext` / `openInitial`
+//     now return `OpenedInitial` (`.establishment(frame:)` / `.bootstrapKp(frame:)`);
+//     `initialEnvelopeTag()` is retired (route by transport channel, not first byte).
+//     `decodeEnvelopeFrame` no longer reads a tag; the header path requires the
+//     establishment variant. (The parallel `pqBootstrapEnvelope` is NOT adopted — we keep
+//     the sequential side-band bootstrap, so no BootstrapKp envelope ever reaches us.)
+// v22 (TwoMLSPQ 0.7.0): one declared TwoMLS suite drives every crypto choice, and the §A.1
+//     seal binds it via an UNTRANSMITTED AAD. Both sides derive `[framingVersion][suite
+//     pair]` locally, so the split-open path must pass `envelopeFramingAad()` to `hpkeOpen`
+//     or the AEAD tag fails. No new FFI types — `TwoMlsSuite` is crate-internal.
+private let expectedBindingContract: UInt64 = 22
 
 enum TwoMLSPQBindingContract {
 	static let verified: Void = {
@@ -476,7 +488,8 @@ extension AbstractTwoMLS {
 				// plumbing, and the honest pipeline hands over bytes `decodeHeader`
 				// already parsed — surfacing a parse failure as an error would
 				// misgrade garbage as fatal (the session itself is untouched).
-				guard let frame = try? decodeInitialPlaintext(plaintext: headerDecrypted),
+				guard case .establishment(let frame)? = try? decodeInitialPlaintext(
+					plaintext: headerDecrypted),
 					let stablePrefix = frame.appPayload ?? frame.welcome
 				else {
 					return nil
@@ -809,9 +822,23 @@ extension AbstractTwoMLS {
 				kemOutput: kemOutput,
 				ciphertext: sealed,
 				info: nil,
-				aad: nil
+				// Contract 22: the §A.1 seal binds the declared suite via an
+				// untransmitted AAD. Both sides derive the same bytes locally —
+				// `[framingVersion][suite pair]` — so we pass `envelopeFramingAad()`
+				// here or the AEAD tag fails as an opaque decryption error.
+				aad: envelopeFramingAad()
 			)
-			let frame = try decodeInitialPlaintext(plaintext: decrypted)
+			// Contract 21: `decodeInitialPlaintext` returns `OpenedInitial`, dispatching
+			// on the plaintext's inner tag. We only send establishment envelopes on the
+			// invitation channel (the A.4 bootstrap KP rides the side-band, not a
+			// parallel envelope), so a `.bootstrapKp` here is malformed.
+			guard case .establishment(let frame) = try decodeInitialPlaintext(
+				plaintext: decrypted)
+			else {
+				throw AbstractTwoMLS.SessionError(
+					code: .malformedFrame,
+					detail: "§A.1 bootstrap-KP envelope on the header channel")
+			}
 			// The digest doubles as the FFI's opaque spawn token — computed over the
 			// STABLE PREFIX (the app payload; the bare welcome for payload-less
 			// envelopes), which is byte-identical across the initial frame and every
@@ -1100,9 +1127,11 @@ extension AbstractTwoMLS {
 
 // MARK: - §A.1 envelope outer frame
 
-/// The crate's §A.1 envelope (contract 15): `[tag][u32-LE kem-len][kem_output]
-/// [ciphertext…]` (ciphertext runs to the end), `tag` read via the exported
-/// `initialEnvelopeTag()` — never hardcoded (the `pqFrameKind` convention). Produced
+/// The crate's §A.1 envelope (contract 21): the raw HPKE blob `[u32-LE kem-len]
+/// [kem_output][ciphertext…]` (ciphertext runs to the end) — NO outer tag. Contract 21
+/// dropped it so the establishment reply and a parallel bootstrap-KP frame share one
+/// indistinguishable shape; discrimination moved INSIDE, to the HPKE plaintext's
+/// authenticated leading tag (`decodeInitialPlaintext` -> `OpenedInitial`). Produced
 /// entirely by the crate (initiate / the attach setters / pre-establishment encrypt);
 /// split HERE — rather than opened via `openInitial` — so `hpkeOpen`'s two inputs stay
 /// separate and the raw plaintext remains available for the forward-routing path
@@ -1111,7 +1140,7 @@ private func decodeEnvelopeFrame(
 	_ data: Data
 ) throws(AbstractTwoMLS.SessionError) -> (kemOutput: Data, ciphertext: Data) {
 	var rest = data[...]
-	guard rest.popFirst() == initialEnvelopeTag(), rest.count >= 4 else {
+	guard rest.count >= 4 else {
 		throw AbstractTwoMLS.SessionError(
 			code: .malformedFrame, detail: "§A.1 envelope outer frame")
 	}

@@ -42,8 +42,16 @@ struct LifecycleTests {
 		// createTwoMLSGroup (in the reply harness) attached the AppWelcome and
 		// consumed the parked §A.1 envelope via pendingOutbound (take-once)…
 		#expect(localBase.pendingOutbound() == nil)
-		// …and it travels as the crate's tagged envelope (contract 15).
-		#expect(encryptedCombinedWelcome.first == initialEnvelopeTag())
+		// …and it travels as the crate's opaque §A.1 envelope. Contract 21 dropped
+		// the outer tag, so the blob is the raw `[u32-LE kem-len][kem_output]
+		// [ciphertext]`; assert that shape (a well-formed kem-length prefix bounding
+		// the kem_output, with ciphertext after) rather than a now-absent tag byte.
+		let envelopeKemLen = Int(
+			encryptedCombinedWelcome.prefix(4).withUnsafeBytes {
+				$0.loadUnaligned(as: UInt32.self)
+			}.littleEndian)
+		#expect(envelopeKemLen > 0)
+		#expect(encryptedCombinedWelcome.count > 4 + envelopeKemLen)
 
 		// Routing: listening works from birth — addresses derive from our send
 		// group's classical half, one per epoch. Nowhere to post yet: the post

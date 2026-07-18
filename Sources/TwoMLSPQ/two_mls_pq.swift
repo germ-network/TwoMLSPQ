@@ -825,17 +825,20 @@ public func FfiConverterTypeArchiveSink_lower(_ value: ArchiveSink) -> UInt64 {
 public protocol MlsCipherSuiteProtocol: AnyObject, Sendable {
     
     /**
-     * True if this suite is the classical component of a Combiner pair (0x0003).
-     * When a key package with this suite is paired with an ML-KEM-768 key package,
-     * both belong to TwoMLS as a `CombinerKeyPackage` — do not route the classical
-     * half to mls-rs-uniffi-ios independently.
+     * True if this suite is the classical component of the declared Combiner pair
+     * (`TwoMlsSuite::CURRENT.pair().classical` — 0x0003 today). When a key package with
+     * this suite is paired with the declared PQ key package, both belong to TwoMLS as a
+     * `CombinerKeyPackage` — do not route the classical half to mls-rs-uniffi-ios
+     * independently.
      */
     func isCombinerClassical()  -> Bool
     
     /**
-     * True if this suite is the post-quantum (ML-KEM-768) component of a Combiner pair — the
-     * PQ half TwoMLS handles. Use `is_combiner_classical` to identify the classical half
-     * before routing — do not route a Combiner classical KP to mls-rs-uniffi-ios.
+     * True if this suite is the post-quantum component of the declared Combiner pair
+     * (`TwoMlsSuite::CURRENT.pair().pq` — ML-KEM-768 today), the PQ half TwoMLS handles.
+     * Use `is_combiner_classical` to identify the classical half before routing — do not
+     * route a Combiner classical KP to mls-rs-uniffi-ios. Reads the declared suite, not a
+     * local constant, so these routing predicates track a future suite variant.
      *
      * (Renamed from `is_supported` in binding contract v4: the name always meant "is the PQ
      * combiner suite", not "is a supported suite".)
@@ -947,10 +950,11 @@ public static func x25519Chacha() -> MlsCipherSuite  {
 
     
     /**
-     * True if this suite is the classical component of a Combiner pair (0x0003).
-     * When a key package with this suite is paired with an ML-KEM-768 key package,
-     * both belong to TwoMLS as a `CombinerKeyPackage` — do not route the classical
-     * half to mls-rs-uniffi-ios independently.
+     * True if this suite is the classical component of the declared Combiner pair
+     * (`TwoMlsSuite::CURRENT.pair().classical` — 0x0003 today). When a key package with
+     * this suite is paired with the declared PQ key package, both belong to TwoMLS as a
+     * `CombinerKeyPackage` — do not route the classical half to mls-rs-uniffi-ios
+     * independently.
      */
 open func isCombinerClassical() -> Bool  {
     return try!  FfiConverterBool.lift(try! rustCall() {
@@ -961,9 +965,11 @@ open func isCombinerClassical() -> Bool  {
 }
     
     /**
-     * True if this suite is the post-quantum (ML-KEM-768) component of a Combiner pair — the
-     * PQ half TwoMLS handles. Use `is_combiner_classical` to identify the classical half
-     * before routing — do not route a Combiner classical KP to mls-rs-uniffi-ios.
+     * True if this suite is the post-quantum component of the declared Combiner pair
+     * (`TwoMlsSuite::CURRENT.pair().pq` — ML-KEM-768 today), the PQ half TwoMLS handles.
+     * Use `is_combiner_classical` to identify the classical half before routing — do not
+     * route a Combiner classical KP to mls-rs-uniffi-ios. Reads the declared suite, not a
+     * local constant, so these routing predicates track a future suite variant.
      *
      * (Renamed from `is_supported` in binding contract v4: the name always meant "is the PQ
      * combiner suite", not "is a supported suite".)
@@ -1066,6 +1072,8 @@ public protocol TwoMlsPqInvitationProtocol: AnyObject, Sendable {
      * inherited from classical TwoMLS, which sealed to its classical init key. `info`
      * defaults to the ClientId; `kem_output` and `ciphertext` are the two components of the
      * HPKE ciphertext (kept separate so this stays agnostic to any outer wire framing).
+     * Opening a §A.1 envelope blob requires `aad = envelope_framing_aad()` (contract 22 —
+     * the suite binding `open_initial` derives internally; without it the tag fails).
      * Fails with `InvitationSpent` once a single-use invitation has been consumed — its
      * captured PQ key-package material, and thus the init key this opens with, is then gone.
      */
@@ -1083,21 +1091,27 @@ public protocol TwoMlsPqInvitationProtocol: AnyObject, Sendable {
     func installSink(sink: ArchiveSink) throws 
     
     /**
-     * Open an initiator envelope (the §A.1 blob produced by `initiate` and by every
-     * pre-establishment `encrypt`), returning its parsed sections (see [`InitialFrame`]).
-     * Decrypt-only and **state-free** — it does NOT consume a single-use invitation's
-     * key package (consumption happens in `receive`), so a host can open a frame to
-     * validate it before deciding to join, and re-opens are harmless. Fails
-     * `InvitationSpent` once a single-use invitation is consumed (its KP′ material, and
-     * thus the opener, is gone); `DecryptionFailed`/`Mls` on a malformed or wrong-key
-     * blob. The counterpart is the free function `seal_initial_envelope`.
+     * Open a §A.1 envelope blob (produced by `initiate`, by every pre-establishment
+     * `encrypt`, or by `pq_bootstrap_envelope`), dispatching on the inner authenticated
+     * leading tag into [`OpenedInitial`]. Decrypt-only and **state-free** — it does NOT
+     * consume a single-use invitation's key package (consumption happens in `receive`), so a
+     * host can open a frame to validate it before deciding to join, and re-opens are
+     * harmless. Fails `InvitationSpent` once a single-use invitation is consumed (its KP′
+     * material, and thus the opener, is gone); `DecryptionFailed`/`Mls` on a malformed or
+     * wrong-key blob. The counterpart is the free function `seal_hpke_blob`
+     * (via `seal_initial_envelope` / `pq_bootstrap_envelope`).
+     *
+     * The blob carries NO outer tag (`[u32-LE kem_len][kem_output][ciphertext]`); the host
+     * already knows to open it because it arrived on the invitation channel. Which §A.1 frame
+     * it is — establishment vector or parallel bootstrap KP — is decided only after
+     * HPKE-open, by the plaintext's leading byte.
      *
      * Every envelope from one initiator is freshly HPKE-sealed (different outer bytes)
      * and — pre-establishment — may staple a different app message, so a replay-stable
      * token must be computed over the decrypted STABLE PREFIX: the `app_payload`
      * section when present, else the `welcome` section (see `decode_initial_plaintext`).
      */
-    func openInitial(blob: Data) throws  -> InitialFrame
+    func openInitial(blob: Data) throws  -> OpenedInitial
     
     /**
      * Resolve a welcome against the processed-welcome ledger: `Some` names the receive
@@ -1284,6 +1298,8 @@ open func forwardGroupId(spawnToken: Data) -> MlsGroupId?  {
      * inherited from classical TwoMLS, which sealed to its classical init key. `info`
      * defaults to the ClientId; `kem_output` and `ciphertext` are the two components of the
      * HPKE ciphertext (kept separate so this stays agnostic to any outer wire framing).
+     * Opening a §A.1 envelope blob requires `aad = envelope_framing_aad()` (contract 22 —
+     * the suite binding `open_initial` derives internally; without it the tag fails).
      * Fails with `InvitationSpent` once a single-use invitation has been consumed — its
      * captured PQ key-package material, and thus the init key this opens with, is then gone.
      */
@@ -1317,22 +1333,28 @@ open func installSink(sink: ArchiveSink)throws   {try rustCallWithError(FfiConve
 }
     
     /**
-     * Open an initiator envelope (the §A.1 blob produced by `initiate` and by every
-     * pre-establishment `encrypt`), returning its parsed sections (see [`InitialFrame`]).
-     * Decrypt-only and **state-free** — it does NOT consume a single-use invitation's
-     * key package (consumption happens in `receive`), so a host can open a frame to
-     * validate it before deciding to join, and re-opens are harmless. Fails
-     * `InvitationSpent` once a single-use invitation is consumed (its KP′ material, and
-     * thus the opener, is gone); `DecryptionFailed`/`Mls` on a malformed or wrong-key
-     * blob. The counterpart is the free function `seal_initial_envelope`.
+     * Open a §A.1 envelope blob (produced by `initiate`, by every pre-establishment
+     * `encrypt`, or by `pq_bootstrap_envelope`), dispatching on the inner authenticated
+     * leading tag into [`OpenedInitial`]. Decrypt-only and **state-free** — it does NOT
+     * consume a single-use invitation's key package (consumption happens in `receive`), so a
+     * host can open a frame to validate it before deciding to join, and re-opens are
+     * harmless. Fails `InvitationSpent` once a single-use invitation is consumed (its KP′
+     * material, and thus the opener, is gone); `DecryptionFailed`/`Mls` on a malformed or
+     * wrong-key blob. The counterpart is the free function `seal_hpke_blob`
+     * (via `seal_initial_envelope` / `pq_bootstrap_envelope`).
+     *
+     * The blob carries NO outer tag (`[u32-LE kem_len][kem_output][ciphertext]`); the host
+     * already knows to open it because it arrived on the invitation channel. Which §A.1 frame
+     * it is — establishment vector or parallel bootstrap KP — is decided only after
+     * HPKE-open, by the plaintext's leading byte.
      *
      * Every envelope from one initiator is freshly HPKE-sealed (different outer bytes)
      * and — pre-establishment — may staple a different app message, so a replay-stable
      * token must be computed over the decrypted STABLE PREFIX: the `app_payload`
      * section when present, else the `welcome` section (see `decode_initial_plaintext`).
      */
-open func openInitial(blob: Data)throws  -> InitialFrame  {
-    return try  FfiConverterTypeInitialFrame_lift(try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
+open func openInitial(blob: Data)throws  -> OpenedInitial  {
+    return try  FfiConverterTypeOpenedInitial_lift(try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
     uniffi_two_mls_pq_fn_method_twomlspqinvitation_open_initial(
             self.uniffiCloneHandle(),
         FfiConverterData.lower(blob),$0
@@ -1750,9 +1772,14 @@ public protocol TwoMlsPqSessionProtocol: AnyObject, Sendable {
      * establishment payload (next to the classical return key package), and the peer
      * threads it back through `receive`/`accept`, where `pq_bootstrap_respond`
      * enforces it — anchoring the ML-KEM key material to the host's signed
-     * establishment rather than resting it on classical channel auth alone. `None` on
-     * acceptor sessions and once `pq_bootstrap_begin` has consumed the retained KP
-     * (read it at reply time, which is when the envelope is composed).
+     * establishment rather than resting it on classical channel auth alone.
+     *
+     * `None` on acceptor sessions and once EITHER consumer of the retained KP has run:
+     * `pq_bootstrap_begin`, or the Part 3 parallel `pq_bootstrap_envelope` (whose FIRST
+     * emit registers the round and consumes the KP). **Read it before emitting**: it is
+     * available from `initiate`, the signed reply must carry it, and the parallel frame
+     * ships alongside that reply — compose-the-reply-then-emit is the only order that
+     * works, and this accessor going quiet afterwards is the tell if the order slips.
      */
     func bootstrapKpCommitment()  -> Data?
     
@@ -2013,6 +2040,12 @@ public protocol TwoMlsPqSessionProtocol: AnyObject, Sendable {
      * ESTABLISHMENT credential regardless of any completed Phase 8 rotation (the
      * commitment outranks the live principal; A.5 hands the PQ leaves to the rotated
      * credential afterward).
+     *
+     * Idempotent once the round is registered — by an earlier call, or by the Part 3
+     * parallel `pq_bootstrap_envelope`: it then re-seals and returns the retained
+     * `[0x13][KP′]` frame with no state change and no persist, so a host keeping its
+     * standard post-establishment A.4 kickoff after adopting the parallel envelope is
+     * safe.
      */
     func pqBootstrapBegin(rotating: ClientId?) throws  -> Data
     
@@ -2036,6 +2069,40 @@ public protocol TwoMlsPqSessionProtocol: AnyObject, Sendable {
      * no confirmation of.
      */
     func pqBootstrapBind(welcomeMsg: Data) throws 
+    
+    /**
+     * Part 3 — parallel KP′ delivery. Emit the initiator's pre-committed A.4 KP′ (the same
+     * verbatim `[0x13][KP′]` frame `pq_bootstrap_respond` consumes) IN PARALLEL with the
+     * establishment reply, HPKE-sealed to the retained seal target `initial_their_kp` as a
+     * RAW §A.1 blob (`seal_hpke_blob`: `[u32 kem_len][kem_output][ciphertext]`, no sections,
+     * no outer tag). It shares that outer shape with the establishment reply — no per-frame
+     * "carries PQ material" distinguisher; the receiver tells them apart on unpacking, by the
+     * `0x13` inner leading tag vs. the reply's `ESTABLISHMENT_VECTOR_TAG`. Initiator-only,
+     * PRE-ESTABLISHMENT only: `initial_their_kp` exists solely in that window (cleared at the
+     * cutover), and `seal_side_band` — the steady-state carrier — needs a recv group that
+     * does not exist yet, which is exactly why this frame rides the HPKE envelope instead.
+     *
+     * The FIRST emit REGISTERS the A.4 round exactly as `pq_bootstrap_begin` does — the
+     * shared `register_bootstrap_round` (`pq_inflight = BootstrapInitiated`, the retained
+     * frame, the eviction-exempt `mine` credential pin) — and persists a Checkpoint, so the
+     * initiator can process an EARLY `Welcome'`: an acceptor that already holds this KP′
+     * when its return welcome goes out sends `Welcome'` alongside it, and A.4 completes ~one
+     * round trip sooner. **Read `bootstrap_kp_commitment()` BEFORE the first emit** — it
+     * consumes the pre-committed KP, and the signed reply must carry the commitment. EVERY
+     * LATER pre-cutover emit is a PURE re-seal of the retained frame — fresh HPKE, no state
+     * change, no persist (register-once, re-seal-per-send pure). After the establishment
+     * cutover the SAME retained frame flows over the steady-state side-band (`hand_out`
+     * re-seals it), so a dropped parallel envelope self-heals, and `pq_bootstrap_begin` is
+     * idempotent afterward — it re-seals and returns the retained frame (the round is
+     * registered). Fresh HPKE per call — the re-sends are unlinkable.
+     *
+     * Concurrency note: the guard block and the registering closure take the lock
+     * separately, so two concurrent FIRST emits can both fall through the guard. The
+     * closure's re-check keeps the state correct (the loser registers nothing), but the
+     * loser still records one redundant, idempotent Checkpoint — the register-once/pure
+     * contract is exact only under the sequential driving the session assumes throughout.
+     */
+    func pqBootstrapEnvelope() throws  -> Data
     
     /**
      * A.4 responder — stand up the deferred send-group PQ half around the peer's key
@@ -2368,9 +2435,14 @@ open func appBinding()throws  -> Data?  {
      * establishment payload (next to the classical return key package), and the peer
      * threads it back through `receive`/`accept`, where `pq_bootstrap_respond`
      * enforces it — anchoring the ML-KEM key material to the host's signed
-     * establishment rather than resting it on classical channel auth alone. `None` on
-     * acceptor sessions and once `pq_bootstrap_begin` has consumed the retained KP
-     * (read it at reply time, which is when the envelope is composed).
+     * establishment rather than resting it on classical channel auth alone.
+     *
+     * `None` on acceptor sessions and once EITHER consumer of the retained KP has run:
+     * `pq_bootstrap_begin`, or the Part 3 parallel `pq_bootstrap_envelope` (whose FIRST
+     * emit registers the round and consumes the KP). **Read it before emitting**: it is
+     * available from `initiate`, the signed reply must carry it, and the parallel frame
+     * ships alongside that reply — compose-the-reply-then-emit is the only order that
+     * works, and this accessor going quiet afterwards is the tell if the order slips.
      */
 open func bootstrapKpCommitment() -> Data?  {
     return try!  FfiConverterOptionData.lift(try! rustCall() {
@@ -2799,6 +2871,12 @@ open func myPqTurn() -> Bool  {
      * ESTABLISHMENT credential regardless of any completed Phase 8 rotation (the
      * commitment outranks the live principal; A.5 hands the PQ leaves to the rotated
      * credential afterward).
+     *
+     * Idempotent once the round is registered — by an earlier call, or by the Part 3
+     * parallel `pq_bootstrap_envelope`: it then re-seals and returns the retained
+     * `[0x13][KP′]` frame with no state change and no persist, so a host keeping its
+     * standard post-establishment A.4 kickoff after adopting the parallel envelope is
+     * safe.
      */
 open func pqBootstrapBegin(rotating: ClientId?)throws  -> Data  {
     return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
@@ -2834,6 +2912,46 @@ open func pqBootstrapBind(welcomeMsg: Data)throws   {try rustCallWithError(FfiCo
         FfiConverterData.lower(welcomeMsg),$0
     )
 }
+}
+    
+    /**
+     * Part 3 — parallel KP′ delivery. Emit the initiator's pre-committed A.4 KP′ (the same
+     * verbatim `[0x13][KP′]` frame `pq_bootstrap_respond` consumes) IN PARALLEL with the
+     * establishment reply, HPKE-sealed to the retained seal target `initial_their_kp` as a
+     * RAW §A.1 blob (`seal_hpke_blob`: `[u32 kem_len][kem_output][ciphertext]`, no sections,
+     * no outer tag). It shares that outer shape with the establishment reply — no per-frame
+     * "carries PQ material" distinguisher; the receiver tells them apart on unpacking, by the
+     * `0x13` inner leading tag vs. the reply's `ESTABLISHMENT_VECTOR_TAG`. Initiator-only,
+     * PRE-ESTABLISHMENT only: `initial_their_kp` exists solely in that window (cleared at the
+     * cutover), and `seal_side_band` — the steady-state carrier — needs a recv group that
+     * does not exist yet, which is exactly why this frame rides the HPKE envelope instead.
+     *
+     * The FIRST emit REGISTERS the A.4 round exactly as `pq_bootstrap_begin` does — the
+     * shared `register_bootstrap_round` (`pq_inflight = BootstrapInitiated`, the retained
+     * frame, the eviction-exempt `mine` credential pin) — and persists a Checkpoint, so the
+     * initiator can process an EARLY `Welcome'`: an acceptor that already holds this KP′
+     * when its return welcome goes out sends `Welcome'` alongside it, and A.4 completes ~one
+     * round trip sooner. **Read `bootstrap_kp_commitment()` BEFORE the first emit** — it
+     * consumes the pre-committed KP, and the signed reply must carry the commitment. EVERY
+     * LATER pre-cutover emit is a PURE re-seal of the retained frame — fresh HPKE, no state
+     * change, no persist (register-once, re-seal-per-send pure). After the establishment
+     * cutover the SAME retained frame flows over the steady-state side-band (`hand_out`
+     * re-seals it), so a dropped parallel envelope self-heals, and `pq_bootstrap_begin` is
+     * idempotent afterward — it re-seals and returns the retained frame (the round is
+     * registered). Fresh HPKE per call — the re-sends are unlinkable.
+     *
+     * Concurrency note: the guard block and the registering closure take the lock
+     * separately, so two concurrent FIRST emits can both fall through the guard. The
+     * closure's re-check keeps the state correct (the loser registers nothing), but the
+     * loser still records one redundant, idempotent Checkpoint — the register-once/pure
+     * contract is exact only under the sequential driving the session assumes throughout.
+     */
+open func pqBootstrapEnvelope()throws  -> Data  {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
+    uniffi_two_mls_pq_fn_method_twomlspqsession_pq_bootstrap_envelope(
+            self.uniffiCloneHandle(),$0
+    )
+})
 }
     
     /**
@@ -3709,10 +3827,11 @@ public func FfiConverterTypeHpkeSealed_lower(_ value: HpkeSealed) -> RustBuffer 
 
 
 /**
- * The opened §A.1 envelope after `TwoMlsPqInvitation::open_initial` (or
- * `decode_initial_plaintext` on an already-HPKE-opened plaintext). Every section is
- * optional on the wire (empty = absent); which are populated follows the either/or
- * rule on `seal_initial_envelope`:
+ * The establishment vector of a §A.1 envelope — the `OpenedInitial::Establishment` payload
+ * after `TwoMlsPqInvitation::open_initial` (or `decode_initial_plaintext` on an
+ * already-HPKE-opened plaintext whose inner leading tag is `ESTABLISHMENT_VECTOR_TAG`).
+ * Every section is optional on the wire (empty = absent); which are populated follows the
+ * either/or rule on `seal_initial_envelope`:
  * - `app_payload` — the host's app-layer welcome. When present it is establishment-
  * self-sufficient (carries the MLS welcome, the initiator's CLASSICAL return key
  * package, and the bootstrap KP commitment inside, e.g. a signed identity
@@ -4561,6 +4680,101 @@ public func FfiConverterTypeOpenedFrameKind_lift(_ buf: RustBuffer) throws -> Op
 #endif
 public func FfiConverterTypeOpenedFrameKind_lower(_ value: OpenedFrameKind) -> RustBuffer {
     return FfiConverterTypeOpenedFrameKind.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * The result of opening a §A.1 envelope blob (`TwoMlsPqInvitation::open_initial`, or
+ * `decode_initial_plaintext` on an HPKE-opened plaintext). The envelope carries NO outer
+ * wire tag (contract 21); the inner authenticated leading tag of the HPKE plaintext selects
+ * the variant — the same channel-routes-then-inner-tag-dispatches pattern the whole tag
+ * space follows (see [`ESTABLISHMENT_VECTOR_TAG`]).
+ */
+
+public enum OpenedInitial: Equatable, Hashable {
+    
+    /**
+     * Leading tag `ESTABLISHMENT_VECTOR_TAG` (0x07): the establishment reply's four optional
+     * sections (see [`InitialFrame`]).
+     */
+    case establishment(frame: InitialFrame
+    )
+    /**
+     * Leading tag `PQ_BOOTSTRAP_KP_TAG` (0x13): the initiator's A.4 bootstrap frame delivered
+     * IN PARALLEL with the reply (Part 3). The pre-commitment fixed the KP bytes at
+     * `initiate`, so the initiator ships its A.4 KP′ alongside the establishment reply
+     * instead of waiting a round trip for A.4's first send. `frame` is the VERBATIM
+     * `[0x13][KP′ …]` side-band frame `pq_bootstrap_respond` consumes — only the OUTER
+     * framing differed (the §A.1 HPKE envelope here vs. the header-sealed side-band in
+     * steady state). The receiver holds it UNTIL the reply establishes the session, then
+     * feeds it to `pq_bootstrap_respond`, which enforces it against the anchor-signed
+     * commitment.
+     */
+    case bootstrapKp(frame: Data
+    )
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension OpenedInitial: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeOpenedInitial: FfiConverterRustBuffer {
+    typealias SwiftType = OpenedInitial
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> OpenedInitial {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .establishment(frame: try FfiConverterTypeInitialFrame.read(from: &buf)
+        )
+        
+        case 2: return .bootstrapKp(frame: try FfiConverterData.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: OpenedInitial, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case let .establishment(frame):
+            writeInt(&buf, Int32(1))
+            FfiConverterTypeInitialFrame.write(frame, into: &buf)
+            
+        
+        case let .bootstrapKp(frame):
+            writeInt(&buf, Int32(2))
+            FfiConverterData.write(frame, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOpenedInitial_lift(_ buf: RustBuffer) throws -> OpenedInitial {
+    return try FfiConverterTypeOpenedInitial.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOpenedInitial_lower(_ value: OpenedInitial) -> RustBuffer {
+    return FfiConverterTypeOpenedInitial.lower(value)
 }
 
 
@@ -5560,16 +5774,22 @@ public func decodeCombinerKeyPackage(bytes: Data)throws  -> CombinerKeyPackage  
 })
 }
 /**
- * Parse an HPKE-opened §A.1 envelope plaintext into its four optional sections — the
- * attacker-facing decoder shared by `open_initial` and any host that HPKE-opens the
- * envelope itself (`hpke_open`) and needs the sections (e.g. to key a replay-stable
- * token off the stable prefix: `app_payload` when present, else `welcome` — the two
- * sections that are identical across an initiator's re-sealed/re-stapled envelopes).
- * Rejects truncation, trailing bytes, and an envelope carrying neither an
- * `app_payload` nor a `welcome` (no establishment vector at all).
+ * Dispatch an HPKE-opened §A.1 plaintext on its inner authenticated leading tag — the
+ * attacker-facing decoder shared by `open_initial` and any host that HPKE-opens the envelope
+ * itself (`hpke_open`). `ESTABLISHMENT_VECTOR_TAG` (0x07) → the four optional establishment
+ * sections (see [`InitialFrame`]); `PQ_BOOTSTRAP_KP_TAG` (0x13) → the parallel bootstrap-KP
+ * frame, returned VERBATIM (`[0x13][KP′]`, the exact bytes `pq_bootstrap_respond` consumes).
+ * Any other leading byte is `Mls`.
+ *
+ * For a replay-stable token, a host keys off the establishment vector's stable prefix:
+ * `app_payload` when present, else `welcome` — the two sections identical across an
+ * initiator's re-sealed/re-stapled envelopes (the bootstrap-KP frame is itself stable
+ * per-round, but the fresh HPKE outer makes every emitted blob distinct). Rejects
+ * truncation, trailing bytes, and an establishment vector carrying NOTHING (no `app_payload`
+ * and no `welcome`).
  */
-public func decodeInitialPlaintext(plaintext: Data)throws  -> InitialFrame  {
-    return try  FfiConverterTypeInitialFrame_lift(try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
+public func decodeInitialPlaintext(plaintext: Data)throws  -> OpenedInitial  {
+    return try  FfiConverterTypeOpenedInitial_lift(try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
     uniffi_two_mls_pq_fn_func_decode_initial_plaintext(
         FfiConverterData.lower(plaintext),$0
     )
@@ -5589,11 +5809,30 @@ public func encodeCombinerKeyPackage(keyPackage: CombinerKeyPackage) -> Data  {
 })
 }
 /**
+ * The §A.1 envelope's HPKE AAD (contract 22): `[framing version (1)][classical u16 BE]
+ * [pq u16 BE]` — the declared suite's envelope framing, **derived locally on both sides
+ * and never transmitted** (RFC 9180 `aad` is a seal/open input, not part of the
+ * ciphertext; only byte-equality matters). Binding it means a peer whose declared suite
+ * pair or framing version differs fails the AEAD tag (`DecryptionFailed`) — downgrade
+ * binding of the WHOLE pair, classical half included, at zero wire bytes. Exported so a
+ * host driving the split path (`hpke_open` + `decode_initial_plaintext`) supplies the
+ * same bytes without hardcoding them — the `pq_frame_kind` convention; `open_initial`
+ * derives it internally.
+ */
+public func envelopeFramingAad() -> Data  {
+    return try!  FfiConverterData.lift(try! rustCall() {
+    uniffi_two_mls_pq_fn_func_envelope_framing_aad($0
+    )
+})
+}
+/**
  * HPKE-seal `plaintext` to a published combiner key package's **PQ half** init key (spec
  * §A.1: the envelope is sealed to the PQ EK in KP′, under the PQ suite) — the sender side
  * of the initial routing-header pattern; the holder of the key package's invitation opens
  * it with `TwoMlsPqInvitation::hpke_open`. `info` defaults to the key package's credential
- * (the recipient's ClientId), matching `hpke_open`'s default.
+ * (the recipient's ClientId), matching `hpke_open`'s default. A §A.1 envelope seal passes
+ * [`envelope_framing_aad`] as `aad` (the crate's own seal paths do so via
+ * `seal_hpke_blob`); the parameter stays open for non-envelope uses.
  */
 public func hpkeSealToKeyPackage(keyPackage: CombinerKeyPackage, plaintext: Data, info: Data?, aad: Data?)throws  -> HpkeSealed  {
     return try  FfiConverterTypeHpkeSealed_lift(try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
@@ -5602,19 +5841,6 @@ public func hpkeSealToKeyPackage(keyPackage: CombinerKeyPackage, plaintext: Data
         FfiConverterData.lower(plaintext),
         FfiConverterOptionData.lower(info),
         FfiConverterOptionData.lower(aad),$0
-    )
-})
-}
-/**
- * [`INITIAL_ENVELOPE_TAG`] for hosts that parse the outer frame themselves —
- * splitting kem/ct for `hpke_open` + `decode_initial_plaintext` keeps the raw
- * plaintext available for replay routing, which `open_initial` would swallow.
- * Exported as a function so no host hardcodes the tag byte (the `pq_frame_kind`
- * convention).
- */
-public func initialEnvelopeTag() -> UInt8  {
-    return try!  FfiConverterUInt8.lift(try! rustCall() {
-    uniffi_two_mls_pq_fn_func_initial_envelope_tag($0
     )
 })
 }
@@ -5681,16 +5907,16 @@ private let initializationResult: InitializationResult = {
     if (uniffi_two_mls_pq_checksum_func_decode_combiner_key_package() != 61532) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_func_decode_initial_plaintext() != 41865) {
+    if (uniffi_two_mls_pq_checksum_func_decode_initial_plaintext() != 49183) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_func_encode_combiner_key_package() != 48037) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_func_hpke_seal_to_key_package() != 8686) {
+    if (uniffi_two_mls_pq_checksum_func_envelope_framing_aad() != 2011) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_func_initial_envelope_tag() != 8037) {
+    if (uniffi_two_mls_pq_checksum_func_hpke_seal_to_key_package() != 7730) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_func_parse_combiner_key_package() != 43275) {
@@ -5705,10 +5931,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_two_mls_pq_checksum_method_archivesink_persist() != 64624) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_mlsciphersuite_is_combiner_classical() != 42584) {
+    if (uniffi_two_mls_pq_checksum_method_mlsciphersuite_is_combiner_classical() != 23721) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_mlsciphersuite_is_combiner_pq() != 50060) {
+    if (uniffi_two_mls_pq_checksum_method_mlsciphersuite_is_combiner_pq() != 27749) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_mlsciphersuite_value() != 46029) {
@@ -5723,13 +5949,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_two_mls_pq_checksum_method_twomlspqinvitation_forward_group_id() != 59815) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqinvitation_hpke_open() != 19762) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqinvitation_hpke_open() != 24281) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqinvitation_install_sink() != 4147) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqinvitation_open_initial() != 14550) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqinvitation_open_initial() != 36225) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqinvitation_processed_welcome_group_id() != 55990) {
@@ -5759,7 +5985,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_app_binding() != 59144) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_bootstrap_kp_commitment() != 30355) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_bootstrap_kp_commitment() != 61225) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_epochs() != 27665) {
@@ -5840,10 +6066,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_my_pq_turn() != 43166) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_bootstrap_begin() != 24353) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_bootstrap_begin() != 36603) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_bootstrap_bind() != 63281) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_bootstrap_envelope() != 52814) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_bootstrap_respond() != 25723) {
