@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use super::{SideBandSealing, TwoMlsPqSession};
+use super::{SideBandSealing, TwoMlsPqSession, WelcomeEstablishment};
 
 use crate::{
     assert_err, assert_ok, assert_some,
@@ -3154,16 +3154,24 @@ fn test_prepare_result_proposal_message_at_establishment_binds_the_dedicated_can
         None
     ));
 
+    // Contract 26: the delegation installs before anything emits.
+    let envelope = crate::test_utils::install_mock_envelope(&bob_session);
+
     // Stage → prepare, all before any peer frame: the result carries the bytes, already
     // digesting to the round's binding value.
     assert_ok!(bob_session.stage_rotation(dedicated_id.bytes.clone()));
     let prep = assert_ok!(bob_session.prepare_to_encrypt(Some(dedicated_id.clone())));
     assert_eq!(crate::sha256(&prep.proposal_message), prep.proposal_hash);
 
-    // The first frame delivers that exact Upd: the initiator derives the same digest
-    // and sees the dedicated candidate's credential.
+    // The first frame delivers that exact Upd: the initiator (after the pause →
+    // approve dance) derives the same digest and sees the dedicated credential.
     let enc = assert_ok!(bob_session.encrypt(b"first frame".to_vec()));
-    let got = assert_some!(assert_ok!(alice_session.process_incoming(enc.cipher_text)));
+    let got = assert_some!(crate::test_utils::approve_establishment(
+        &alice_session,
+        enc.cipher_text,
+        &envelope,
+        &dedicated_id.bytes
+    ));
     let proposal = assert_some!(got.proposal);
     assert_eq!(crate::sha256(&prep.proposal_message), proposal.digest);
     assert_eq!(proposal.proposing, dedicated_id);
@@ -4353,12 +4361,27 @@ fn test_receive_under_dedicated_principal() {
         bob_inv.client_id().bytes
     );
 
-    // Bob's first frame staples APQWelcome_B, whose creator leaf carries the
-    // dedicated id: the joining frame surfaces the handoff like a rotation
-    // (remote_commit.new_sender) and message attribution carries it from the start.
+    // Contract 26: every emission door refuses until the delegation installs — an
+    // undelegated dedicated credential never reaches the wire.
+    assert!(matches!(
+        bob_s.prepare_to_encrypt(None),
+        Err(TwoMlsPqError::EstablishmentEnvelopeRequired)
+    ));
+    assert!(bob_s.pending_outbound().is_none());
+    let envelope = crate::test_utils::install_mock_envelope(&bob_s);
+
+    // Bob's first frame staples the 0x0B establishment handoff wrapping APQWelcome_B,
+    // whose creator leaf carries the dedicated id. Alice PAUSES for verification and
+    // completes via the approved re-feed: the joining frame surfaces the handoff like
+    // a rotation (remote_commit.new_sender) and attribution carries it from the start.
     assert_ok!(bob_s.prepare_to_encrypt(None));
     let enc = assert_ok!(bob_s.encrypt(b"hello".to_vec()));
-    let res = assert_some!(assert_ok!(alice_s.process_incoming(enc.cipher_text)));
+    let res = assert_some!(crate::test_utils::approve_establishment(
+        &alice_s,
+        enc.cipher_text,
+        &envelope,
+        &dedicated
+    ));
     let commit = assert_some!(res.remote_commit);
     assert_eq!(assert_some!(commit.new_sender).bytes, dedicated);
     let msg = assert_some!(res.application_message);
@@ -4457,15 +4480,388 @@ fn test_standalone_welcome_surfaces_dedicated_principal() {
         None
     ));
 
+    // Contract 26: the standalone copy is also gated — nothing emits pre-install —
+    // and post-install it carries the same enveloped framing as the staple.
+    assert!(bob_s.pending_outbound().is_none());
+    let envelope = crate::test_utils::install_mock_envelope(&bob_s);
     let welcome_b = assert_some!(bob_s.pending_outbound());
-    let res = assert_some!(assert_ok!(alice_s.process_incoming(welcome_b.clone())));
+    let res = assert_some!(crate::test_utils::approve_establishment(
+        &alice_s,
+        welcome_b.clone(),
+        &envelope,
+        &dedicated
+    ));
     assert!(res.application_message.is_none());
     assert!(res.proposal.is_none());
     let commit = assert_some!(res.remote_commit);
     assert_eq!(assert_some!(commit.new_sender).bytes, dedicated);
     assert_eq!(alice_s.their_principal_state().client_id().bytes, dedicated);
-    // Re-delivery of the same (sealed) welcome: idempotent, silent.
+    // Re-delivery of the same (sealed) welcome: idempotent, silent — the approved
+    // join recorded the INNER welcome digest, so no re-pause.
     assert!(assert_ok!(alice_s.process_incoming(welcome_b)).is_none());
+}
+
+/// Contract 26: the approval covers the exact (envelope, welcome) PAIR the host
+/// verified — a re-feed whose approval mismatches EITHER section's digest pauses
+/// again instead of joining. Without the welcome half a deviating acceptor could
+/// pair the approved envelope with a DIFFERENT joinable welcome under the same
+/// delegated id (the envelope's signatures bind the welcome, but the blob is
+/// opaque here, and header sealing does not gate this arm), so the crate must
+/// enforce the pairing byte-exactly.
+#[test]
+fn test_establishment_approval_pins_both_sections() {
+    use crate::key_packages::TwoMlsPqInvitation;
+    let alice = make_client();
+    let bob = make_client();
+    let alice_kp = make_classical_kp(&alice);
+    let bob_inv = assert_ok!(TwoMlsPqInvitation::restore(assert_ok!(
+        bob.generate_invitation(true)
+    )));
+    let bob_kp = bob_inv.combiner_key_package();
+
+    let alice_s = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
+    let opened = assert_ok!(bob_inv.open_establishment(assert_some!(alice_s.pending_outbound())));
+    let dedicated = crate::test_utils::test_client_id();
+    let bob_s = assert_ok!(bob_inv.receive(
+        assert_some!(opened.welcome),
+        alice_kp,
+        commitment_of(&alice_s),
+        b"tok".to_vec(),
+        Some(dedicated.clone()),
+        None,
+        None
+    ));
+    let invitation_identity = bob_inv.client_id().bytes;
+    let envelope = crate::test_utils::install_mock_envelope(&bob_s);
+    let frame = assert_some!(bob_s.pending_outbound());
+
+    let paused = assert_some!(assert_ok!(alice_s.process_incoming(frame.clone())));
+    let pending = assert_some!(paused.pending_establishment);
+
+    // Wrong WELCOME digest (envelope correct): paused again, nothing joined —
+    // the approved-envelope half alone must never admit a different welcome.
+    let res = assert_some!(assert_ok!(alice_s.process_incoming_approved(
+        frame.clone(),
+        crate::sha256(&pending.envelope),
+        crate::sha256(b"a different welcome"),
+        dedicated.clone(),
+    )));
+    assert!(res.pending_establishment.is_some());
+    assert_eq!(
+        alice_s.their_principal_state().client_id().bytes,
+        invitation_identity
+    );
+
+    // Wrong ENVELOPE digest (welcome correct): likewise paused.
+    let res = assert_some!(assert_ok!(alice_s.process_incoming_approved(
+        frame.clone(),
+        crate::sha256(b"a different envelope"),
+        crate::sha256(&pending.welcome),
+        dedicated.clone(),
+    )));
+    assert!(res.pending_establishment.is_some());
+    assert_eq!(
+        alice_s.their_principal_state().client_id().bytes,
+        invitation_identity
+    );
+
+    // The exact verified pair: joins and adopts the dedicated principal.
+    let res = assert_some!(assert_ok!(alice_s.process_incoming_approved(
+        frame,
+        crate::sha256(&envelope),
+        crate::sha256(&pending.welcome),
+        dedicated.clone(),
+    )));
+    let commit = assert_some!(res.remote_commit);
+    assert_eq!(assert_some!(commit.new_sender).bytes, dedicated);
+    assert_eq!(alice_s.their_principal_state().client_id().bytes, dedicated);
+}
+
+/// Contract 26: the one-envelope-per-session rule. Re-installing the SAME bytes
+/// is an idempotent no-op; DIFFERENT bytes are `EstablishmentEnvelopeConflict`
+/// (a host bug — the signatures bind this session's welcome); an EMPTY blob is
+/// `EstablishmentEnvelopeRequired`; and install on a NON-dedicated (nil-topology)
+/// session is `SessionNotReady` (it owes nothing).
+#[test]
+fn test_install_establishment_envelope_rules() {
+    let d = crate::test_utils::born_dedicated_pending();
+    let envelope = b"the-signed-delegation".to_vec();
+
+    // Empty is refused before anything is touched.
+    assert!(matches!(
+        d.bob.install_establishment_envelope(Vec::new()),
+        Err(TwoMlsPqError::EstablishmentEnvelopeRequired)
+    ));
+
+    // First install succeeds; the same bytes again are an idempotent no-op.
+    assert_ok!(d.bob.install_establishment_envelope(envelope.clone()));
+    assert_ok!(d.bob.install_establishment_envelope(envelope.clone()));
+
+    // Different bytes after an install are a loud conflict — never a silent replace.
+    assert!(matches!(
+        d.bob
+            .install_establishment_envelope(b"a-different-delegation".to_vec()),
+        Err(TwoMlsPqError::EstablishmentEnvelopeConflict)
+    ));
+    // The original still drives establishment (the conflict changed nothing).
+    let frame = assert_some!(d.bob.pending_outbound());
+    assert_some!(crate::test_utils::approve_establishment(
+        &d.alice,
+        frame,
+        &envelope,
+        &d.dedicated
+    ));
+
+    // A nil-topology acceptor owes no envelope: install is SessionNotReady.
+    let (nil_alice, nil_bob) = establish_sessions();
+    let _ = &nil_alice;
+    assert!(matches!(
+        nil_bob.install_establishment_envelope(b"unexpected".to_vec()),
+        Err(TwoMlsPqError::SessionNotReady)
+    ));
+}
+
+/// Contract 26: the PQ side-band emission doors are gated like the message doors —
+/// a born-dedicated acceptor hands out nothing pre-install. (The A.4 side-band only
+/// runs post-establishment, so this gate is defense in depth, but it must hold.)
+#[test]
+fn test_pq_side_band_gated_pre_install() {
+    let d = crate::test_utils::born_dedicated_pending();
+    assert!(d.bob.pq_pending_outbound(SideBandSealing::Fresh).is_none());
+    assert!(d.bob.pq_take_pending_outbound().is_none());
+    // Post-install the gate opens (there is no parked side-band frame yet, so the
+    // result is still None — but for the "nothing owed" reason, not the gate).
+    let _ = crate::test_utils::install_mock_envelope(&d.bob);
+    assert!(d.bob.pq_take_pending_outbound().is_none());
+}
+
+/// Contract 26: an approved re-feed whose `expected_creator` does not match the
+/// welcome's actual creator leaf is `EstablishmentCreatorMismatch` — a security
+/// rejection (the delegation is genuine but names a different key than the group
+/// runs under). The join is discarded whole: nothing is adopted, nothing is
+/// persisted, and a subsequent CORRECT re-feed still completes (the rejected
+/// attempt consumed nothing).
+#[test]
+fn test_expected_creator_mismatch_rejects_and_persists_nothing() {
+    let d = crate::test_utils::born_dedicated_pending();
+    let envelope = crate::test_utils::install_mock_envelope(&d.bob);
+    let frame = assert_some!(d.bob.pending_outbound());
+
+    let paused = assert_some!(assert_ok!(d.alice.process_incoming(frame.clone())));
+    let pending = assert_some!(paused.pending_establishment);
+
+    // A sink on the initiator proves the rejected join persists nothing.
+    let sink = Arc::new(RecordingSink::default());
+    assert_ok!(d.alice.install_sink(sink.clone()));
+    let baseline = sink.kinds().len();
+
+    let wrong_creator = crate::test_utils::test_client_id();
+    assert!(matches!(
+        d.alice.process_incoming_approved(
+            frame.clone(),
+            crate::sha256(&pending.envelope),
+            crate::sha256(&pending.welcome),
+            wrong_creator,
+        ),
+        Err(TwoMlsPqError::EstablishmentCreatorMismatch)
+    ));
+    // Nothing adopted, nothing pushed.
+    assert_eq!(
+        d.alice.their_principal_state().client_id().bytes,
+        d.invitation_identity
+    );
+    assert_eq!(
+        sink.kinds().len(),
+        baseline,
+        "a rejected join must not persist"
+    );
+
+    // The correct re-feed still completes — the rejection consumed nothing.
+    let res = assert_some!(assert_ok!(d.alice.process_incoming_approved(
+        frame,
+        crate::sha256(&envelope),
+        crate::sha256(&pending.welcome),
+        d.dedicated.clone(),
+    )));
+    assert_eq!(
+        assert_some!(assert_some!(res.remote_commit).new_sender).bytes,
+        d.dedicated
+    );
+}
+
+/// Contract 26, the second fail-closed rule: a BARE (un-enveloped) welcome whose
+/// creator leaf differs from the invitation identity is rejected at the join
+/// (`EstablishmentEnvelopeRequired`) — a born-dedicated establishment MUST arrive
+/// wrapped in the signed handoff, so the un-enveloped form cannot smuggle an
+/// undelegated credential in on the weld alone. Nothing is adopted.
+#[test]
+fn test_bare_welcome_differing_creator_rejected() {
+    let d = crate::test_utils::born_dedicated_pending();
+    // Pre-install, the acceptor's bare birth welcome carries the dedicated creator
+    // leaf; delivering it standalone (never wrapped) is exactly the attack the rule
+    // closes.
+    let bare_welcome = assert_some!(d.bob.initial_welcome());
+    assert_eq!(bare_welcome.first(), Some(&0x01), "bare APQWelcome_A");
+
+    assert!(matches!(
+        d.alice.process_incoming(bare_welcome),
+        Err(TwoMlsPqError::EstablishmentEnvelopeRequired)
+    ));
+    assert_eq!(
+        d.alice.their_principal_state().client_id().bytes,
+        d.invitation_identity
+    );
+    assert!(d.alice.receive_group_id().is_none());
+}
+
+/// Contract 26 credential-differ rule: `receive(new_client_id: Some(id))` where
+/// `id` equals the invitation identity degenerates to the NIL topology — no
+/// second principal is minted (that would seed a two-element self-succession),
+/// no envelope is owed, the session emits immediately with a bare staple, and
+/// the initiator accepts it as the invitation identity with no handoff signal.
+#[test]
+fn test_receive_same_id_as_invitation_degenerates() {
+    use crate::key_packages::TwoMlsPqInvitation;
+    let alice = make_client();
+    let bob = make_client();
+    let alice_kp = make_classical_kp(&alice);
+    let bob_inv = assert_ok!(TwoMlsPqInvitation::restore(assert_ok!(
+        bob.generate_invitation(true)
+    )));
+    let invitation_id = bob_inv.client_id().bytes;
+    let bob_kp = bob_inv.combiner_key_package();
+
+    let alice_s = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
+    let opened = assert_ok!(bob_inv.open_establishment(assert_some!(alice_s.pending_outbound())));
+    let bob_s = assert_ok!(bob_inv.receive(
+        assert_some!(opened.welcome),
+        alice_kp,
+        commitment_of(&alice_s),
+        b"tok".to_vec(),
+        Some(invitation_id.clone()), // == the invitation identity → degenerates
+        None,
+        None,
+    ));
+
+    // The principal is the invitation identity itself — no dedicated second id.
+    assert_eq!(bob_s.my_principal_state().client_id().bytes, invitation_id);
+    // No envelope owed: the session emits with no install (the bare staple).
+    let welcome_b = assert_some!(bob_s.pending_outbound());
+
+    // The initiator joins it as the invitation identity — no born-dedicated
+    // handoff signal, since the creator IS who it initiated toward.
+    let res = assert_ok!(alice_s.process_incoming(welcome_b));
+    if let Some(r) = res {
+        assert!(r.remote_commit.and_then(|c| c.new_sender).is_none());
+    }
+    assert_eq!(
+        alice_s.their_principal_state().client_id().bytes,
+        invitation_id
+    );
+}
+
+/// Contract 26: a pause is a PURE PARSE — it pushes nothing to the sink (the peer
+/// re-staples the frame until it lands, so persisting per pause would be a DoS
+/// amplifier). Only the approved join that actually advances state persists.
+#[test]
+fn test_pause_does_not_persist() {
+    let d = crate::test_utils::born_dedicated_pending();
+    let envelope = crate::test_utils::install_mock_envelope(&d.bob);
+    let frame = assert_some!(d.bob.pending_outbound());
+
+    let sink = Arc::new(RecordingSink::default());
+    assert_ok!(d.alice.install_sink(sink.clone()));
+    let baseline = sink.kinds().len();
+
+    // Pause: nothing joined, nothing pushed.
+    let paused = assert_some!(assert_ok!(d.alice.process_incoming(frame.clone())));
+    let pending = assert_some!(paused.pending_establishment);
+    assert_eq!(
+        sink.kinds().len(),
+        baseline,
+        "a pause is a pure parse and must not persist"
+    );
+
+    // The approved join advances state, so it does persist.
+    assert_some!(assert_ok!(d.alice.process_incoming_approved(
+        frame,
+        crate::sha256(&envelope),
+        crate::sha256(&pending.welcome),
+        d.dedicated.clone(),
+    )));
+    assert!(
+        sink.kinds().len() > baseline,
+        "the approved join persists the adopted state"
+    );
+}
+
+/// Contract 26: a born-dedicated acceptor persisted BEFORE its envelope installs
+/// restores still non-emittable — the `requires_establishment_envelope` flag
+/// rides the archive precisely so a restore cannot reopen the emission doors.
+/// After a post-restore install it emits normally.
+#[test]
+fn test_pre_install_restore_stays_non_emittable() {
+    let d = crate::test_utils::born_dedicated_pending();
+    // Capture + restore the acceptor while it still owes its envelope.
+    let restored = round_trip(&d.bob);
+
+    // Every door still refuses.
+    assert!(restored.pending_outbound().is_none());
+    assert!(matches!(
+        restored.prepare_to_encrypt(None),
+        Err(TwoMlsPqError::EstablishmentEnvelopeRequired)
+    ));
+
+    // Install on the restored session opens the doors.
+    let envelope = crate::test_utils::install_mock_envelope(&restored);
+    let frame = assert_some!(restored.pending_outbound());
+    let res = assert_some!(crate::test_utils::approve_establishment(
+        &d.alice,
+        frame,
+        &envelope,
+        &d.dedicated
+    ));
+    assert_eq!(
+        assert_some!(assert_some!(res.remote_commit).new_sender).bytes,
+        d.dedicated
+    );
+}
+
+/// Contract 26 liveness pin: the establishment envelope structurally OUTLIVES the
+/// initiator's verify-and-join. The acceptor re-staples the enveloped welcome on
+/// every frame until its first fold — and no fold can happen before the initiator
+/// joins (nothing has driven a commit) — so the initiator can pause on an early
+/// frame, drop it, and still complete off a LATER frame. Here the acceptor sends
+/// three messages the initiator ignores, then joins off the third.
+#[test]
+fn test_envelope_outlives_until_initiator_joins() {
+    let d = crate::test_utils::born_dedicated_pending();
+    let envelope = crate::test_utils::install_mock_envelope(&d.bob);
+
+    // The acceptor sends three frames; the initiator processes none of them yet.
+    let mut third = Vec::new();
+    for i in 0..3 {
+        assert_ok!(d.bob.prepare_to_encrypt(None));
+        let enc = assert_ok!(d.bob.encrypt(format!("msg-{i}").into_bytes()));
+        third = enc.cipher_text;
+    }
+
+    // The envelope still rides the third frame: the initiator joins off it and
+    // reads that frame's app message — the intervening sends never stripped it.
+    let res = assert_some!(crate::test_utils::approve_establishment(
+        &d.alice,
+        third,
+        &envelope,
+        &d.dedicated
+    ));
+    assert_eq!(
+        assert_some!(assert_some!(res.remote_commit).new_sender).bytes,
+        d.dedicated
+    );
+    assert_eq!(
+        assert_some!(res.application_message).app_message_data,
+        b"msg-2".to_vec()
+    );
 }
 
 /// The dedicated-principal session drives the full lifecycle: cross-party PSK
@@ -4498,10 +4894,17 @@ fn test_dedicated_principal_full_lifecycle() {
         None
     ));
 
-    // Confirm both directions (each side processes a peer frame).
+    // Contract 26: install the delegation, then confirm both directions (each side
+    // processes a peer frame); Alice's first receive runs the pause → approve dance.
+    let envelope = crate::test_utils::install_mock_envelope(&bob_s);
     assert_ok!(bob_s.prepare_to_encrypt(None));
     let enc = assert_ok!(bob_s.encrypt(b"confirm-b".to_vec()));
-    let res = assert_some!(assert_ok!(alice_s.process_incoming(enc.cipher_text)));
+    let res = assert_some!(crate::test_utils::approve_establishment(
+        &alice_s,
+        enc.cipher_text,
+        &envelope,
+        &dedicated
+    ));
     let bob_upd = assert_some!(res.proposal);
     assert_ok!(alice_s.prepare_to_encrypt(None));
     let enc = assert_ok!(alice_s.encrypt(b"confirm-a".to_vec()));
@@ -6154,7 +6557,7 @@ fn test_return_welcome_without_app_binding_rejected() {
     // Alice's return-welcome join refuses it before adopting any state.
     let mut inner = alice_session.lock();
     assert_err!(
-        inner.process_welcome(&welcome_b),
+        inner.process_welcome(&welcome_b, WelcomeEstablishment::Bare),
         TwoMlsPqError::AppBindingMismatch
     );
     assert!(inner.recv_group.is_none());

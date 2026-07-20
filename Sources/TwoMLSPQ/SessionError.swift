@@ -134,6 +134,21 @@ public struct SessionError: Error, Sendable {
 		case sinkAlreadyInstalled
 		/// No backend surface implements this member yet.
 		case notImplemented
+		/// Contract 26. The initiator received a BARE welcome whose creator leaf differs from the
+		/// invitation identity — a born-dedicated establishment that MUST arrive wrapped in the
+		/// signed handoff. The un-enveloped form is refused so an undelegated credential cannot be
+		/// admitted on the cross-group weld alone. (The acceptor-side "emitted before installing
+		/// the envelope" flavor of the same crate error maps to `.sequenceViolation` instead — a
+		/// caller-sequencing bug, not a peer rejection.)
+		case establishmentEnvelopeRequired
+		/// Contract 26. The credential the host admitted from the VERIFIED delegation does not match
+		/// the welcome's creator leaf: the delegation is genuine but names a different key than the
+		/// group runs under. A security rejection — the join was discarded whole, nothing consumed.
+		case establishmentCreatorMismatch
+		/// Contract 26. `installEstablishmentEnvelope` was called with bytes differing from an
+		/// envelope already installed. One session gets one envelope (its signatures bind this
+		/// session's welcome), so a second distinct one can only be a host bug.
+		case establishmentEnvelopeConflict
 		/// Opaque / internal failure: an MLS protocol error, a PSK-binding failure, an FFI decode
 		/// error, or a Rust panic. Discard the session object; do not persist it.
 		case internalError
@@ -161,12 +176,16 @@ public struct SessionError: Error, Sendable {
 				return .discardArtifact
 			case .identityMismatch, .pqUnavailable, .cipherSuiteMismatch,
 				.invalidKeyPackage, .apqInfoMismatch, .appBindingMismatch,
-				.unexpectedWelcome:
+				.unexpectedWelcome, .establishmentEnvelopeRequired,
+				.establishmentCreatorMismatch:
+				// Contract 26: a born-dedicated establishment that fails its delegation check
+				// (un-enveloped, or the creator does not match the admitted key) is refused
+				// exactly like any other bad establishment — tear down, do not adopt.
 				return .rejectEstablishment
 			case .misroutedFrame, .sequenceViolation, .sessionNotEstablished,
 				.invalidClientId, .proposalRejected,
 				.unsupportedCipherSuite, .missingWelcome, .sinkAlreadyInstalled,
-				.notImplemented:
+				.establishmentEnvelopeConflict, .notImplemented:
 				return .callerBug
 			case .internalError:
 				return .fatal

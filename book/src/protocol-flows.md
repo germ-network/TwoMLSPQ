@@ -371,7 +371,8 @@ sequenceDiagram
     Bob->>Bob: Mint an Alice-dedicated principal (handing off from the invitation principal)
     Bob->>Bob: Export key from ASG-cl
     Bob->>Bob: [BSG-cl] Create group + Add(Alice) seeded with PSK from ASG-cl → BSG-cl epoch 1,<br/>created under the dedicated principal
-    Note over Alice,Bob: BSG-PQ is deferred so Bob can send app messages immediately (see A.4).<br/>Alice adopts Bob's dedicated principal when she joins BSG-cl.
+    Bob->>Bob: Mint the signed establishment handoff (identity/anchor delegates the dedicated key,<br/>binding sha256(Welcome)) and install it → staple becomes [0x0B][blob][Welcome]. Non-emittable until installed.
+    Note over Alice,Bob: BSG-PQ is deferred so Bob can send app messages immediately (see A.4).<br/>Alice PAUSES on the 0x0B staple, verifies the delegation, then re-feeds to adopt Bob's dedicated principal.
 ```
 
 **The return key package is classical-only; the PQ key package travels in A.4, hash-bound.**
@@ -402,6 +403,33 @@ package *inside* the signed envelope — and when one is present the composer om
 without an identity envelope. Exactly one of the two shapes is on the wire. Note also that
 step 8's "app payload" is that signed identity envelope; the "app messages" of step 9 are the
 ordinary application ciphertexts stapled to each pre-establishment frame — different things.
+
+**Born-dedicated credential delegation (contract 26).** Bob's send group is created under a
+freshly-minted *dedicated* principal (step 7 above), so the credential Alice reads out of its
+creator leaf is one she initiated no exchange toward — unlike every other credential the
+receive path admits, nothing has signed a delegation to it. The cross-party PSK weld proves the
+group was made by the invitation holder; it does **not** prove the *identity* delegated the
+dedicated key. That delegation rides the establishment wire as a **signed handoff**: Bob's
+staple becomes `ESTABLISHMENT_HANDOFF_TAG` (`0x0B`) — `[0x0B][len][signed blob][len][APQWelcome_A]`
+— wrapping the *unmodified, spec-conformant* welcome next to a host-minted artifact whose
+signatures bind `sha256(welcome)` (card: the identity's `IdentityDelegate` + the dedicated
+agent's proof-of-possession; anchor: the invitation/retired agent + anchor + new agent). The
+crate treats the blob as opaque — the app mints and verifies it.
+
+The credential-differ rule keys everything off the leaf, not the parameter: `receive` mints the
+dedicated principal only when `new_client_id` **differs** from the invitation identity (an equal
+id degenerates to the nil topology, staple unchanged), and a session that owes a delegation is
+**non-emittable** at every door until `install_establishment_envelope` supplies it. On the
+initiator, a `0x0B` staple **pauses** `process_incoming` (`DecryptResult.pending_establishment` —
+a pure parse: nothing joined, consumed, or persisted) so the app can verify the artifact against
+the surfaced welcome, then completes via the stateless re-feed `process_incoming_approved`, which
+pins the exact `(envelope, welcome)` pair by digest and requires the joined creator leaf to equal
+the id the verified delegation names. A **bare** welcome whose creator differs from the invitation
+identity is refused at the join (`EstablishmentEnvelopeRequired`) — a born-dedicated establishment
+must arrive enveloped, so the un-enveloped form can never smuggle an undelegated credential in on
+the weld alone. The envelope structurally outlives the initiator's join: Bob's staple is replaced
+only by his first *fold*, and no fold can occur before Alice joins (nothing has driven a commit),
+so a dropped early frame heals off any later one.
 
 **Envelope framing & parallel KP′ delivery.** The §A.1 envelope is a RAW HPKE blob with
 **no outer tag** — `[u32-LE kem_output_len][kem_output][ciphertext]` — because the invitation

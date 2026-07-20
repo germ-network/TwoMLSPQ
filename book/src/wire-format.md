@@ -14,6 +14,7 @@ HPKE plaintext (see "The §A.1 envelope" below).
 | `APQ_PRIVATE_MESSAGE_TAG` | `0x05` | Draft-02 §7 `APQPrivateMessage` — the staple slot's bind form. Declared in `apq` |
 | `ESTABLISHMENT_VECTOR_TAG` | `0x07` | Inner leading tag of the §A.1 establishment vector (an HPKE-plaintext byte, not an outer wire tag). Declared in `key_packages` |
 | `PRE_ESTABLISHMENT_APP_TAG` | `0x09` | §A.1 app staple, envelope-interior only: `[0x09][ASG-cl PrivateMessage]` (sealed in the initiator's send group) |
+| `ESTABLISHMENT_HANDOFF_TAG` | `0x0B` | Born-dedicated establishment staple: `[0x0B][u32-LE len][signed handoff blob][u32-LE len][APQWelcome_A]` — wraps the *unmodified* welcome next to the acceptor's opaque host-signed delegation. A message-path staple form (rides the `0x03` staple slot and standalone delivery), but banded here because it exists only during establishment |
 | `PQ_BOOTSTRAP_KP_TAG` | `0x13` | Bootstrap: PQ key package for the deferred send-group half |
 | `PQ_BOOTSTRAP_WELCOME_TAG` | `0x15` | Bootstrap: the new PQ group's Welcome (PQ-groups-only; no classical commit) |
 | `PQ_EK_TAG` | `0x17` | PQ ratchet: ML-KEM encapsulation key |
@@ -83,7 +84,7 @@ start, and keeps its remaining room at the end:
 | Band | Range | Used | Contents |
 |------|-------|------|----------|
 | Message path | `0x01`–`0x05` | 3 / 3 | APQWelcome, message frame, APQPrivateMessage staple form. Full, and closed by design — the message path has exactly these shapes |
-| A.1 establishment | `0x07`–`0x11` | 2 / 6 | establishment-vector inner tag, pre-establishment staple. The hybrid nested envelope would land in the room |
+| A.1 establishment | `0x07`–`0x11` | 3 / 6 | establishment-vector inner tag, pre-establishment staple, born-dedicated establishment handoff. The hybrid nested envelope would land in the room |
 | PQ side-band | `0x13`–`0x31` | 6 / 16 | exactly what `pq_frame_kind` classifies, in lifecycle order: bootstrap, ratchet, re-key |
 
 Banding is what makes "the side-band is `0x13`–`0x31`" a claim that survives growth: a new
@@ -121,24 +122,27 @@ optional sections**:
 
 - **`staple`** — the sender's latest send-group classical commit, re-stapled on
   **every** frame until superseded; the send group's APQWelcome until the first
-  commit exists; or — when the commit discharged an owed bind — the draft-02 §7
-  `APQPrivateMessage` carrying the classical commit **and** its PQ partner (the
-  classical half is unusable without the `apq_psk` only the PQ half supplies, so
-  the two travel as one). Any single received frame therefore brings the peer up
-  to the sender's current epoch: losing the frame that first carried a commit no
-  longer strands the direction — the next frame heals it, and a lost bind heals
-  by the same re-send. (Multi-commit gaps still exceed one staple; that is
-  re-establish territory.)
+  commit exists; the born-dedicated establishment handoff (`0x0B`) wrapping that
+  welcome until a dedicated acceptor's first commit; or — when the commit
+  discharged an owed bind — the draft-02 §7 `APQPrivateMessage` carrying the
+  classical commit **and** its PQ partner (the classical half is unusable without
+  the `apq_psk` only the PQ half supplies, so the two travel as one). Any single
+  received frame therefore brings the peer up to the sender's current epoch:
+  losing the frame that first carried a commit no longer strands the direction —
+  the next frame heals it, and a lost bind heals by the same re-send. (Multi-commit
+  gaps still exceed one staple; that is re-establish territory.)
 - **`proposal`** — the routine `Upd(sender)` addressed to the peer's send group,
   staged on every round, including principal-rotation rounds.
 - **`app`** — the application message; its authenticated data is
   `sha256(proposal)` on every round.
 
 The staple slot self-discriminates by its first byte: an APQWelcome starts `0x01`,
-an `MLSMessage` starts `0x00` (its two-byte `ProtocolVersion`), and an
+an `MLSMessage` starts `0x00` (its two-byte `ProtocolVersion`), an
 `APQPrivateMessage` starts `0x05` — the wrapper tag exists precisely because the
 draft struct's own first byte is its inner `MLSPrivateMessage`'s `0x00`, which the
-slot could not tell from a bare commit. The receiver processes staples
+slot could not tell from a bare commit — and a born-dedicated establishment
+handoff starts `0x0B` (the receiver extracts its inner welcome and processes that,
+dedup keyed on the inner welcome's digest). The receiver processes staples
 **idempotently** — a welcome for an already-joined group and a commit older than
 the receive group's epoch are cheap skips; a commit *ahead* of the receive group
 surfaces `EpochDesync` before the app ciphertext is touched.

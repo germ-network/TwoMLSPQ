@@ -30,9 +30,15 @@ use super::*;
 // start, and keeps its remaining room at the end:
 //   0x01–0x05  message path      — APQWelcome, message frame, APQPrivateMessage (the staple
 //                                  slot's bind form, declared in `apq`). FULL, and closed by
-//                                  design: the message path has exactly these shapes.
-//   0x07–0x11  A.1 establishment — envelope (invitation channel), pre-establishment staple.
-//                                  2 of 6; the hybrid nested envelope would land here.
+//                                  design: the message path has exactly these shapes. (The
+//                                  establishment-handoff staple FUNCTIONS as a message-path
+//                                  form — it rides the staple slot and standalone deliveries —
+//                                  but the band was already full, so it lives in the
+//                                  establishment band below, which is also where it belongs
+//                                  semantically: it exists only during establishment.)
+//   0x07–0x11  A.1 establishment — envelope (invitation channel), pre-establishment staple,
+//                                  born-dedicated establishment handoff.
+//                                  3 of 6; the hybrid nested envelope would land here.
 //   0x13–0x31  PQ side-band      — exactly the tags `pq_frame_kind` classifies, in lifecycle
 //                                  order: bootstrap, then ratchet, then re-key. 6 of 16.
 //
@@ -82,6 +88,23 @@ pub(crate) const MESSAGE_FRAME_TAG: u8 = 0x03;
 /// HPKE envelope on the invitation channel — never header-sealed, so it is deliberately
 /// NOT an `opened_frame_kind`; the host hands it to `process_incoming` after the join.
 pub(crate) const PRE_ESTABLISHMENT_APP_TAG: u8 = 0x09;
+
+/// Born-dedicated establishment handoff (contract 26):
+/// `[tag][u32-LE len][signed handoff blob][u32-LE len][APQWelcome_A bytes]`.
+///
+/// A born-dedicated acceptor's send group is created under a fresh dedicated
+/// principal whose credential the initiator has no delegation for, so the acceptor
+/// staples this frame instead of the bare welcome: the host-supplied signed blob
+/// (opaque here — the host mints and verifies it; its signatures bind the welcome
+/// bytes) next to the UNMODIFIED, spec-conformant `APQWelcome_A`. It appears
+/// everywhere the bare welcome would — the message frame's staple slot and optional
+/// standalone delivery — until the acceptor's first commit supersedes it.
+///
+/// The initiator PAUSES on this frame pre-join (`process_incoming` surfaces the
+/// blob without joining or consuming anything) and completes via the approved
+/// re-feed; post-join deliveries dedup on the INNER welcome digest exactly like
+/// bare re-staples.
+pub(crate) const ESTABLISHMENT_HANDOFF_TAG: u8 = 0x0B;
 
 // ── Band: PQ side-band (0x13–0x31, 6 of 16 used) ────────────────────────────────────
 // Exactly the tags `pq_frame_kind` classifies, ordered by lifecycle: a session bootstraps
@@ -227,7 +250,9 @@ pub struct OpenedFrame {
 /// frame, treated as malformed.
 pub(crate) fn opened_frame_kind(tag: u8) -> Option<OpenedFrameKind> {
     match tag {
-        APQ_TAG | MESSAGE_FRAME_TAG => Some(OpenedFrameKind::Message),
+        // The establishment handoff routes like the welcome it wraps: standalone
+        // deliveries go to `process_incoming`, which pauses or dedups there.
+        APQ_TAG | MESSAGE_FRAME_TAG | ESTABLISHMENT_HANDOFF_TAG => Some(OpenedFrameKind::Message),
         other => pq_frame_kind(other).map(|kind| OpenedFrameKind::PqSideBand { kind }),
     }
 }
@@ -261,6 +286,34 @@ fn read_sections<const N: usize>(body: &[u8]) -> Result<[Vec<u8>; N]> {
         return Err(TwoMlsPqError::Mls);
     }
     Ok(out)
+}
+
+/// Encode the born-dedicated establishment handoff:
+/// `[0x0B][len][signed blob][len][welcome]`. Both sections non-empty: an empty
+/// blob could never verify, and an empty welcome could never be joined.
+pub(crate) fn encode_establishment_handoff(envelope: &[u8], welcome: &[u8]) -> Vec<u8> {
+    debug_assert!(!envelope.is_empty() && !welcome.is_empty());
+    let mut out = Vec::with_capacity(1 + 8 + envelope.len() + welcome.len());
+    out.push(ESTABLISHMENT_HANDOFF_TAG);
+    push_section(&mut out, envelope);
+    push_section(&mut out, welcome);
+    out
+}
+
+/// Decode a born-dedicated establishment handoff into
+/// `(signed blob, welcome bytes)`. The inner welcome must itself be a welcome
+/// (`APQ_TAG`-leading) — the wrapper carries the spec-conformant `APQWelcome_A`
+/// verbatim, never another wrapper or frame kind.
+pub(crate) fn decode_establishment_handoff(bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
+    let (&tag, body) = bytes.split_first().ok_or(TwoMlsPqError::Mls)?;
+    if tag != ESTABLISHMENT_HANDOFF_TAG {
+        return Err(TwoMlsPqError::Mls);
+    }
+    let [envelope, welcome] = read_sections::<2>(body)?;
+    if envelope.is_empty() || welcome.first() != Some(&APQ_TAG) {
+        return Err(TwoMlsPqError::Mls);
+    }
+    Ok((envelope, welcome))
 }
 
 /// Encode the A.4 bootstrap reply: `[tag][pq_welcome…]`. PQ-groups-only per the spec — no
@@ -398,9 +451,11 @@ mod pq_frame_kind_tests {
         // Bare-MLS first byte, the three message-path tags (welcome, message frame, and
         // the APQPrivateMessage staple form — a bind is not a side-band frame), evens
         // inside the side-band band, the pre-establishment staple tag (envelope-interior
-        // only), the envelope tag (invitation channel only), the establishment band's
-        // reserve (0x0B), a RESERVED odd byte inside the side-band band (0x1F — in range,
-        // not allocated), and a byte past every band (0x33) are not side-band frames.
+        // only), the envelope tag (invitation channel only), the establishment-handoff
+        // tag (a message-path form, routed to `process_incoming`), the establishment
+        // band's reserve (0x0D), a RESERVED odd byte inside the side-band band (0x1F —
+        // in range, not allocated), and a byte past every band (0x33) are not side-band
+        // frames.
         for tag in [
             0x00,
             APQ_TAG,
@@ -410,7 +465,8 @@ mod pq_frame_kind_tests {
             0x1A,
             PRE_ESTABLISHMENT_APP_TAG,
             crate::key_packages::ESTABLISHMENT_VECTOR_TAG,
-            0x0B,
+            ESTABLISHMENT_HANDOFF_TAG,
+            0x0D,
             0x1F,
             0x33,
             0xFF,
@@ -466,6 +522,7 @@ mod pq_frame_kind_tests {
                     "key_packages::ESTABLISHMENT_VECTOR_TAG",
                 ),
                 (PRE_ESTABLISHMENT_APP_TAG, "PRE_ESTABLISHMENT_APP_TAG"),
+                (ESTABLISHMENT_HANDOFF_TAG, "ESTABLISHMENT_HANDOFF_TAG"),
             ],
         },
         Band {

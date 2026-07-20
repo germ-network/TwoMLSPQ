@@ -847,7 +847,19 @@ impl TwoMlsPqInvitation {
         if expected_remote.is_some_and(|expected| expected != their_id.bytes) {
             return Err(TwoMlsPqError::RemoteIdentityMismatch);
         }
-        let session_client = new_client_id.map(TwoMlsPqPrincipal::new).transpose()?;
+        // The credential-differ rule (contract 26): everything born-dedicated — the
+        // delegation requirement, the peer's verification pause — keys off the creator
+        // leaf DIFFERING from the invitation identity, not the parameter shape. An id
+        // equal to the invitation identity therefore degenerates to the nil topology
+        // outright: minting a second principal under the same id would seed a
+        // two-element self-succession in the AS core and change nothing the peer can
+        // observe. (A brief lock just to read the immutable invitation id; the
+        // validation section proper stays lock-free.)
+        let invitation_id = self.lock().invitation.client_id.clone();
+        let session_client = new_client_id
+            .filter(|id| *id != invitation_id)
+            .map(TwoMlsPqPrincipal::new)
+            .transpose()?;
         let welcome_digest = crate::sha256(&welcome);
         // Retain the commitment for the routing table below — `accept_with` moves the parameter,
         // and it is the exact key a bootstrap-KP envelope self-routes on (`bootstrap_kp_group_id`

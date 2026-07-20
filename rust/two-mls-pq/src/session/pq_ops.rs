@@ -766,6 +766,11 @@ impl TwoMlsPqSession {
     /// constraint.
     pub fn pq_pending_outbound(&self, sealing: SideBandSealing) -> Option<Vec<u8>> {
         let mut inner = self.lock();
+        // Contract 26 emission gate: nothing leaves a born-dedicated acceptor
+        // before its establishment envelope installs.
+        if inner.ensure_establishment_delegated().is_err() {
+            return None;
+        }
         inner.hand_out(sealing)
     }
 
@@ -777,6 +782,10 @@ impl TwoMlsPqSession {
     /// request/response and accept that.
     pub fn pq_take_pending_outbound(&self) -> Option<Vec<u8>> {
         let mut inner = self.lock();
+        // Contract 26 emission gate — see `pq_pending_outbound`.
+        if inner.ensure_establishment_delegated().is_err() {
+            return None;
+        }
         // Pre-establishment there is no side-band to take from — and since Part 3 the slot
         // can be OCCUPIED then (`pq_bootstrap_envelope` parks the round's `[0x13][KP′]`
         // before any recv group exists). Taking it here would destroy the round's only

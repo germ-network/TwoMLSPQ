@@ -4,9 +4,11 @@
 //
 //  Pins the SessionError contract: the abstract surface throws ONE type; every
 //  backend error maps to a stable code with the documented disposition; and the
-//  translation is total over the 22 TwoMlsPqError cases (a binding bump that
+//  translation is total over every TwoMlsPqError case (a binding bump that
 //  adds a case fails compilation in SessionErrorBridge.swift, and this
-//  totality test catches a silent remapping of an existing one).
+//  totality test catches a silent remapping of an existing one). The two
+//  surface-DEPENDENT cases (SessionNotReady, EstablishmentEnvelopeRequired)
+//  are pinned per-surface below.
 //
 
 import CommProtocol
@@ -19,7 +21,9 @@ import TwoMLSPQBinding  // public TwoMlsPqError cases
 
 struct ErrorContractTests {
 
-	// MARK: Code -> Disposition table (exhaustive; a new code forces a row)
+	// MARK: Code -> Disposition table (a data pin, kept in sync by the totality
+	// test below — the compiler forces the mapping in SessionError.swift; this
+	// table catches a silent re-disposition)
 
 	@Test func codeDispositionTable() {
 		typealias E = SessionError
@@ -52,6 +56,10 @@ struct ErrorContractTests {
 			(.missingWelcome, .callerBug),
 			(.sinkAlreadyInstalled, .callerBug),
 			(.notImplemented, .callerBug),
+			(.bootstrapKpMismatch, .discardFrame),
+			(.establishmentEnvelopeRequired, .rejectEstablishment),
+			(.establishmentCreatorMismatch, .rejectEstablishment),
+			(.establishmentEnvelopeConflict, .callerBug),
 			(.internalError, .fatal),
 		]
 		for (code, disposition) in table {
@@ -59,10 +67,11 @@ struct ErrorContractTests {
 		}
 	}
 
-	// MARK: Totality over the 22 TwoMlsPqError cases
+	// MARK: Totality over the TwoMlsPqError cases
 
-	/// Every crate case, mapped at a neutral surface. `SessionNotReady` is
-	/// surface-dependent and covered separately below.
+	/// Every crate case, mapped at a neutral surface. `SessionNotReady` and
+	/// `EstablishmentEnvelopeRequired` are surface-dependent and covered
+	/// separately below.
 	@Test func everyCrateCaseMaps() {
 		let expected: [(TwoMlsPqError, SessionError.Code)] = [
 			(.Mls, .internalError),
@@ -86,8 +95,16 @@ struct ErrorContractTests {
 			(.ApqInfoMismatch, .apqInfoMismatch),
 			(.SinkAlreadyInstalled, .sinkAlreadyInstalled),
 			(.AppBindingMismatch, .appBindingMismatch),
+			(.DuplicateSideBand, .duplicateSideBand),
+			(.BindApplyFailed, .bindApplyFailed),
+			(.BindDischargeFailed, .bindDischargeFailed),
+			(.BootstrapKpMismatch, .bootstrapKpMismatch),
+			(.EstablishmentCreatorMismatch, .establishmentCreatorMismatch),
+			(.EstablishmentEnvelopeConflict, .establishmentEnvelopeConflict),
 		]
-		#expect(expected.count == 21)  // + SessionNotReady (per-surface) = 22 cases
+		// + the two per-surface cases (SessionNotReady,
+		// EstablishmentEnvelopeRequired) = all 29 crate cases
+		#expect(expected.count == 27)
 		for (crate, code) in expected {
 			let mapped = SessionError(pqError: crate, at: .client)
 			#expect(mapped.code == code, "\(crate) -> \(mapped.code)")
@@ -107,6 +124,26 @@ struct ErrorContractTests {
 		for surface in sequencing {
 			let e = SessionError(pqError: TwoMlsPqError.SessionNotReady, at: surface)
 			#expect(e.code == .sequenceViolation, "\(surface)")
+		}
+	}
+
+	/// Contract 26: `EstablishmentEnvelopeRequired` is likewise surface-dependent —
+	/// at the receive doors it is the INITIATOR refusing an un-enveloped
+	/// born-dedicated welcome (a peer-side establishment rejection); everywhere
+	/// else it is the ACCEPTOR driven before installing its delegation (a
+	/// caller-sequencing bug).
+	@Test func establishmentEnvelopeRequiredIsSurfaceDependent() {
+		for surface in [PQErrorSurface.processIncoming, .forwarded] {
+			let e = SessionError(
+				pqError: TwoMlsPqError.EstablishmentEnvelopeRequired, at: surface)
+			#expect(e.code == .establishmentEnvelopeRequired, "\(surface)")
+			#expect(e.disposition == .rejectEstablishment)
+		}
+		for surface in [PQErrorSurface.receive, .prepareToEncrypt, .encrypt, .pqOperation] {
+			let e = SessionError(
+				pqError: TwoMlsPqError.EstablishmentEnvelopeRequired, at: surface)
+			#expect(e.code == .sequenceViolation, "\(surface)")
+			#expect(e.disposition == .callerBug)
 		}
 	}
 

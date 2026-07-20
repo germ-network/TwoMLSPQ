@@ -149,6 +149,20 @@ impl RetainedFrame {
     }
 }
 
+/// The contract-26 creator rule a welcome join must satisfy (see
+/// `SessionInner::process_welcome`): which creator credential the join may adopt.
+enum WelcomeEstablishment<'a> {
+    /// A bare, un-enveloped welcome: the creator leaf must equal the invitation
+    /// identity this session initiated toward. A differing creator is a
+    /// born-dedicated establishment whose delegation is missing —
+    /// `EstablishmentEnvelopeRequired`, fail-closed.
+    Bare,
+    /// An enveloped welcome the host has VERIFIED and approved via the re-feed:
+    /// the creator leaf must equal the id the verified delegation names —
+    /// `EstablishmentCreatorMismatch` otherwise.
+    Approved { expected_creator: &'a [u8] },
+}
+
 struct SessionInner {
     client: Arc<TwoMlsPqPrincipal>,
     /// The cipher-suite pair this session is locked to — a fixed property, captured from the
@@ -415,6 +429,18 @@ struct SessionInner {
     /// still admits the committed KP after a Phase 8 rotation (PQ leaves lag
     /// credentials by design; A.5 catches them up). Acceptor-only; rides the archive.
     expected_bootstrap_kp_commitment: Option<Vec<u8>>,
+    /// Contract 26 (born-dedicated): this session's send group was created under a
+    /// dedicated per-session principal whose credential differs from the invitation
+    /// identity, so its establishment staple must carry the host's signed delegation
+    /// before anything may emit. Set at `accept_with` when a dedicated
+    /// `session_client` was supplied; never cleared. Rides the archive.
+    requires_establishment_envelope: bool,
+    /// The installed signed delegation blob (host-minted; opaque to this crate — the
+    /// host's signatures inside it bind the welcome bytes). `None` until
+    /// `install_establishment_envelope`; once installed, the establishment staple is
+    /// the `ESTABLISHMENT_HANDOFF_TAG` framing of `[envelope][bare welcome]` and the
+    /// emission gates open. Rides the archive.
+    establishment_envelope: Option<Vec<u8>>,
     /// The foreign persistence hook this session pushes to after every state-advancing
     /// mutation (see `mutate_and_persist`). `None` opts out of push persistence (tests,
     /// benches, fuzz). Not part of the archive — it is live plumbing supplied at every
@@ -823,7 +849,17 @@ impl SessionInner {
     ///   second attempt would fail, and must never be reached);
     /// - a *different* welcome while the recv group is live → `UnexpectedWelcome` (an
     ///   unexpected re-invite on an established session).
-    fn process_welcome(&mut self, welcome: &[u8]) -> Result<()> {
+    ///
+    /// `establishment` is the contract-26 creator rule this join must satisfy, checked
+    /// after the join computes the creator id but BEFORE any of it is adopted into
+    /// session state — an `Err` leaves `recv_group`/`their_state`/the digest untouched,
+    /// so the frame stays retriable (the only residue is idempotent-per-epoch PSK
+    /// bookkeeping that a retry skips).
+    fn process_welcome(
+        &mut self,
+        welcome: &[u8],
+        establishment: WelcomeEstablishment<'_>,
+    ) -> Result<()> {
         let digest = crate::sha256(welcome);
         if self.recv_group.is_some() {
             return if self.joined_welcome_digest.as_deref() == Some(digest.as_slice()) {
@@ -912,13 +948,12 @@ impl SessionInner {
         if let Some(pq) = recv_group.pq.as_ref() {
             verify_pq_half_unbound(pq)?;
         }
-        // Adopt the peer's principal from the send group's creator leaf. The peer may
+        // Read the peer's principal from the send group's creator leaf. The peer may
         // have created this group under a dedicated per-session principal
         // (`TwoMlsPqInvitation::receive(new_client_id:)`) whose id differs from the
-        // invitation identity we initiated toward. Authenticity: the cross-party PSK
-        // bound into this welcome is derivable only inside OUR send group, so the
-        // creator is provably the invitation holder — the id itself is app-layer
-        // meaning, exactly like a rotation commit's leaf-credential announcement.
+        // invitation identity we initiated toward. The cross-party PSK bound into this
+        // welcome proves the creator is the invitation HOLDER; the contract-26 rule
+        // below is what authenticates the dedicated ID ITSELF (the weld cannot).
         let creator_id = {
             let classical = &recv_group.classical;
             let mine = classical.current_member_index();
@@ -927,6 +962,29 @@ impl SessionInner {
             let peer_index = if mine == 0 { 1 } else { 0 };
             sender_client_id(classical, peer_index)?
         };
+        // Contract 26 creator rule — the fail-closed gate on adopting a credential
+        // nobody delegated. Checked before ANY adoption below, so an `Err` here leaves
+        // the session exactly as it was (the join result is dropped whole).
+        match establishment {
+            // A BARE welcome may only come from the invitation identity we initiated
+            // toward: a differing creator is a born-dedicated establishment that MUST
+            // arrive wrapped in the signed handoff — reject the un-enveloped form
+            // rather than adopt an undelegated credential on the weld alone.
+            WelcomeEstablishment::Bare => {
+                if self.their_state.client_id().bytes != creator_id {
+                    return Err(TwoMlsPqError::EstablishmentEnvelopeRequired);
+                }
+            }
+            // An APPROVED enveloped welcome must run under exactly the id the host
+            // read out of the VERIFIED delegation: the signatures prove the identity
+            // delegated `expected_creator`, and only this equality proves the session
+            // actually runs under it.
+            WelcomeEstablishment::Approved { expected_creator } => {
+                if expected_creator != creator_id.as_slice() {
+                    return Err(TwoMlsPqError::EstablishmentCreatorMismatch);
+                }
+            }
+        }
         self.with_auth(|core| core.theirs.commit(creator_id.clone()));
         self.their_state = PrincipalState::Sync {
             client_id: ClientId { bytes: creator_id },
@@ -984,6 +1042,19 @@ impl SessionInner {
             return_kp,
             stapled,
         )
+    }
+
+    /// Contract 26 emission gate: a born-dedicated session refuses every emission
+    /// door — `prepare_to_encrypt`/`encrypt`, `pending_outbound`, and the side-band
+    /// takes — until its signed establishment envelope installs. An undelegated
+    /// dedicated credential must never reach the wire; the peer would hard-reject
+    /// the bare welcome anyway (`EstablishmentEnvelopeRequired` at its join), so
+    /// gating here fails at the honest end, before key material moves.
+    fn ensure_establishment_delegated(&self) -> Result<()> {
+        if self.requires_establishment_envelope && self.establishment_envelope.is_none() {
+            return Err(TwoMlsPqError::EstablishmentEnvelopeRequired);
+        }
+        Ok(())
     }
 
     /// The current epoch of each PQ half (`None` when the half is absent), as
@@ -1083,6 +1154,8 @@ fn build_session(
             bootstrap_kp: None,
             bootstrap_kp_secret: None,
             expected_bootstrap_kp_commitment: None,
+            requires_establishment_envelope: false,
+            establishment_envelope: None,
             // Attached post-construction via `install_sink` (which also pushes the baseline
             // checkpoint); a fresh session starts with no persistence hook.
             sink: None,
@@ -1587,6 +1660,11 @@ impl TwoMlsPqSession {
         // payload): `pq_bootstrap_respond` refuses to stand up BSG-PQ around a KP′ that
         // hashes to anything else.
         session.lock().expected_bootstrap_kp_commitment = Some(bootstrap_kp_commitment);
+        // Contract 26: a dedicated principal means the creator leaf the peer will read
+        // out of this welcome carries a credential the peer holds no delegation for —
+        // the session owes its signed establishment envelope and refuses every
+        // emission door until `install_establishment_envelope` supplies it.
+        session.lock().requires_establishment_envelope = session_client.is_some();
         // Seed the PSK ledger with the send group's establishment epoch, and capture
         // the establishment epoch's listen address (and the send-PQ header key when the
         // send-PQ half exists — the initiator's does at `initiate`; the acceptor's is
@@ -1649,9 +1727,15 @@ impl TwoMlsPqSession {
     }
 
     /// Welcome bytes to deliver to the remote party to complete group establishment.
-    /// Returns `None` once consumed or when both groups are live.
+    /// Returns `None` once consumed or when both groups are live. A born-dedicated
+    /// session returns `None` until its establishment envelope installs — this is an
+    /// emission door, and the parked frame is exactly the welcome the envelope must
+    /// wrap (the un-enveloped form would be hard-rejected by the peer).
     pub fn pending_outbound(&self) -> Option<Vec<u8>> {
         let mut inner = self.lock();
+        if inner.ensure_establishment_delegated().is_err() {
+            return None;
+        }
         // `take` is the state change; a `None` here is not one, so no bump/push.
         let frame = inner.pending_outbound.take()?;
         // The acceptor's return welcome (recv group already exists) is sealed like any
@@ -1684,10 +1768,83 @@ impl TwoMlsPqSession {
     /// 0x01) while it is still the current staple — for the host to bind into its
     /// app-layer identity envelope at reply time (e.g. sign over the welcome + the
     /// return key package, then attach the result via `set_initial_app_payload`).
-    /// `None` once the first send-group commit replaced the staple. Read-only.
+    /// On a born-dedicated acceptor this is the welcome the establishment envelope
+    /// must sign over — read it, mint, then `install_establishment_envelope`.
+    /// `None` once the first send-group commit replaced the staple (or, on a
+    /// born-dedicated acceptor, once the install wrapped it). Read-only.
     pub fn initial_welcome(&self) -> Option<Vec<u8>> {
         let inner = self.lock();
         (inner.current_staple.first() == Some(&APQ_TAG)).then(|| inner.current_staple.clone())
+    }
+
+    /// Contract 26: install the host's signed establishment envelope on a
+    /// born-dedicated acceptor. The blob is opaque here — the host minted it by
+    /// signing over the `initial_welcome()` bytes plus its delegation artifact —
+    /// and from this call on, every establishment staple and standalone delivery
+    /// carries the `[envelope][welcome]` handoff framing instead of the bare
+    /// welcome, and the emission doors open.
+    ///
+    /// One envelope per session: re-installing the SAME bytes is an idempotent
+    /// no-op; DIFFERENT bytes are `EstablishmentEnvelopeConflict` (loud — the
+    /// envelope's signatures bind this session's welcome, so a second distinct
+    /// envelope can only be a host bug). An EMPTY envelope is
+    /// `EstablishmentEnvelopeRequired` (the wrapper guards it with a clearer
+    /// message). `SessionNotReady` when the session owes no envelope (not
+    /// born-dedicated, or the host already let the staple move on — neither
+    /// occurs in the intended receive→mint→install sequence).
+    ///
+    /// CAPTURE ORDERING: capture/persist the session AFTER this call (the same
+    /// rule as `set_initial_app_payload`) — the envelope rides the archive, and
+    /// the app's own admission-side discipline depends on the persisted session
+    /// carrying it.
+    pub fn install_establishment_envelope(&self, envelope: Vec<u8>) -> Result<()> {
+        if envelope.is_empty() {
+            return Err(TwoMlsPqError::EstablishmentEnvelopeRequired);
+        }
+        // Answer the settled cases from a read: a same-bytes re-install is a TRUE
+        // no-op (no seq bump, no redundant Core push — `mutate_and_persist` would
+        // otherwise encode a full blob per retry), and a conflict needs no write to
+        // reject. Checked again under the write lock below — this pre-check drops
+        // its guard, and correctness never rests on it.
+        {
+            let inner = self.lock();
+            if let Some(existing) = &inner.establishment_envelope {
+                return if *existing == envelope {
+                    Ok(())
+                } else {
+                    Err(TwoMlsPqError::EstablishmentEnvelopeConflict)
+                };
+            }
+        }
+        self.mutate_and_persist(crate::BlobKind::Core, |inner| {
+            if !inner.requires_establishment_envelope {
+                return Err(TwoMlsPqError::SessionNotReady);
+            }
+            if let Some(existing) = &inner.establishment_envelope {
+                return if *existing == envelope {
+                    Ok(())
+                } else {
+                    Err(TwoMlsPqError::EstablishmentEnvelopeConflict)
+                };
+            }
+            // Pre-install the staple is necessarily still the bare birth welcome:
+            // every door that could replace it is gated on this very install.
+            if inner.current_staple.first() != Some(&APQ_TAG) {
+                return Err(TwoMlsPqError::SessionNotReady);
+            }
+            let framed = frames::encode_establishment_handoff(&envelope, &inner.current_staple);
+            inner.current_staple = framed.clone();
+            // The parked standalone copy (if not yet taken) must carry the same
+            // framing — it is the same welcome on a different channel.
+            if inner.pending_outbound.is_some() {
+                inner.pending_outbound = Some(framed);
+            }
+            inner.establishment_envelope = Some(envelope);
+            // Frames that re-staple the enveloped welcome gate their transmission
+            // on THIS mutation's persistence (`depends_on_seq`).
+            inner.current_staple_seq = inner.state_seq;
+            Ok(())
+        })
     }
 
     /// Attach (or replace) the host's app-layer welcome on this initiated session. The

@@ -356,7 +356,20 @@ pub fn version() -> String {
 // separate stage call. The `stage_rotation` FFI is REMOVED (kept crate-internal for the
 // stage-without-send invariant tests only); the app proposes credentials via `prepare_to_encrypt`
 // and establishes a dedicated principal directly through `receive(new_client_id:)`.
-const BINDING_CONTRACT_VERSION: u64 = 25;
+//
+// v26 (2026-07-20): born-dedicated establishment carries a signed delegation. A dedicated
+// `receive(new_client_id:)` acceptor is non-emittable until `install_establishment_envelope`
+// supplies the host's signed delegation, which then wraps the (unmodified, spec-conformant)
+// return welcome in the 0x0B establishment-handoff staple. The initiator's `process_incoming`
+// PAUSES on that frame (`DecryptResult.pending_establishment` — a pure parse, nothing consumed)
+// for host verification, resumed via the stateless re-feed `process_incoming_approved(ciphertext,
+// approved_envelope_digest:, approved_welcome_digest:, expected_creator:)` — the approval pins
+// the exact (envelope, welcome) pair the host verified; a BARE welcome whose creator differs from the
+// invitation identity is rejected (`EstablishmentEnvelopeRequired`). New errors appended:
+// `EstablishmentEnvelopeRequired`, `EstablishmentCreatorMismatch`,
+// `EstablishmentEnvelopeConflict`. `receive(new_client_id:)` equal to the invitation identity
+// now degenerates to the nil topology (credential-differ rule).
+const BINDING_CONTRACT_VERSION: u64 = 26;
 
 /// See `BINDING_CONTRACT_VERSION`. Exported so the Swift layer can verify the
 /// binding it was generated with matches the binary it loaded.
@@ -466,11 +479,41 @@ pub struct EncryptResult {
 
 /// Returned by `process_incoming`. Fields are `None` when not applicable to
 /// the message type (e.g. `application_message` is absent for proposals/commits).
+///
+/// When `pending_establishment` is `Some`, it is the ONLY populated field and
+/// NOTHING WAS PROCESSED: the frame carried a born-dedicated establishment
+/// handoff this session has not yet verified, the pause was a pure parse (no
+/// join, no consumption, no persist), and the frame must be re-presented via
+/// `process_incoming_approved` after the host verifies the envelope. Wrappers
+/// MUST surface this as a distinct, unmissable outcome — not an optional a
+/// caller can ignore.
 #[derive(Debug, uniffi::Record)]
 pub struct DecryptResult {
     pub application_message: Option<MlsSenderMessage>,
     pub proposal: Option<QueuedRemoteProposal>,
     pub remote_commit: Option<CommitResult>,
+    pub pending_establishment: Option<PendingEstablishment>,
+}
+
+/// Contract 26: the paused surface of a born-dedicated establishment handoff.
+/// The host verifies `envelope` (the acceptor's signed delegation — its
+/// signatures bind the `welcome` bytes) out-of-band of this crate, derives the
+/// delegated creator id from the VERIFIED artifact, then re-presents the same
+/// frame via `process_incoming_approved(ciphertext, approved_envelope_digest:
+/// sha256(envelope), approved_welcome_digest: sha256(welcome),
+/// expected_creator:)` — BOTH digests, over exactly the two fields surfaced
+/// here, so the crate enforces the same (envelope, welcome) pair the host
+/// verified. Never resume a frame whose envelope failed verification — not
+/// resuming IS the rejection (nothing was consumed; the peer re-staples, and
+/// each re-delivery pauses again until the host classifies the session
+/// terminally).
+#[derive(Debug, uniffi::Record)]
+pub struct PendingEstablishment {
+    /// The opaque signed delegation blob, exactly as stapled by the acceptor.
+    pub envelope: Vec<u8>,
+    /// The spec-conformant `APQWelcome_A` bytes the envelope signs over — the
+    /// input the host's signature verification binds against.
+    pub welcome: Vec<u8>,
 }
 
 /// Decrypted application message with its verified sender identity.
@@ -811,14 +854,39 @@ pub enum TwoMlsPqError {
     /// `receive` (wrong length — it could never match anything). Rejected before any
     /// group is stood up, so the session state is untouched and the genuine KP′ still
     /// completes the round.
+    #[error("bootstrap key package does not match the establishment commitment")]
+    BootstrapKpMismatch,
+    /// Contract 26, born-dedicated establishment. On the ACCEPTOR: a born-dedicated
+    /// session tried to emit — `prepare_to_encrypt`/`encrypt`, `pending_outbound`,
+    /// or a side-band take — before `install_establishment_envelope` supplied the
+    /// signed delegation its staple must carry (an undelegated dedicated credential
+    /// never reaches the wire). On the INITIATOR: a BARE welcome's creator leaf
+    /// differs from the invitation identity — a born-dedicated welcome must arrive
+    /// wrapped in the establishment handoff, so the un-enveloped form is rejected
+    /// at the join, fail-closed, with nothing consumed.
+    #[error("born-dedicated establishment requires the signed envelope")]
+    EstablishmentEnvelopeRequired,
+    /// Contract 26. The approved re-feed's `expected_creator` — the dedicated
+    /// client id the app read out of the VERIFIED delegation — does not match the
+    /// welcome's actual creator leaf: the delegation is genuine but was issued for
+    /// a different key than the session actually runs under. A security rejection,
+    /// not a retry. The join is discarded whole (memory-only until the success
+    /// persist), so nothing was consumed.
+    #[error("establishment delegation names a different creator than the welcome")]
+    EstablishmentCreatorMismatch,
+    /// Contract 26. `install_establishment_envelope` was called with bytes that
+    /// differ from an envelope already installed. One session gets exactly one
+    /// envelope (its signatures bind this session's welcome; a second distinct
+    /// envelope can only be a host bug), so the conflict is loud rather than a
+    /// silent replace. Re-installing the SAME bytes is an idempotent no-op.
     ///
     //
     // Deliberately the LAST variant: uniffi numbers error cases by position, so appending
     // keeps every prior variant's ordinal stable. Keep appending future variants here (the
     // contract bump already forces binding/binary pairing, but there is no reason to
     // renumber the survivors).
-    #[error("bootstrap key package does not match the establishment commitment")]
-    BootstrapKpMismatch,
+    #[error("a different establishment envelope is already installed")]
+    EstablishmentEnvelopeConflict,
 }
 
 /// The protocol digest over `bytes` — the single hashing primitive behind every
