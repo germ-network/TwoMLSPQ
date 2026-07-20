@@ -51,16 +51,24 @@ jobs:
           fetch-depth: 0
 
       # Decide up front whether this tag is already pinned. If Package.swift's fallback url
-      # already points at THIS tag's zip, the tag was finalized in a prior run — skip
-      # everything (a rebuild would not be byte-identical and would break the existing pin).
+      # already points at THIS tag's zip AND the zip asset is present, the tag was finalized in a
+      # prior run — skip everything (a rebuild would not be byte-identical and would break the
+      # existing pin). The asset check matters: a url pinned by hand (or by a run that then failed
+      # to upload) with no asset must NOT skip, or the tag resolves to a 404.
       - name: Check whether the tag is already pinned
         id: pinned
         env:
           TAG: ${{ inputs.tag }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/TwoMLSPQ.xcframework.zip"
-          if grep -qF "$url" Package.swift; then
-            echo "Package.swift already pins ${TAG} — nothing to build, pin, or upload"
+          asset_present=false
+          if gh release view "${TAG}" --json assets --jq '.assets[].name' 2>/dev/null \
+              | grep -qxF "TwoMLSPQ.xcframework.zip"; then
+            asset_present=true
+          fi
+          if grep -qF "$url" Package.swift && [ "$asset_present" = true ]; then
+            echo "Package.swift pins ${TAG} and its asset is present — nothing to build, pin, or upload"
             echo "already=true" >> "$GITHUB_OUTPUT"
           else
             echo "already=false" >> "$GITHUB_OUTPUT"
