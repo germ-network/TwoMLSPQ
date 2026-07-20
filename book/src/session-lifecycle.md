@@ -123,8 +123,8 @@ Sending is two-phase so CommProtocol can bind a per-round proposal hash:
     binding), **or** when an owed PQ bind must be discharged (a proposal-less,
     updatePath-only commit — `did_commit: true` with nothing folded, so PQ liveness never
     waits on app approval policy). A round with neither pending commits nothing.
-  - `proposing: Some(new_client_id)` → this round's Upd proposes the named staged
-    rotation candidate (after `stage_rotation`; see Principal key rotation below).
+  - `proposing: Some(new_client_id)` → this round's Upd proposes a rotation to that
+    ClientId, admitting the candidate on the fly (see Principal key rotation below).
 - **`encrypt(app_message)`** — binds the pending `proposal_hash` into the message's
   authenticated data and returns `EncryptResult { cipher_text, sender, recipient,
   epochs }`, where `epochs` is the send group's epoch pair — `pq_epoch` (0 while that
@@ -167,11 +167,12 @@ epoch and refreshing the PSK binding.
 ## Principal key rotation
 
 Rotation is **proposal-driven** (see [Group Rules](./group-rules.md) — the
-Authentication Service): `stage_rotation(new_client_id)` mints the successor (the app
-supplies only the opaque ClientId; signing keys are session-owned) and marks the
-session `Pending`; `prepare_to_encrypt(Some(new_id))` makes this round's stapled
-Upd(self) carry the candidate's credential. Different rounds may propose different
-candidates — the app orders them. The peer surfaces each candidate as
+Authentication Service) and **lazy** — there is no separate stage call:
+`prepare_to_encrypt(Some(new_id))` makes this round's stapled Upd(self) carry the
+successor's credential, minting the successor (the app supplies only the opaque
+ClientId; signing keys are session-owned) and authorizing it on the fly if `new_id` is
+not already a candidate. Admitting a candidate marks the session `Pending`. Different
+rounds may propose different candidates — the app orders them. The peer surfaces each candidate as
 `QueuedRemoteProposal.proposing`, approves one with `queue_proposal` (the running
 tally), and its next commit **canonicalizes** it: `committed_remote_client_id` and
 `their_principal_state` report the new identity on the committing side, and the

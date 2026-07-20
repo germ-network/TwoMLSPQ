@@ -1154,9 +1154,9 @@ public protocol TwoMlsPqInvitationProtocol: AnyObject, Sendable {
      *
      * `new_client_id` is an optional dedicated per-session principal: when `Some`, the
      * spawned session's send group is created under a freshly-minted principal carrying
-     * that ClientId (signing keys are session-owned, minted internally — the same
-     * convention as `stage_rotation`), so the initiator sees the dedicated principal
-     * from the very first frame and no rotation commit is needed. The receive-group
+     * that ClientId (signing keys are session-owned, minted internally), so the initiator
+     * sees the dedicated principal from the very first frame and no rotation commit is
+     * needed (born-dedicated). The receive-group
      * join still uses this invitation's identity — the welcome was addressed to its key
      * package. `None` keeps the session under the invitation identity.
      *
@@ -1433,9 +1433,9 @@ open func processedWelcomeGroupId(welcome: Data) -> MlsGroupId?  {
      *
      * `new_client_id` is an optional dedicated per-session principal: when `Some`, the
      * spawned session's send group is created under a freshly-minted principal carrying
-     * that ClientId (signing keys are session-owned, minted internally — the same
-     * convention as `stage_rotation`), so the initiator sees the dedicated principal
-     * from the very first frame and no rotation commit is needed. The receive-group
+     * that ClientId (signing keys are session-owned, minted internally), so the initiator
+     * sees the dedicated principal from the very first frame and no rotation commit is
+     * needed (born-dedicated). The receive-group
      * join still uses this invitation's identity — the welcome was addressed to its key
      * package. `None` keeps the session under the invitation identity.
      *
@@ -5126,7 +5126,7 @@ public enum TwoMlsPqError: Swift.Error, Equatable, Hashable, Foundation.Localize
      * reserved: the rotation-commit discriminator is "empty authenticated_data = ratchet
      * commit", so an empty id could never be announced or observed by the peer. Raised by
      * `TwoMlsPqInvitation::receive(new_client_id: Some(vec![]))` and
-     * `stage_rotation(vec![])`.
+     * `prepare_to_encrypt(Some(<empty id>))` (which lazily admits the candidate).
      */
     case InvalidClientId
     /**
@@ -5964,7 +5964,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_two_mls_pq_checksum_method_twomlspqinvitation_processed_welcome_group_id() != 55990) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqinvitation_receive() != 19940) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqinvitation_receive() != 55740) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqinvitation_state_seq() != 33948) {

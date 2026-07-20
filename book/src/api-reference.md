@@ -73,10 +73,11 @@ The receiving side of a published key package — no live client required.
   `spawn_token` is an opaque, replay-stable identifier for the initial frame, keying
   the forward table.
   `new_client_id` is an optional **dedicated per-session principal**: when `Some`, the
-  spawned session's send group is created under a freshly-minted principal carrying
-  that ClientId (signing keys minted internally, as with `stage_rotation`), so the
-  initiator sees the dedicated principal from the very first frame — no rotation
-  commit, so nothing can displace the welcome staple. The receive-group join still
+  spawned session's send group is created directly under a freshly-minted principal
+  carrying that ClientId (signing keys minted internally) — so the acceptor runs as the
+  dedicated agent from birth (its creator leaf carries `new_client_id`) and the
+  initiator sees the dedicated principal from the very first frame, with no
+  founding→dedicated rotation, so nothing can displace the welcome staple. The receive-group join still
   uses the invitation identity (the welcome was addressed to its key package), and
   the session id still derives from the founding pair, so both sides agree on it.
   `expected_remote` is the identity the caller already expects the welcome from
@@ -161,9 +162,11 @@ it rides the persisted group state, so a restored session's owner re-verifies he
 errors only on a present-but-undecodable extension, so corruption can never read back as
 "unbound").
 
-Messaging: `prepare_to_encrypt(proposing)` — `Some(id)` selects which staged rotation
-candidate this round's Upd proposes (`None` re-proposes the current identity; the
-commit path is unchanged); its result carries the staged Upd both raw
+Messaging: `prepare_to_encrypt(proposing)` — `Some(id)` proposes a rotation to that
+ClientId on this round's Upd, admitting the candidate on the fly (minting the successor's
+signing keys and authorizing it if `id` is not already staged — so a rotation can ride the
+very first frame); `None` re-proposes the current identity and the commit path is
+unchanged; its result carries the staged Upd both raw
 (`proposal_message` — the exact message the paired `encrypt` staples) and digested
 (`proposal_hash`), from one critical section, so a host binding a signature to the
 proposal (the anchor agent handoff) applies its own digest to the returned bytes with
@@ -173,10 +176,11 @@ no staged-slot read a later prepare could have replaced; `encrypt`;
 latest-wins; validates then leaves the proposal cache untouched, so a rejected call is
 a no-op and a replacement never doubles up; dropped when the send epoch advances via an
 A.3 bind); `queued_remote_successor() -> Option<ClientId>` — the credential currently
-queued, for the app's replace policy; `stage_rotation` — mints a successor candidate
-(re-staging adds candidates, never evicting a sent one; overflow beyond the in-flight
-window defers to a single slot and is proposed next round; the peer's commit picks the
-winner). See [Group Rules](./group-rules.md) for the Authentication Service semantics.
+queued, for the app's replace policy. Proposing another `Some(id)` adds a candidate,
+never evicting one already sent, so several may be in flight (`my_principal_state` is
+`Pending` while any are); overflow beyond the in-flight window defers to a single slot
+proposed next round, and the peer's commit picks the winner. See
+[Group Rules](./group-rules.md) for the Authentication Service semantics.
 
 Header encryption: `open_incoming(blob) -> Option<OpenedFrame { kind, frame }>` removes
 the outer seal from a rendezvous-channel blob and returns the plaintext `frame` plus a
@@ -265,7 +269,7 @@ state as broken but leaves sending intact, and a restore from the last persisted
 heals it. `DuplicateSideBand` is a benign no-op (a re-delivered side-band frame);
 `BootstrapKpMismatch` rejects an A.4 bootstrap key package whose hash does not match the
 commitment `receive` was given. `InvalidClientId` rejects an empty
-principal id supplied to `receive(new_client_id:)` or `stage_rotation` — empty is
+principal id supplied to `receive(new_client_id:)` or `prepare_to_encrypt(Some(id))` — empty is
 reserved (it is the ratchet-commit authenticated-data discriminator, so an empty id
 could never be announced to the peer). `RemoteIdentityMismatch` is an establishment
 identity-binding failure: an `expected_remote` the key package does not name, a

@@ -436,12 +436,15 @@ fn rotate_round(
     peer: &Arc<TwoMlsPqSession>,
     new_id: crate::ClientId,
 ) {
-    assert_ok!(party.stage_rotation(new_id.bytes.clone()));
+    // Lazy staging (contract 25): proposing an unstaged id admits it on the fly — mint +
+    // authorize — with no separate `stage_rotation` call, so `my_principal_state` goes `Pending`
+    // as the proposal is prepared. (This drives the ROTATION-heavy suite through the lazy path the
+    // app actually uses; the eager `stage_rotation` helper keeps its own dedicated invariant tests.)
+    assert_ok!(party.prepare_to_encrypt(Some(new_id.clone())));
     assert!(matches!(
         party.my_principal_state(),
         PrincipalState::Pending { .. }
     ));
-    assert_ok!(party.prepare_to_encrypt(Some(new_id.clone())));
     let enc = assert_ok!(party.encrypt(b"rotate".to_vec()));
     let got = assert_some!(assert_ok!(peer.process_incoming(enc.cipher_text)));
     let offered = assert_some!(got.proposal);
@@ -3338,6 +3341,28 @@ fn test_prepare_to_encrypt_lazily_stages_unstaged_candidate() {
         alice_session.my_principal_state(),
         PrincipalState::Pending { new, .. } if new == new_alice.client_id()
     ));
+}
+
+/// Lazy staging respects the candidate window (contract 25): filling `CANDIDATE_WINDOW` in-flight
+/// candidates via `prepare_to_encrypt(Some(id))` and then proposing ONE MORE unstaged id returns
+/// `SessionNotReady` for that round — the pool is full, so the request parks in the single deferred
+/// slot rather than riding this frame (the same overflow contract the eager `stage_rotation` has; a
+/// canonicalization frees a slot and a later routine round promotes the parked id).
+#[test]
+fn test_lazy_prepare_respects_candidate_window() {
+    let (alice, _bob) = establish_confirmed_sessions();
+    // Propose CANDIDATE_WINDOW distinct candidates, none canonicalized — the pool fills.
+    for i in 0..super::CANDIDATE_WINDOW {
+        let id = make_client().client_id();
+        assert_ok!(alice.prepare_to_encrypt(Some(id)));
+        assert_ok!(alice.encrypt(format!("cand{i}").into_bytes()));
+    }
+    // One more unstaged id can't ride this round: the window is full.
+    let overflow = make_client().client_id();
+    assert_err!(
+        alice.prepare_to_encrypt(Some(overflow)),
+        TwoMlsPqError::SessionNotReady
+    );
 }
 
 /// A frame that crossed one of our commits references our send group's *previous*

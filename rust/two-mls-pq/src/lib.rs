@@ -738,7 +738,7 @@ pub enum TwoMlsPqError {
     /// reserved: the rotation-commit discriminator is "empty authenticated_data = ratchet
     /// commit", so an empty id could never be announced or observed by the peer. Raised by
     /// `TwoMlsPqInvitation::receive(new_client_id: Some(vec![]))` and
-    /// `stage_rotation(vec![])`.
+    /// `prepare_to_encrypt(Some(<empty id>))` (which lazily admits the candidate).
     #[error("principal client id must be non-empty")]
     InvalidClientId,
     /// An establishment identity failed to match: the remote's key package does not carry
