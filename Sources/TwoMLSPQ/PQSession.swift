@@ -1048,15 +1048,19 @@ public struct PQInvitation {
 		remoteClientId: ClientID,
 		welcomeToken: WelcomeToken,
 		stapledMessage: Data?,
-		newClientId: ClientID
+		newClientId: ClientID?
 	) throws(SessionError) -> (PQSession, stapled: PQSenderMessage?) {
 		return try mapPQErrors(.receive) {
-		// Validate the dedicated principal id BEFORE any invitation state is
-		// claimed: `stageRotation` (below) throws `.invalidClientId` on an empty
-		// id, but by then `base.receive` has consumed the welcome — the session
-		// would be orphaned and a retry refused as `.duplicateWelcome`. Same
+		// Contract 26: `newClientId` is optional — `nil` establishes under the
+		// invitation identity (the nil topology: no dedicated principal, no signed
+		// delegation owed; also the NSE preview-decrypt-discard case). `Some(id)`
+		// establishes born-dedicated (and `Some(id == invitation identity)`
+		// degenerates to the nil topology inside the crate). Validate a NON-nil id
+		// BEFORE any invitation state is claimed: the crate throws `.invalidClientId`
+		// on an empty id, but by then `base.receive` has consumed the welcome — the
+		// session would be orphaned and a retry refused as `.duplicateWelcome`. Same
 		// error identity, fixed ordering.
-		guard !newClientId.isEmpty else {
+		if let newClientId, newClientId.isEmpty {
 			throw SessionError(
 				code: .invalidClientId,
 				detail: "dedicated principal id must be non-empty")
