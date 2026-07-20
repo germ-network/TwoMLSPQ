@@ -327,6 +327,14 @@ pub(crate) mod archive_wire {
         /// establishment payload, enforced at `pq_bootstrap_respond`. `None` on
         /// initiators.
         pub(in crate::session) expected_bootstrap_kp_commitment: Option<Vec<u8>>,
+        /// Contract 26: born-dedicated — this session owes a signed establishment
+        /// envelope before it may emit. A restored pre-install session must keep
+        /// refusing the emission doors, so the flag rides the archive.
+        pub(in crate::session) requires_establishment_envelope: bool,
+        /// Contract 26: the installed signed delegation blob (`None` pre-install).
+        /// The enveloped staple re-derives from it + the inner welcome, so the
+        /// blob itself is the durable truth.
+        pub(in crate::session) establishment_envelope: Option<Vec<u8>>,
     }
 }
 
@@ -536,14 +544,19 @@ fn session_from_wire(wire: archive_wire::SessionArchive) -> Result<Arc<TwoMlsPqS
         return Err(TwoMlsPqError::ArchiveInvalid);
     }
     // The staple is never empty on a live session (set at construction), and its
-    // first byte is one of the three staple forms: MLSMessage (0x00), APQWelcome
-    // (0x01), or APQPrivateMessage (0x05 -- a discharged bind, the staple until the
-    // next commit supersedes it). This check also structurally rejects pre-v2
-    // archive layouts, whose bytes can otherwise alias into these fields (an
-    // Option-None byte reads as an empty byte_vec).
+    // first byte is one of the four staple forms: MLSMessage (0x00), APQWelcome
+    // (0x01), APQPrivateMessage (0x05 -- a discharged bind, the staple until the
+    // next commit supersedes it), or the born-dedicated establishment handoff
+    // (0x0B, contract 26 -- the enveloped welcome an installed acceptor staples).
+    // This check also structurally rejects pre-v2 archive layouts, whose bytes can
+    // otherwise alias into these fields (an Option-None byte reads as an empty
+    // byte_vec).
     if !matches!(
         wire.current_staple.first(),
-        Some(&0x00) | Some(&APQ_TAG) | Some(&apq::APQ_PRIVATE_MESSAGE_TAG)
+        Some(&0x00)
+            | Some(&APQ_TAG)
+            | Some(&apq::APQ_PRIVATE_MESSAGE_TAG)
+            | Some(&ESTABLISHMENT_HANDOFF_TAG)
     ) {
         return Err(TwoMlsPqError::ArchiveInvalid);
     }
@@ -688,6 +701,11 @@ fn session_from_wire(wire: archive_wire::SessionArchive) -> Result<Arc<TwoMlsPqS
             bootstrap_kp: wire.bootstrap_kp,
             bootstrap_kp_secret: wire.bootstrap_kp_secret,
             expected_bootstrap_kp_commitment: wire.expected_bootstrap_kp_commitment,
+            // Contract 26: a restored pre-install born-dedicated session keeps
+            // refusing the emission doors (the flag rides the archive precisely
+            // so a restore cannot reopen them).
+            requires_establishment_envelope: wire.requires_establishment_envelope,
+            establishment_envelope: wire.establishment_envelope,
             // Attached post-restore via `install_sink`.
             sink: None,
             // Feature B: re-supplied post-restore via `set_pad_target` (mirrors `sink`); the
@@ -907,6 +925,8 @@ fn build_archive_wire(
             bootstrap_kp: inner.bootstrap_kp.clone(),
             bootstrap_kp_secret: inner.bootstrap_kp_secret.clone(),
             expected_bootstrap_kp_commitment: inner.expected_bootstrap_kp_commitment.clone(),
+            requires_establishment_envelope: inner.requires_establishment_envelope,
+            establishment_envelope: inner.establishment_envelope.clone(),
         };
     Ok(archive)
 }
