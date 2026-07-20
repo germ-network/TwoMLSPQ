@@ -76,6 +76,46 @@ pub(crate) fn approve_establishment(
     ))
 }
 
+/// Contract 26: an initiator (alice) plus a freshly-`receive`d born-dedicated
+/// acceptor (bob), the acceptor's dedicated id, and its invitation identity —
+/// the pre-install starting point for the establishment edge tests. Bob owes
+/// its envelope; alice still knows bob as the invitation identity.
+pub(crate) struct BornDedicated {
+    pub alice: Arc<TwoMlsPqSession>,
+    pub bob: Arc<TwoMlsPqSession>,
+    pub dedicated: Vec<u8>,
+    pub invitation_identity: Vec<u8>,
+}
+
+pub(crate) fn born_dedicated_pending() -> BornDedicated {
+    let alice = make_client();
+    let bob = make_client();
+    let alice_kp = make_classical_kp(&alice);
+    let bob_inv = assert_ok!(TwoMlsPqInvitation::restore(assert_ok!(
+        bob.generate_invitation(true)
+    )));
+    let bob_kp = bob_inv.combiner_key_package();
+
+    let alice_s = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
+    let opened = assert_ok!(bob_inv.open_establishment(assert_some!(alice_s.pending_outbound())));
+    let dedicated = test_client_id();
+    let bob_s = assert_ok!(bob_inv.receive(
+        assert_some!(opened.welcome),
+        alice_kp,
+        commitment_of(&alice_s),
+        b"tok".to_vec(),
+        Some(dedicated.clone()),
+        None,
+        None,
+    ));
+    BornDedicated {
+        alice: alice_s,
+        bob: bob_s,
+        dedicated,
+        invitation_identity: bob_inv.client_id().bytes,
+    }
+}
+
 pub(crate) fn establish_sessions() -> (Arc<TwoMlsPqSession>, Arc<TwoMlsPqSession>) {
     let alice = make_client();
     let bob = make_client();
