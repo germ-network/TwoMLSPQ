@@ -1853,9 +1853,11 @@ public protocol TwoMlsPqSessionProtocol: AnyObject, Sendable {
      * One envelope per session: re-installing the SAME bytes is an idempotent
      * no-op; DIFFERENT bytes are `EstablishmentEnvelopeConflict` (loud — the
      * envelope's signatures bind this session's welcome, so a second distinct
-     * envelope can only be a host bug). `SessionNotReady` when the session owes
-     * no envelope (not born-dedicated, or the host already let the staple move
-     * on — neither occurs in the intended receive→mint→install sequence).
+     * envelope can only be a host bug). An EMPTY envelope is
+     * `EstablishmentEnvelopeRequired` (the wrapper guards it with a clearer
+     * message). `SessionNotReady` when the session owes no envelope (not
+     * born-dedicated, or the host already let the staple move on — neither
+     * occurs in the intended receive→mint→install sequence).
      *
      * CAPTURE ORDERING: capture/persist the session AFTER this call (the same
      * rule as `set_initial_app_payload`) — the envelope rides the archive, and
@@ -2567,9 +2569,11 @@ open func initialWelcome() -> Data?  {
      * One envelope per session: re-installing the SAME bytes is an idempotent
      * no-op; DIFFERENT bytes are `EstablishmentEnvelopeConflict` (loud — the
      * envelope's signatures bind this session's welcome, so a second distinct
-     * envelope can only be a host bug). `SessionNotReady` when the session owes
-     * no envelope (not born-dedicated, or the host already let the staple move
-     * on — neither occurs in the intended receive→mint→install sequence).
+     * envelope can only be a host bug). An EMPTY envelope is
+     * `EstablishmentEnvelopeRequired` (the wrapper guards it with a clearer
+     * message). `SessionNotReady` when the session owes no envelope (not
+     * born-dedicated, or the host already let the staple move on — neither
+     * occurs in the intended receive→mint→install sequence).
      *
      * CAPTURE ORDERING: capture/persist the session AFTER this call (the same
      * rule as `set_initial_app_payload`) — the envelope rides the archive, and
@@ -6274,7 +6278,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_initial_welcome() != 13904) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_install_establishment_envelope() != 40753) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_install_establishment_envelope() != 28716) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_install_sink() != 61277) {
