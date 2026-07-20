@@ -23,7 +23,7 @@ let twoMLSPQrs: Target =
 		name: "TwoMLSPQrs",
 		url:
 			"https://github.com/germ-network/TwoMLSPQ/releases/download/v0.10.0/TwoMLSPQ.xcframework.zip",
-		checksum: "3ca1b86d265d2ded4ac78da4b0f26373a68ae65e0d814f542422de509a51c0fd"
+		checksum: "897071cf3ba8fd278c205aa13dcea3303dc01195167dc39e7eabc7510db51dee"
 	)
 
 let package = Package(
