@@ -25,6 +25,16 @@ There is no bind tag: a round's closing bind is the **message-frame staple** (th
 `APQPrivateMessage` above), not a side-band frame, so every side-band frame is answered by
 its round's next leg.
 
+**Length prefix & padding (inside the seal).** These tagged frames are the AEAD *plaintext*; the
+symmetric header seal wraps each as `[u32-LE frame_len][frame][optional zero padding]` (see
+[Header Encryption](./header-encryption.md)). Two consequences at the wire level: every frame
+carries a fixed **+4-byte length prefix**, and a side-band frame may be **zero-padded** up to the
+size of the message it is co-stapled with when the host declares a frame-sizing intent
+(`set_pad_target(Some(n))`, capped at a push-payload budget `n`). The intent's purpose today is
+*unlinkability* — equal sealed lengths make the two co-stapled payloads size-indistinguishable to
+an on-path observer — and, as the motivating forward-looking use of the same knob, *chunking* into
+fixed push-payload units. Absent the intent, frames are the natural size and carry only the prefix.
+
 The table is the prose half of the registry; `frames::tests::BANDS` is the executable
 half, and the two must agree. The space spans **three declaration sites**, because each tag
 lives with the thing it tags: `APQ_TAG` and `APQ_PRIVATE_MESSAGE_TAG` in the `apq` crate,

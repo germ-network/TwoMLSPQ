@@ -436,12 +436,15 @@ fn rotate_round(
     peer: &Arc<TwoMlsPqSession>,
     new_id: crate::ClientId,
 ) {
-    assert_ok!(party.stage_rotation(new_id.bytes.clone()));
+    // Lazy staging (contract 25): proposing an unstaged id admits it on the fly — mint +
+    // authorize — with no separate `stage_rotation` call, so `my_principal_state` goes `Pending`
+    // as the proposal is prepared. (This drives the ROTATION-heavy suite through the lazy path the
+    // app actually uses; the eager `stage_rotation` helper keeps its own dedicated invariant tests.)
+    assert_ok!(party.prepare_to_encrypt(Some(new_id.clone())));
     assert!(matches!(
         party.my_principal_state(),
         PrincipalState::Pending { .. }
     ));
-    assert_ok!(party.prepare_to_encrypt(Some(new_id.clone())));
     let enc = assert_ok!(party.encrypt(b"rotate".to_vec()));
     let got = assert_some!(assert_ok!(peer.process_incoming(enc.cipher_text)));
     let offered = assert_some!(got.proposal);
@@ -557,9 +560,10 @@ fn test_queue_proposal_declared_mismatch_is_noop() {
 fn test_never_approving_app_still_discharges_its_bind() {
     let (alice, bob) = establish_full();
 
-    // Bob holds the turn: he runs an A.3 round to the trigger. PQ moves, classical is owed.
+    // Bob holds the turn: he opens an A.3 round with a send and runs it to the trigger. PQ
+    // moves, classical is owed.
     let before = bob.epochs();
-    let ek = assert_ok!(bob.pq_ratchet_begin());
+    let ek = open_ratchet(&bob, &alice);
     assert_ok!(alice.pq_ratchet_respond(ek));
     let ct = assert_some!(alice.pq_take_pending_outbound());
     assert_ok!(bob.pq_ratchet_bind(ct));
@@ -613,7 +617,7 @@ fn test_unlicensed_discharge_waits_for_evidence() {
     drop(assert_ok!(bob.encrypt(b"committed".to_vec()))); // never delivered
 
     // Bob binds, then tries to discharge with nothing licensing him.
-    let ek = assert_ok!(bob.pq_ratchet_begin());
+    let ek = assert_some!(bob.pq_pending_outbound(SideBandSealing::Fresh));
     assert_ok!(alice.pq_ratchet_respond(ek));
     let ct = assert_some!(alice.pq_take_pending_outbound());
     assert_ok!(bob.pq_ratchet_bind(ct));
@@ -716,9 +720,9 @@ fn test_forged_high_epoch_offer_does_not_license() {
 #[test]
 fn test_rotation_canonicalized_by_a_discharging_commit() {
     let (alice, bob) = establish_full();
-    // Bob holds the turn after A.4: he opens an A.3 round and binds, so his next
+    // Bob holds the turn after A.4: he opens an A.3 round with a send and binds, so his next
     // COMMITTING round is the one that must discharge it.
-    let ek = assert_ok!(bob.pq_ratchet_begin());
+    let ek = open_ratchet(&bob, &alice);
     assert_ok!(alice.pq_ratchet_respond(ek));
     let ct = assert_some!(alice.pq_take_pending_outbound());
     assert_ok!(bob.pq_ratchet_bind(ct));
@@ -781,34 +785,36 @@ fn test_rotation_canonicalized_by_a_discharging_commit() {
 #[test]
 fn test_queued_proposal_survives_bind_and_folds_with_discharge() {
     let (alice, bob) = establish_full();
-    // Bob proposes a candidate; Alice approves it (the running tally).
-    let id_b = make_client().client_id();
-    assert_ok!(bob.stage_rotation(id_b.bytes.clone()));
-    assert_ok!(bob.prepare_to_encrypt(Some(id_b.clone())));
-    let f = assert_ok!(bob.encrypt(b"propose".to_vec()));
-    let got = assert_some!(assert_ok!(alice.process_incoming(f.cipher_text)));
-    assert_ok!(alice.queue_proposal(assert_some!(got.proposal).digest));
-    assert_eq!(alice.queued_remote_successor(), Some(id_b.clone()));
+    // Bob holds the turn: he opens an A.3 round with a send BEFORE any proposal is queued
+    // (a queued proposal would make the opener COMMIT instead of staging the ratchet).
+    let ek = open_ratchet(&bob, &alice);
 
-    // Alice runs an A.3 ratchet up to the bind: PQ moves, classical is owed, and the
-    // tally is untouched.
-    let ek = assert_ok!(alice.pq_ratchet_begin());
-    assert_ok!(bob.pq_ratchet_respond(ek));
-    let ct = assert_some!(bob.pq_take_pending_outbound());
-    assert_ok!(alice.pq_ratchet_bind(ct));
-    assert_eq!(alice.queued_remote_successor(), Some(id_b.clone()));
+    // Alice proposes a candidate; Bob approves it (the running tally).
+    let id_a = make_client().client_id();
+    assert_ok!(alice.stage_rotation(id_a.bytes.clone()));
+    assert_ok!(alice.prepare_to_encrypt(Some(id_a.clone())));
+    let f = assert_ok!(alice.encrypt(b"propose".to_vec()));
+    let got = assert_some!(assert_ok!(bob.process_incoming(f.cipher_text)));
+    assert_ok!(bob.queue_proposal(assert_some!(got.proposal).digest));
+    assert_eq!(bob.queued_remote_successor(), Some(id_a.clone()));
+
+    // Complete the A.3 up to the bind: PQ moves, classical is owed, and the tally is untouched.
+    assert_ok!(alice.pq_ratchet_respond(ek));
+    let ct = assert_some!(alice.pq_take_pending_outbound());
+    assert_ok!(bob.pq_ratchet_bind(ct));
+    assert_eq!(bob.queued_remote_successor(), Some(id_a.clone()));
 
     // One committing round folds the queued proposal AND carries the bind's staple.
-    let prepared = assert_ok!(alice.prepare_to_encrypt(None));
+    let prepared = assert_ok!(bob.prepare_to_encrypt(None));
     assert!(prepared.did_commit);
     assert_eq!(
         assert_some!(prepared.committed_remote_client_id).bytes,
-        id_b.bytes
+        id_a.bytes
     );
-    let frame = assert_ok!(alice.encrypt(b"fold+bind".to_vec()));
-    assert_some!(assert_ok!(bob.process_incoming(frame.cipher_text)));
-    // The bind landed with the fold: the round is closed and the turn is Bob's.
-    assert!(bob.my_pq_turn());
+    let frame = assert_ok!(bob.encrypt(b"fold+bind".to_vec()));
+    assert_some!(assert_ok!(alice.process_incoming(frame.cipher_text)));
+    // The bind landed with the fold: the round is closed and the turn is Alice's.
+    assert!(alice.my_pq_turn());
 }
 
 /// A candidate that was proposed on the wire is never evicted: staging beyond the
@@ -1167,42 +1173,89 @@ fn test_commit_round_mints_new_listen_address_and_retains_old() {
 
 #[test]
 fn test_pq_ratchet_discharge_mints_new_listen_address() {
-    let (alice, bob) = establish_sessions();
-    let before = assert_ok!(alice.should_listen_on())
-        .rendezvous_by_epoch
-        .len();
+    let (alice, bob) = establish_full();
+    let before = assert_ok!(bob.should_listen_on()).rendezvous_by_epoch.len();
 
-    // A.3 to the trigger: the PQ commit touches nothing classical, so no new address
-    // yet — the listen map tracks the classical epoch, which is owed.
-    let ek = assert_ok!(alice.pq_ratchet_begin());
-    assert_ok!(bob.pq_ratchet_respond(ek));
-    let ct = assert_some!(bob.pq_take_pending_outbound());
-    assert_ok!(alice.pq_ratchet_bind(ct));
+    // Bob holds the turn: he opens an A.3 to the trigger. The PQ commit touches nothing
+    // classical, so no new address yet — the listen map tracks the classical epoch, which
+    // is owed.
+    let ek = open_ratchet(&bob, &alice);
+    assert_ok!(alice.pq_ratchet_respond(ek));
+    let ct = assert_some!(alice.pq_take_pending_outbound());
+    assert_ok!(bob.pq_ratchet_bind(ct));
     assert_eq!(
-        assert_ok!(alice.should_listen_on())
-            .rendezvous_by_epoch
-            .len(),
+        assert_ok!(bob.should_listen_on()).rendezvous_by_epoch.len(),
         before
     );
 
-    // The discharge IS the classical commit: it advances alice's send-group epoch and
-    // mints the new epoch's address; Bob's post address lands on it once he applies
+    // The discharge IS the classical commit: it advances bob's send-group epoch and
+    // mints the new epoch's address; Alice's post address lands on it once she applies
     // the stapled bind.
-    discharge_bind(&alice, &bob, b"bind");
-    let listen_a = assert_ok!(alice.should_listen_on());
-    assert_eq!(listen_a.rendezvous_by_epoch.len(), before + 1);
-    let bob_post = assert_some!(assert_ok!(bob.send_rendezvous()));
-    assert!(listen_a
+    discharge_bind(&bob, &alice, b"bind");
+    let listen_b = assert_ok!(bob.should_listen_on());
+    assert_eq!(listen_b.rendezvous_by_epoch.len(), before + 1);
+    let alice_post = assert_some!(assert_ok!(alice.send_rendezvous()));
+    assert!(listen_b
         .rendezvous_by_epoch
         .iter()
-        .any(|e| e.rendezvous_id.bytes == bob_post.bytes));
+        .any(|e| e.rendezvous_id.bytes == alice_post.bytes));
 }
 
-/// Drive one full A.5 rekey with `initiator` holding the turn: Upd' → Commit' → the
-/// stapled ack, delivered by the discharge round. Returns after the responder applies
-/// the ack from the staple (turn flipped to the responder).
-fn rekey_round(initiator: &Arc<TwoMlsPqSession>, responder: &Arc<TwoMlsPqSession>) {
-    let upd = assert_ok!(initiator.pq_rekey_begin(None));
+/// Send-driven A.5 open: the initiator (turn holder, whose PQ leaf lags a rotated principal)
+/// sends an ordinary message, which auto-stages the A.5 Upd'; `responder` consumes the opener
+/// and the peeked Upd' is returned. The rekey mirror of `open_ratchet`.
+fn open_rekey(initiator: &Arc<TwoMlsPqSession>, responder: &Arc<TwoMlsPqSession>) -> Vec<u8> {
+    assert_ok!(initiator.prepare_to_encrypt(None));
+    let opener = assert_ok!(initiator.encrypt(b"rekey-open".to_vec()));
+    assert_ok!(responder.process_incoming(opener.cipher_text));
+    assert_some!(initiator.pq_pending_outbound(SideBandSealing::Fresh))
+}
+
+/// Drive one full A.5 rekey, rotation-driven. The session self-drives A.5 ONLY as a credential
+/// catch-up — there is no host-callable plain rekey — so this rotates the initiator's principal
+/// to make its send-PQ leaf lag, then lets sends carry the catch-up.
+///
+/// `initiator` must be the NON-turn-holder (`responder` holds the turn). The rotation's
+/// canonicalize is sent by the turn-holding responder, which auto-stages one incidental A.3 —
+/// the one-round catch-up deferral (a staged A.3 can't be upgraded to A.5 mid-flight). Draining
+/// that A.3 passes the turn to the initiator, whose next send then auto-stages the A.5 Upd'
+/// announcing `new_id`. Upd' -> Commit' -> the stapled ack closes it (turn back to the responder).
+fn rekey_round(
+    initiator: &Arc<TwoMlsPqSession>,
+    responder: &Arc<TwoMlsPqSession>,
+    new_id: crate::ClientId,
+) {
+    let reply = rekey_to_commit(initiator, responder, new_id);
+    // Leg 3 applies the Commit' and acks: PQ moves, classical is owed.
+    assert_ok!(initiator.pq_rekey_apply(reply));
+    // The ack rides the initiator's next classical COMMIT as the staple.
+    discharge_bind(initiator, responder, b"rekey-ack");
+}
+
+/// Drive a rotation-driven A.5 up to — but not through — the initiator's apply, returning the
+/// responder's Commit' frame (its `pq_rekey_respond` reply). Same preconditions and mechanics as
+/// [`rekey_round`]: `initiator` must be the NON-turn-holder; the rotation's incidental A.3 is
+/// drained, then the initiator's send auto-stages the A.5 Upd' announcing `new_id`, and the
+/// responder answers with its Commit'. Used where a test needs to interpose on the apply.
+fn rekey_to_commit(
+    initiator: &Arc<TwoMlsPqSession>,
+    responder: &Arc<TwoMlsPqSession>,
+    new_id: crate::ClientId,
+) -> Vec<u8> {
+    // Rotate the initiator (it does not hold the turn, so its rotate-send stages nothing; the
+    // responder's canonicalize send stages the incidental A.3).
+    rotate_round(initiator, responder, new_id.clone());
+
+    // Drain the responder's incidental A.3 (the catch-up deferral) — the turn passes to the
+    // initiator, whose leaf now lags the rotated principal.
+    let ek = assert_some!(responder.pq_pending_outbound(SideBandSealing::Fresh));
+    assert_ok!(initiator.pq_ratchet_respond(ek));
+    let ct = assert_some!(initiator.pq_take_pending_outbound());
+    assert_ok!(responder.pq_ratchet_bind(ct));
+    discharge_bind(responder, initiator, b"catch-up-deferral");
+
+    // The initiator now holds the turn and its leaf lags: a send auto-stages the A.5 Upd'.
+    let upd = open_rekey(initiator, responder);
     // The frame is sealed on the wire; opened, it classifies as the rekey Upd'.
     assert_eq!(
         assert_some!(assert_ok!(responder.open_incoming(upd.clone()))).kind,
@@ -1210,73 +1263,106 @@ fn rekey_round(initiator: &Arc<TwoMlsPqSession>, responder: &Arc<TwoMlsPqSession
             kind: super::PqFrameKind::RekeyUpdate
         }
     );
-    // A rotation-less rekey announces no credential.
-    assert!(assert_ok!(responder.pq_rekey_respond(upd)).is_none());
-    let reply = assert_some!(responder.pq_take_pending_outbound());
-    // Leg 3 applies the Commit' and acks: PQ moves, classical is owed.
-    assert_ok!(initiator.pq_rekey_apply(reply));
-    // The ack rides the initiator's next classical COMMIT as the staple.
-    discharge_bind(initiator, responder, b"rekey-ack");
+    // The catch-up announces the credential the initiator rotated to.
+    assert_eq!(assert_ok!(responder.pq_rekey_respond(upd)), Some(new_id));
+    assert_some!(responder.pq_take_pending_outbound())
+}
+
+/// Send-driven A.3 open. The session no longer exposes a ratchet `begin`: the turn holder
+/// opens a round simply by SENDING an ordinary message, and `encrypt`'s `maybe_stage_next_round`
+/// auto-stages the A.3 EK into the side-band slot. This helper does that send (delivering the
+/// opener to `responder`) and returns the peeked EK for the responder to answer.
+///
+/// Preconditions the caller must meet, since they are exactly what the auto-driver gates on:
+/// `initiator` is post-A.4 (both PQ halves live), holds the turn, and has nothing queued (a
+/// queued proposal would make the opener COMMIT instead of a plain message) — so open a round
+/// before queuing, not after.
+fn open_ratchet(initiator: &Arc<TwoMlsPqSession>, responder: &Arc<TwoMlsPqSession>) -> Vec<u8> {
+    assert_ok!(initiator.prepare_to_encrypt(None));
+    let opener = assert_ok!(initiator.encrypt(b"ratchet-open".to_vec()));
+    assert_ok!(responder.process_incoming(opener.cipher_text));
+    assert_some!(initiator.pq_pending_outbound(SideBandSealing::Fresh))
 }
 
 /// Drive one full A.3 ratchet with `initiator` holding the turn: EK → CT → the
 /// stapled bind, delivered by the discharge round (`app` is asserted through to the
 /// responder by `discharge_bind`).
 fn ratchet_round(initiator: &Arc<TwoMlsPqSession>, responder: &Arc<TwoMlsPqSession>, app: &[u8]) {
-    let ek = assert_ok!(initiator.pq_ratchet_begin());
+    let ek = open_ratchet(initiator, responder);
     assert_ok!(responder.pq_ratchet_respond(ek));
     let ct = assert_some!(responder.pq_take_pending_outbound());
     assert_ok!(initiator.pq_ratchet_bind(ct));
     discharge_bind(initiator, responder, app);
 }
 
+/// A ROTATED party can discharge its owed A.3 bind via the BARE v19 license (no approved fold)
+/// and the peer opens the frame. The discharge commit carries the party's own-leaf credential
+/// handoff (`set_new_signing_identity`) but no folded Update to force an updatePath; mls-rs does
+/// not treat a new signing identity as path-forcing, so without the `TwoMlsRules::commit_options`
+/// FULL-commit path policy the new leaf never reaches the peer and its next app message fails
+/// `InvalidSignature`. Crate-level counterpart of the AbstractTwoMLS
+/// `licenseOnlyDischargeAfterRotationIsKnownBroken` withKnownIssue (which this retires).
+#[test]
+fn test_rotated_party_license_discharge_delivers_handoff() {
+    let (alice, bob) = establish_full();
+    // Rotate the A.3 initiator; its send-group leaf now lags the new principal.
+    let new_bob = make_client().client_id();
+    rotate_round(&bob, &alice, new_bob.clone());
+
+    // Bob opens an A.3 ratchet and ends OWING the bind.
+    let ek = open_ratchet(&bob, &alice);
+    assert_ok!(alice.pq_ratchet_respond(ek));
+    let ct = assert_some!(alice.pq_take_pending_outbound());
+    assert_ok!(bob.pq_ratchet_bind(ct));
+
+    // Discharge via the BARE license: alice offers to license the commit, bob does NOT approve it,
+    // so bob's `prepare_to_encrypt(None)` commits purely on `owed_bind && licensed` (no fold).
+    assert_ok!(alice.prepare_to_encrypt(None));
+    let offer = assert_ok!(alice.encrypt(b"license-offer".to_vec()));
+    assert_ok!(bob.process_incoming(offer.cipher_text));
+    assert!(assert_ok!(bob.prepare_to_encrypt(None)).did_commit);
+    let frame = assert_ok!(bob.encrypt(b"license-discharge".to_vec()));
+
+    // The peer OPENS it (the handoff leaf rode the forced path) and reads the app message.
+    let got = assert_some!(assert_ok!(alice.process_incoming(frame.cipher_text)));
+    assert_eq!(
+        assert_some!(got.application_message).app_message_data,
+        b"license-discharge".to_vec()
+    );
+    // Both sides agree bob now runs under the rotated principal.
+    assert_eq!(bob.my_principal_state().client_id(), new_bob);
+    assert_eq!(alice.their_principal_state().client_id(), new_bob);
+}
+
+/// A rotation-driven A.5 rekey advances BOTH send-PQ epochs and keeps messaging flowing, and
+/// consecutive rekeys alternate cleanly. (The old plain-rekey "classical untouched" invariant is
+/// gone by design: A.5 now only fires as a credential catch-up, so a rotation's classical commits
+/// ride along — see `rekey_round`.)
 #[test]
 fn test_pq_rekey_full_round() {
     let (alice, bob) = establish_full();
-    // Bob holds the turn after Alice's bootstrap completed.
+    // Rekey initiator = Alice (the non-turn-holder after bootstrap); she rotates and catches up.
     assert!(bob.my_pq_turn());
-    let alice_classical = alice.epochs().classical_epoch;
-    let alice_listen = assert_ok!(alice.should_listen_on())
-        .rendezvous_by_epoch
-        .len();
+    let alice_pq = alice.epochs().pq_epoch;
+    let bob_pq = bob.epochs().pq_epoch;
 
-    rekey_round(&bob, &alice);
+    let new_alice = make_client().client_id();
+    rekey_round(&alice, &bob, new_alice);
 
-    // Both send groups' PQ epochs advanced; classical and the listen map are
-    // untouched (A.5 is PQ-groups-only); the turn flipped back to Alice.
-    //
-    // Asymmetric because A.4's bind is a real commit: it advanced the initiator's send-PQ
-    // (1→2) on top of the birth epoch, while the responder's send-PQ was born at A.4 and
-    // does not move until its own next A.3 bind. So one rekey puts Alice at 3, Bob at 2.
-    assert_eq!(alice.epochs().pq_epoch, 3);
-    assert_eq!(bob.epochs().pq_epoch, 2);
-    assert_eq!(alice.epochs().classical_epoch, alice_classical);
-    assert_eq!(
-        assert_ok!(alice.should_listen_on())
-            .rendezvous_by_epoch
-            .len(),
-        alice_listen
-    );
-    assert!(alice.my_pq_turn());
-    assert!(!bob.my_pq_turn());
+    // Both send groups' PQ epochs advanced, and the turn flipped back to Bob (the responder).
+    assert!(alice.epochs().pq_epoch > alice_pq);
+    assert!(bob.epochs().pq_epoch > bob_pq);
+    assert!(bob.my_pq_turn());
+    assert!(!alice.my_pq_turn());
 
-    // Messaging still flows both ways on the rekeyed groups, and the next
-    // encrypt reports the bumped pq epoch.
-    assert_ok!(alice.prepare_to_encrypt(None));
-    let a2b = assert_ok!(alice.encrypt(b"post-rekey".to_vec()));
-    // 3, not 2: A.4's bind advanced Alice's send-PQ before this rekey did.
-    assert_eq!(a2b.epochs.pq_epoch, 3);
-    let got = assert_ok!(bob.process_incoming(a2b.cipher_text));
+    // Messaging still flows both ways on the rekeyed groups.
+    assert_ok!(bob.prepare_to_encrypt(None));
+    let b2a = assert_ok!(bob.encrypt(b"post-rekey".to_vec()));
+    let got = assert_ok!(alice.process_incoming(b2a.cipher_text));
     assert_eq!(
         assert_some!(assert_some!(got).application_message).app_message_data,
         b"post-rekey".to_vec()
     );
-
-    // Consecutive rekeys work: the turn machine supports Alice going next.
-    // A.5 advances BOTH send-PQs, so A.4's one-epoch head start on Alice rides along.
-    rekey_round(&alice, &bob);
-    assert_eq!(alice.epochs().pq_epoch, 4);
-    assert_eq!(bob.epochs().pq_epoch, 3);
 }
 
 /// Regression: two consecutive A.5 rekeys with an archive/restore of BOTH parties
@@ -1290,37 +1376,36 @@ fn test_pq_rekey_full_round() {
 #[test]
 fn test_two_rekeys_with_archive_between_rounds() {
     let (alice, bob) = establish_full();
-    // Round 1: Bob holds the turn after the bootstrap, so he initiates.
+    // Round 1: Alice (the non-turn-holder) rotates and catches up.
     assert!(bob.my_pq_turn());
-    rekey_round(&bob, &alice);
-    // Asymmetric from A.4 (see `test_a5_rekey_round_completes_without_attestation`).
-    assert_eq!(alice.epochs().pq_epoch, 3);
-    assert_eq!(bob.epochs().pq_epoch, 2);
-    // The turn flipped to Alice.
-    assert!(alice.my_pq_turn());
-    assert!(!bob.my_pq_turn());
+    let a0 = alice.epochs().pq_epoch;
+    let new_alice1 = make_client().client_id();
+    rekey_round(&alice, &bob, new_alice1);
+    assert!(alice.epochs().pq_epoch > a0);
+    // The turn flipped to Bob (the responder).
+    assert!(bob.my_pq_turn());
+    assert!(!alice.my_pq_turn());
 
     // Archive + restore both parties between the rounds. The A.5 cross-party PSKs live
     // only in the ephemeral store, which does not ride the archive.
     let alice = round_trip(&alice);
     let bob = round_trip(&bob);
-    assert!(alice.my_pq_turn());
-    assert!(!bob.my_pq_turn());
+    assert!(bob.my_pq_turn());
+    assert!(!alice.my_pq_turn());
 
-    // Round 2: Alice initiates on the restored sessions. If the second round tried to
+    // Round 2: Alice rotates again on the restored sessions. If the second round tried to
     // re-export a send-PQ leaf the first round consumed, or the peer referenced a PSK
     // the empty store could not resolve, this would fail here.
-    rekey_round(&alice, &bob);
-    assert_eq!(alice.epochs().pq_epoch, 4);
-    assert_eq!(bob.epochs().pq_epoch, 3);
+    let a1 = alice.epochs().pq_epoch;
+    let new_alice2 = make_client().client_id();
+    rekey_round(&alice, &bob, new_alice2);
+    assert!(alice.epochs().pq_epoch > a1);
     assert!(bob.my_pq_turn());
 
     // Messaging still flows on the twice-rekeyed, once-restored groups.
-    assert_ok!(alice.prepare_to_encrypt(None));
-    let a2b = assert_ok!(alice.encrypt(b"after-two-rekeys".to_vec()));
-    // 4, not 3: A.4's bind gave Alice's send-PQ a one-epoch head start.
-    assert_eq!(a2b.epochs.pq_epoch, 4);
-    let got = assert_ok!(bob.process_incoming(a2b.cipher_text));
+    assert_ok!(bob.prepare_to_encrypt(None));
+    let b2a = assert_ok!(bob.encrypt(b"after-two-rekeys".to_vec()));
+    let got = assert_ok!(alice.process_incoming(b2a.cipher_text));
     assert_eq!(
         assert_some!(assert_some!(got).application_message).app_message_data,
         b"after-two-rekeys".to_vec()
@@ -1330,9 +1415,11 @@ fn test_two_rekeys_with_archive_between_rounds() {
 #[test]
 fn test_pq_rekey_then_ratchet_still_works() {
     let (alice, bob) = establish_full();
-    rekey_round(&bob, &alice);
-    // A.3 ratchet after a rekey: Alice holds the turn.
-    ratchet_round(&alice, &bob, b"post-rekey-ratchet");
+    let new_alice = make_client().client_id();
+    rekey_round(&alice, &bob, new_alice);
+    // A.3 ratchet after a rekey: Bob holds the turn (the rekey responder) and his leaf does not
+    // lag, so his next send drives an ordinary A.3.
+    ratchet_round(&bob, &alice, b"post-rekey-ratchet");
 }
 
 /// A refused Commit' must leave the A.5 round exactly where it was, because the refusal
@@ -1351,46 +1438,33 @@ fn test_refused_rekey_commit_leaves_the_round_retriable() {
     let (alice, bob) = establish_full();
     let (carol, dave) = establish_full();
 
-    // Bob holds the turn after A.4, so he initiates and Alice's Commit' answers.
-    let upd = assert_ok!(bob.pq_rekey_begin(None));
-    assert_ok!(alice.pq_rekey_respond(upd));
-    let real = assert_some!(alice.pq_take_pending_outbound());
+    // Drive a real rotation-driven A.5 up to the initiator's apply. Alice is the non-turn-holder
+    // after bootstrap, so she is the rekey initiator; `rekey_to_commit` returns Bob's Commit'.
+    let new_alice = make_client().client_id();
+    let real = rekey_to_commit(&alice, &bob, new_alice);
 
-    // An unrelated pair's Commit', taken as PLAINTEXT via its own initiator so it reaches
-    // Bob's apply rather than dying at the header seal.
-    let foreign_upd = assert_ok!(dave.pq_rekey_begin(None));
-    assert_ok!(carol.pq_rekey_respond(foreign_upd));
-    let foreign_sealed = assert_some!(carol.pq_take_pending_outbound());
-    let foreign = assert_some!(assert_ok!(dave.open_incoming(foreign_sealed))).frame;
+    // An unrelated pair's Commit', opened to PLAINTEXT via its own initiator so it reaches
+    // Alice's apply rather than dying at the header seal.
+    let new_carol = make_client().client_id();
+    let foreign_sealed = rekey_to_commit(&carol, &dave, new_carol);
+    let foreign = assert_some!(assert_ok!(carol.open_incoming(foreign_sealed))).frame;
 
     // Refused — it commits another group entirely.
-    assert_err!(bob.pq_rekey_apply(foreign), TwoMlsPqError::Mls);
+    assert_err!(alice.pq_rekey_apply(foreign), TwoMlsPqError::Mls);
 
     // The round is intact: the real Commit' still applies, and the ack still closes it.
-    assert_ok!(bob.pq_rekey_apply(real));
-    discharge_bind(&bob, &alice, b"after-refusal");
-    assert!(alice.my_pq_turn());
+    assert_ok!(alice.pq_rekey_apply(real));
+    discharge_bind(&alice, &bob, b"after-refusal");
+    assert!(bob.my_pq_turn());
 }
 
+/// The session self-drives A.5, so there is no host `begin` to guard — but a peer can still
+/// replay a Commit' with no rekey in flight, and that unsolicited frame must be rejected.
 #[test]
-fn test_pq_rekey_requires_full_establishment() {
-    // Pre-A.4 the acceptor's send-PQ (and the initiator's recv mirror) is missing.
-    let (alice, _bob) = establish_sessions();
-    assert!(alice.my_pq_turn());
-    assert_err!(alice.pq_rekey_begin(None), TwoMlsPqError::SessionNotReady);
-}
-
-#[test]
-fn test_pq_rekey_requires_turn_and_rejects_unsolicited() {
-    let (alice, bob) = establish_full();
-    // Alice's bootstrap completion passed the turn to Bob.
-    assert_err!(alice.pq_rekey_begin(None), TwoMlsPqError::SessionNotReady);
-    // An unsolicited Commit' (no rekey in flight) is rejected.
+fn test_unsolicited_rekey_commit_is_rejected() {
+    let (_alice, bob) = establish_full();
     let bogus = super::encode_pq_rekey_commit(vec![0u8; 8]);
     assert_err!(bob.pq_rekey_apply(bogus), TwoMlsPqError::SessionNotReady);
-    // A second begin while one is in flight is rejected (single slot).
-    let _upd = assert_ok!(bob.pq_rekey_begin(None));
-    assert_err!(bob.pq_rekey_begin(None), TwoMlsPqError::SessionNotReady);
 }
 
 /// The session's own leaf signature public keys in (send-PQ, recv-PQ) — the two
@@ -1423,18 +1497,24 @@ fn own_pq_leaf_signature_keys(session: &Arc<TwoMlsPqSession>) -> (Vec<u8>, Vec<u
     (send, recv)
 }
 
+/// A rotation catch-up A.5 hands the PQ credential to the new principal: the leg-1 Upd' replaces
+/// the proposer, so the initiator's leaf in its recv-PQ mirror (the peer's send-PQ) moves to the
+/// rotated identity, and the responder learns the announced id. (The initiator's OWN send-PQ leaf
+/// follows only on a later round it RESPONDS to — reached once the peer rotates too; the
+/// recv-mirror handoff is the credential step that keeps the peer's view canonical.)
 #[test]
-fn test_pq_rekey_rotation_hands_pq_leaves_to_new_principal() {
+fn test_pq_rekey_rotation_hands_pq_leaf_to_new_principal() {
     let (alice, bob) = establish_full();
+    // Bob is the party we rotate; make him the non-turn-holder rekey initiator (flip the turn).
+    ratchet_round(&bob, &alice, b"flip");
 
-    // Phase 8 first: the classical rotation swaps the session client to the new
-    // principal (whose signing keys `stage_rotation` minted internally) and announces the
-    // ClientId to the peer.
+    // Bob rotates and runs his catch-up A.5. `rekey_round` swaps Bob's client to the successor
+    // and drives Upd' -> Commit' -> ack. The leg-1 Upd' announces the new id and moves Bob's
+    // recv-mirror leaf to it; his own-send leaf still lags until a round he RESPONDS to.
     let new_bob_id = make_client().client_id();
-    rotate_round(&bob, &alice, new_bob_id.clone());
+    rekey_round(&bob, &alice, new_bob_id.clone());
 
-    // The successor's PQ signing key is now the session's current client — that is
-    // what the A.5 handoff must install into both leaves.
+    // The successor's PQ signing key is now the session's current client.
     let new_key = {
         let inner = bob.lock();
         inner
@@ -1445,41 +1525,18 @@ fn test_pq_rekey_rotation_hands_pq_leaves_to_new_principal() {
             .as_bytes()
             .to_vec()
     };
-    // The PQ leaves still sign as the old principal until the A.5 handoff.
-    let before = own_pq_leaf_signature_keys(&bob);
-    assert_ne!(before.0, new_key);
-    assert_ne!(before.1, new_key);
-
-    // Round 1 — Bob initiates with the handoff. The leg-1 Upd' replaces the PROPOSER's
-    // leaf, so Bob's leaf in Alice's send-PQ (his recv mirror) moves; the responder
-    // learns the announced id. His own send-PQ leaf is untouched — the leg-3 ack is
-    // pathless and cannot carry a leaf.
-    let upd = assert_ok!(bob.pq_rekey_begin(Some(new_bob_id.clone())));
+    let leaves = own_pq_leaf_signature_keys(&bob);
     assert_eq!(
-        assert_some!(assert_ok!(alice.pq_rekey_respond(upd))),
-        new_bob_id
+        leaves.1, new_key,
+        "the recv-mirror leaf moved to the rotated principal via the Upd'"
     );
-    let reply = assert_some!(alice.pq_take_pending_outbound());
-    assert_ok!(bob.pq_rekey_apply(reply));
-    discharge_bind(&bob, &alice, b"handoff-ack");
-    let mid = own_pq_leaf_signature_keys(&bob);
     assert_ne!(
-        mid.0, new_key,
-        "the own-send-PQ leaf waits for the round Bob RESPONDS to"
+        leaves.0, new_key,
+        "the own-send-PQ leaf still lags — it moves only on a round Bob RESPONDS to"
     );
-    assert_eq!(mid.1, new_key, "the recv-mirror leaf moved via the Upd'");
 
-    // Round 2 — Alice initiates (the turn alternated), and Bob's Commit' replaces the
-    // COMMITTER's leaf: its updatePath catches his own send-PQ leaf up to the session's
-    // canonical principal automatically — no handoff argument, the leaf simply lags the
-    // rotated client.
-    rekey_round(&alice, &bob);
-    let after = own_pq_leaf_signature_keys(&bob);
-    assert_eq!(after.0, new_key);
-    assert_eq!(after.1, new_key);
-
-    // The rekeyed, rotated groups keep working: messaging flows and the next
-    // rekey round (Bob's turn again) proceeds — the new signer owns the leaves.
+    // The rekeyed, rotated groups keep working: Bob (now signing as the successor's canonical
+    // credential in his recv mirror) sends and Alice reads it.
     assert_ok!(bob.prepare_to_encrypt(None));
     let msg = assert_ok!(bob.encrypt(b"post-handoff".to_vec()));
     let got = assert_ok!(alice.process_incoming(msg.cipher_text));
@@ -1487,7 +1544,6 @@ fn test_pq_rekey_rotation_hands_pq_leaves_to_new_principal() {
         assert_some!(assert_some!(got).application_message).app_message_data,
         b"post-handoff".to_vec()
     );
-    rekey_round(&bob, &alice);
 }
 
 /// Phase 8 swaps the session client, but the existing groups keep resolving
@@ -1496,23 +1552,19 @@ fn test_pq_rekey_rotation_hands_pq_leaves_to_new_principal() {
 /// psk_stores registry (a plain rekey, an A.3 ratchet, and a full classical
 /// commit round, all post-rotation, no credential handoff involved).
 #[test]
-fn test_psk_flows_survive_rotation_without_handoff() {
+fn test_psk_flows_survive_rotation() {
     let (alice, bob) = establish_full();
 
-    let new_bob = make_client();
-    assert_ok!(bob.stage_rotation(new_bob.client_id().bytes));
-    assert_ok!(bob.prepare_to_encrypt(Some(new_bob.client_id())));
-    let enc = assert_ok!(bob.encrypt(b"rotate".to_vec()));
-    assert_some!(assert_ok!(alice.process_incoming(enc.cipher_text)));
+    // A.5 rekey driven by rotating the non-turn-holder (Alice): after the client swap the group
+    // halves must still resolve their cross-party PSKs from the creation-time stores.
+    let new_alice = make_client().client_id();
+    rekey_round(&alice, &bob, new_alice);
 
-    // A.5 plain rekey, initiated by the rotated side (Bob holds the turn).
-    rekey_round(&bob, &alice);
+    // A.3 ratchet with the rotated side (Alice) responding — Bob holds the turn now.
+    ratchet_round(&bob, &alice, b"post-rotation-ratchet");
 
-    // A.3 ratchet with the rotated side responding (Alice's turn now).
-    ratchet_round(&alice, &bob, b"post-rotation-ratchet");
-
-    // Full classical commit round from the rotated side: Alice staples an Upd
-    // that Bob approves and commits with a cross-party PSK refresh.
+    // Full classical commit round: Alice staples an Upd that Bob approves and commits with a
+    // cross-party PSK refresh.
     assert_ok!(alice.prepare_to_encrypt(None));
     let a2b = assert_ok!(alice.encrypt(b"staple".to_vec()));
     let got = assert_some!(assert_ok!(bob.process_incoming(a2b.cipher_text)));
@@ -1527,19 +1579,6 @@ fn test_psk_flows_survive_rotation_without_handoff() {
         .app_message_data,
         b"folding-commit"
     );
-}
-
-#[test]
-fn test_pq_rekey_begin_rotating_requires_current_agent() {
-    let (_alice, bob) = establish_full();
-    // Bob holds the turn, but no Phase 8 rotation has run: a handoff to an
-    // arbitrary principal is refused, and the slot stays free for a plain rekey.
-    let stranger = make_client();
-    assert_err!(
-        bob.pq_rekey_begin(Some(stranger.client_id())),
-        TwoMlsPqError::SessionNotReady
-    );
-    assert_ok!(bob.pq_rekey_begin(None));
 }
 
 #[test]
@@ -1607,15 +1646,16 @@ fn test_a4_bootstrap_mints_no_listen_addresses_but_advertises_pq_id() {
 /// makes it 2/2.
 #[test]
 fn test_bind_moves_pq_and_owes_classical() {
-    let (alice, bob) = establish_sessions();
-    let before = alice.epochs();
+    let (alice, bob) = establish_full();
+    let before = bob.epochs();
 
-    let ek = assert_ok!(alice.pq_ratchet_begin());
-    assert_ok!(bob.pq_ratchet_respond(ek));
-    let ct = assert_some!(bob.pq_take_pending_outbound());
-    assert_ok!(alice.pq_ratchet_bind(ct));
+    // Bob holds the turn: he opens the A.3 with a send, Alice responds, Bob binds.
+    let ek = open_ratchet(&bob, &alice);
+    assert_ok!(alice.pq_ratchet_respond(ek));
+    let ct = assert_some!(alice.pq_take_pending_outbound());
+    assert_ok!(bob.pq_ratchet_bind(ct));
 
-    let after = alice.epochs();
+    let after = bob.epochs();
     assert_eq!(
         after.pq_epoch,
         before.pq_epoch + 1,
@@ -1635,8 +1675,8 @@ fn test_bind_moves_pq_and_owes_classical() {
 #[test]
 fn test_ordinary_discharge_is_not_flagged_fatal() {
     let (alice, bob) = establish_full();
-    // A clean A.3 round through its discharge — no error, no fatal wrapper.
-    ratchet_round(&alice, &bob, b"clean");
+    // Bob holds the turn: a clean A.3 round through its discharge — no error, no fatal wrapper.
+    ratchet_round(&bob, &alice, b"clean");
     // A plain fold with nothing owed still commits normally.
     approved_commit_round(&bob, &alice);
     message_round(&alice, &bob, b"after");
@@ -1653,8 +1693,8 @@ fn test_ordinary_discharge_is_not_flagged_fatal() {
 fn test_failed_bind_apply_breaks_receive_not_send_and_heals_on_restore() {
     let (alice, bob) = establish_full();
 
-    // Bob holds the turn after A.4, so he initiates; Alice responds and holds S.
-    let ek = assert_ok!(bob.pq_ratchet_begin());
+    // Bob holds the turn after A.4, so he opens the round with a send; Alice responds and holds S.
+    let ek = open_ratchet(&bob, &alice);
     assert_ok!(alice.pq_ratchet_respond(ek));
     let ct = assert_some!(alice.pq_take_pending_outbound());
     assert_ok!(bob.pq_ratchet_bind(ct));
@@ -1736,31 +1776,32 @@ fn test_failed_bind_apply_breaks_receive_not_send_and_heals_on_restore() {
 /// refuse loudly on OUR side, before anything reaches the wire.
 #[test]
 fn test_discharge_refuses_a_violated_reservation() {
-    let (alice, bob) = establish_sessions();
-    let ek = assert_ok!(alice.pq_ratchet_begin());
-    assert_ok!(bob.pq_ratchet_respond(ek));
-    let ct = assert_some!(bob.pq_take_pending_outbound());
-    assert_ok!(alice.pq_ratchet_bind(ct));
+    let (alice, bob) = establish_full();
+    // Bob holds the turn: he opens the A.3 with a send, Alice responds, Bob binds.
+    let ek = open_ratchet(&bob, &alice);
+    assert_ok!(alice.pq_ratchet_respond(ek));
+    let ct = assert_some!(alice.pq_take_pending_outbound());
+    assert_ok!(bob.pq_ratchet_bind(ct));
 
     // Tamper with the reservation as a stand-in for the (structurally unreachable)
     // epoch theft the check guards against.
     {
-        let mut inner = alice.lock();
+        let mut inner = bob.lock();
         let owed = inner.owed_bind.as_mut().expect("bind is owed");
         owed.t_epoch += 1;
     }
 
-    // The committing round that would discharge it refuses — on Alice's side, with nothing
+    // The committing round that would discharge it refuses — on Bob's side, with nothing
     // sent. And because a bind was being discharged when the reservation check failed, the
     // error is the FATAL `BindDischargeFailed`, not the retriable one it would wear
     // otherwise: the reservation was already consumed and the leaf spent, so a host must
     // route to re-establishment rather than retry.
-    assert_ok!(bob.prepare_to_encrypt(None));
-    let upd = assert_ok!(bob.encrypt(b"upd".to_vec()));
-    let got = assert_some!(assert_ok!(alice.process_incoming(upd.cipher_text)));
-    assert_ok!(alice.queue_proposal(assert_some!(got.proposal).digest));
+    assert_ok!(alice.prepare_to_encrypt(None));
+    let upd = assert_ok!(alice.encrypt(b"upd".to_vec()));
+    let got = assert_some!(assert_ok!(bob.process_incoming(upd.cipher_text)));
+    assert_ok!(bob.queue_proposal(assert_some!(got.proposal).digest));
     assert_err!(
-        alice.prepare_to_encrypt(None),
+        bob.prepare_to_encrypt(None),
         TwoMlsPqError::BindDischargeFailed
     );
 }
@@ -1771,65 +1812,69 @@ fn test_discharge_refuses_a_violated_reservation() {
 /// peer accepts the stapled bind.
 #[test]
 fn test_archive_mid_hold_discharges_after_restore() {
-    let (alice, bob) = establish_sessions();
-    let ek = assert_ok!(alice.pq_ratchet_begin());
-    assert_ok!(bob.pq_ratchet_respond(ek));
-    let ct = assert_some!(bob.pq_take_pending_outbound());
-    assert_ok!(alice.pq_ratchet_bind(ct));
+    let (alice, bob) = establish_full();
+    // Bob holds the turn: he opens the A.3 with a send, Alice responds, Bob binds.
+    let ek = open_ratchet(&bob, &alice);
+    assert_ok!(alice.pq_ratchet_respond(ek));
+    let ct = assert_some!(alice.pq_take_pending_outbound());
+    assert_ok!(bob.pq_ratchet_bind(ct));
 
-    // Round-trip Alice while the bind is owed.
-    let restored = round_trip(&alice);
+    // Round-trip Bob while the bind is owed.
+    let restored = round_trip(&bob);
 
-    // The restored session discharges on its next committing round and Bob accepts.
-    discharge_bind(&restored, &bob, b"post-restore-bind");
-    assert!(bob.my_pq_turn());
-    message_round(&restored, &bob, b"after");
+    // The restored session discharges on its next committing round and Alice accepts.
+    discharge_bind(&restored, &alice, b"post-restore-bind");
+    assert!(alice.my_pq_turn());
+    message_round(&restored, &alice, b"after");
 }
 
 #[test]
 fn test_pq_ratchet_round_trip_delivers_app_message() {
-    let (alice, bob) = establish_sessions();
-    // Alice initiates a PQ ratchet on her send group; Bob responds; the bind rides
-    // Alice's next committing round, whose frame carries the app to Bob.
-    ratchet_round(&alice, &bob, b"hello-pq");
+    let (alice, bob) = establish_full();
+    // Bob holds the turn after bootstrap, so Bob opens a PQ ratchet on his send group; Alice
+    // responds; the bind rides Bob's next committing round, whose frame carries the app to Alice.
+    ratchet_round(&bob, &alice, b"hello-pq");
 }
 
-/// A stale ciphertext re-sent from a completed round, crossing into the NEXT round while the
-/// initiator holds a fresh ephemeral, must be rejected with that ephemeral and its PQ leaf
-/// intact — not silently decapsulated into a garbage secret that poisons the round.
+/// A stale ciphertext re-sent from a completed round, arriving while the initiator holds a fresh
+/// ephemeral from a LATER round, must be rejected with that ephemeral and its PQ leaf intact —
+/// not silently decapsulated into a garbage secret that poisons the round.
 ///
-/// This is the bundling window: the initiator binds round N, opens round N+1, then discharges
-/// round N (clearing `owed_bind`) — and a lagging peer's re-sent round-N CT can now reach the
-/// bind guard. ML-KEM's implicit rejection would hand back garbage for it; the sealed-secret
-/// open (keyed by the round's ephemeral AND its group epoch) fails EXPLICITLY instead.
+/// (Send-driven advancement removed the old within-turn bundling — a round no longer opens while
+/// its predecessor's bind is owed — so the fresh ephemeral is held by a later round the turn came
+/// back around to, not one parked beside an owed bind. The hazard is the same: a lagging peer's
+/// re-sent round-N CT reaches the bind guard. ML-KEM's implicit rejection would hand back garbage
+/// for it; the sealed-secret open, keyed by the round's ephemeral AND its group epoch, fails
+/// EXPLICITLY instead.)
 #[test]
 fn test_stale_ciphertext_crossing_rounds_is_rejected() {
     let (alice, bob) = establish_full();
 
-    // Round N: Bob (the turn holder) initiates, Alice responds, Bob binds. Keep the round-N
+    // Round N: Bob (the turn holder) initiates, Alice responds, Bob binds. Keep round N's
     // ciphertext as PLAINTEXT so the re-send below does not depend on header-seal windows.
-    let ek1 = assert_ok!(bob.pq_ratchet_begin());
+    let ek1 = open_ratchet(&bob, &alice);
     assert_ok!(alice.pq_ratchet_respond(ek1));
     let ct1_sealed = assert_some!(alice.pq_pending_outbound(SideBandSealing::Fresh));
     let ct1 = assert_some!(assert_ok!(bob.open_incoming(ct1_sealed))).frame;
     assert_ok!(bob.pq_ratchet_bind(ct1.clone()));
+    discharge_bind(&bob, &alice, b"round-n"); // turn -> alice; Bob's round-N ephemeral is spent
 
-    // Bob opens round N+1 while still owing round N's bind (the bundling), then discharges
-    // round N — so `owed_bind` clears and Bob is left holding the round-N+1 ephemeral.
-    let ek2 = assert_ok!(bob.pq_ratchet_begin());
-    discharge_bind(&bob, &alice, b"round-n");
+    // Round N+1 (Alice's) flips the turn back to Bob, and round N+2 has Bob open a fresh round —
+    // so Bob now holds the round-N+2 ephemeral, waiting for Alice's CT.
+    ratchet_round(&alice, &bob, b"round-n+1");
+    let ek3 = open_ratchet(&bob, &alice);
 
-    // The transport re-delivers round N's ciphertext. It answers a spent ephemeral and a
-    // prior epoch, so the open fails explicitly — the round-N+1 ephemeral is untouched.
+    // The transport re-delivers round N's ciphertext. It answers a spent ephemeral and a prior
+    // epoch, so the open fails explicitly — the round-N+2 ephemeral is untouched.
     assert_err!(bob.pq_ratchet_bind(ct1), TwoMlsPqError::Mls);
 
-    // Proof the ephemeral survived: the CORRECT round-N+1 ciphertext still binds, and the
-    // round completes cleanly.
-    assert_ok!(alice.pq_ratchet_respond(ek2));
-    let ct2 = assert_some!(alice.pq_pending_outbound(SideBandSealing::Fresh));
-    let ct2 = assert_some!(assert_ok!(bob.open_incoming(ct2))).frame;
-    assert_ok!(bob.pq_ratchet_bind(ct2));
-    discharge_bind(&bob, &alice, b"round-n+1");
+    // Proof the ephemeral survived: the CORRECT round-N+2 ciphertext still binds, and the round
+    // completes cleanly.
+    assert_ok!(alice.pq_ratchet_respond(ek3));
+    let ct3 = assert_some!(alice.pq_pending_outbound(SideBandSealing::Fresh));
+    let ct3 = assert_some!(assert_ok!(bob.open_incoming(ct3))).frame;
+    assert_ok!(bob.pq_ratchet_bind(ct3));
+    discharge_bind(&bob, &alice, b"round-n+2");
     assert!(alice.my_pq_turn());
 }
 
@@ -1839,25 +1884,19 @@ fn test_stale_ciphertext_crossing_rounds_is_rejected() {
 /// Bob's apply both fail to find their PSKs after the client swap.
 #[test]
 fn test_pq_ratchet_completes_after_principal_rotation() {
-    let (alice, bob) = establish_confirmed_sessions();
+    let (alice, bob) = establish_full();
 
-    // Rotate both agents, delivering each rotation commit so the peer's recv group
-    // tracks the new epoch.
-    let new_alice = make_client();
-    assert_ok!(alice.stage_rotation(new_alice.client_id().bytes));
-    assert_ok!(alice.prepare_to_encrypt(Some(new_alice.client_id())));
-    let enc = assert_ok!(alice.encrypt(b"alice-rotated".to_vec()));
-    assert_some!(assert_ok!(bob.process_incoming(enc.cipher_text)));
+    // Rotate both principals (Phase 8 classical), so each session's `self.client` is swapped
+    // to the winner while the PQ leaves still lag — the exact state whose PSK stores this pins.
+    let new_alice = make_client().client_id();
+    rotate_round(&alice, &bob, new_alice);
+    let new_bob = make_client().client_id();
+    rotate_round(&bob, &alice, new_bob);
 
-    let new_bob = make_client();
-    assert_ok!(bob.stage_rotation(new_bob.client_id().bytes));
-    assert_ok!(bob.prepare_to_encrypt(Some(new_bob.client_id())));
-    let enc = assert_ok!(bob.encrypt(b"bob-rotated".to_vec()));
-    assert_some!(assert_ok!(alice.process_incoming(enc.cipher_text)));
-
-    // A full A.3 round after both rotations: Alice injects on her send group's PQ half
-    // and binds into its classical half; Bob applies on his recv halves.
-    ratchet_round(&alice, &bob, b"pq-after-rotation");
+    // A full A.3 round after both rotations: the injected-secret and apq PSKs must land in the
+    // stores the group halves actually resolve from (captured at group creation), not the
+    // rotated-in client's. Bob holds the turn, so he drives it.
+    ratchet_round(&bob, &alice, b"pq-after-rotation");
 }
 
 /// Complete the A.4 bootstrap after establishment so both directions are full
@@ -1906,38 +1945,38 @@ fn test_bootstrap_kp_from_unknown_principal_rejected() {
 #[test]
 fn test_pq_ratchet_turn_flips_to_responder() {
     let (alice, bob) = establish_full();
-    // Round 1: Alice initiates; the turn passes at her discharge and Bob takes it
-    // applying the staple.
-    ratchet_round(&alice, &bob, b"a1");
-    assert!(bob.my_pq_turn());
-    assert!(!alice.my_pq_turn());
-    // Round 2: turn flipped — Bob initiates on his send group, Alice applies.
+    // Round 1: Bob holds the turn after bootstrap, so Bob initiates; the turn passes at his
+    // discharge and Alice takes it applying the staple.
     ratchet_round(&bob, &alice, b"b1");
     assert!(alice.my_pq_turn());
     assert!(!bob.my_pq_turn());
+    // Round 2: turn flipped — Alice initiates on her send group, Bob applies.
+    ratchet_round(&alice, &bob, b"a1");
+    assert!(bob.my_pq_turn());
+    assert!(!alice.my_pq_turn());
 }
 
 #[test]
 fn test_pq_ratchet_bind_guarded_while_commit_staged() {
     let (alice, bob) = establish_full();
-    let ek = assert_ok!(alice.pq_ratchet_begin());
-    assert_ok!(bob.pq_ratchet_respond(ek));
-    let ct = assert_some!(bob.pq_take_pending_outbound());
+    let ek = open_ratchet(&bob, &alice);
+    assert_ok!(alice.pq_ratchet_respond(ek));
+    let ct = assert_some!(alice.pq_take_pending_outbound());
 
     // A prepared-but-unsent round holds the staple slot: the bind's PQ commit must
     // not fire while a prepared commit has never ridden a frame (the peer would hit
     // EpochDesync with zero loss on the wire).
-    assert_ok!(alice.prepare_to_encrypt(None));
+    assert_ok!(bob.prepare_to_encrypt(None));
     assert_err!(
-        alice.pq_ratchet_bind(ct.clone()),
+        bob.pq_ratchet_bind(ct.clone()),
         TwoMlsPqError::SessionNotReady
     );
 
     // Retriable: once the round's encrypt has gone out, the bind proceeds.
-    let enc = assert_ok!(alice.encrypt(b"round".to_vec()));
-    assert_some!(assert_ok!(bob.process_incoming(enc.cipher_text)));
-    assert_ok!(alice.pq_ratchet_bind(ct));
-    discharge_bind(&alice, &bob, b"app");
+    let enc = assert_ok!(bob.encrypt(b"round".to_vec()));
+    assert_some!(assert_ok!(alice.process_incoming(enc.cipher_text)));
+    assert_ok!(bob.pq_ratchet_bind(ct));
+    discharge_bind(&bob, &alice, b"app");
 }
 
 /// A.4's bind calls the same `commit_pq_and_owe_bind` as A.3's, so it carries the identical
@@ -1983,29 +2022,45 @@ fn test_pq_bootstrap_bind_guarded_while_commit_staged() {
 #[test]
 fn test_no_message_frame_can_overtake_the_bind() {
     let (alice, bob) = establish_full();
-    // Alice's A.3 round up to the trigger: PQ committed, classical owed.
-    let ek = assert_ok!(alice.pq_ratchet_begin());
-    assert_ok!(bob.pq_ratchet_respond(ek));
-    let ct = assert_some!(bob.pq_take_pending_outbound());
-    assert_ok!(alice.pq_ratchet_bind(ct));
 
-    // A frame sent mid-hold is a NON-committing round (nothing is queued), so its
-    // staple is the previous commit — Bob applies it as an idempotent skip, where the
-    // old design handed him a staple he could not use yet.
-    let prepared = assert_ok!(alice.prepare_to_encrypt(None));
+    // Put Bob in the unlicensed hold window. He folds an Alice offer and commits — Alice
+    // applies that commit, but her return frame proving it is never delivered, so Bob's
+    // evidence watermark stays behind his own send epoch. This is the only state in which a
+    // mid-hold frame could try to overtake the bind: with the turn-holder freshly licensed,
+    // an owed bind simply discharges on the next round. The committing send also auto-stages
+    // Bob's A.3 EK.
+    assert_ok!(alice.prepare_to_encrypt(None));
+    let offer = assert_ok!(alice.encrypt(b"offer".to_vec()));
+    let got = assert_some!(assert_ok!(bob.process_incoming(offer.cipher_text)));
+    assert_ok!(bob.queue_proposal(assert_some!(got.proposal).digest));
+    assert!(assert_ok!(bob.prepare_to_encrypt(None)).did_commit);
+    let committed = assert_ok!(bob.encrypt(b"committed".to_vec()));
+    assert_some!(assert_ok!(alice.process_incoming(committed.cipher_text))); // Alice applies it
+
+    // Bob's A.3 round up to the trigger: PQ committed, classical owed.
+    let ek = assert_some!(bob.pq_pending_outbound(SideBandSealing::Fresh));
+    assert_ok!(alice.pq_ratchet_respond(ek));
+    let ct = assert_some!(alice.pq_take_pending_outbound());
+    assert_ok!(bob.pq_ratchet_bind(ct));
+
+    // A frame sent mid-hold is a NON-committing round (unlicensed: Alice has not proven she
+    // applied Bob's last commit), so its staple re-sends the previous, already-applied commit
+    // — Alice skips it idempotently — where the old design handed her a staple she could not
+    // use yet.
+    let prepared = assert_ok!(bob.prepare_to_encrypt(None));
     assert!(
         !prepared.did_commit,
-        "nothing queued: this round must not commit"
+        "unlicensed mid-hold: this round must not commit"
     );
-    let mid_hold = assert_ok!(alice.encrypt(b"mid-hold".to_vec()));
-    let res = assert_some!(assert_ok!(bob.process_incoming(mid_hold.cipher_text)));
+    let mid_hold = assert_ok!(bob.encrypt(b"mid-hold".to_vec()));
+    let res = assert_some!(assert_ok!(alice.process_incoming(mid_hold.cipher_text)));
     assert_eq!(
         assert_some!(res.application_message).app_message_data,
         b"mid-hold"
     );
 
     // The bind then rides the next committing round as its staple, PQ half attached.
-    discharge_bind(&alice, &bob, b"bound");
+    discharge_bind(&bob, &alice, b"bound");
 }
 
 #[test]
@@ -2018,8 +2073,8 @@ fn test_pq_ratchet_bind_without_begin_is_rejected() {
 
 #[test]
 fn test_classical_round_still_works_after_pq_ratchet() {
-    let (alice, bob) = establish_sessions();
-    ratchet_round(&alice, &bob, b"pq");
+    let (alice, bob) = establish_full();
+    ratchet_round(&bob, &alice, b"pq");
 
     // The classical ratchet must continue normally after a PQ bind.
     assert_ok!(alice.prepare_to_encrypt(None));
@@ -2034,7 +2089,8 @@ fn test_classical_round_still_works_after_pq_ratchet() {
 #[test]
 fn test_three_sequential_pq_ratchets_alternate_and_deliver() {
     let (alice, bob) = establish_full();
-    for (i, (initiator, responder)) in [(&alice, &bob), (&bob, &alice), (&alice, &bob)]
+    // Bob holds the turn after bootstrap, so the ping-pong starts with him.
+    for (i, (initiator, responder)) in [(&bob, &alice), (&alice, &bob), (&bob, &alice)]
         .iter()
         .enumerate()
     {
@@ -2063,10 +2119,10 @@ fn test_pq_frame_routed_to_process_incoming_is_rejected() {
 
 #[test]
 fn test_pq_side_band_frame_from_stranger_is_rejected() {
-    let (alice, bob) = establish_sessions();
-    let ek = assert_ok!(alice.pq_ratchet_begin());
-    assert_ok!(bob.pq_ratchet_respond(ek));
-    let ct = assert_some!(bob.pq_take_pending_outbound());
+    let (alice, bob) = establish_full();
+    let ek = open_ratchet(&bob, &alice);
+    assert_ok!(alice.pq_ratchet_respond(ek));
+    let ct = assert_some!(alice.pq_take_pending_outbound());
     // A different session cannot open the sealed CT (its header window holds none
     // of this session's keys), so it is rejected at the seal — `Mls` on the
     // passed-through, unparseable blob — before any KEM state is consulted.
@@ -2075,27 +2131,20 @@ fn test_pq_side_band_frame_from_stranger_is_rejected() {
 }
 
 #[test]
-fn test_pq_ratchet_double_begin_is_rejected() {
-    let (alice, _bob) = establish_sessions();
-    assert_ok!(alice.pq_ratchet_begin());
-    assert_err!(alice.pq_ratchet_begin(), TwoMlsPqError::SessionNotReady);
-}
-
-#[test]
 fn test_pq_ratchet_tampered_frame_fails_to_bind() {
-    let (alice, bob) = establish_sessions();
-    let ek = assert_ok!(alice.pq_ratchet_begin());
-    assert_ok!(bob.pq_ratchet_respond(ek));
-    let mut ct = assert_some!(bob.pq_take_pending_outbound());
+    let (alice, bob) = establish_full();
+    let ek = open_ratchet(&bob, &alice);
+    assert_ok!(alice.pq_ratchet_respond(ek));
+    let mut ct = assert_some!(alice.pq_take_pending_outbound());
     // Flip a byte of the sealed ciphertext frame: the header AEAD tag no longer
-    // verifies, so Alice cannot open it and the bind is rejected at the seal (the
+    // verifies, so Bob cannot open it and the bind is rejected at the seal (the
     // passed-through blob's nonce byte is not `PQ_CT_TAG`). Header encryption makes
     // any wire-level tamper a seal failure before the ML-KEM layer is reached.
     // (ML-KEM implicit rejection itself is exercised at the `apq` layer, below the
     // seal.)
     let last = ct.len() - 1;
     ct[last] ^= 0xFF;
-    assert_err!(alice.pq_ratchet_bind(ct), TwoMlsPqError::Mls);
+    assert_err!(bob.pq_ratchet_bind(ct), TwoMlsPqError::Mls);
 }
 
 #[test]
@@ -2365,8 +2414,8 @@ fn test_push_persistence_smoke() {
         sink.kinds()
     );
 
-    // A PQ side-band round (A.5 rekey) pushes Checkpoint(s).
-    rekey_round(&bob, &alice);
+    // A PQ side-band round (A.3 ratchet) pushes Checkpoint(s).
+    ratchet_round(&bob, &alice, b"pq-round");
     assert!(
         sink.kinds()
             .iter()
@@ -2406,7 +2455,7 @@ fn test_install_sink_rejects_second_call() {
 /// DoS amplifier the choke point must avoid. This pins the checks OUTSIDE `mutate_and_persist`.
 #[test]
 fn test_guard_first_rejection_neither_pushes_nor_bumps() {
-    let (alice, _bob) = establish_full();
+    let (alice, bob) = establish_full();
     let sink = Arc::new(RecordingSink::default());
     assert_ok!(alice.install_sink(sink.clone()));
 
@@ -2427,24 +2476,28 @@ fn test_guard_first_rejection_neither_pushes_nor_bumps() {
         "an idempotent stage_rotation must not push a blob"
     );
 
-    // (2) Checkpoint path — a state-guard rejection of a PQ op. The first `pq_ratchet_begin` is a
-    // real mutation (pushes a Checkpoint); the second sees the in-flight ephemeral and rejects.
-    // That rejection is the peer-replayable amplifier class, and it must NOT push a full ML-KEM
-    // Checkpoint for a no-op. (`begin` has no turn guard, so this holds regardless of whose turn
-    // it is.)
-    assert_ok!(alice.pq_ratchet_begin());
+    // (2) Checkpoint path — a peer-replayable side-band frame that fails its guard. Bob opens an
+    // A.3 with a send; Alice's respond is a real mutation (pushes a Checkpoint). A REPLAY of the
+    // same EK — the peer re-sending it until Alice's CT lands — is the amplifier class: it is
+    // rejected as a duplicate ABOVE the persist choke point, so it must neither bump `state_seq`
+    // nor push a second full ML-KEM Checkpoint for a no-op.
+    let ek = open_ratchet(&bob, &alice);
+    assert_ok!(alice.pq_ratchet_respond(ek.clone()));
     let seq = alice.state_seq();
     let pushes = sink.kinds().len();
-    assert_err!(alice.pq_ratchet_begin(), TwoMlsPqError::SessionNotReady);
+    assert_err!(
+        alice.pq_ratchet_respond(ek),
+        TwoMlsPqError::DuplicateSideBand
+    );
     assert_eq!(
         alice.state_seq(),
         seq,
-        "a rejected pq_ratchet_begin must not advance state_seq"
+        "a rejected duplicate respond must not advance state_seq"
     );
     assert_eq!(
         sink.kinds().len(),
         pushes,
-        "a rejected pq_ratchet_begin must not push a Checkpoint"
+        "a rejected duplicate respond must not push a Checkpoint"
     );
 }
 
@@ -2460,9 +2513,9 @@ fn test_restore_fails_closed_on_stale_checkpoint() {
     let stale_checkpoint = sink.latest(crate::BlobKind::Checkpoint);
     assert!(stale_checkpoint.is_some());
 
-    // A PQ rekey advances alice's PQ halves (and pushes a fresh checkpoint we deliberately
+    // A PQ round advances alice's PQ halves (and pushes a fresh checkpoint we deliberately
     // ignore); a classical message then pushes a Core whose manifest names the NEW PQ epochs.
-    rekey_round(&bob, &alice);
+    ratchet_round(&bob, &alice, b"pq-round");
     message_round(&alice, &bob, b"post-rekey");
     let core = sink.latest(crate::BlobKind::Core);
     assert!(core.is_some());
@@ -2473,6 +2526,42 @@ fn test_restore_fails_closed_on_stale_checkpoint() {
         TwoMlsPqSession::restore(core, stale_checkpoint),
         TwoMlsPqError::ArchiveInvalid
     );
+}
+
+/// A session-driven A.5 rekey is staged inside `encrypt` (a Core push), but `stage_rekey`
+/// mutates the recv-PQ group (a pending update + its new leaf secret) — state only a Checkpoint
+/// captures. Restoring from the A.5-staging Core spliced onto an OLDER checkpoint must still be
+/// able to complete the round (the pending update + leaf secret survive the crash window).
+#[test]
+fn test_staged_a5_survives_core_only_push_restore() {
+    let (alice, bob) = establish_full();
+    let sink = Arc::new(RecordingSink::default());
+    assert_ok!(alice.install_sink(sink.clone()));
+
+    // Rotate Alice (the non-turn-holder) and drain Bob's incidental A.3 — the turn passes to
+    // Alice and her send-PQ leaf now lags. The discharge's apply pushes the last checkpoint.
+    let new_alice = make_client().client_id();
+    rotate_round(&alice, &bob, new_alice.clone());
+    let ek = assert_some!(bob.pq_pending_outbound(SideBandSealing::Fresh));
+    assert_ok!(alice.pq_ratchet_respond(ek));
+    let ct = assert_some!(alice.pq_take_pending_outbound());
+    assert_ok!(bob.pq_ratchet_bind(ct));
+    discharge_bind(&bob, &alice, b"deferral");
+
+    // Alice's next send auto-stages the A.5 Upd' — the Core push under test.
+    let upd = open_rekey(&alice, &bob);
+
+    // Restore Alice from the latest pushed blobs: the Core is the A.5-staging send; the
+    // checkpoint predates the staged proposal. The round must still complete.
+    let core = sink.latest(crate::BlobKind::Core);
+    let checkpoint = sink.latest(crate::BlobKind::Checkpoint);
+    let restored = assert_ok!(TwoMlsPqSession::restore(core, checkpoint));
+
+    assert_eq!(assert_ok!(bob.pq_rekey_respond(upd)), Some(new_alice));
+    let reply = assert_some!(bob.pq_take_pending_outbound());
+    assert_ok!(restored.pq_rekey_apply(reply));
+    discharge_bind(&restored, &bob, b"rekey-ack");
+    assert!(bob.my_pq_turn());
 }
 
 /// `depends_on_seq`: a routine app message re-staples an already-committed staple, so its
@@ -2732,7 +2821,7 @@ fn test_archive_preserves_parked_pq_frame() {
 
     // Bob initiates a ratchet round; Alice responds and parks the CT frame, then
     // archives with it parked.
-    let ek = assert_ok!(bob_session.pq_ratchet_begin());
+    let ek = open_ratchet(&bob_session, &alice_session);
     assert_ok!(alice_session.pq_ratchet_respond(ek));
     let restored_alice = round_trip(&alice_session);
 
@@ -2753,11 +2842,25 @@ fn test_archive_mid_rekey_round_completes_after_restore() {
     assert_ok!(alice_session.pq_bootstrap_bind(welcome));
     discharge_bind(&alice_session, &bob_session, b"bootstrap-bind");
 
-    // Bob holds the turn: he initiates the rekey, then archives mid-round.
-    let upd = assert_ok!(bob_session.pq_rekey_begin(None));
+    // Make Bob the rekey initiator (the non-turn-holder): flip the turn to Alice, rotate Bob so
+    // his leaf lags, and drain the deferral A.3 back to Bob.
+    ratchet_round(&bob_session, &alice_session, b"flip");
+    let new_bob = make_client().client_id();
+    rotate_round(&bob_session, &alice_session, new_bob.clone());
+    let drain_ek = assert_some!(alice_session.pq_pending_outbound(SideBandSealing::Fresh));
+    assert_ok!(bob_session.pq_ratchet_respond(drain_ek));
+    let drain_ct = assert_some!(bob_session.pq_take_pending_outbound());
+    assert_ok!(alice_session.pq_ratchet_bind(drain_ct));
+    discharge_bind(&alice_session, &bob_session, b"catch-up-deferral");
+
+    // Bob opens the A.5 Upd', then archives mid-round (RekeyInitiated).
+    let upd = open_rekey(&bob_session, &alice_session);
     let restored_bob = round_trip(&bob_session);
 
-    assert!(assert_ok!(alice_session.pq_rekey_respond(upd)).is_none());
+    assert_eq!(
+        assert_ok!(alice_session.pq_rekey_respond(upd)),
+        Some(new_bob)
+    );
     // Alice archives mid-round too (RekeyResponded, parked reply survives).
     let restored_alice = round_trip(&alice_session);
 
@@ -2827,9 +2930,9 @@ fn test_stage_rotation_same_id_is_idempotent() {
     assert_ok!(alice_session.encrypt(b"candidate-two".to_vec()));
 }
 
-/// Total archive #2: archive mid-A.3 as the INITIATOR (after `pq_ratchet_begin`,
-/// before the ciphertext arrives). The held ephemeral survives the jump, so the
-/// restored initiator binds the responder's ciphertext and the round completes.
+/// Total archive #2: archive mid-A.3 as the INITIATOR (after the send that opened the round,
+/// before the ciphertext arrives). The held ephemeral survives the jump, so the restored
+/// initiator binds the responder's ciphertext and the round completes.
 #[test]
 fn test_archive_mid_a3_as_initiator_completes_after_restore() {
     let (alice_session, bob_session) = establish_sessions();
@@ -2839,8 +2942,8 @@ fn test_archive_mid_a3_as_initiator_completes_after_restore() {
     assert_ok!(alice_session.pq_bootstrap_bind(welcome));
     discharge_bind(&alice_session, &bob_session, b"bootstrap-bind");
 
-    // Bob holds the turn after the bootstrap: he is the A.3 initiator.
-    let ek = assert_ok!(bob_session.pq_ratchet_begin());
+    // Bob holds the turn after the bootstrap: he is the A.3 initiator, opening it with a send.
+    let ek = open_ratchet(&bob_session, &alice_session);
     // Archive Bob mid-round (Initiating, holding the ephemeral) before the ct arrives.
     let restored_bob = round_trip(&bob_session);
 
@@ -2865,8 +2968,8 @@ fn test_archive_mid_a3_as_responder_completes_after_restore() {
     assert_ok!(alice_session.pq_bootstrap_bind(welcome));
     discharge_bind(&alice_session, &bob_session, b"bootstrap-bind");
 
-    // Bob initiates; Alice responds and holds S (having emitted the ciphertext).
-    let ek = assert_ok!(bob_session.pq_ratchet_begin());
+    // Bob initiates with a send; Alice responds and holds S (having emitted the ciphertext).
+    let ek = open_ratchet(&bob_session, &alice_session);
     assert_ok!(alice_session.pq_ratchet_respond(ek));
     let ct = assert_some!(alice_session.pq_take_pending_outbound());
     // Archive Alice mid-round (Responding, holding S).
@@ -3225,12 +3328,39 @@ fn test_principal_rotation_resolves_pending_state_after_peer_reply() {
     assert_eq!(alice_session.my_principal_state().client_id(), new_alice_id);
 }
 
+/// Proposing an id that was never staged SUCCEEDS: `prepare_to_encrypt(Some(id))` admits the
+/// candidate on the fly (lazy staging), so a rotation rides the frame with no separate
+/// `stage_rotation` call. The candidate is then in flight — `my_principal_state` is `Pending`
+/// on the proposed id.
 #[test]
-fn test_prepare_to_encrypt_rotation_without_stage_rotation_returns_error() {
+fn test_prepare_to_encrypt_lazily_stages_unstaged_candidate() {
     let (alice_session, _) = establish_sessions();
     let new_alice = make_client();
+    assert_ok!(alice_session.prepare_to_encrypt(Some(new_alice.client_id())));
+    assert!(matches!(
+        alice_session.my_principal_state(),
+        PrincipalState::Pending { new, .. } if new == new_alice.client_id()
+    ));
+}
+
+/// Lazy staging respects the candidate window (contract 25): filling `CANDIDATE_WINDOW` in-flight
+/// candidates via `prepare_to_encrypt(Some(id))` and then proposing ONE MORE unstaged id returns
+/// `SessionNotReady` for that round — the pool is full, so the request parks in the single deferred
+/// slot rather than riding this frame (the same overflow contract the eager `stage_rotation` has; a
+/// canonicalization frees a slot and a later routine round promotes the parked id).
+#[test]
+fn test_lazy_prepare_respects_candidate_window() {
+    let (alice, _bob) = establish_confirmed_sessions();
+    // Propose CANDIDATE_WINDOW distinct candidates, none canonicalized — the pool fills.
+    for i in 0..super::CANDIDATE_WINDOW {
+        let id = make_client().client_id();
+        assert_ok!(alice.prepare_to_encrypt(Some(id)));
+        assert_ok!(alice.encrypt(format!("cand{i}").into_bytes()));
+    }
+    // One more unstaged id can't ride this round: the window is full.
+    let overflow = make_client().client_id();
     assert_err!(
-        alice_session.prepare_to_encrypt(Some(new_alice.client_id())),
+        alice.prepare_to_encrypt(Some(overflow)),
         TwoMlsPqError::SessionNotReady
     );
 }
@@ -3598,23 +3728,107 @@ fn test_header_key_len_matches_aead() {
     assert!(sealed.len() > cs.aead_nonce_size());
 }
 
+/// Feature B: with a sizing intent, the auto-driven side-band frame pads up to the co-stapled
+/// message's sealed length, so the two co-stapled payloads are size-indistinguishable — and the
+/// padded frame still round-trips, its padding stripped on open before any decoder sees it.
+#[test]
+fn test_side_band_padding_equalizes_with_message() {
+    let (alice, bob) = establish_full();
+    bob.set_pad_target(Some(3072));
+    // A message under the cap: the co-stapled A.3 EK (naturally smaller) pads up to it exactly.
+    assert_ok!(bob.prepare_to_encrypt(None));
+    let msg = assert_ok!(bob.encrypt(vec![7u8; 500]));
+    let ek = assert_some!(bob.pq_pending_outbound(SideBandSealing::Fresh));
+    assert_eq!(
+        ek.len(),
+        msg.cipher_text.len(),
+        "a padded side-band frame must seal to exactly the message's length"
+    );
+    // Round-trip: the padded EK opens (padding stripped) and drives the round to completion.
+    assert_ok!(alice.process_incoming(msg.cipher_text));
+    assert_ok!(alice.pq_ratchet_respond(ek));
+    let ct = assert_some!(alice.pq_take_pending_outbound());
+    assert_ok!(bob.pq_ratchet_bind(ct));
+    discharge_bind(&bob, &alice, b"padded-round");
+}
+
+/// Feature B: the sizing intent is a CAP. A message larger than the target does not drag the
+/// side-band frame past the push-payload budget — it pads only up to the target.
+#[test]
+fn test_side_band_padding_honors_the_cap() {
+    let (_alice, bob) = establish_full();
+    bob.set_pad_target(Some(3072));
+    assert_ok!(bob.prepare_to_encrypt(None));
+    let msg = assert_ok!(bob.encrypt(vec![7u8; 5000]));
+    let ek = assert_some!(bob.pq_pending_outbound(SideBandSealing::Fresh));
+    assert!(
+        ek.len() < msg.cipher_text.len(),
+        "an over-cap message must not equalize the frame past the budget"
+    );
+    // Bounded on BOTH sides: the frame is padded UP to the cap (>= 3072, else a padding-disabled
+    // impl — natural EK ~1.2 KB — would pass the upper bound alone), but no further than the cap
+    // (+ the 4-byte prefix and seal overhead).
+    assert!(
+        (3072..=3072 + 64).contains(&ek.len()),
+        "the frame pads up to — and only to — the target cap, got {}",
+        ek.len()
+    );
+}
+
+/// Feature B: absent a sizing intent (the default), frames go out at their natural size — the
+/// side-band frame is left SMALLER than its co-stapled message, not padded.
+#[test]
+fn test_no_pad_target_leaves_frames_natural() {
+    let (_alice, bob) = establish_full();
+    assert_ok!(bob.prepare_to_encrypt(None));
+    let msg = assert_ok!(bob.encrypt(vec![7u8; 500]));
+    let ek = assert_some!(bob.pq_pending_outbound(SideBandSealing::Fresh));
+    assert!(
+        ek.len() < msg.cipher_text.len(),
+        "no pad_target ⇒ the frame stays at its natural, smaller size"
+    );
+}
+
+/// Feature B: padding only ever GROWS a frame. A frame naturally larger than the target keeps its
+/// natural size (the A.4 welcome / A.5 Commit' case, stood in for by a target below the EK size).
+#[test]
+fn test_side_band_padding_never_shrinks_a_larger_frame() {
+    let (_a1, natural_sess) = establish_full();
+    let (_a2, clamped_sess) = establish_full();
+    clamped_sess.set_pad_target(Some(8)); // far below any real frame
+
+    assert_ok!(natural_sess.prepare_to_encrypt(None));
+    let _ = assert_ok!(natural_sess.encrypt(vec![7u8; 1]));
+    let natural = assert_some!(natural_sess.pq_pending_outbound(SideBandSealing::Fresh));
+
+    assert_ok!(clamped_sess.prepare_to_encrypt(None));
+    let _ = assert_ok!(clamped_sess.encrypt(vec![7u8; 1]));
+    let clamped = assert_some!(clamped_sess.pq_pending_outbound(SideBandSealing::Fresh));
+
+    assert_eq!(
+        natural.len(),
+        clamped.len(),
+        "a target below the frame size must not shrink it"
+    );
+}
+
 /// full A.3 round drives end-to-end through sealed frames.
 #[test]
 fn test_sealed_side_band_opens_and_classifies() {
     let (alice, bob) = establish_full();
-    let ek = assert_ok!(alice.pq_ratchet_begin());
-    // Sealed on the wire; opens on Bob's window as the ratchet EK frame.
+    let ek = open_ratchet(&bob, &alice);
+    // Sealed on the wire; opens on Alice's window as the ratchet EK frame.
     assert_eq!(
-        assert_some!(assert_ok!(bob.open_incoming(ek.clone()))).kind,
+        assert_some!(assert_ok!(alice.open_incoming(ek.clone()))).kind,
         super::OpenedFrameKind::PqSideBand {
             kind: super::PqFrameKind::RatchetEphemeralKey
         }
     );
     // And the round completes through the sealed frames (receivers auto-open).
-    assert_ok!(bob.pq_ratchet_respond(ek));
-    let ct = assert_some!(bob.pq_take_pending_outbound());
-    assert_ok!(alice.pq_ratchet_bind(ct));
-    discharge_bind(&alice, &bob, b"a");
+    assert_ok!(alice.pq_ratchet_respond(ek));
+    let ct = assert_some!(alice.pq_take_pending_outbound());
+    assert_ok!(bob.pq_ratchet_bind(ct));
+    discharge_bind(&bob, &alice, b"a");
 }
 
 /// The point of the PQ family: a side-band frame is keyed by `pq_epoch`, so it
@@ -3624,12 +3838,15 @@ fn test_sealed_side_band_opens_and_classifies() {
 #[test]
 fn test_side_band_survives_classical_churn() {
     let (alice, bob) = establish_full();
+    // Flip the turn to Alice so she can open the A.3 by sending (Bob holds it after bootstrap).
+    ratchet_round(&bob, &alice, b"flip");
 
     // Capture two pre-churn frames Bob will try to open later: a message frame
-    // (classical-keyed) and a side-band EK (PQ-keyed).
+    // (classical-keyed) and a side-band EK (PQ-keyed). Alice's send auto-stages the EK; the
+    // message frame is held back, not delivered.
     assert_ok!(alice.prepare_to_encrypt(None));
     let early_message = assert_ok!(alice.encrypt(b"early".to_vec())).cipher_text;
-    let ek = assert_ok!(alice.pq_ratchet_begin());
+    let ek = assert_some!(alice.pq_pending_outbound(SideBandSealing::Fresh));
 
     // Churn ONLY the classical ratchet, well past mls-rs epoch retention: Alice
     // proposes, Bob commits Bob's send group each round, both stay in lockstep. No PQ
@@ -3686,10 +3903,10 @@ fn test_bootstrap_kp_opens_via_classical_fallback() {
 #[test]
 fn test_restored_session_opens_in_flight_side_band() {
     let (alice, bob) = establish_full();
-    let ek = assert_ok!(alice.pq_ratchet_begin());
+    let ek = open_ratchet(&bob, &alice);
 
-    // Bob archives and restores before opening the EK.
-    let restored = assert_ok!(TwoMlsPqSession::from_archive(assert_ok!(bob.archive())));
+    // Alice archives and restores before opening the EK.
+    let restored = assert_ok!(TwoMlsPqSession::from_archive(assert_ok!(alice.archive())));
     assert_eq!(
         assert_some!(assert_ok!(restored.open_incoming(ek))).kind,
         super::OpenedFrameKind::PqSideBand {
@@ -5120,16 +5337,20 @@ fn test_prepare_to_encrypt_before_established_is_noop_round() {
     assert_ne!(frame.cipher_text.first(), Some(&super::APQ_TAG));
 }
 
+/// Proposing a SECOND, different unstaged id also lazily stages it — there is no "mismatch"
+/// with an earlier staged candidate to reject. Both are admitted into the in-flight window and
+/// the peer's commit picks the winner; `my_principal_state` tracks the latest proposed.
 #[test]
-fn test_prepare_to_encrypt_rotation_client_id_mismatch_returns_error() {
+fn test_prepare_to_encrypt_lazily_stages_a_second_candidate() {
     let (alice_session, _) = establish_sessions();
     let new_alice = make_client();
     let other = make_client();
-    assert_ok!(alice_session.stage_rotation(new_alice.client_id().bytes));
-    assert_err!(
-        alice_session.prepare_to_encrypt(Some(other.client_id())),
-        TwoMlsPqError::SessionNotReady
-    );
+    assert_ok!(alice_session.prepare_to_encrypt(Some(new_alice.client_id())));
+    assert_ok!(alice_session.prepare_to_encrypt(Some(other.client_id())));
+    assert!(matches!(
+        alice_session.my_principal_state(),
+        PrincipalState::Pending { new, .. } if new == other.client_id()
+    ));
 }
 
 #[test]
@@ -5723,29 +5944,26 @@ fn test_apqinfo_deferred_verifier_rejects_bound_pq_epoch() {
 #[test]
 fn test_a3_bind_full_round_verifies_attestation_both_directions() {
     let (alice, bob) = establish_full();
-    ratchet_round(&alice, &bob, b"a-to-b");
-    // Turn flipped to Bob; his bind's attestation verifies on Alice's apply too.
+    // Bob holds the turn after bootstrap, so he goes first.
     ratchet_round(&bob, &alice, b"b-to-a");
+    // Turn flipped to Alice; her bind's attestation verifies on Bob's apply too.
+    ratchet_round(&alice, &bob, b"a-to-b");
 }
 
-/// The A.5 side-band Commit' must not carry an AppDataUpdate — the round's
-/// reconciliation is the stapled ACK's job (a conformant FULL commit pair). A full
-/// A.5 round completes cleanly under the receiver checks; a smuggled attestation on
-/// the Commit' is rejected in `pq_rekey_apply`. After `establish_full` the turn is
-/// Bob's, so Bob initiates.
+/// The A.5 side-band Commit' must not carry an AppDataUpdate — the round's reconciliation is the
+/// stapled ACK's job (a conformant FULL commit pair). A full rotation-driven A.5 round completes
+/// cleanly under the receiver checks: `pq_rekey_apply` accepts a Commit' precisely because it
+/// carries no attestation (a smuggled one would be rejected there), so a clean apply is the proof.
 #[test]
 fn test_a5_rekey_round_completes_without_attestation() {
     let (alice, bob) = establish_full();
-    assert!(bob.my_pq_turn());
-    let alice_classical = alice.epochs().classical_epoch;
-    rekey_round(&bob, &alice);
-    // A.5's side-band legs advanced only the PQ epochs — the responder's classical
-    // stream is untouched (the initiator's advances once, at his ack's discharge).
-    // Asymmetric from A.4: its bind advanced Alice's send-PQ off the birth epoch,
-    // while Bob's send-PQ was born there and waits for his own bind.
-    assert_eq!(alice.epochs().pq_epoch, 3);
-    assert_eq!(bob.epochs().pq_epoch, 2);
-    assert_eq!(alice.epochs().classical_epoch, alice_classical);
+    let alice_pq = alice.epochs().pq_epoch;
+    let bob_pq = bob.epochs().pq_epoch;
+    let new_alice = make_client().client_id();
+    rekey_round(&alice, &bob, new_alice);
+    // Both send-PQ epochs advanced; the round completed through the (attestation-free) Commit'.
+    assert!(alice.epochs().pq_epoch > alice_pq);
+    assert!(bob.epochs().pq_epoch > bob_pq);
 }
 
 /// The cross-party injection is event-driven, not procedural: the acceptor's first full
@@ -6073,12 +6291,13 @@ fn test_welcome_with_pq_half_binding_rejected() {
 #[test]
 fn test_pq_pending_outbound_peek_is_repeatable_and_non_consuming() {
     let (alice, bob) = establish_full();
-    assert_ok!(alice.pq_ratchet_begin());
+    // Bob holds the turn: his send opens the A.3, staging the EK.
+    let _ = open_ratchet(&bob, &alice);
 
     // Three peeks, three sealed frames — each independently openable by the peer.
-    let first = assert_some!(alice.pq_pending_outbound(SideBandSealing::Fresh));
-    let second = assert_some!(alice.pq_pending_outbound(SideBandSealing::Fresh));
-    assert!(alice.pq_pending_outbound(SideBandSealing::Fresh).is_some());
+    let first = assert_some!(bob.pq_pending_outbound(SideBandSealing::Fresh));
+    let second = assert_some!(bob.pq_pending_outbound(SideBandSealing::Fresh));
+    assert!(bob.pq_pending_outbound(SideBandSealing::Fresh).is_some());
 
     // Fresh seals draw a new nonce each time, so the sealed bytes differ even though the
     // frame does not. (Belt-and-braces on the seal: identical ciphertext under Fresh would
@@ -6086,7 +6305,7 @@ fn test_pq_pending_outbound_peek_is_repeatable_and_non_consuming() {
     assert_ne!(first, second);
 
     // And the peer opens the SECOND copy — a re-send is a real frame, not a stub.
-    assert_ok!(bob.pq_ratchet_respond(second));
+    assert_ok!(alice.pq_ratchet_respond(second));
 }
 
 /// A dropped bind heals by the staple's own machinery: the bind is the committing
@@ -6097,29 +6316,29 @@ fn test_pq_pending_outbound_peek_is_repeatable_and_non_consuming() {
 #[test]
 fn test_dropped_bind_heals_on_restaple() {
     let (alice, bob) = establish_full();
-    let ek = assert_ok!(alice.pq_ratchet_begin());
-    assert_ok!(bob.pq_ratchet_respond(ek));
-    let ct = assert_some!(bob.pq_pending_outbound(SideBandSealing::Fresh));
-    assert_ok!(alice.pq_ratchet_bind(ct));
+    let ek = open_ratchet(&bob, &alice);
+    assert_ok!(alice.pq_ratchet_respond(ek));
+    let ct = assert_some!(alice.pq_pending_outbound(SideBandSealing::Fresh));
+    assert_ok!(bob.pq_ratchet_bind(ct));
 
     // The committing round discharges the bind, but the transport drops its frame.
-    assert_ok!(bob.prepare_to_encrypt(None));
-    let upd = assert_ok!(bob.encrypt(b"upd".to_vec()));
-    let got = assert_some!(assert_ok!(alice.process_incoming(upd.cipher_text)));
-    assert_ok!(alice.queue_proposal(assert_some!(got.proposal).digest));
-    assert!(assert_ok!(alice.prepare_to_encrypt(None)).did_commit);
-    drop(assert_ok!(alice.encrypt(b"lost".to_vec()))); // never delivered
-
-    // Alice's next frame re-staples the same APQPrivateMessage: Bob applies the bind
-    // from it and the round closes as if nothing had been lost.
     assert_ok!(alice.prepare_to_encrypt(None));
-    let healing = assert_ok!(alice.encrypt(b"healing".to_vec()));
-    let res = assert_some!(assert_ok!(bob.process_incoming(healing.cipher_text)));
+    let upd = assert_ok!(alice.encrypt(b"upd".to_vec()));
+    let got = assert_some!(assert_ok!(bob.process_incoming(upd.cipher_text)));
+    assert_ok!(bob.queue_proposal(assert_some!(got.proposal).digest));
+    assert!(assert_ok!(bob.prepare_to_encrypt(None)).did_commit);
+    drop(assert_ok!(bob.encrypt(b"lost".to_vec()))); // never delivered
+
+    // Bob's next frame re-staples the same APQPrivateMessage: Alice applies the bind
+    // from it and the round closes as if nothing had been lost.
+    assert_ok!(bob.prepare_to_encrypt(None));
+    let healing = assert_ok!(bob.encrypt(b"healing".to_vec()));
+    let res = assert_some!(assert_ok!(alice.process_incoming(healing.cipher_text)));
     assert_eq!(
         assert_some!(res.application_message).app_message_data,
         b"healing"
     );
-    assert!(bob.my_pq_turn(), "the re-stapled bind closed the round");
+    assert!(alice.my_pq_turn(), "the re-stapled bind closed the round");
 }
 
 /// Re-sends make duplicates steady-state traffic, not an edge case: a retained frame
@@ -6132,23 +6351,26 @@ fn test_dropped_bind_heals_on_restaple() {
 fn test_duplicate_side_band_frames_are_discardable_not_routing_errors() {
     let (alice, bob) = establish_full();
 
-    // Duplicate EK: Bob already responded.
-    let ek = assert_ok!(alice.pq_ratchet_begin());
-    assert_ok!(bob.pq_ratchet_respond(ek.clone()));
-    assert_err!(bob.pq_ratchet_respond(ek), TwoMlsPqError::DuplicateSideBand);
+    // Duplicate EK: Alice already responded.
+    let ek = open_ratchet(&bob, &alice);
+    assert_ok!(alice.pq_ratchet_respond(ek.clone()));
+    assert_err!(
+        alice.pq_ratchet_respond(ek),
+        TwoMlsPqError::DuplicateSideBand
+    );
 
     // Duplicate CT mid-hold: the owed-bind guard answers first (retriable).
-    let ct = assert_some!(bob.pq_pending_outbound(SideBandSealing::Fresh));
-    assert_ok!(alice.pq_ratchet_bind(ct.clone()));
+    let ct = assert_some!(alice.pq_pending_outbound(SideBandSealing::Fresh));
+    assert_ok!(bob.pq_ratchet_bind(ct.clone()));
     assert_err!(
-        alice.pq_ratchet_bind(ct.clone()),
+        bob.pq_ratchet_bind(ct.clone()),
         TwoMlsPqError::SessionNotReady
     );
 
     // Duplicate CT after the discharge: the turn has passed, so the state proves the
     // step is done — a discardable duplicate.
-    discharge_bind(&alice, &bob, b"x");
-    assert_err!(alice.pq_ratchet_bind(ct), TwoMlsPqError::DuplicateSideBand);
+    discharge_bind(&bob, &alice, b"x");
+    assert_err!(bob.pq_ratchet_bind(ct), TwoMlsPqError::DuplicateSideBand);
 
     // The bind's own repeats are the staple's: every post-discharge frame re-staples
     // it and the receiver skips it idempotently (see
@@ -6162,29 +6384,29 @@ fn test_duplicate_side_band_frames_are_discardable_not_routing_errors() {
 #[test]
 fn test_side_band_falls_silent_on_both_sides_after_the_round() {
     let (alice, bob) = establish_full();
-    let ek = assert_ok!(alice.pq_ratchet_begin());
-    assert_ok!(bob.pq_ratchet_respond(ek));
-    let ct = assert_some!(bob.pq_pending_outbound(SideBandSealing::Fresh));
-    assert_ok!(alice.pq_ratchet_bind(ct));
+    let ek = open_ratchet(&bob, &alice);
+    assert_ok!(alice.pq_ratchet_respond(ek));
+    let ct = assert_some!(alice.pq_pending_outbound(SideBandSealing::Fresh));
+    assert_ok!(bob.pq_ratchet_bind(ct));
 
-    // Alice's EK is spent the moment she binds — the CT answered it. Nothing of hers
+    // Bob's EK is spent the moment he binds — the CT answered it. Nothing of his
     // re-sends (the bind travels the staple, not the side-band).
-    assert!(alice.pq_pending_outbound(SideBandSealing::Fresh).is_none());
-    // Bob's CT still re-sends: the stapled bind has not landed yet.
-    assert!(bob.pq_pending_outbound(SideBandSealing::Fresh).is_some());
-
-    discharge_bind(&alice, &bob, b"x");
-
-    // Bob applied the staple: his CT is spent too, and he holds the turn.
     assert!(bob.pq_pending_outbound(SideBandSealing::Fresh).is_none());
-    assert!(bob.my_pq_turn());
+    // Alice's CT still re-sends: the stapled bind has not landed yet.
+    assert!(alice.pq_pending_outbound(SideBandSealing::Fresh).is_some());
 
-    // The next round starts on empty slots.
-    let ek2 = assert_ok!(bob.pq_ratchet_begin());
-    assert_ok!(alice.pq_ratchet_respond(ek2));
-    let ct2 = assert_some!(alice.pq_pending_outbound(SideBandSealing::Fresh));
-    assert_ok!(bob.pq_ratchet_bind(ct2));
-    discharge_bind(&bob, &alice, b"y");
+    discharge_bind(&bob, &alice, b"x");
+
+    // Alice applied the staple: her CT is spent too, and she holds the turn.
+    assert!(alice.pq_pending_outbound(SideBandSealing::Fresh).is_none());
+    assert!(alice.my_pq_turn());
+
+    // The next round starts on empty slots — Alice holds the turn now, so she opens it.
+    let ek2 = open_ratchet(&alice, &bob);
+    assert_ok!(bob.pq_ratchet_respond(ek2));
+    let ct2 = assert_some!(bob.pq_pending_outbound(SideBandSealing::Fresh));
+    assert_ok!(alice.pq_ratchet_bind(ct2));
+    discharge_bind(&alice, &bob, b"y");
 }
 
 /// Retention rides the archive: a session restored mid-round must still be able to
@@ -6193,12 +6415,12 @@ fn test_side_band_falls_silent_on_both_sides_after_the_round() {
 #[test]
 fn test_retained_frame_survives_archive_round_trip() {
     let (alice, bob) = establish_full();
-    assert_ok!(alice.pq_ratchet_begin());
+    let _ = open_ratchet(&bob, &alice);
 
-    let restored = round_trip(&alice);
+    let restored = round_trip(&bob);
 
     let resent = assert_some!(restored.pq_pending_outbound(SideBandSealing::Fresh));
-    assert_ok!(bob.pq_ratchet_respond(resent));
+    assert_ok!(alice.pq_ratchet_respond(resent));
 }
 
 /// The reason `Stable` exists: a chunking host cuts pieces out of the sealed bytes, so the
@@ -6207,22 +6429,22 @@ fn test_retained_frame_survives_archive_round_trip() {
 #[test]
 fn test_stable_sealing_holds_the_base_still_for_chunking() {
     let (alice, bob) = establish_full();
-    assert_ok!(alice.pq_ratchet_begin());
+    let _ = open_ratchet(&bob, &alice);
 
-    let base = assert_some!(alice.pq_pending_outbound(SideBandSealing::Stable));
-    let again = assert_some!(alice.pq_pending_outbound(SideBandSealing::Stable));
+    let base = assert_some!(bob.pq_pending_outbound(SideBandSealing::Stable));
+    let again = assert_some!(bob.pq_pending_outbound(SideBandSealing::Stable));
     assert_eq!(base, again, "Stable must hand out identical bytes");
 
     // Reassembling halves cut from two separate hand-outs yields the original — the
     // property a chunking transport depends on.
     let mid = base.len() / 2;
-    let first_half = &assert_some!(alice.pq_pending_outbound(SideBandSealing::Stable))[..mid];
-    let second_half = &assert_some!(alice.pq_pending_outbound(SideBandSealing::Stable))[mid..];
+    let first_half = &assert_some!(bob.pq_pending_outbound(SideBandSealing::Stable))[..mid];
+    let second_half = &assert_some!(bob.pq_pending_outbound(SideBandSealing::Stable))[mid..];
     let reassembled: Vec<u8> = [first_half, second_half].concat();
     assert_eq!(reassembled, base);
 
     // And the reassembly is a real frame, not just equal bytes.
-    assert_ok!(bob.pq_ratchet_respond(reassembled));
+    assert_ok!(alice.pq_ratchet_respond(reassembled));
 }
 
 /// `Fresh` is the opposite contract, and it is what an en-bloc host wants: repeated sends
@@ -6231,14 +6453,14 @@ fn test_stable_sealing_holds_the_base_still_for_chunking() {
 #[test]
 fn test_fresh_sealing_differs_per_send_but_opens_the_same() {
     let (alice, bob) = establish_full();
-    assert_ok!(alice.pq_ratchet_begin());
+    let _ = open_ratchet(&bob, &alice);
 
-    let a = assert_some!(alice.pq_pending_outbound(SideBandSealing::Fresh));
-    let b = assert_some!(alice.pq_pending_outbound(SideBandSealing::Fresh));
+    let a = assert_some!(bob.pq_pending_outbound(SideBandSealing::Fresh));
+    let b = assert_some!(bob.pq_pending_outbound(SideBandSealing::Fresh));
     assert_ne!(a, b, "Fresh must not repeat wire bytes");
 
     // Distinct bytes, same frame underneath: either copy drives the round.
-    assert_ok!(bob.pq_ratchet_respond(b));
+    assert_ok!(alice.pq_ratchet_respond(b));
 }
 
 /// Stability is scoped to the FRAME, not to time. When the round moves past a frame,
@@ -6249,53 +6471,28 @@ fn test_fresh_sealing_differs_per_send_but_opens_the_same() {
 #[test]
 fn test_stable_seal_is_invalidated_when_the_frame_advances() {
     let (alice, bob) = establish_full();
-    assert_ok!(alice.pq_ratchet_begin());
-    let ek_seal = assert_some!(alice.pq_pending_outbound(SideBandSealing::Stable));
+    let _ = open_ratchet(&bob, &alice);
+    let ek_seal = assert_some!(bob.pq_pending_outbound(SideBandSealing::Stable));
 
     // Drive the round on: the CT answers the EK at the bind.
-    assert_ok!(bob.pq_ratchet_respond(ek_seal.clone()));
-    let ct = assert_some!(bob.pq_pending_outbound(SideBandSealing::Stable));
-    assert_ok!(alice.pq_ratchet_bind(ct));
+    assert_ok!(alice.pq_ratchet_respond(ek_seal.clone()));
+    let ct = assert_some!(alice.pq_pending_outbound(SideBandSealing::Stable));
+    assert_ok!(bob.pq_ratchet_bind(ct));
 
     // The EK (and its cached seal) is gone with the frame — not served stale.
-    assert!(alice.pq_pending_outbound(SideBandSealing::Stable).is_none());
-    discharge_bind(&alice, &bob, b"payload");
+    assert!(bob.pq_pending_outbound(SideBandSealing::Stable).is_none());
+    discharge_bind(&bob, &alice, b"payload");
 
-    // The next round's frame is a fresh base, not the old cache.
-    let ek2 = assert_ok!(bob.pq_ratchet_begin());
-    assert_ok!(alice.pq_ratchet_respond(ek2));
-    let ct2 = assert_some!(alice.pq_pending_outbound(SideBandSealing::Stable));
+    // The next round's frame is a fresh base, not the old cache. Alice holds the turn now.
+    let ek2 = open_ratchet(&alice, &bob);
+    assert_ok!(bob.pq_ratchet_respond(ek2));
+    let ct2 = assert_some!(bob.pq_pending_outbound(SideBandSealing::Stable));
     assert_ne!(ct2, ek_seal, "a new frame must never reuse a stale base");
-    assert_ok!(bob.pq_ratchet_bind(ct2));
-    discharge_bind(&bob, &alice, b"round-two");
+    assert_ok!(alice.pq_ratchet_bind(ct2));
+    discharge_bind(&alice, &bob, b"round-two");
 }
 
-/// `*_begin` both RETURNS a sealed frame and retains it, so the two must not disagree: a
-/// chunking host that sent the return and then peeked for the rest of the pass would cut
-/// pieces from two different seals, which reassemble into nothing. Seeding the seal cache
-/// at `begin` is what keeps them identical — this pins it for all three initiator entry
-/// points, since each seals and retains independently.
-#[test]
-fn test_begin_return_matches_the_stable_base() {
-    let (alice, bob) = establish_full();
-
-    // A.3
-    let returned = assert_ok!(alice.pq_ratchet_begin());
-    let peeked = assert_some!(alice.pq_pending_outbound(SideBandSealing::Stable));
-    assert_eq!(returned, peeked, "A.3 begin disagrees with the Stable base");
-    assert_ok!(bob.pq_ratchet_respond(returned));
-
-    // A.5 — Bob holds the turn only after a full round, so drive one first.
-    let ct = assert_some!(bob.pq_pending_outbound(SideBandSealing::Stable));
-    assert_ok!(alice.pq_ratchet_bind(ct));
-    discharge_bind(&alice, &bob, b"x");
-
-    let returned = assert_ok!(bob.pq_rekey_begin(None));
-    let peeked = assert_some!(bob.pq_pending_outbound(SideBandSealing::Stable));
-    assert_eq!(returned, peeked, "A.5 begin disagrees with the Stable base");
-}
-
-/// The A.4 half of `test_begin_return_matches_the_stable_base`: its KP' is minted
+/// The A.4 begin-return / Stable-base agreement: its KP' is minted
 /// pre-establishment and is the one frame sealed classically, so it takes a different path
 /// through `seal_side_band` and is worth pinning separately.
 #[test]
@@ -6317,50 +6514,6 @@ fn test_bootstrap_begin_return_matches_the_stable_base() {
 // machinery an earlier cut recovered from header encryption (the epoch of the key that
 // opens a frame proves what the peer applied) was real, but nothing needs it — see the
 // changeset.
-
-/// The collision this leg exists to remove, asserted at its source rather than accommodated.
-///
-/// A.4 used to be invisible to `pq_inflight`, so a ratchet round could open beside a
-/// bootstrap and evict its irreplaceable frame from the single retained slot — reachable in
-/// a NORMAL flow, because `pq_bootstrap_respond` took the turn at its own send. Now A.4
-/// registers like any other round, so the single-occupancy that already kept A.3 and A.5
-/// apart covers it too: the eviction is unreachable rather than absorbed.
-#[test]
-fn test_bootstrap_and_ratchet_are_mutually_exclusive() {
-    let (alice, bob) = establish_confirmed_sessions();
-    let kp = assert_ok!(alice.pq_bootstrap_begin(None));
-
-    // The initiator is mid-bootstrap: no ratchet round may open beside it.
-    assert_err!(alice.pq_ratchet_begin(), TwoMlsPqError::SessionNotReady);
-
-    assert_ok!(bob.pq_bootstrap_respond(kp));
-    // Nor may the responder open one — it holds no turn until it applies the bind, which is
-    // exactly the state that used to let it evict its own welcome.
-    assert!(!bob.my_pq_turn());
-    assert_err!(bob.pq_ratchet_begin(), TwoMlsPqError::SessionNotReady);
-
-    // The bind frees the SLOT and rule 2 takes over: while the bind is owed a new
-    // round may BEGIN — the deliberate async bundling (the next round's EK parks
-    // beside the owed bind, and both land before the peer takes a turn) — but the
-    // peer, still mid-A.4, answers nothing until the stapled bind closes its round.
-    let welcome = assert_some!(bob.pq_pending_outbound(SideBandSealing::Fresh));
-    assert_ok!(alice.pq_bootstrap_bind(welcome));
-    let ek = assert_ok!(alice.pq_ratchet_begin());
-    assert_err!(
-        bob.pq_ratchet_respond(ek.clone()),
-        TwoMlsPqError::SessionNotReady
-    );
-
-    // The staple lands: Bob's bootstrap closes, and the parked EK — which arrived
-    // "early" — is now answerable, exactly the ordering the bundling relies on.
-    discharge_bind(&alice, &bob, b"bootstrap-bind");
-    assert_ok!(bob.pq_ratchet_respond(ek));
-    let ct = assert_some!(bob.pq_pending_outbound(SideBandSealing::Fresh));
-    assert_ok!(alice.pq_ratchet_bind(ct));
-    discharge_bind(&alice, &bob, b"ratchet-bind");
-    assert!(bob.my_pq_turn());
-    assert!(!alice.my_pq_turn());
-}
 
 /// Each leg re-sends until the leg that answers it lands, and CLEARS the moment it
 /// does. This is the test that catches a dropped slot-clear: without the clear at the

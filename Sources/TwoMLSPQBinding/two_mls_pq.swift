@@ -1154,9 +1154,9 @@ public protocol TwoMlsPqInvitationProtocol: AnyObject, Sendable {
      *
      * `new_client_id` is an optional dedicated per-session principal: when `Some`, the
      * spawned session's send group is created under a freshly-minted principal carrying
-     * that ClientId (signing keys are session-owned, minted internally — the same
-     * convention as `stage_rotation`), so the initiator sees the dedicated principal
-     * from the very first frame and no rotation commit is needed. The receive-group
+     * that ClientId (signing keys are session-owned, minted internally), so the initiator
+     * sees the dedicated principal from the very first frame and no rotation commit is
+     * needed (born-dedicated). The receive-group
      * join still uses this invitation's identity — the welcome was addressed to its key
      * package. `None` keeps the session under the invitation identity.
      *
@@ -1433,9 +1433,9 @@ open func processedWelcomeGroupId(welcome: Data) -> MlsGroupId?  {
      *
      * `new_client_id` is an optional dedicated per-session principal: when `Some`, the
      * spawned session's send group is created under a freshly-minted principal carrying
-     * that ClientId (signing keys are session-owned, minted internally — the same
-     * convention as `stage_rotation`), so the initiator sees the dedicated principal
-     * from the very first frame and no rotation commit is needed. The receive-group
+     * that ClientId (signing keys are session-owned, minted internally), so the initiator
+     * sees the dedicated principal from the very first frame and no rotation commit is
+     * needed (born-dedicated). The receive-group
      * join still uses this invitation's identity — the welcome was addressed to its key
      * package. `None` keeps the session under the invitation identity.
      *
@@ -1898,6 +1898,15 @@ public protocol TwoMlsPqSessionProtocol: AnyObject, Sendable {
     func setInitialReturnKeyPackage(keyPackage: Data) throws 
     
     /**
+     * Declare the side-band frame-sizing intent (Feature B). `Some(n)` asks the session to grow
+     * each side-band frame up to the co-stapled message's size, capped at the push-payload budget
+     * `n` bytes, so the two co-stapled payloads become size-indistinguishable to an on-path
+     * observer; `None` (the default) sends frames at their natural size. Like `install_sink`,
+     * this is live plumbing outside the archive — set it right after restore, before use.
+     */
+    func setPadTarget(target: UInt64?) 
+    
+    /**
      * The session's current persistence `state_seq` (the monotonic mutation counter). Lets
      * the app correlate a frame's `depends_on_seq` against its own durable high-water mark,
      * and gate transmission of the key-material-bearing frames whose return type does not
@@ -2049,18 +2058,6 @@ public protocol TwoMlsPqSessionProtocol: AnyObject, Sendable {
     func shouldListenOn() throws  -> ListenChannels
     
     /**
-     * Stage a new principal for the next rotation commit, minting its signing keys
-     * internally: the MLS signing keys are session-owned state, so the app supplies only
-     * the opaque ClientId. Call before `prepare_to_encrypt(Some(new_client_id))`, which
-     * commits the handoff.
-     *
-     * Idempotent-ish, matching the classical `propose`: staging the id already staged is
-     * a no-op (the existing staged identity — and its freshly minted keys — is kept); a
-     * different id replaces the staged identity.
-     */
-    func stageRotation(newClientId: Data) throws 
-    
-    /**
      * Whose move the PQ side-band is: true when this side owes the next operation.
      * The initiator owes the A.4 bootstrap; completing an operation passes the turn.
      */
@@ -2190,12 +2187,6 @@ public protocol TwoMlsPqSessionProtocol: AnyObject, Sendable {
     func pqPendingOutbound(sealing: SideBandSealing)  -> Data?
     
     /**
-     * Initiator step 1 — generate an ML-KEM ephemeral and return the encapsulation-key message
-     * (tag 0x17). The decapsulation key is held until the ciphertext arrives.
-     */
-    func pqRatchetBegin() throws  -> Data
-    
-    /**
      * Initiator step 2 — decapsulate S and inject it into the send group's PQ half via a
      * pathless commit, OWING the classical half: the bind rides our next classical COMMIT
      * as an `APQPrivateMessage` staple (see `discharge_owed_bind`), which is also where
@@ -2235,22 +2226,6 @@ public protocol TwoMlsPqSessionProtocol: AnyObject, Sendable {
      * on applying the staple.
      */
     func pqRekeyApply(msg: Data) throws 
-    
-    /**
-     * A.5 initiator — propose Upd'(self) into the peer's send-PQ (our recv mirror) and
-     * return the Upd' frame (tag 0x1B). Requires both PQ halves live (post-A.4 only), the turn, and
-     * no other side-band operation in flight. Proposal only: no epochs move until the
-     * responder commits.
-     *
-     * `rotating` is the A.5 credential handoff: it must name the session's CURRENT
-     * principal (a Phase 8 rotation has already swapped `self.client` to it), and the Upd'
-     * then moves our leaf's signing key to that principal, announcing its ClientId in the
-     * proposal's authenticated_data — the same announcement convention as the Phase 8
-     * classical rotation commit. The leaf's credential BYTES stay what they were:
-     * `BasicIdentityProvider` requires a stable identity across leaf updates, so principal
-     * identity travels at the announcement level, not in the Basic Credential.
-     */
-    func pqRekeyBegin(rotating: ClientId?) throws  -> Data
     
     /**
      * A.5 responder — commit the initiator's Upd' on our own send-PQ with an updatePath
@@ -2633,6 +2608,21 @@ open func setInitialReturnKeyPackage(keyPackage: Data)throws   {try rustCallWith
 }
     
     /**
+     * Declare the side-band frame-sizing intent (Feature B). `Some(n)` asks the session to grow
+     * each side-band frame up to the co-stapled message's size, capped at the push-payload budget
+     * `n` bytes, so the two co-stapled payloads become size-indistinguishable to an on-path
+     * observer; `None` (the default) sends frames at their natural size. Like `install_sink`,
+     * this is live plumbing outside the archive — set it right after restore, before use.
+     */
+open func setPadTarget(target: UInt64?)  {try! rustCall() {
+    uniffi_two_mls_pq_fn_method_twomlspqsession_set_pad_target(
+            self.uniffiCloneHandle(),
+        FfiConverterOptionUInt64.lower(target),$0
+    )
+}
+}
+    
+    /**
      * The session's current persistence `state_seq` (the monotonic mutation counter). Lets
      * the app correlate a frame's `depends_on_seq` against its own durable high-water mark,
      * and gate transmission of the key-material-bearing frames whose return type does not
@@ -2868,24 +2858,6 @@ open func shouldListenOn()throws  -> ListenChannels  {
 }
     
     /**
-     * Stage a new principal for the next rotation commit, minting its signing keys
-     * internally: the MLS signing keys are session-owned state, so the app supplies only
-     * the opaque ClientId. Call before `prepare_to_encrypt(Some(new_client_id))`, which
-     * commits the handoff.
-     *
-     * Idempotent-ish, matching the classical `propose`: staging the id already staged is
-     * a no-op (the existing staged identity — and its freshly minted keys — is kept); a
-     * different id replaces the staged identity.
-     */
-open func stageRotation(newClientId: Data)throws   {try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
-    uniffi_two_mls_pq_fn_method_twomlspqsession_stage_rotation(
-            self.uniffiCloneHandle(),
-        FfiConverterData.lower(newClientId),$0
-    )
-}
-}
-    
-    /**
      * Whose move the PQ side-band is: true when this side owes the next operation.
      * The initiator owes the A.4 bootstrap; completing an operation passes the turn.
      */
@@ -3053,18 +3025,6 @@ open func pqPendingOutbound(sealing: SideBandSealing) -> Data?  {
 }
     
     /**
-     * Initiator step 1 — generate an ML-KEM ephemeral and return the encapsulation-key message
-     * (tag 0x17). The decapsulation key is held until the ciphertext arrives.
-     */
-open func pqRatchetBegin()throws  -> Data  {
-    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
-    uniffi_two_mls_pq_fn_method_twomlspqsession_pq_ratchet_begin(
-            self.uniffiCloneHandle(),$0
-    )
-})
-}
-    
-    /**
      * Initiator step 2 — decapsulate S and inject it into the send group's PQ half via a
      * pathless commit, OWING the classical half: the bind rides our next classical COMMIT
      * as an `APQPrivateMessage` staple (see `discharge_owed_bind`), which is also where
@@ -3127,29 +3087,6 @@ open func pqRekeyApply(msg: Data)throws   {try rustCallWithError(FfiConverterTyp
         FfiConverterData.lower(msg),$0
     )
 }
-}
-    
-    /**
-     * A.5 initiator — propose Upd'(self) into the peer's send-PQ (our recv mirror) and
-     * return the Upd' frame (tag 0x1B). Requires both PQ halves live (post-A.4 only), the turn, and
-     * no other side-band operation in flight. Proposal only: no epochs move until the
-     * responder commits.
-     *
-     * `rotating` is the A.5 credential handoff: it must name the session's CURRENT
-     * principal (a Phase 8 rotation has already swapped `self.client` to it), and the Upd'
-     * then moves our leaf's signing key to that principal, announcing its ClientId in the
-     * proposal's authenticated_data — the same announcement convention as the Phase 8
-     * classical rotation commit. The leaf's credential BYTES stay what they were:
-     * `BasicIdentityProvider` requires a stable identity across leaf updates, so principal
-     * identity travels at the announcement level, not in the Basic Credential.
-     */
-open func pqRekeyBegin(rotating: ClientId?)throws  -> Data  {
-    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
-    uniffi_two_mls_pq_fn_method_twomlspqsession_pq_rekey_begin(
-            self.uniffiCloneHandle(),
-        FfiConverterOptionTypeClientId.lower(rotating),$0
-    )
-})
 }
     
     /**
@@ -5189,7 +5126,7 @@ public enum TwoMlsPqError: Swift.Error, Equatable, Hashable, Foundation.Localize
      * reserved: the rotation-commit discriminator is "empty authenticated_data = ratchet
      * commit", so an empty id could never be announced or observed by the peer. Raised by
      * `TwoMlsPqInvitation::receive(new_client_id: Some(vec![]))` and
-     * `stage_rotation(vec![])`.
+     * `prepare_to_encrypt(Some(<empty id>))` (which lazily admits the candidate).
      */
     case InvalidClientId
     /**
@@ -5459,6 +5396,30 @@ public func FfiConverterTypeTwoMlsPqError_lift(_ buf: RustBuffer) throws -> TwoM
 #endif
 public func FfiConverterTypeTwoMlsPqError_lower(_ value: TwoMlsPqError) -> RustBuffer {
     return FfiConverterTypeTwoMlsPqError.lower(value)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionUInt64: FfiConverterRustBuffer {
+    typealias SwiftType = UInt64?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterUInt64.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterUInt64.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
 }
 
 #if swift(>=5.8)
@@ -6003,7 +5964,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_two_mls_pq_checksum_method_twomlspqinvitation_processed_welcome_group_id() != 55990) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqinvitation_receive() != 19940) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqinvitation_receive() != 55740) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqinvitation_state_seq() != 33948) {
@@ -6063,6 +6024,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_set_initial_return_key_package() != 40915) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_set_pad_target() != 13394) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_state_seq() != 41299) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -6102,9 +6066,6 @@ private let initializationResult: InitializationResult = {
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_should_listen_on() != 34726) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_stage_rotation() != 14756) {
-        return InitializationResult.apiChecksumMismatch
-    }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_my_pq_turn() != 43166) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -6123,9 +6084,6 @@ private let initializationResult: InitializationResult = {
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_pending_outbound() != 19268) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_ratchet_begin() != 52268) {
-        return InitializationResult.apiChecksumMismatch
-    }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_ratchet_bind() != 28798) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -6136,9 +6094,6 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_rekey_apply() != 36622) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_rekey_begin() != 3712) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_rekey_respond() != 19548) {

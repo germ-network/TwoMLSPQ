@@ -112,10 +112,11 @@ Two properties worth naming:
 Each party's leaf credential evolves along an **app-defined sequence**, and the
 sequence is driven by the classical ratchet itself:
 
-1. **Candidates ride the Upd proposals.** `stage_rotation(new_id)` mints a successor
-   principal and authorizes it; `prepare_to_encrypt(Some(id))` selects which staged
-   candidate this frame's Upd(self) carries (its new leaf bears the candidate's
-   credential). Different frames may propose different candidates. A candidate that has
+1. **Candidates ride the Upd proposals.** `prepare_to_encrypt(Some(id))` makes this
+   frame's Upd(self) carry a successor credential (its new leaf bears the candidate's
+   credential), minting the successor principal and authorizing it on the fly if `id` is
+   not already a candidate — there is no separate stage call, so a rotation can ride the
+   very first frame. Different frames may propose different candidates. A candidate that has
    been proposed on the wire is **never evicted** — the peer may commit any of them, and
    only the proposer holds the winner's signing key. Staging beyond the in-flight window
    parks the request in a single deferred slot (a newer stage replaces it) and it is
@@ -142,7 +143,7 @@ sequence is driven by the classical ratchet itself:
 4. **Everything else lags and catches up.** The sender's own send-group leaf moves at
    its next approved commit (the peer observes `new_sender`); the PQ leaves catch up
    at the next A.4/A.5 handoff; the acceptor's recv-group leaf converges from the
-   invitation identity to the #48 dedicated principal via its first committed Upd.
+   invitation identity to the dedicated principal via its first committed Upd.
    The AS validates every catch-up against the sequence *history*
    (`CREDENTIAL_HISTORY_WINDOW = 8` canonical steps) — a lagging leaf may only
    fast-forward to an already-canonical credential; candidates are proposed and

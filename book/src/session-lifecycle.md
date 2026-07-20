@@ -40,11 +40,21 @@
 ## The PQ side-band
 
 Three flows run beside the message path on their own tagged frames (see
-[Wire Format](./wire-format.md)). This section is the caller's view — which function to
-call, in what order; [Protocol Flows](./protocol-flows.md) §A.3–A.5 is the protocol they
-implement, and why the epochs must line up as they do. A single **turn** alternates between the parties:
-the session initiator owes the bootstrap; completing an operation passes the turn to
-the peer (`my_pq_turn()`), and only one operation may be in flight at a time.
+[Wire Format](./wire-format.md)). This section is the caller's view;
+[Protocol Flows](./protocol-flows.md) §A.3–A.5 is the protocol they implement, and why the
+epochs must line up as they do. A single **turn** alternates between the parties: the session
+initiator owes the bootstrap; completing an operation passes the turn to the peer
+(`my_pq_turn()`), and only one operation may be in flight at a time.
+
+**The host drives only the A.4 bootstrap and then ordinary sends — the SESSION self-drives A.3
+and A.5.** There is no `begin(.ratchet/.rekey)` for the host to call: on each `encrypt`, when it
+is our turn and the side-band is idle, the session opens the next round automatically — an **A.5**
+re-key when our send-PQ leaf still lags the canonical (classically committed) identity, else an
+**A.3** ratchet. "A.3 begins immediately" is just the first send after the turn becomes ours; the
+ratchet then ping-pongs, turn-gated so the two sides never both open at once. Staging is
+best-effort (a transient KEM/proposal failure simply retries on the next send) and the staged
+frame rides that send's re-staple peek (`pq_pending_outbound`), so the host's role is
+`.finishBootstrap` plus sending messages.
 
 - **Bootstrap** (`0x13`/`0x15`, then a stapled bind) — stands up Group_B's deferred PQ half
   off the critical path: Alice sends her PQ key package (`0x13`) — the one PRE-COMMITTED at
@@ -59,18 +69,23 @@ the peer (`my_pq_turn()`), and only one operation may be in flight at a time.
   Group_B.pq, so a bind that applies at all proves Alice joined.
 - **PQ ratchet** (`0x17`/`0x19`, then a stapled bind) — injects fresh ML-KEM
   entropy into a send group's PQ half via a pathless PSK commit and re-binds the
-  exported APQ-PSK into the classical half in the same round. The initiator sends its
-  ML-KEM encapsulation key (`0x17`), the responder its ciphertext plus the AEAD-sealed
-  injected secret (`0x19`), and the closing bind rides the next message frame's staple.
+  exported APQ-PSK into the classical half in the same round. Opened automatically by the
+  turn-holder's next send (no host call): it auto-stages the initiator's ML-KEM encapsulation
+  key (`0x17`); the responder answers with its ciphertext plus the AEAD-sealed injected secret
+  (`0x19`), and the closing bind rides the next message frame's staple.
 - **PQ re-key** (`0x1B`/`0x1D`, then a stapled bind) — updatePath commits run on the two
   send groups' PQ halves **alone**, so the classical ratchet is never blocked behind a large
-  ML-KEM updatePath: the initiator proposes `Upd'(self)` into the PQ half of the
-  peer's send group (`pq_rekey_begin`, `0x1B`), the responder commits it with its own
-  `Commit'` (`pq_rekey_respond`, `0x1D`) — whose updatePath rotates the committer's leaf and
-  which cross-injects a PSK exported from the PQ half of the *opposite* send group. The
-  round's third leg is not a side-band frame: the initiator acks with a pathless partial
-  commit stapled onto its next classical commit (`pq_rekey_apply`), a FULL commit whose
-  `AppDataUpdate` reconciles the bumped `pq_epoch` **in-round**.
+  ML-KEM updatePath. It is not a host call either: the session opens it in place of an A.3 when
+  our send-PQ leaf still lags the canonical principal (a Phase 8 classical rotation moved the
+  session client; the PQ leaf catches up here), announcing that principal as the handoff. The
+  initiator's send auto-stages `Upd'(self)` into the PQ half of the peer's send group (`0x1B`);
+  the responder commits it with its own `Commit'` (`pq_rekey_respond`, `0x1D`) — whose updatePath
+  rotates the committer's leaf and cross-injects a PSK exported from the PQ half of the *opposite*
+  send group. The round's third leg is not a side-band frame: the initiator acks with a pathless
+  partial commit stapled onto its next classical commit (`pq_rekey_apply`), a FULL commit whose
+  `AppDataUpdate` reconciles the bumped `pq_epoch` **in-round**. (One credential catch-up can defer
+  a round when an A.3 is already in flight — a staged A.3 is not upgraded mid-flight; the A.5 fires
+  on the next turn.)
 
 ## Routing
 
@@ -108,8 +123,8 @@ Sending is two-phase so CommProtocol can bind a per-round proposal hash:
     binding), **or** when an owed PQ bind must be discharged (a proposal-less,
     updatePath-only commit — `did_commit: true` with nothing folded, so PQ liveness never
     waits on app approval policy). A round with neither pending commits nothing.
-  - `proposing: Some(new_client_id)` → this round's Upd proposes the named staged
-    rotation candidate (after `stage_rotation`; see Principal key rotation below).
+  - `proposing: Some(new_client_id)` → this round's Upd proposes a rotation to that
+    ClientId, admitting the candidate on the fly (see Principal key rotation below).
 - **`encrypt(app_message)`** — binds the pending `proposal_hash` into the message's
   authenticated data and returns `EncryptResult { cipher_text, sender, recipient,
   epochs }`, where `epochs` is the send group's epoch pair — `pq_epoch` (0 while that
@@ -152,11 +167,12 @@ epoch and refreshing the PSK binding.
 ## Principal key rotation
 
 Rotation is **proposal-driven** (see [Group Rules](./group-rules.md) — the
-Authentication Service): `stage_rotation(new_client_id)` mints the successor (the app
-supplies only the opaque ClientId; signing keys are session-owned) and marks the
-session `Pending`; `prepare_to_encrypt(Some(new_id))` makes this round's stapled
-Upd(self) carry the candidate's credential. Different rounds may propose different
-candidates — the app orders them. The peer surfaces each candidate as
+Authentication Service) and **lazy** — there is no separate stage call:
+`prepare_to_encrypt(Some(new_id))` makes this round's stapled Upd(self) carry the
+successor's credential, minting the successor (the app supplies only the opaque
+ClientId; signing keys are session-owned) and authorizing it on the fly if `new_id` is
+not already a candidate. Admitting a candidate marks the session `Pending`. Different
+rounds may propose different candidates — the app orders them. The peer surfaces each candidate as
 `QueuedRemoteProposal.proposing`, approves one with `queue_proposal` (the running
 tally), and its next commit **canonicalizes** it: `committed_remote_client_id` and
 `their_principal_state` report the new identity on the committing side, and the
@@ -172,11 +188,12 @@ epoch advances by an A.3 bind.
 
 The winner's other leaves **lag and catch up**: the proposer's own send-group leaf
 moves at its next approved commit (the peer observes `new_sender` on that staple, and
-message attribution follows); the PQ leaves catch up at the next A.4/A.5 handoff
-(`pq_rekey_begin(rotating:)` must name the session's *current* — already canonical —
-principal, and the handoff's new leaf carries that credential); the acceptor's
-recv-group leaf converges from the invitation identity to the dedicated
-establishment principal via its first committed Upd. Every catch-up is validated
+message attribution follows); the PQ leaves catch up at the next A.4/A.5 handoff (the
+session self-drives this — when a rotation leaves the send-PQ leaf lagging, the next A.5
+it opens announces the session's *current*, already-canonical principal as the handoff,
+and the handoff's new leaf carries that credential); the acceptor's recv-group leaf
+converges from the invitation identity to the dedicated establishment principal via its
+first committed Upd. Every catch-up is validated
 against the AS history window.
 
 For the common "dedicated agent per session" pattern, don't rotate at establishment

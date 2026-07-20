@@ -343,7 +343,20 @@ pub fn version() -> String {
 // for reusable invitations (one transport address, many sessions) without a rendezvous
 // side-band; `pq_bootstrap_begin` is unchanged. Invitation archive layout changed
 // (`INVITATION_VERSION` 1 -> 2, pre-release hard cut: a v1 blob decodes short and regenerates).
-const BINDING_CONTRACT_VERSION: u64 = 23;
+//
+// v24 (2026-07-19): the session self-drives A.3/A.5 advancement (the host no longer calls
+// `begin(.ratchet/.rekey)` — an ordinary send opens the next round when it is our turn: A.5 on a
+// credential lag, else A.3) AND every header-sealed frame gains a 4-byte length prefix so a
+// side-band frame can be zero-padded up to its co-stapled message (Feature B, `set_pad_target`).
+// The prefix is a hard wire cut: a v23 seal (no prefix) mis-parses under a v24 `try_open` and vice
+// versa. New FFI: `set_pad_target(Option<u64>)`. Safe because PQ is unshipped.
+//
+// v25 (2026-07-19): credential staging is lazy — `prepare_to_encrypt(Some(id))` admits an unstaged
+// candidate on the fly (mint + authorize), so a rotation rides the very first frame with no
+// separate stage call. The `stage_rotation` FFI is REMOVED (kept crate-internal for the
+// stage-without-send invariant tests only); the app proposes credentials via `prepare_to_encrypt`
+// and establishes a dedicated principal directly through `receive(new_client_id:)`.
+const BINDING_CONTRACT_VERSION: u64 = 25;
 
 /// See `BINDING_CONTRACT_VERSION`. Exported so the Swift layer can verify the
 /// binding it was generated with matches the binary it loaded.
@@ -725,7 +738,7 @@ pub enum TwoMlsPqError {
     /// reserved: the rotation-commit discriminator is "empty authenticated_data = ratchet
     /// commit", so an empty id could never be announced or observed by the peer. Raised by
     /// `TwoMlsPqInvitation::receive(new_client_id: Some(vec![]))` and
-    /// `stage_rotation(vec![])`.
+    /// `prepare_to_encrypt(Some(<empty id>))` (which lazily admits the candidate).
     #[error("principal client id must be non-empty")]
     InvalidClientId,
     /// An establishment identity failed to match: the remote's key package does not carry

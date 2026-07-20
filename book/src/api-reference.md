@@ -73,10 +73,11 @@ The receiving side of a published key package — no live client required.
   `spawn_token` is an opaque, replay-stable identifier for the initial frame, keying
   the forward table.
   `new_client_id` is an optional **dedicated per-session principal**: when `Some`, the
-  spawned session's send group is created under a freshly-minted principal carrying
-  that ClientId (signing keys minted internally, as with `stage_rotation`), so the
-  initiator sees the dedicated principal from the very first frame — no rotation
-  commit, so nothing can displace the welcome staple. The receive-group join still
+  spawned session's send group is created directly under a freshly-minted principal
+  carrying that ClientId (signing keys minted internally) — so the acceptor runs as the
+  dedicated agent from birth (its creator leaf carries `new_client_id`) and the
+  initiator sees the dedicated principal from the very first frame, with no
+  founding→dedicated rotation, so nothing can displace the welcome staple. The receive-group join still
   uses the invitation identity (the welcome was addressed to its key package), and
   the session id still derives from the founding pair, so both sides agree on it.
   `expected_remote` is the identity the caller already expects the welcome from
@@ -161,9 +162,11 @@ it rides the persisted group state, so a restored session's owner re-verifies he
 errors only on a present-but-undecodable extension, so corruption can never read back as
 "unbound").
 
-Messaging: `prepare_to_encrypt(proposing)` — `Some(id)` selects which staged rotation
-candidate this round's Upd proposes (`None` re-proposes the current identity; the
-commit path is unchanged); its result carries the staged Upd both raw
+Messaging: `prepare_to_encrypt(proposing)` — `Some(id)` proposes a rotation to that
+ClientId on this round's Upd, admitting the candidate on the fly (minting the successor's
+signing keys and authorizing it if `id` is not already staged — so a rotation can ride the
+very first frame); `None` re-proposes the current identity and the commit path is
+unchanged; its result carries the staged Upd both raw
 (`proposal_message` — the exact message the paired `encrypt` staples) and digested
 (`proposal_hash`), from one critical section, so a host binding a signature to the
 proposal (the anchor agent handoff) applies its own digest to the returned bytes with
@@ -173,10 +176,11 @@ no staged-slot read a later prepare could have replaced; `encrypt`;
 latest-wins; validates then leaves the proposal cache untouched, so a rejected call is
 a no-op and a replacement never doubles up; dropped when the send epoch advances via an
 A.3 bind); `queued_remote_successor() -> Option<ClientId>` — the credential currently
-queued, for the app's replace policy; `stage_rotation` — mints a successor candidate
-(re-staging adds candidates, never evicting a sent one; overflow beyond the in-flight
-window defers to a single slot and is proposed next round; the peer's commit picks the
-winner). See [Group Rules](./group-rules.md) for the Authentication Service semantics.
+queued, for the app's replace policy. Proposing another `Some(id)` adds a candidate,
+never evicting one already sent, so several may be in flight (`my_principal_state` is
+`Pending` while any are); overflow beyond the in-flight window defers to a single slot
+proposed next round, and the peer's commit picks the winner. See
+[Group Rules](./group-rules.md) for the Authentication Service semantics.
 
 Header encryption: `open_incoming(blob) -> Option<OpenedFrame { kind, frame }>` removes
 the outer seal from a rendezvous-channel blob and returns the plaintext `frame` plus a
@@ -194,16 +198,25 @@ rendezvous address per retained epoch), `send_rendezvous()` (where to post),
 invitation's forward table).
 
 PQ side-band (see [Session Lifecycle](./session-lifecycle.md)): `my_pq_turn`,
-`pq_take_pending_outbound`, `pq_bootstrap_begin(rotating)` / `pq_bootstrap_respond` /
-`pq_bootstrap_bind`, and `pq_ratchet_begin` /
-`pq_ratchet_respond` / `pq_ratchet_bind`, and
-`pq_rekey_begin(rotating)` / `pq_rekey_respond` / `pq_rekey_apply`. The A.3 ratchet and
-A.4 bootstrap have no separate `apply` call: the initiator ingests the responder's reply
-and stages the owed bind with `pq_ratchet_bind` / `pq_bootstrap_bind`, and that bind then
-rides the next message frame's staple, which the peer applies through `process_incoming`
-(the v18 "a bind is the staple" model). The `rotating`
-parameters carry the principal credential handoff and must name the session's current
-principal.
+`pq_pending_outbound(sealing)` / `pq_take_pending_outbound`, `pq_bootstrap_begin(rotating)` /
+`pq_bootstrap_respond` / `pq_bootstrap_bind`, and the ratchet/re-key *responder* and *bind/apply*
+legs — `pq_ratchet_respond` / `pq_ratchet_bind` and `pq_rekey_respond` / `pq_rekey_apply`. **There
+is no `pq_ratchet_begin` / `pq_rekey_begin`: the session self-drives A.3 and A.5.** On each
+`encrypt`, when it is our turn and the side-band is idle, the session auto-stages the next round's
+opening frame (A.5 on a credential lag — announcing the session's current principal as the handoff
+— else A.3), and the host takes it from `pq_pending_outbound`/`pq_take_pending_outbound` to send
+alongside the message. A.4 bootstrap stays host-driven (`pq_bootstrap_begin`, whose `rotating`
+parameter carries the principal credential handoff and must name the session's current principal).
+The A.3 ratchet and A.4 bootstrap have no separate `apply` call: the initiator ingests the
+responder's reply and stages the owed bind with `pq_ratchet_bind` / `pq_bootstrap_bind`, and that
+bind then rides the next message frame's staple, which the peer applies through `process_incoming`
+(the v18 "a bind is the staple" model).
+
+Side-band frame sizing (Feature B): `set_pad_target(target)` declares the frame-sizing intent.
+`Some(n)` pads each side-band frame up to the co-stapled message's size, capped at the
+push-payload budget `n` bytes, so the two co-stapled payloads are size-indistinguishable to an
+on-path observer; `None` (the default) sends frames at their natural size. Like `install_sink`,
+it is live plumbing outside the archive — set it right after restore, before use.
 
 Persistence (push): attach an `ArchiveSink` with `install_sink` (once-only —
 `SinkAlreadyInstalled` on a second call; the first pushes a baseline `Checkpoint`). The
@@ -256,7 +269,7 @@ state as broken but leaves sending intact, and a restore from the last persisted
 heals it. `DuplicateSideBand` is a benign no-op (a re-delivered side-band frame);
 `BootstrapKpMismatch` rejects an A.4 bootstrap key package whose hash does not match the
 commitment `receive` was given. `InvalidClientId` rejects an empty
-principal id supplied to `receive(new_client_id:)` or `stage_rotation` — empty is
+principal id supplied to `receive(new_client_id:)` or `prepare_to_encrypt(Some(id))` — empty is
 reserved (it is the ratchet-commit authenticated-data discriminator, so an empty id
 could never be announced to the peer). `RemoteIdentityMismatch` is an establishment
 identity-binding failure: an `expected_remote` the key package does not name, a

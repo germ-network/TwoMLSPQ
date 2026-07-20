@@ -53,6 +53,8 @@ In its place we have two PQ operations:
     
     One round re-keys ONE group; the turn alternation brings the other group’s round next. The large updatePath commit happens in isolation on the PQ group, otherwise we block the classical ratchet on transmitting it — only the small pathless ack rides the classical staple.
 
+**Who opens a round — the session, not the host.** The host never selects or opens A.3/A.5; the session self-drives them. Whenever it is our turn, the PQ side-band is idle, and both halves are live (post-A.4), the next `encrypt` opens the next round automatically: an **A.5 re-key** if our send-PQ leaf still lags the canonical (classically committed) identity — the credential catch-up, announcing that identity — else an **A.3 ratchet**. Opening is send-driven and best-effort (a transient staging failure just retries on the next send), and the frame it stages rides that same send's re-staple. So the abstract "initiator (Alice) sends…" above is, concretely, *Alice's next ordinary message once the turn is hers*. One subtlety: a rotation that lands while an A.3 is already staged does not upgrade that A.3 to an A.5 mid-flight — the catch-up defers to the following turn.
+
 1. Session establishment
     1. Bob posts an APQ keyPackage
     2. Alice forms an APQ group (as her send group), sends the APQ Welcome
@@ -587,11 +589,11 @@ bootstrap-KP counterpart of `forward_group_id`/`processed_welcome_group_id`. Bec
 key is `H(KP′)`, a frame that resolves can never fail `pq_bootstrap_respond`'s own hash check.
 
 **Why the bind leg exists.** Without it A.4 is the only two-leg operation, and the turn has to
-pass at Bob's *send* rather than at an apply — so Bob is expected to open the next A.3 round while
-his own Welcome' is still unconfirmed, and the two operations contend. The bind makes A.4 a
-well-formed round (initiator → responder → initiator, as A.3 and A.5 already are), so the usual
-rule applies unchanged: **the initiator relinquishes at its terminal send, the responder takes the
-turn on applying it.**
+pass at Bob's *send* rather than at an apply — so Bob's next send would open the next A.3 round
+(advancement is send-driven) while his own Welcome' is still unconfirmed, and the two operations
+contend. The bind makes A.4 a well-formed round (initiator → responder → initiator, as A.3 and A.5
+already are), so the usual rule applies unchanged: **the initiator relinquishes at its terminal
+send, the responder takes the turn on applying it.**
 
 **The receipt is free.** S is derivable only from *inside* [BSG-PQ], so a bind that applies at all
 is proof Alice joined — the confirmation is a side effect of entropy Alice had to chain anyway,

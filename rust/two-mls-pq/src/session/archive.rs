@@ -690,6 +690,11 @@ fn session_from_wire(wire: archive_wire::SessionArchive) -> Result<Arc<TwoMlsPqS
             expected_bootstrap_kp_commitment: wire.expected_bootstrap_kp_commitment,
             // Attached post-restore via `install_sink`.
             sink: None,
+            // Feature B: re-supplied post-restore via `set_pad_target` (mirrors `sink`); the
+            // last-message length resets to 0 (the first side-band seal before any `encrypt` is
+            // then unpadded).
+            pad_target: None,
+            last_message_frame_len: 0,
         }),
     }))
 }

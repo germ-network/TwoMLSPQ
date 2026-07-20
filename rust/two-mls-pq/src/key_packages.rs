@@ -770,9 +770,9 @@ impl TwoMlsPqInvitation {
     ///
     /// `new_client_id` is an optional dedicated per-session principal: when `Some`, the
     /// spawned session's send group is created under a freshly-minted principal carrying
-    /// that ClientId (signing keys are session-owned, minted internally — the same
-    /// convention as `stage_rotation`), so the initiator sees the dedicated principal
-    /// from the very first frame and no rotation commit is needed. The receive-group
+    /// that ClientId (signing keys are session-owned, minted internally), so the initiator
+    /// sees the dedicated principal from the very first frame and no rotation commit is
+    /// needed (born-dedicated). The receive-group
     /// join still uses this invitation's identity — the welcome was addressed to its key
     /// package. `None` keeps the session under the invitation identity.
     ///

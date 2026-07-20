@@ -184,13 +184,30 @@ impl MlsRules for TwoMlsRules {
         &self,
         _roster: &Roster,
         _context: &GroupContext,
-        _proposals: &ProposalBundle,
+        proposals: &ProposalBundle,
     ) -> Result<CommitOptions, RuleError> {
-        // Defaults are deliberate: RFC 9420 already forces an updatePath on empty
-        // commits and on commits covering Update proposals, which is every commit
-        // that needs one; `path_required` would bolt a full ML-KEM updatePath onto
-        // the A.3 bind's pathless PSK commit and defeat the side-band's cheapness.
-        Ok(CommitOptions::default())
+        // TwoMLS policy: a FULL commit — one carrying the APP_DATA_UPDATE attestation, i.e. an
+        // owed-bind discharge — MUST include an updatePath.
+        //
+        // RFC 9420 leaves the path at the committer's DISCRETION for a commit whose proposals do
+        // not require one, and mls-rs honours that: it omits the path unless a proposal forces it
+        // (`path_update_required`) or `path_required` is set. Crucially, mls-rs does NOT treat
+        // `set_new_signing_identity` as path-forcing — so a commit that changes the committer's own
+        // leaf credential can go out pathless, and the new leaf key never reaches the peer. Our
+        // Phase 8 own-leaf catch-up (`prepare_ratchet_commit`'s handoff) rides exactly such a
+        // commit: the bind discharge carries no folded Update to force a path, so without this the
+        // peer keeps the old key and the discharge frame's app message fails to verify
+        // (`InvalidSignature`). Routine folds already carry a path (their folded Update forces one),
+        // so in practice this only pins the path onto the discharge — the one FULL commit that
+        // otherwise wouldn't. It also delivers the "fresh own leaf" PCS source the discharge is
+        // meant to. Deliberately CLASSICAL-only (this is the classical group's rules); the PQ group
+        // sets its own path policy and is untouched — an ML-KEM updatePath is expensive and no PQ
+        // bug requires it.
+        let is_full_commit = proposals
+            .custom_proposals()
+            .iter()
+            .any(|c| c.proposal.proposal_type() == APP_DATA_UPDATE);
+        Ok(CommitOptions::default().with_path_required(is_full_commit))
     }
 
     fn encryption_options(

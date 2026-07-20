@@ -62,6 +62,10 @@ struct LifecycleTests {
 		#expect(try localBase.sendRendezvous() == nil)
 
 		// -- Step 2: the invitation receives — recv group up, send group classical-only.
+		// Born-dedicated (contract 25): the acceptor's send group is created UNDER this dedicated
+		// principal (its creator leaf carries `dedicatedId`), so remote runs as `dedicatedId` from
+		// birth — no founding→dedicated staging.
+		let dedicatedId: ClientID = .mock()
 		let (remoteSession, stapled) = try remote.currentInvitation.receive(
 			sendGroupWelcome: welcome,
 			remoteKeyPackage: myKeyPackage,
@@ -69,7 +73,7 @@ struct LifecycleTests {
 			remoteClientId: try local.clientId,
 			welcomeToken: WelcomeToken(TypedDigest(prefix: .sha256, over: welcome)),
 			stapledMessage: nil,
-			newClientId: .mock()
+			newClientId: dedicatedId
 		)
 		#expect(stapled == nil)
 		let remoteBase = remoteSession.base
@@ -84,17 +88,13 @@ struct LifecycleTests {
 		let remoteRecv = try #require(remoteBase.receiveGroupId())
 		#expect(!remoteRecv.classical.bytes.isEmpty)
 		#expect(!remoteRecv.pq.bytes.isEmpty)
-		// Each side's view of the peer matches the peer's self-view — modulo the
-		// acceptor's staged candidate: `receive(newClientId:)` leaves the acceptor
-		// .pending, and a candidate stays PRIVATE to its proposer until a frame
-		// carries it (contract v9 candidate lifecycle), so the initiator still
-		// sees the canonical invitation identity. Asserted through the abstract
-		// truth surface (M6), not the raw binding.
-		#expect(localSession.myPrincipalState == remoteSession.theirPrincipalState)
-		guard case .pending(let old, _) = remoteSession.myPrincipalState else {
-			throw TestErrors.unexpected
-		}
-		#expect(localSession.theirPrincipalState == .sync(old))
+		// Born-dedicated: remote runs as `dedicatedId` from birth (`.sync`, not `.pending`), and
+		// its view of the peer is the initiator's own id. The initiator has NOT yet joined remote's
+		// send group (that is step 3's stapled return welcome), so it still sees remote's invitation
+		// identity — it adopts `dedicatedId` from the creator leaf on the join below. Asserted
+		// through the abstract truth surface (M6), not the raw binding.
+		#expect(remoteSession.myPrincipalState == .sync(dedicatedId))
+		#expect(remoteSession.theirPrincipalState == localSession.myPrincipalState)
 
 		// Routing: remote can post immediately — its post address is the recv
 		// group's current exporter, which is the same MLS group as the initiator's
@@ -113,6 +113,8 @@ struct LifecycleTests {
 
 		// -- Step 3: remote's first frame staples the return welcome; local joins in-band.
 		try remoteSession.send(to: localSession)
+		// The join adopts the dedicated id from remote's send-group creator leaf (born-dedicated).
+		#expect(localSession.theirPrincipalState == .sync(dedicatedId))
 		#expect(localBase.isEstablished())
 		#expect(!localBase.isFullyEstablished())
 		// Local's recv group mirrors the deferred half: classical id only, empty PQ slot.
@@ -186,7 +188,7 @@ struct LifecycleTests {
 		// -- Step 5: A.4 bootstrap. Local owes it (holds the turn).
 		#expect(localSession.turn == .weInitiate)
 		#expect(remoteSession.turn == .theyInitiate)
-		let kp = try localSession.begin(.finishBootstrap, rotating: nil)
+		let kp = try localSession.finishBootstrap(rotating: nil)
 		#expect(kp.kind == .finishBootstrap)
 		// Bootstrap key-package frame — classify by opening the seal (wire tag sealed, v7).
 		#expect(try remoteBase.openIncoming(blob: kp.payload)?.kind == .pqSideBand(kind: .bootstrapKeyPackage))
@@ -257,61 +259,48 @@ struct LifecycleTests {
 		#expect(try postAddressMatches(poster: localBase, listener: remoteBase))
 		#expect(try postAddressMatches(poster: remoteBase, listener: localBase))
 
-		// -- Step 7: A.5 rekey — PQ-group updatePath commits, isolated from the
-		// classical ratchet. Remote holds the turn (local's A.4 completion passed it).
+		// -- Step 7: A.3 ratchet — SESSION-DRIVEN (contract 24). There is no host
+		// `begin(.ratchet)`: Remote holds the turn (local's A.4 completion passed it),
+		// so Remote's next ordinary SEND auto-stages the EK, taken via `pendingSideBand`.
+		// (A.5 as a rotation credential catch-up is exercised in the Rust crate suite.)
 		#expect(remoteSession.turn == .weInitiate)
-		let rekeyUpd = try remoteSession.begin(.rekey, rotating: nil)
-		#expect(rekeyUpd.kind == .rekey)
-		// Rekey Upd' proposal frame — classify by opening the seal (wire tag sealed, v7).
-		#expect(try localBase.openIncoming(blob: rekeyUpd.payload)?.kind == .pqSideBand(kind: .rekeyUpdate))
-		// The proposal alone moves no epochs on the initiator's side.
-		#expect(remoteBase.epochs().pqEpoch == 1)
+		let remotePqBeforeRatchet = remoteBase.epochs().pqEpoch
+		try remoteSession.send(to: localSession) // opener — auto-stages Remote's A.3 EK
+		let ratchetEk = try #require(remoteSession.pendingSideBand(sealing: .fresh))
+		// EK frame — classify by opening the seal (wire tag sealed, v7).
+		#expect(try localBase.openIncoming(blob: ratchetEk)?.kind == .pqSideBand(kind: .ratchetEphemeralKey))
 
-		// Local responds: commits Upd'(remote) on its own send-PQ with an updatePath
-		// and the cross-injected PSK — pq epoch advances, classical is untouched,
-		// and no listen addresses are minted (PQ-only commits, like A.4).
-		let localClassicalBeforeRekey = localBase.epochs().classicalEpoch
-		let localListenBeforeRekey = try localBase.shouldListenOn().rendezvousByEpoch.count
-		let rekeyInbound1 = try localSession.ingest(rekeyUpd.payload)
-		#expect(rekeyInbound1.kind == .rekey)
-		#expect(localBase.epochs().pqEpoch == 3)
-		#expect(localBase.epochs().classicalEpoch == localClassicalBeforeRekey)
-		#expect(
-			try localBase.shouldListenOn().rendezvousByEpoch.count
-				== localListenBeforeRekey)
+		// Local responds: seals the injected secret to the EK, parking the CT reply.
+		let ratchetInbound1 = try localSession.ingest(ratchetEk)
+		#expect(ratchetInbound1.kind == .ratchet)
+		let ratchetReply = try #require(localSession.advance(after: ratchetInbound1))
+		#expect(ratchetReply.kind == .ratchet)
+		// CT frame — classify by opening the seal.
+		#expect(try remoteBase.openIncoming(blob: ratchetReply.payload)?.kind == .pqSideBand(kind: .ratchetCiphertext))
+		// The consuming take hands the frame out exactly once.
+		#expect(localSession.advance(after: ratchetInbound1) == nil)
 
-		// Local's parked reply is its Commit' — the round's ONE updatePath commit
-		// (v18: the counter-Upd' is gone; one A.5 round re-keys one group).
-		let rekeyReply = try #require(localSession.advance(after: rekeyInbound1))
-		#expect(rekeyReply.kind == .rekey)
-		// Rekey Commit' frame — classify by opening the seal (wire tag sealed, v7).
-		#expect(try remoteBase.openIncoming(blob: rekeyReply.payload)?.kind == .pqSideBand(kind: .rekeyCommit))
-		#expect(localSession.advance(after: rekeyInbound1) == nil)
+		// Remote binds the CT: its send-PQ commits EAGERLY (a pathless partial) and the
+		// classical half is OWED — it rides Remote's next classical commit as the staple.
+		// No further side-band frame is produced.
+		let ratchetInbound2 = try remoteSession.ingest(ratchetReply.payload)
+		#expect(ratchetInbound2.kind == .ratchet)
+		#expect(remoteSession.advance(after: ratchetInbound2) == nil)
+		#expect(remoteBase.epochs().pqEpoch > remotePqBeforeRatchet)
 
-		// Remote applies local's Commit' to its recv mirror, and the closing ACK's
-		// PQ half commits EAGERLY on remote's own send-PQ (a pathless partial —
-		// the same eager-PQ/owed-classical split every bind takes). The classical
-		// half is owed and rides remote's next classical commit as the staple. No
-		// third side-band frame exists (v18).
-		let rekeyInbound2 = try remoteSession.ingest(rekeyReply.payload)
-		#expect(rekeyInbound2.kind == .rekey)
-		#expect(remoteBase.epochs().pqEpoch == 2)
-		#expect(remoteSession.advance(after: rekeyInbound2) == nil)
-
-		// Remote's next committing round staples the ACK; local applies it and the
+		// Remote's next committing round staples the bind; local applies it and the
 		// turn passes back to local.
 		try remoteSession.exchange(with: localSession)
-		#expect(remoteBase.epochs().pqEpoch == 2)
 		#expect(localSession.turn == .weInitiate)
 		#expect(remoteSession.turn == .theyInitiate)
 
-		// -- Step 8: exchanges still flow on the rekeyed groups, and the next
-		// send reports the bumped pq epoch.
+		// -- Step 8: exchanges still flow on the ratcheted groups.
 		try localSession.exchange(with: remoteSession)
 		_ = try remoteSession.prepareToEncrypt(proposing: nil)
-		let postRekeyFrame = try remoteSession.encrypt(appMessage: Data("post-rekey".utf8))
-		#expect(postRekeyFrame.epochs.pqEpoch == 2)
-		_ = try localSession.processIncoming(ciphertext: postRekeyFrame.cipherText)
+		let postRatchetFrame = try remoteSession.encrypt(appMessage: Data("post-ratchet".utf8))
+		let postRatchet = try #require(
+			try localSession.processIncoming(ciphertext: postRatchetFrame.cipherText))
+		#expect(try postRatchet.applicationMessage.tryUnwrap.appMessageData == Data("post-ratchet".utf8))
 	}
 
 	/// The poster's post address is its recv group's current exporter; the recv
