@@ -124,9 +124,6 @@ public struct SessionError: Error, Sendable {
 		case invalidClientId
 		/// The app declined a proposal.
 		case proposalRejected
-		/// A rotation was asked to ride the A.3 ratchet, which has no updatePath to carry a
-		/// credential (use `.rekey`/`.finishBootstrap`).
-		case rotationCannotRideRatchet
 		/// The crypto provider can't back the required suite — a build / provider-config bug, never
 		/// a healthy-runtime condition.
 		case unsupportedCipherSuite
@@ -167,7 +164,7 @@ public struct SessionError: Error, Sendable {
 				.unexpectedWelcome:
 				return .rejectEstablishment
 			case .misroutedFrame, .sequenceViolation, .sessionNotEstablished,
-				.invalidClientId, .proposalRejected, .rotationCannotRideRatchet,
+				.invalidClientId, .proposalRejected,
 				.unsupportedCipherSuite, .missingWelcome, .sinkAlreadyInstalled,
 				.notImplemented:
 				return .callerBug

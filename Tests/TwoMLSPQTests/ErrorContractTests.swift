@@ -48,7 +48,6 @@ struct ErrorContractTests {
 			(.sessionNotEstablished, .callerBug),
 			(.invalidClientId, .callerBug),
 			(.proposalRejected, .callerBug),
-			(.rotationCannotRideRatchet, .callerBug),
 			(.unsupportedCipherSuite, .callerBug),
 			(.missingWelcome, .callerBug),
 			(.sinkAlreadyInstalled, .callerBug),
