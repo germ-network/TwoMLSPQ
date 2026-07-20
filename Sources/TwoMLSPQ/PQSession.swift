@@ -16,10 +16,11 @@
 //  `expectedBindingContract` for the v17/v18/v19 deltas):
 //   - `PQSession`, the six result adapters, `PQClient`, and `PQInvitation` are wired:
 //     routing (`shouldListenOn`/`sendRendezvous`), the true APQ epoch pair on encrypt
-//     results, A.5 rekey (`begin(.rekey)`); principal rotation — `receive(newClientId:)`
-//     stages the dedicated principal, the contract-v9 candidate lifecycle canonicalizes
-//     it, `begin(.rekey/.finishBootstrap, rotating:)` moves the PQ leaves (the
-//     peer reads `PQInbound.rotatedCredential`); forward routing — a re-delivered
+//     results, A.5 rekey (session-driven — contract 24); principal rotation —
+//     `receive(newClientId:)` stages the dedicated principal, the contract-v9 candidate
+//     lifecycle canonicalizes it, and the session-driven A.5 catch-up / `finishBootstrap(
+//     rotating:)` moves the PQ leaves (the peer reads `PQInbound.rotatedCredential`);
+//     forward routing — a re-delivered
 //     §A.1 envelope decodes as `.forward` via the invitation's spawn-token table
 //     (the `WelcomeToken` opaque token, keyed over the envelope's STABLE PREFIX so
 //     every pre-establishment re-staple resolves), and the spawned session both
@@ -175,7 +176,7 @@ import TwoMLSPQBinding
 //     `DuplicateSideBand` when the side-band won the race is the common one). The parked
 //     `Welcome'` rides the acceptor's next `pendingSideBand` hand-out. Invitation archive layout
 //     changed (INVITATION_VERSION 1→2, pre-release hard cut) — a stale blob fails to decode.
-private let expectedBindingContract: UInt64 = 23
+private let expectedBindingContract: UInt64 = 24
 
 enum TwoMLSPQBindingContract {
 	static let verified: Void = {
@@ -404,6 +405,16 @@ public struct PQSession {
 		}
 	}
 
+	/// Declare the side-band frame-sizing intent (Feature B, binding contract 24). `.some(n)`
+	/// pads each side-band frame up to the co-stapled message's size, capped at `n` bytes, so the
+	/// two co-stapled payloads are size-indistinguishable to an on-path observer; `nil` (the
+	/// default) sends frames at their natural size. Like `installSink`, this is live plumbing
+	/// outside the archive — set it right after restore, before use. A negative target clamps to
+	/// `0` (no padding).
+	public func setPadTarget(_ target: Int?) {
+		base.setPadTarget(target: target.map(UInt64.init(clamping:)))
+	}
+
 	public var stateSeq: UInt64 {
 		base.stateSeq()
 	}
@@ -581,43 +592,25 @@ public struct PQSession {
 		base.isFullyEstablished()
 	}
 
-	public func begin(
-		_ kind: PQOperationKind,
+	/// Finish the A.4 bootstrap — stand up the deferred send-group PQ half. This is the ONLY PQ
+	/// side-band round the host initiates. A.3 ratchet and A.5 re-key are session-driven (binding
+	/// contract 24): the session opens the next round automatically on the turn holder's next send
+	/// (A.5 as a credential catch-up when the send-PQ leaf lags, else A.3), and the host takes the
+	/// auto-staged frame via `pendingSideBand` / `advance`. There is no host `begin` for them — the
+	/// crate's `pq_ratchet_begin` / `pq_rekey_begin` were removed, so this method is bootstrap-only.
+	///
+	/// `rotating` is the credential handoff: it must name the session's CURRENT principal — the
+	/// Phase 8 classical rotation must have COMPLETED first (proposing puts the candidate on the
+	/// wire, the peer's approval + commit canonicalizes, and the staple back swaps the session
+	/// client; proposing alone has not swapped anything — a handoff before that round-trip returns
+	/// SessionNotReady). The bootstrap then moves the PQ leaves to that principal's signing key.
+	public func finishBootstrap(
 		rotating: ClientID?
 	) throws(SessionError) -> PQOutbound {
 		try mapPQErrors(.pqOperation) {
-		// `rotating` is the A.4/A.5 credential handoff: it must name the session's
-		// CURRENT principal — i.e. the Phase 8 classical rotation must have
-		// COMPLETED first (contract v9+: proposing puts the candidate on the
-		// wire, the peer's approval + commit canonicalizes, and the staple back
-		// swaps the session client; proposing alone has not swapped anything —
-		// `begin(rotating:)` before that round-trip returns SessionNotReady).
-		// The operation then moves the PQ leaves to that principal's signing
-		// key; the peer observes it as PQInbound.rotatedCredential on the
-		// rekey Upd'.
-		switch kind {
-		case .finishBootstrap:
-			return PQOutbound(
-				kind: kind,
-				payload: try base.pqBootstrapBegin(
-					rotating: rotating?.pqClientId)
-			)
-		case .ratchet:
-			// A.3 injects a PSK with no updatePath — nothing carries a new
-			// leaf credential.
-			guard rotating == nil else {
-				throw SessionError(
-					code: .rotationCannotRideRatchet,
-					detail: "A.3 has no updatePath; rotate via .rekey or .finishBootstrap")
-			}
-			return PQOutbound(kind: kind, payload: try base.pqRatchetBegin())
-		case .rekey:
-			return PQOutbound(
-				kind: kind,
-				payload: try base.pqRekeyBegin(
-					rotating: rotating?.pqClientId)
-			)
-		}
+			PQOutbound(
+				kind: .finishBootstrap,
+				payload: try base.pqBootstrapBegin(rotating: rotating?.pqClientId))
 		}
 	}
 
@@ -1031,8 +1024,8 @@ public struct PQInvitation {
 		// proposing: newClientId)` puts the candidate on the wire as this
 		// side's Upd proposal — the PEER's approval (`queueProposal`) plus
 		// commit canonicalizes it, and the staple back swaps the session
-		// client. Only then do the PQ leaves catch up at the next
-		// `begin(.rekey, rotating: newClientId)` (A.5).
+		// client. Only then do the PQ leaves catch up — at the next
+		// session-driven A.5 the send opens once the leaf lags the rotated client.
 		try session.base.stageRotation(newClientId: newClientId)
 
 		return (session, stapled)
