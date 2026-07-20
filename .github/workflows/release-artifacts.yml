@@ -128,11 +128,11 @@ jobs:
           PY
           # Re-sync the vendored binding from THIS build so the tagged tree ships a matched
           # binding/binary pair.
-          cp bindings/two_mls_pq.swift Sources/TwoMLSPQ/two_mls_pq.swift
+          cp bindings/two_mls_pq.swift Sources/TwoMLSPQBinding/two_mls_pq.swift
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           # Stage exactly the two files we pinned — never a stray tracked change swept up by -a.
-          git commit Package.swift Sources/TwoMLSPQ/two_mls_pq.swift \
+          git commit Package.swift Sources/TwoMLSPQBinding/two_mls_pq.swift \
             -m "Release ${TAG}: pin xcframework (${SUM}) + binding"
           git tag -f "${TAG}"
           git push origin --force "refs/tags/${TAG}"
