@@ -350,7 +350,13 @@ pub fn version() -> String {
 // side-band frame can be zero-padded up to its co-stapled message (Feature B, `set_pad_target`).
 // The prefix is a hard wire cut: a v23 seal (no prefix) mis-parses under a v24 `try_open` and vice
 // versa. New FFI: `set_pad_target(Option<u64>)`. Safe because PQ is unshipped.
-const BINDING_CONTRACT_VERSION: u64 = 24;
+//
+// v25 (2026-07-19): credential staging is lazy — `prepare_to_encrypt(Some(id))` admits an unstaged
+// candidate on the fly (mint + authorize), so a rotation rides the very first frame with no
+// separate stage call. The `stage_rotation` FFI is REMOVED (kept crate-internal for the
+// stage-without-send invariant tests only); the app proposes credentials via `prepare_to_encrypt`
+// and establishes a dedicated principal directly through `receive(new_client_id:)`.
+const BINDING_CONTRACT_VERSION: u64 = 25;
 
 /// See `BINDING_CONTRACT_VERSION`. Exported so the Swift layer can verify the
 /// binding it was generated with matches the binary it loaded.

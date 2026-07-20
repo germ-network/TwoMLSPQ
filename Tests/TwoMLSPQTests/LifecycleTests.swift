@@ -62,6 +62,10 @@ struct LifecycleTests {
 		#expect(try localBase.sendRendezvous() == nil)
 
 		// -- Step 2: the invitation receives — recv group up, send group classical-only.
+		// Born-dedicated (contract 25): the acceptor's send group is created UNDER this dedicated
+		// principal (its creator leaf carries `dedicatedId`), so remote runs as `dedicatedId` from
+		// birth — no founding→dedicated staging.
+		let dedicatedId: ClientID = .mock()
 		let (remoteSession, stapled) = try remote.currentInvitation.receive(
 			sendGroupWelcome: welcome,
 			remoteKeyPackage: myKeyPackage,
@@ -69,7 +73,7 @@ struct LifecycleTests {
 			remoteClientId: try local.clientId,
 			welcomeToken: WelcomeToken(TypedDigest(prefix: .sha256, over: welcome)),
 			stapledMessage: nil,
-			newClientId: .mock()
+			newClientId: dedicatedId
 		)
 		#expect(stapled == nil)
 		let remoteBase = remoteSession.base
@@ -84,17 +88,13 @@ struct LifecycleTests {
 		let remoteRecv = try #require(remoteBase.receiveGroupId())
 		#expect(!remoteRecv.classical.bytes.isEmpty)
 		#expect(!remoteRecv.pq.bytes.isEmpty)
-		// Each side's view of the peer matches the peer's self-view — modulo the
-		// acceptor's staged candidate: `receive(newClientId:)` leaves the acceptor
-		// .pending, and a candidate stays PRIVATE to its proposer until a frame
-		// carries it (contract v9 candidate lifecycle), so the initiator still
-		// sees the canonical invitation identity. Asserted through the abstract
-		// truth surface (M6), not the raw binding.
-		#expect(localSession.myPrincipalState == remoteSession.theirPrincipalState)
-		guard case .pending(let old, _) = remoteSession.myPrincipalState else {
-			throw TestErrors.unexpected
-		}
-		#expect(localSession.theirPrincipalState == .sync(old))
+		// Born-dedicated: remote runs as `dedicatedId` from birth (`.sync`, not `.pending`), and
+		// its view of the peer is the initiator's own id. The initiator has NOT yet joined remote's
+		// send group (that is step 3's stapled return welcome), so it still sees remote's invitation
+		// identity — it adopts `dedicatedId` from the creator leaf on the join below. Asserted
+		// through the abstract truth surface (M6), not the raw binding.
+		#expect(remoteSession.myPrincipalState == .sync(dedicatedId))
+		#expect(remoteSession.theirPrincipalState == localSession.myPrincipalState)
 
 		// Routing: remote can post immediately — its post address is the recv
 		// group's current exporter, which is the same MLS group as the initiator's
@@ -113,6 +113,8 @@ struct LifecycleTests {
 
 		// -- Step 3: remote's first frame staples the return welcome; local joins in-band.
 		try remoteSession.send(to: localSession)
+		// The join adopts the dedicated id from remote's send-group creator leaf (born-dedicated).
+		#expect(localSession.theirPrincipalState == .sync(dedicatedId))
 		#expect(localBase.isEstablished())
 		#expect(!localBase.isFullyEstablished())
 		// Local's recv group mirrors the deferred half: classical id only, empty PQ slot.

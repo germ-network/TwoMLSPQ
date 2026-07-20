@@ -176,7 +176,7 @@ import TwoMLSPQBinding
 //     `DuplicateSideBand` when the side-band won the race is the common one). The parked
 //     `Welcome'` rides the acceptor's next `pendingSideBand` hand-out. Invitation archive layout
 //     changed (INVITATION_VERSION 1→2, pre-release hard cut) — a stale blob fails to decode.
-private let expectedBindingContract: UInt64 = 24
+private let expectedBindingContract: UInt64 = 25
 
 enum TwoMLSPQBindingContract {
 	static let verified: Void = {
@@ -985,10 +985,12 @@ public struct PQInvitation {
 		// invitation state is claimed — redundant with the key-package guard
 		// above by construction, kept so the binding is enforced independently
 		// on both sides of the FFI (defense-in-depth of two, not one).
-		// `newClientId: nil` stays deliberate: passing it would establish
-		// directly under the dedicated principal and retire the
-		// stage→propose→approve dance below — a semantic change deferred to its
-		// own follow-up.
+		// Contract 25: establish the send group DIRECTLY under the dedicated per-session
+		// principal — `newClientId` becomes the creator leaf's credential, so there is no
+		// founding→dedicated rotation dance (that dance's `stageRotation` is gone from the FFI;
+		// steady-state rotations propose lazily via `prepareToEncrypt(proposing:)`). The peer
+		// adopts the dedicated id from the creator leaf and surfaces it as
+		// `remoteCommit.newSender` when it differs from the invitation identity.
 		// `expectedAppBinding: nil` — unbound (v15's AppBinding): this surface does
 		// not state a binding yet, and the crate never silently accepts a
 		// binding-carrying welcome against a nil expectation.
@@ -998,7 +1000,7 @@ public struct PQInvitation {
 				theirClassicalKeyPackage: remoteKeyPackage,
 				bootstrapKpCommitment: bootstrapKpCommitment,
 				spawnToken: welcomeToken.wireFormat,
-				newClientId: nil,
+				newClientId: newClientId,
 				expectedRemote: remoteClientId,
 				expectedAppBinding: nil
 			))
@@ -1018,15 +1020,6 @@ public struct PQInvitation {
 			else { return nil }
 			return result.applicationMessage
 		}
-
-		// Stage the app-spawned session-dedicated principal for the Phase 8
-		// rotation (contract v9+ candidate lifecycle): `prepareToEncrypt(
-		// proposing: newClientId)` puts the candidate on the wire as this
-		// side's Upd proposal — the PEER's approval (`queueProposal`) plus
-		// commit canonicalizes it, and the staple back swaps the session
-		// client. Only then do the PQ leaves catch up — at the next
-		// session-driven A.5 the send opens once the leaf lags the rotated client.
-		try session.base.stageRotation(newClientId: newClientId)
 
 		return (session, stapled)
 		}

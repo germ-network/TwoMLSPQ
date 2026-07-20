@@ -464,14 +464,63 @@ impl SessionInner {
         })
     }
 
+    /// Mint, admit, and authorize a rotation candidate for OUR sequence — the state a
+    /// proposal of `new_client_id` needs. The signing keys are session-owned, so the caller
+    /// supplies only the opaque id. Idempotent: an id already staged or parked is a no-op.
+    /// If the in-flight pool (`CANDIDATE_WINDOW`) is full, the request parks in the single
+    /// deferred slot, promoted on a later round once a canonicalization frees a slot. Sets
+    /// `my_state` to `Pending` while the rotation is outstanding. This is the lazy-staging
+    /// core: `prepare_ratchet_commit` calls it when a `Some(id)` names an unstaged candidate,
+    /// so proposing an id stages it on the fly and no separate `stage_rotation` is required.
+    fn admit_candidate(&mut self, new_client_id: Vec<u8>) -> Result<()> {
+        if new_client_id.is_empty() {
+            // Empty is reserved: the rotation commit announces the id via the committer's
+            // leaf credential, and an empty credential id is indistinguishable from no
+            // announcement — the handoff would be structurally invisible to the peer.
+            return Err(TwoMlsPqError::InvalidClientId);
+        }
+        if self
+            .staged_candidates
+            .iter()
+            .any(|staged| staged.client_id().bytes == new_client_id)
+            || self.deferred_candidate.as_deref() == Some(new_client_id.as_slice())
+        {
+            return Ok(());
+        }
+        if self.staged_candidates.len() < CANDIDATE_WINDOW {
+            // Admit into the in-flight pool: mint, rebind the candidate's clients to the
+            // session-canonical AS core, and authorize the id for OUR sequence (the peer's
+            // provider learns it from the proposal we send; ours needs it for the local
+            // commit apply). It is proposable this round.
+            let candidate = TwoMlsPqPrincipal::new(new_client_id.clone())?;
+            candidate.combiner().auth_view().rebind(&self.auth_core);
+            self.with_auth(|core| core.mine.authorize(new_client_id.clone()));
+            self.staged_candidates.push(candidate);
+        } else {
+            // Pool full — never evict a sent candidate. Park this request in the single
+            // deferred slot; it is promoted and proposed on the next routine round once a
+            // canonicalization frees a slot. Not authorized yet (it is not on the wire).
+            self.deferred_candidate = Some(new_client_id.clone());
+        }
+        let old = self.my_state.client_id();
+        self.my_state = PrincipalState::Pending {
+            old,
+            new: ClientId {
+                bytes: new_client_id,
+            },
+        };
+        Ok(())
+    }
+
     /// Routine round (A.2): commit in OUR OWN send group — only the owner commits — and
     /// stage an Upd(self) proposal for the peer's send group to staple alongside. With an
     /// app-approved queued proposal (already cached in the send group via `queue_proposal`),
     /// the commit consumes it and additionally refreshes the cross-party TwoMLS-PSK
     /// exported from the recv group (the peer derives the same PSK from its send group).
-    /// `selected` names the staged rotation candidate whose credential this round's
-    /// Upd(self) proposes (`prepare_to_encrypt(Some(id))`); `None` re-proposes the
-    /// session's current identity. Different rounds may select different candidates —
+    /// `selected` names the rotation candidate whose credential this round's Upd(self)
+    /// proposes (`prepare_to_encrypt(Some(id))`); it is admitted on the fly if not already
+    /// staged (`admit_candidate`), so no separate staging call is needed. `None` re-proposes
+    /// the session's current identity. Different rounds may select different candidates —
     /// the peer's commit picks the winner.
     pub(in crate::session) fn prepare_ratchet_commit(
         &mut self,
@@ -619,23 +668,22 @@ impl SessionInner {
         // pool), promote the parked request — mint, admit, authorize — and propose it
         // this round in place of the default self-refresh.
         let selected = match selected {
-            Some(id) => Some(id),
+            Some(id) => {
+                // Lazy staging: proposing an id admits it (mint + authorize) on the fly when
+                // it is not already in flight — no separate `stage_rotation` call is needed.
+                // A rotation may thus ride the very first frame. `admit_candidate` reports the
+                // in-flight rotation as `Pending` in `my_principal_state`.
+                self.admit_candidate(id.bytes.clone())?;
+                Some(id)
+            }
             None if self.staged_candidates.len() < CANDIDATE_WINDOW => {
+                // Steer a deferred rotation onto this round: the app did not name a candidate
+                // and a slot has freed (a prior canonicalization cleared the pool), so promote
+                // the parked request via `admit_candidate` and propose it in place of the
+                // default self-refresh.
                 match self.deferred_candidate.take() {
                     Some(id) => {
-                        let candidate = TwoMlsPqPrincipal::new(id.clone())?;
-                        candidate.combiner().auth_view().rebind(&self.auth_core);
-                        self.with_auth(|core| core.mine.authorize(id.clone()));
-                        self.staged_candidates.push(candidate);
-                        // A rotation to this candidate is now in flight (proposed this
-                        // round, awaiting the peer's commit) — report it as `Pending`.
-                        // A prior canonicalization set `Sync` when it committed an
-                        // earlier candidate; without this, the promoted rotation would
-                        // be invisible in `my_principal_state`.
-                        self.my_state = PrincipalState::Pending {
-                            old: self.client.client_id(),
-                            new: ClientId { bytes: id.clone() },
-                        };
+                        self.admit_candidate(id.clone())?;
                         Some(ClientId { bytes: id })
                     }
                     None => None,
@@ -817,6 +865,47 @@ impl SessionInner {
         // new epoch once it sees this commit's staple.
         self.offered_proposal = None;
         Ok(())
+    }
+}
+
+// Test-only, deliberately OUTSIDE the `#[uniffi::export]` block below: staging is not part of the
+// FFI surface. `prepare_to_encrypt(Some(id))` admits an unstaged id on the fly (lazy staging via
+// `admit_candidate`), so a proposal needs no separate stage call — a session advances state only by
+// sending, and staging that never rides a frame buys nothing.
+#[cfg(test)]
+impl TwoMlsPqSession {
+    /// Eagerly stage a rotation candidate, minting its signing keys internally. Kept for the
+    /// tests, which exercise stage-without-send invariants (the deferred-slot overflow, an
+    /// archive cut mid-stage, the idempotent no-persist guard) in isolation — the app never
+    /// needs it (it proposes lazily via `prepare_to_encrypt(Some(id))`).
+    ///
+    /// Idempotent-ish, matching the classical `propose`: staging the id already staged is
+    /// a no-op (the existing staged identity — and its freshly minted keys — is kept); a
+    /// different id becomes a second in-flight candidate.
+    pub(crate) fn stage_rotation(&self, new_client_id: Vec<u8>) -> Result<()> {
+        // Empty is reserved: the rotation commit announces the id via the committer's
+        // leaf credential, and an empty credential id is indistinguishable from no
+        // announcement — the handoff would be structurally invisible to the peer.
+        if new_client_id.is_empty() {
+            return Err(TwoMlsPqError::InvalidClientId);
+        }
+        // Guard-first: staging an id already in flight (or already parked as the next request)
+        // is an idempotent no-op — return before the persist choke point so it neither bumps the
+        // seq nor pushes a Core for a state that did not change.
+        {
+            let inner = self.lock();
+            if inner
+                .staged_candidates
+                .iter()
+                .any(|staged| staged.client_id().bytes == new_client_id)
+                || inner.deferred_candidate.as_deref() == Some(new_client_id.as_slice())
+            {
+                return Ok(());
+            }
+        }
+        self.mutate_and_persist(crate::BlobKind::Core, |inner| {
+            inner.admit_candidate(new_client_id)
+        })
     }
 }
 
@@ -1549,63 +1638,6 @@ impl TwoMlsPqSession {
             .map(|(_, proposing, _)| ClientId {
                 bytes: proposing.clone(),
             })
-    }
-
-    /// Stage a new principal for the next rotation commit, minting its signing keys
-    /// internally: the MLS signing keys are session-owned state, so the app supplies only
-    /// the opaque ClientId. Call before `prepare_to_encrypt(Some(new_client_id))`, which
-    /// commits the handoff.
-    ///
-    /// Idempotent-ish, matching the classical `propose`: staging the id already staged is
-    /// a no-op (the existing staged identity — and its freshly minted keys — is kept); a
-    /// different id replaces the staged identity.
-    pub fn stage_rotation(&self, new_client_id: Vec<u8>) -> Result<()> {
-        // Empty is reserved: the rotation commit announces the id via the committer's
-        // leaf credential, and an empty credential id is indistinguishable from no
-        // announcement — the handoff would be structurally invisible to the peer.
-        if new_client_id.is_empty() {
-            return Err(TwoMlsPqError::InvalidClientId);
-        }
-        // Guard-first: staging an id already in flight (or already parked as the next request)
-        // is an idempotent no-op — return before the persist choke point so it neither bumps the
-        // seq nor pushes a Core for a state that did not change.
-        {
-            let inner = self.lock();
-            if inner
-                .staged_candidates
-                .iter()
-                .any(|staged| staged.client_id().bytes == new_client_id)
-                || inner.deferred_candidate.as_deref() == Some(new_client_id.as_slice())
-            {
-                return Ok(());
-            }
-        }
-        self.mutate_and_persist(crate::BlobKind::Core, |inner| {
-            if inner.staged_candidates.len() < CANDIDATE_WINDOW {
-                // Admit into the in-flight pool: mint, rebind the candidate's clients to the
-                // session-canonical AS core, and authorize the id for OUR sequence (the peer's
-                // provider learns it from the proposal we send; ours needs it for the local
-                // commit apply). It is proposable this round via `prepare_to_encrypt(Some(id))`.
-                let candidate = TwoMlsPqPrincipal::new(new_client_id.clone())?;
-                candidate.combiner().auth_view().rebind(&inner.auth_core);
-                inner.with_auth(|core| core.mine.authorize(new_client_id.clone()));
-                inner.staged_candidates.push(candidate);
-            } else {
-                // Pool full — never evict a sent candidate. Park this request in the single
-                // deferred slot; it is promoted and proposed on the next routine round once a
-                // canonicalization frees a slot. Not authorized yet (it is not on the wire),
-                // keeping `mine.authorized_next` aligned with the retained principals.
-                inner.deferred_candidate = Some(new_client_id.clone());
-            }
-            let old = inner.my_state.client_id();
-            inner.my_state = PrincipalState::Pending {
-                old,
-                new: ClientId {
-                    bytes: new_client_id,
-                },
-            };
-            Ok(())
-        })
     }
 
     /// Acknowledge a re-delivered pre-establishment frame routed here by the

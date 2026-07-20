@@ -1292,6 +1292,45 @@ fn ratchet_round(initiator: &Arc<TwoMlsPqSession>, responder: &Arc<TwoMlsPqSessi
     discharge_bind(initiator, responder, app);
 }
 
+/// A ROTATED party can discharge its owed A.3 bind via the BARE v19 license (no approved fold)
+/// and the peer opens the frame. The discharge commit carries the party's own-leaf credential
+/// handoff (`set_new_signing_identity`) but no folded Update to force an updatePath; mls-rs does
+/// not treat a new signing identity as path-forcing, so without the `TwoMlsRules::commit_options`
+/// FULL-commit path policy the new leaf never reaches the peer and its next app message fails
+/// `InvalidSignature`. Crate-level counterpart of the AbstractTwoMLS
+/// `licenseOnlyDischargeAfterRotationIsKnownBroken` withKnownIssue (which this retires).
+#[test]
+fn test_rotated_party_license_discharge_delivers_handoff() {
+    let (alice, bob) = establish_full();
+    // Rotate the A.3 initiator; its send-group leaf now lags the new principal.
+    let new_bob = make_client().client_id();
+    rotate_round(&bob, &alice, new_bob.clone());
+
+    // Bob opens an A.3 ratchet and ends OWING the bind.
+    let ek = open_ratchet(&bob, &alice);
+    assert_ok!(alice.pq_ratchet_respond(ek));
+    let ct = assert_some!(alice.pq_take_pending_outbound());
+    assert_ok!(bob.pq_ratchet_bind(ct));
+
+    // Discharge via the BARE license: alice offers to license the commit, bob does NOT approve it,
+    // so bob's `prepare_to_encrypt(None)` commits purely on `owed_bind && licensed` (no fold).
+    assert_ok!(alice.prepare_to_encrypt(None));
+    let offer = assert_ok!(alice.encrypt(b"license-offer".to_vec()));
+    assert_ok!(bob.process_incoming(offer.cipher_text));
+    assert!(assert_ok!(bob.prepare_to_encrypt(None)).did_commit);
+    let frame = assert_ok!(bob.encrypt(b"license-discharge".to_vec()));
+
+    // The peer OPENS it (the handoff leaf rode the forced path) and reads the app message.
+    let got = assert_some!(assert_ok!(alice.process_incoming(frame.cipher_text)));
+    assert_eq!(
+        assert_some!(got.application_message).app_message_data,
+        b"license-discharge".to_vec()
+    );
+    // Both sides agree bob now runs under the rotated principal.
+    assert_eq!(bob.my_principal_state().client_id(), new_bob);
+    assert_eq!(alice.their_principal_state().client_id(), new_bob);
+}
+
 /// A rotation-driven A.5 rekey advances BOTH send-PQ epochs and keeps messaging flowing, and
 /// consecutive rekeys alternate cleanly. (The old plain-rekey "classical untouched" invariant is
 /// gone by design: A.5 now only fires as a credential catch-up, so a rotation's classical commits
@@ -3286,14 +3325,19 @@ fn test_principal_rotation_resolves_pending_state_after_peer_reply() {
     assert_eq!(alice_session.my_principal_state().client_id(), new_alice_id);
 }
 
+/// Proposing an id that was never staged SUCCEEDS: `prepare_to_encrypt(Some(id))` admits the
+/// candidate on the fly (lazy staging), so a rotation rides the frame with no separate
+/// `stage_rotation` call. The candidate is then in flight — `my_principal_state` is `Pending`
+/// on the proposed id.
 #[test]
-fn test_prepare_to_encrypt_rotation_without_stage_rotation_returns_error() {
+fn test_prepare_to_encrypt_lazily_stages_unstaged_candidate() {
     let (alice_session, _) = establish_sessions();
     let new_alice = make_client();
-    assert_err!(
-        alice_session.prepare_to_encrypt(Some(new_alice.client_id())),
-        TwoMlsPqError::SessionNotReady
-    );
+    assert_ok!(alice_session.prepare_to_encrypt(Some(new_alice.client_id())));
+    assert!(matches!(
+        alice_session.my_principal_state(),
+        PrincipalState::Pending { new, .. } if new == new_alice.client_id()
+    ));
 }
 
 /// A frame that crossed one of our commits references our send group's *previous*
@@ -5268,16 +5312,20 @@ fn test_prepare_to_encrypt_before_established_is_noop_round() {
     assert_ne!(frame.cipher_text.first(), Some(&super::APQ_TAG));
 }
 
+/// Proposing a SECOND, different unstaged id also lazily stages it — there is no "mismatch"
+/// with an earlier staged candidate to reject. Both are admitted into the in-flight window and
+/// the peer's commit picks the winner; `my_principal_state` tracks the latest proposed.
 #[test]
-fn test_prepare_to_encrypt_rotation_client_id_mismatch_returns_error() {
+fn test_prepare_to_encrypt_lazily_stages_a_second_candidate() {
     let (alice_session, _) = establish_sessions();
     let new_alice = make_client();
     let other = make_client();
-    assert_ok!(alice_session.stage_rotation(new_alice.client_id().bytes));
-    assert_err!(
-        alice_session.prepare_to_encrypt(Some(other.client_id())),
-        TwoMlsPqError::SessionNotReady
-    );
+    assert_ok!(alice_session.prepare_to_encrypt(Some(new_alice.client_id())));
+    assert_ok!(alice_session.prepare_to_encrypt(Some(other.client_id())));
+    assert!(matches!(
+        alice_session.my_principal_state(),
+        PrincipalState::Pending { new, .. } if new == other.client_id()
+    ));
 }
 
 #[test]

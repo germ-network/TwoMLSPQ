@@ -2058,18 +2058,6 @@ public protocol TwoMlsPqSessionProtocol: AnyObject, Sendable {
     func shouldListenOn() throws  -> ListenChannels
     
     /**
-     * Stage a new principal for the next rotation commit, minting its signing keys
-     * internally: the MLS signing keys are session-owned state, so the app supplies only
-     * the opaque ClientId. Call before `prepare_to_encrypt(Some(new_client_id))`, which
-     * commits the handoff.
-     *
-     * Idempotent-ish, matching the classical `propose`: staging the id already staged is
-     * a no-op (the existing staged identity — and its freshly minted keys — is kept); a
-     * different id replaces the staged identity.
-     */
-    func stageRotation(newClientId: Data) throws 
-    
-    /**
      * Whose move the PQ side-band is: true when this side owes the next operation.
      * The initiator owes the A.4 bootstrap; completing an operation passes the turn.
      */
@@ -2867,24 +2855,6 @@ open func shouldListenOn()throws  -> ListenChannels  {
             self.uniffiCloneHandle(),$0
     )
 })
-}
-    
-    /**
-     * Stage a new principal for the next rotation commit, minting its signing keys
-     * internally: the MLS signing keys are session-owned state, so the app supplies only
-     * the opaque ClientId. Call before `prepare_to_encrypt(Some(new_client_id))`, which
-     * commits the handoff.
-     *
-     * Idempotent-ish, matching the classical `propose`: staging the id already staged is
-     * a no-op (the existing staged identity — and its freshly minted keys — is kept); a
-     * different id replaces the staged identity.
-     */
-open func stageRotation(newClientId: Data)throws   {try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
-    uniffi_two_mls_pq_fn_method_twomlspqsession_stage_rotation(
-            self.uniffiCloneHandle(),
-        FfiConverterData.lower(newClientId),$0
-    )
-}
 }
     
     /**
@@ -6094,9 +6064,6 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_should_listen_on() != 34726) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_stage_rotation() != 14756) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_my_pq_turn() != 43166) {

@@ -73,9 +73,9 @@ fn main() {
     let folding = alice_s.encrypt(payload.to_vec()).unwrap().cipher_text;
     bob_s.process_incoming(folding.clone()).unwrap();
 
-    // Principal rotation — message frame 0x03.
+    // Principal rotation — message frame 0x03. Proposing the id lazily stages it (no separate
+    // stage call — that is the contract-25 lazy-staging path).
     let new_id = client().client_id();
-    alice_s.stage_rotation(new_id.bytes.clone()).unwrap();
     alice_s.prepare_to_encrypt(Some(new_id)).unwrap();
     let rotation = alice_s.encrypt(payload.to_vec()).unwrap().cipher_text;
 
