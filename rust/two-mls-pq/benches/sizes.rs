@@ -134,28 +134,48 @@ fn main() {
         let wb = b_s.pending_outbound().unwrap();
         a_s.process_incoming(wb).unwrap();
 
-        let ek = a_s.pq_ratchet_begin().unwrap();
-        b_s.pq_ratchet_respond(ek.clone()).unwrap();
-        let ct = b_s.pq_take_pending_outbound().unwrap();
-        a_s.pq_ratchet_bind(ct.clone()).unwrap();
-        // The bind rides the next committing round as its staple (a draft-02 §7
+        // A.4 bootstrap so both PQ halves are live — send-driven A.3 opens only post-A.4.
+        let kp = a_s.pq_bootstrap_begin(None).unwrap();
+        b_s.pq_bootstrap_respond(kp).unwrap();
+        let welcome = b_s.pq_take_pending_outbound().unwrap();
+        a_s.pq_bootstrap_bind(welcome).unwrap();
+        // Discharge the bootstrap bind: Bob offers an Upd, Alice folds+commits, Bob applies —
+        // which passes the PQ turn to Bob.
+        b_s.prepare_to_encrypt(None).unwrap();
+        let boot_upd = b_s.encrypt(b"boot-upd".to_vec()).unwrap();
+        let g = a_s.process_incoming(boot_upd.cipher_text).unwrap().unwrap();
+        a_s.queue_proposal(g.proposal.unwrap().digest).unwrap();
+        a_s.prepare_to_encrypt(None).unwrap();
+        let boot_disc = a_s.encrypt(b"boot-disc".to_vec()).unwrap();
+        b_s.process_incoming(boot_disc.cipher_text).unwrap();
+
+        // A.3 is session-driven now: Bob (the turn holder) opens the round by SENDING an ordinary
+        // message, which auto-stages the EK; Alice responds, Bob binds.
+        b_s.prepare_to_encrypt(None).unwrap();
+        let opener = b_s.encrypt(b"a3-open".to_vec()).unwrap();
+        a_s.process_incoming(opener.cipher_text).unwrap();
+        let ek = b_s.pq_take_pending_outbound().unwrap();
+        a_s.pq_ratchet_respond(ek.clone()).unwrap();
+        let ct = a_s.pq_take_pending_outbound().unwrap();
+        b_s.pq_ratchet_bind(ct.clone()).unwrap();
+        // The bind rides Bob's next committing round as its staple (a draft-02 §7
         // APQPrivateMessage): drive the fold that discharges it and capture the one
         // message frame carrying both commits and the app.
-        b_s.prepare_to_encrypt(None).unwrap();
-        let upd = b_s.encrypt(b"upd".to_vec()).unwrap();
-        let res = a_s.process_incoming(upd.cipher_text).unwrap().unwrap();
-        a_s.queue_proposal(res.proposal.unwrap().digest).unwrap();
         a_s.prepare_to_encrypt(None).unwrap();
-        let bind_frame = a_s.encrypt(payload.to_vec()).unwrap().cipher_text;
+        let upd = a_s.encrypt(b"upd".to_vec()).unwrap();
+        let res = b_s.process_incoming(upd.cipher_text).unwrap().unwrap();
+        b_s.queue_proposal(res.proposal.unwrap().digest).unwrap();
+        b_s.prepare_to_encrypt(None).unwrap();
+        let bind_frame = b_s.encrypt(payload.to_vec()).unwrap().cipher_text;
         // Sealed on the wire; open on the receiver to dissect the plaintext
         // `[0x03][staple][proposal][app]` whose staple is
         // `[0x05][u32 t-len][t_message][u32 pq-len][pq_message]`.
-        let plain = b_s
+        let plain = a_s
             .open_incoming(bind_frame.clone())
             .unwrap()
             .unwrap()
             .frame;
-        b_s.process_incoming(bind_frame.clone()).unwrap();
+        a_s.process_incoming(bind_frame.clone()).unwrap();
 
         let rdlen = |buf: &[u8], at: usize| {
             u32::from_le_bytes([buf[at], buf[at + 1], buf[at + 2], buf[at + 3]]) as usize

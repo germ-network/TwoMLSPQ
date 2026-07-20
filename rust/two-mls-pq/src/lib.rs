@@ -343,7 +343,14 @@ pub fn version() -> String {
 // for reusable invitations (one transport address, many sessions) without a rendezvous
 // side-band; `pq_bootstrap_begin` is unchanged. Invitation archive layout changed
 // (`INVITATION_VERSION` 1 -> 2, pre-release hard cut: a v1 blob decodes short and regenerates).
-const BINDING_CONTRACT_VERSION: u64 = 23;
+//
+// v24 (2026-07-19): the session self-drives A.3/A.5 advancement (the host no longer calls
+// `begin(.ratchet/.rekey)` — an ordinary send opens the next round when it is our turn: A.5 on a
+// credential lag, else A.3) AND every header-sealed frame gains a 4-byte length prefix so a
+// side-band frame can be zero-padded up to its co-stapled message (Feature B, `set_pad_target`).
+// The prefix is a hard wire cut: a v23 seal (no prefix) mis-parses under a v24 `try_open` and vice
+// versa. New FFI: `set_pad_target(Option<u64>)`. Safe because PQ is unshipped.
+const BINDING_CONTRACT_VERSION: u64 = 24;
 
 /// See `BINDING_CONTRACT_VERSION`. Exported so the Swift layer can verify the
 /// binding it was generated with matches the binary it loaded.

@@ -194,16 +194,25 @@ rendezvous address per retained epoch), `send_rendezvous()` (where to post),
 invitation's forward table).
 
 PQ side-band (see [Session Lifecycle](./session-lifecycle.md)): `my_pq_turn`,
-`pq_take_pending_outbound`, `pq_bootstrap_begin(rotating)` / `pq_bootstrap_respond` /
-`pq_bootstrap_bind`, and `pq_ratchet_begin` /
-`pq_ratchet_respond` / `pq_ratchet_bind`, and
-`pq_rekey_begin(rotating)` / `pq_rekey_respond` / `pq_rekey_apply`. The A.3 ratchet and
-A.4 bootstrap have no separate `apply` call: the initiator ingests the responder's reply
-and stages the owed bind with `pq_ratchet_bind` / `pq_bootstrap_bind`, and that bind then
-rides the next message frame's staple, which the peer applies through `process_incoming`
-(the v18 "a bind is the staple" model). The `rotating`
-parameters carry the principal credential handoff and must name the session's current
-principal.
+`pq_pending_outbound(sealing)` / `pq_take_pending_outbound`, `pq_bootstrap_begin(rotating)` /
+`pq_bootstrap_respond` / `pq_bootstrap_bind`, and the ratchet/re-key *responder* and *bind/apply*
+legs — `pq_ratchet_respond` / `pq_ratchet_bind` and `pq_rekey_respond` / `pq_rekey_apply`. **There
+is no `pq_ratchet_begin` / `pq_rekey_begin`: the session self-drives A.3 and A.5.** On each
+`encrypt`, when it is our turn and the side-band is idle, the session auto-stages the next round's
+opening frame (A.5 on a credential lag — announcing the session's current principal as the handoff
+— else A.3), and the host takes it from `pq_pending_outbound`/`pq_take_pending_outbound` to send
+alongside the message. A.4 bootstrap stays host-driven (`pq_bootstrap_begin`, whose `rotating`
+parameter carries the principal credential handoff and must name the session's current principal).
+The A.3 ratchet and A.4 bootstrap have no separate `apply` call: the initiator ingests the
+responder's reply and stages the owed bind with `pq_ratchet_bind` / `pq_bootstrap_bind`, and that
+bind then rides the next message frame's staple, which the peer applies through `process_incoming`
+(the v18 "a bind is the staple" model).
+
+Side-band frame sizing (Feature B): `set_pad_target(target)` declares the frame-sizing intent.
+`Some(n)` pads each side-band frame up to the co-stapled message's size, capped at the
+push-payload budget `n` bytes, so the two co-stapled payloads are size-indistinguishable to an
+on-path observer; `None` (the default) sends frames at their natural size. Like `install_sink`,
+it is live plumbing outside the archive — set it right after restore, before use.
 
 Persistence (push): attach an `ArchiveSink` with `install_sink` (once-only —
 `SinkAlreadyInstalled` on a second call; the first pushes a baseline `Checkpoint`). The

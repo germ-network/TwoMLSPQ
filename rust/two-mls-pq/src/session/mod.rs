@@ -420,6 +420,18 @@ struct SessionInner {
     /// benches, fuzz). Not part of the archive — it is live plumbing supplied at every
     /// construction/restore.
     sink: Option<Arc<dyn crate::ArchiveSink>>,
+    /// The caller's side-band frame-sizing intent (Feature B). `None` (the default) leaves
+    /// frames at their natural size. `Some(n)` asks `seal_side_band` to grow each frame up to
+    /// `min(n, last_message_frame_len)` — today equalizing it with the co-stapled message so the
+    /// two are size-indistinguishable, with `n` a push-payload budget cap. Set via
+    /// `set_pad_target` (mirrors `install_sink`), not serialized — like `sink`, it is live
+    /// plumbing re-supplied after every restore.
+    pad_target: Option<u64>,
+    /// The sealed length of the last message frame `encrypt` built, the size `seal_side_band`
+    /// grows a padded side-band frame up to (Feature B). Live, non-serialized: it resets to 0 on
+    /// restore, so the first side-band seal before any `encrypt` is unpadded (bounded/harmless
+    /// given send-ordering).
+    last_message_frame_len: u64,
 }
 
 /// Ledger depth for `send_psk_ledger`: one entry per send-group epoch. The peer references
@@ -1074,6 +1086,9 @@ fn build_session(
             // Attached post-construction via `install_sink` (which also pushes the baseline
             // checkpoint); a fresh session starts with no persistence hook.
             sink: None,
+            // Feature B side-band sizing intent: off until the host sets it (mirrors `sink`).
+            pad_target: None,
+            last_message_frame_len: 0,
         }),
     })
 }
@@ -1611,6 +1626,15 @@ impl TwoMlsPqSession {
         drop(inner);
         sink.persist(seq, crate::BlobKind::Checkpoint, bytes);
         Ok(())
+    }
+
+    /// Declare the side-band frame-sizing intent (Feature B). `Some(n)` asks the session to grow
+    /// each side-band frame up to the co-stapled message's size, capped at the push-payload budget
+    /// `n` bytes, so the two co-stapled payloads become size-indistinguishable to an on-path
+    /// observer; `None` (the default) sends frames at their natural size. Like `install_sink`,
+    /// this is live plumbing outside the archive — set it right after restore, before use.
+    pub fn set_pad_target(&self, target: Option<u64>) {
+        self.lock().pad_target = target;
     }
 
     /// The session's current persistence `state_seq` (the monotonic mutation counter). Lets

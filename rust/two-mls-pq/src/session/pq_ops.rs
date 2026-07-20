@@ -89,45 +89,112 @@ pub(in crate::session) fn retire_stale_pins(inner: &SessionInner) {
     });
 }
 
-#[uniffi::export]
-impl TwoMlsPqSession {
-    /// Initiator step 1 — generate an ML-KEM ephemeral and return the encapsulation-key message
-    /// (tag 0x17). The decapsulation key is held until the ciphertext arrives.
-    pub fn pq_ratchet_begin(&self) -> Result<Vec<u8>> {
-        // Guard-first (pre-lock, OUTSIDE `mutate_and_persist`): a call that fails a precondition
-        // mutates nothing. Rejecting it here — rather than inside the closure — keeps the persist
-        // choke point from bumping the seq and pushing a full blob for a no-op. That is the same
-        // pure-guard rule `process_incoming` follows (a peer can replay a well-formed but
-        // ill-timed side-band frame, so an in-closure guard would be a Checkpoint-per-frame
-        // amplifier). Only genuine mutate-then-fail paths stay inside and push their advanced
-        // state. The body keeps its own downstream borrow guards as defense.
-        {
-            let inner = self.lock();
-            // A.3 is post-A.4 (both PQ halves live), so the recv group always exists here —
-            // guard explicitly, both because the ratchet is meaningless pre-establishment and
-            // because the header seal below needs the recv group's key.
-            if inner.recv_group.is_none() {
-                return Err(TwoMlsPqError::SessionNotEstablished);
-            }
-            if inner.pq_inflight.is_some() {
-                return Err(TwoMlsPqError::SessionNotReady);
-            }
-        }
-        self.mutate_and_persist(crate::BlobKind::Checkpoint, |inner| {
-            let eph = apq::pq_ratchet::generate_ephemeral(&providers::pq_kem()?)?;
-            let mut msg = vec![PQ_EK_TAG];
-            msg.extend_from_slice(&eph.encapsulation_key());
-            let sealed = inner.seal_side_band(&msg)?;
-            inner.pq_inflight = Some(PqInflight::Initiating(eph));
-            // Retain for re-send as well as returning it: the EK is this round's only
-            // carrier, and losing it strands the round — `pq_inflight` blocks a re-begin
-            // and nothing else can re-emit the ephemeral's public half. Seeding the seal
-            // cache keeps a Stable hand-out byte-identical to what we return here.
-            inner.pending_side_band = Some(RetainedFrame::seeded(msg, &sealed));
-            Ok(sealed)
-        })
+// --- Session-driven A.3/A.5 advancement (the side-band is the session's job, not the host's) ---
+//
+// The host never opens A.3/A.5 rounds: it drives A.4 bootstrap, then just sends messages. On
+// each send `maybe_stage_next_round` opens the next round automatically when it is our turn and
+// the side-band is idle — A.5 when our send-PQ leaf still lags the canonical identity (a Phase 8
+// classical rotation moved `self.client` and the PQ leaf hasn't caught up), else A.3. Emission is
+// send-driven and best-effort: the staged frame rides the send that opened it (re-staple peek),
+// and a transient staging failure simply retries on the next send. "A.3 begins immediately" is
+// nothing more than the first send after the turn becomes ours.
+//
+// These `stage_*` helpers are the state-mutation cores of `pq_ratchet_begin`/`pq_rekey_begin`
+// minus the seal (the frame is parked UNSEALED — the peek seals it fresh per send). They run
+// inside a caller's `mutate_and_persist`, so the staged state is persisted with the send.
+impl SessionInner {
+    /// A.3 leg 1: generate an ML-KEM ephemeral, hold its decapsulation key, and park the EK
+    /// frame (tag 0x17). Caller persists.
+    fn stage_ratchet(&mut self) -> Result<()> {
+        let eph = apq::pq_ratchet::generate_ephemeral(&providers::pq_kem()?)?;
+        let mut msg = vec![PQ_EK_TAG];
+        msg.extend_from_slice(&eph.encapsulation_key());
+        self.pq_inflight = Some(PqInflight::Initiating(eph));
+        self.pending_side_band = Some(RetainedFrame::unsealed(msg));
+        Ok(())
     }
 
+    /// A.5 leg 1: propose `Upd'(self)` into our recv-PQ mirror (catching the leaf up to
+    /// `rotating` when it lags — the same handoff `pq_rekey_begin` builds) and park the Upd'
+    /// frame (tag 0x1B). Caller persists.
+    fn stage_rekey(&mut self, rotating: Option<ClientId>) -> Result<()> {
+        let handoff = match &rotating {
+            Some(new_id) => {
+                if self.client.client_id() != *new_id {
+                    return Err(TwoMlsPqError::SessionNotReady);
+                }
+                let (new_signer, new_public) = self.client.combiner().pq_signature_keypair();
+                Some((new_signer, new_public, new_id.bytes.clone()))
+            }
+            None => None,
+        };
+        let recv_pq = self
+            .recv_group
+            .as_mut()
+            .and_then(|g| g.pq.as_mut())
+            .ok_or(TwoMlsPqError::SessionNotReady)?;
+        let proposal = match handoff {
+            Some((new_signer, new_public, announced_id)) => {
+                let identity = SigningIdentity::new(
+                    BasicCredential::new(announced_id.clone()).into_credential(),
+                    new_public,
+                );
+                recv_pq
+                    .propose_update_with_identity(new_signer, identity, announced_id)
+                    .map_err(map_credential_err)?
+            }
+            None => recv_pq
+                .propose_update(Vec::new())
+                .map_err(|_| TwoMlsPqError::Mls)?,
+        };
+        let mut msg = vec![PQ_REKEY_UPD_TAG];
+        msg.extend_from_slice(&proposal.to_bytes().map_err(|_| TwoMlsPqError::Mls)?);
+        self.pq_inflight = Some(PqInflight::RekeyInitiated);
+        self.pending_side_band = Some(RetainedFrame::unsealed(msg));
+        Ok(())
+    }
+
+    /// True when our own send-PQ leaf still signs as a principal the session has rotated past
+    /// (a Phase 8 classical rotation swapped `self.client`; the PQ leaf lags until an A.5 catch-up
+    /// updatePath). Drives the A.5-vs-A.3 auto-selection; false (no catch-up owed) if unreadable.
+    fn send_pq_leaf_lags(&self) -> bool {
+        let Some(send_pq) = self.send_group.as_ref().and_then(|g| g.pq.as_ref()) else {
+            return false;
+        };
+        let idx = send_pq.current_member_index();
+        matches!(sender_client_id(send_pq, idx), Ok(leaf) if leaf != self.client.client_id().bytes)
+    }
+
+    /// Open the next PQ side-band round automatically when it is our turn and the side-band is
+    /// idle — A.5 (credential catch-up) if our leaf lags, else A.3. Best-effort: any staging
+    /// failure leaves the slot empty for the next send to retry. No-op unless fully post-A.4, the
+    /// turn is ours, nothing is in flight, no bind is owed, and nothing is already staged.
+    ///
+    /// Returns `true` iff it staged an A.5 — which mutated the recv-PQ group (a pending update +
+    /// its new leaf secret), state the caller's `Core` push omits, so the caller must follow with
+    /// a `Checkpoint`. A staged A.3 (or a no-op / staging failure) returns `false`: its ephemeral
+    /// rides `pq_inflight`, which the `Core` blob carries.
+    pub(in crate::session) fn maybe_stage_next_round(&mut self) -> bool {
+        if !self.pq_turn_mine
+            || !self.pq_halves_live()
+            || self.pq_inflight.is_some()
+            || self.owed_bind.is_some()
+            || self.pending_side_band.is_some()
+        {
+            return false;
+        }
+        if self.send_pq_leaf_lags() {
+            let id = self.client.client_id();
+            self.stage_rekey(Some(id)).is_ok()
+        } else {
+            let _ = self.stage_ratchet();
+            false
+        }
+    }
+}
+
+#[uniffi::export]
+impl TwoMlsPqSession {
     /// Responder — SEAL a fresh secret to the initiator's EK (bound to our current PQ epoch),
     /// hold it, and return the ciphertext message (tag 0x19). The secret is random and sealed
     /// rather than the KEM output itself, so the initiator's open is an explicit receipt (see
@@ -300,82 +367,6 @@ impl TwoMlsPqSession {
             // address: that tracks the CLASSICAL epoch, which has deliberately not moved.
             inner.record_pq_header_key()?;
             Ok(())
-        })
-    }
-
-    /// A.5 initiator — propose Upd'(self) into the peer's send-PQ (our recv mirror) and
-    /// return the Upd' frame (tag 0x1B). Requires both PQ halves live (post-A.4 only), the turn, and
-    /// no other side-band operation in flight. Proposal only: no epochs move until the
-    /// responder commits.
-    ///
-    /// `rotating` is the A.5 credential handoff: it must name the session's CURRENT
-    /// principal (a Phase 8 rotation has already swapped `self.client` to it), and the Upd'
-    /// then moves our leaf's signing key to that principal, announcing its ClientId in the
-    /// proposal's authenticated_data — the same announcement convention as the Phase 8
-    /// classical rotation commit. The leaf's credential BYTES stay what they were:
-    /// `BasicIdentityProvider` requires a stable identity across leaf updates, so principal
-    /// identity travels at the announcement level, not in the Basic Credential.
-    pub fn pq_rekey_begin(&self, rotating: Option<ClientId>) -> Result<Vec<u8>> {
-        // Guard-first (see `pq_ratchet_begin`): the turn/slot/inflight and send-PQ-present
-        // preconditions are pure reads — check them before the persist choke point so an
-        // ill-timed call is a no-op. (The `rotating` credential check stays in the closure: it
-        // guards a handoff that only matters once we mutate, and it needs the moved id.)
-        {
-            let inner = self.lock();
-            // Turn + inflight are the gates; the slot is not consulted (occupancy is round
-            // progress under retention, never "busy").
-            if !inner.pq_turn_mine || inner.pq_inflight.is_some() {
-                return Err(TwoMlsPqError::SessionNotReady);
-            }
-            if inner
-                .send_group
-                .as_ref()
-                .and_then(|g| g.pq.as_ref())
-                .is_none()
-            {
-                return Err(TwoMlsPqError::SessionNotReady);
-            }
-        }
-        self.mutate_and_persist(crate::BlobKind::Checkpoint, |inner| {
-            let handoff = match &rotating {
-                Some(new_id) => {
-                    if inner.client.client_id() != *new_id {
-                        return Err(TwoMlsPqError::SessionNotReady);
-                    }
-                    let (new_signer, new_public) = inner.client.combiner().pq_signature_keypair();
-                    Some((new_signer, new_public, new_id.bytes.clone()))
-                }
-                None => None,
-            };
-            let recv_pq = inner
-                .recv_group
-                .as_mut()
-                .and_then(|g| g.pq.as_mut())
-                .ok_or(TwoMlsPqError::SessionNotReady)?;
-            let proposal = match handoff {
-                Some((new_signer, new_public, announced_id)) => {
-                    // The PQ leaf catches up in the credential sequence: the new leaf
-                    // carries the CANONICAL credential (already committed classically),
-                    // validated by the AS's catch-up rule.
-                    let identity = SigningIdentity::new(
-                        BasicCredential::new(announced_id.clone()).into_credential(),
-                        new_public,
-                    );
-                    recv_pq
-                        .propose_update_with_identity(new_signer, identity, announced_id)
-                        .map_err(map_credential_err)?
-                }
-                None => recv_pq
-                    .propose_update(Vec::new())
-                    .map_err(|_| TwoMlsPqError::Mls)?,
-            };
-            let mut msg = vec![PQ_REKEY_UPD_TAG];
-            msg.extend_from_slice(&proposal.to_bytes().map_err(|_| TwoMlsPqError::Mls)?);
-            let sealed = inner.seal_side_band(&msg)?;
-            inner.pq_inflight = Some(PqInflight::RekeyInitiated);
-            // Retain for re-send (see `pq_ratchet_begin`): a lost Upd' strands the rekey.
-            inner.pending_side_band = Some(RetainedFrame::seeded(msg, &sealed));
-            Ok(sealed)
         })
     }
 

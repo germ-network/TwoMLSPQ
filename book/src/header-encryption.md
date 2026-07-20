@@ -22,8 +22,11 @@ message-frame shape; retagging) landed first — tag values below refer to the r
 its rules are per-*stream* (message path vs. PQ side-band), not per-tag.
 
 **As shipped, in one paragraph.** `TwoMlsPqSession::encrypt`, `pending_outbound` (once
-a recv group exists), `pq_take_pending_outbound`, and the `pq_*_begin` returns all emit
-`[12-byte random nonce][ChaCha20-Poly1305 ct+tag]` over the whole frame. Message-path
+a recv group exists), and `pq_take_pending_outbound`/`pq_pending_outbound` (the session
+self-drives the side-band, so there is no host `begin` return) all emit
+`[12-byte random nonce][ChaCha20-Poly1305 ct+tag]`, the AEAD covering a length-prefixed,
+optionally zero-padded plaintext — `[u32-LE frame_len][frame][padding]` (see **Frame length
+prefix & padding** below). Message-path
 frames key on `exportSecret("germ.network.twomlspq.headerKey.v1", group_id, 32)` on the
 recv group's **classical** half at its current classical epoch; PQ side-band frames key
 on `exportSecret("germ.network.twomlspq.headerKey.pq.v1", group_id, 32)` on the recv
@@ -145,6 +148,9 @@ Every blob that leaves the library is one of:
 ```
 SealedFrame   = [12-byte random nonce][AEAD ct+tag]   ; steady state (symmetric)
 EnvelopeFrame = [kem_output][AEAD ct+tag]             ; establishment only (HPKE)
+
+; the symmetric AEAD's plaintext (never on the wire in the clear):
+Plaintext     = [u32-LE frame_len][frame][zero padding]   ; padding: frame_len..pad_to
 ```
 
 - The AEAD is a **single choice for the whole header layer** (the declared suite's
@@ -156,7 +162,8 @@ EnvelopeFrame = [kem_output][AEAD ct+tag]             ; establishment only (HPKE
   (`header_key_len` = the AEAD's `aead_key_size`) and the nonce length
   (`aead_nonce_size`) are both read from the chosen suite, so swapping the header AEAD
   is a one-line change with nothing downstream assuming a specific cipher or size.
-  Empty AAD; the plaintext is the entire existing frame (tag byte included), unchanged.
+  Empty AAD; the plaintext is a 4-byte little-endian length prefix, then the entire existing
+  frame (tag byte included), then optional zero padding (see below).
   - *Why not the group's AEAD:* the PQ suite's AEAD is AES-128-GCM (128-bit key);
     sealing the side-band with the classical ChaCha20-Poly1305 (256-bit key) gives it
     the stronger primitive and better post-quantum headroom — matching the group's own
@@ -170,6 +177,25 @@ EnvelopeFrame = [kem_output][AEAD ct+tag]             ; establishment only (HPKE
   on rendezvous addresses), so the receiver always knows which opener to use.
 - No version byte, tag, key id, or epoch hint outside the encryption. A sealed frame
   is indistinguishable from random to anyone without the session's keys.
+
+### Frame length prefix & padding
+
+The symmetric AEAD's plaintext is `[u32-LE frame_len][frame][zero padding]`. The 4-byte
+little-endian prefix is the *real* frame length; `try_open` reads it and returns exactly that
+many bytes, so any trailing zero padding is stripped before a (trailing-byte-strict) decoder ever
+sees it. The prefix is unconditional — every symmetric-sealed frame carries it, message-path and
+side-band alike — so the wire grows a fixed 4 bytes per frame.
+
+The padding is the optional half. A host declares a **frame-sizing intent** with
+`set_pad_target(Some(n))`: when set, `seal_side_band` grows each side-band frame up to
+`min(n, last_message_frame_len)` — the co-stapled message's size, capped at a push-payload budget
+`n` — but only ever *grows* (a frame already larger, e.g. an A.4 Welcome' or A.5 Commit', keeps
+its natural size). Message frames and return welcomes (`seal`) carry the prefix but are never
+padded. With the intent set, an A.3/A.5 side-band frame and the message it is co-stapled with seal
+to the **same length**, so an on-path observer — who sees the two as separately-delivered,
+randomly-ordered payloads — cannot tell them apart by size. Absent the intent (`None`, the
+default), frames go out at their natural size. The motivating forward-looking use of the same knob
+is to *chunk* frames into fixed push-payload units.
 
 ### Key schedule
 
@@ -243,13 +269,13 @@ HeaderKeyPQ(G, e) = exportSecret(label = "germ.network.twomlspq.headerKey.pq.v1"
   `HeaderKey(recv_group, current classical epoch)`.
 - **PQ side-band frames** (0x13–0x1D): seal under `HeaderKeyPQ(recv_group,
   current pq_epoch)` — the opposite PQ group at its `pq_epoch`. This covers every
-  side-band frame however it reaches the host: those surfaced by
-  `pq_take_pending_outbound` (the responder replies — `pq_ratchet_respond`'s 0x19,
-  `pq_bootstrap_respond`'s 0x15, and `pq_rekey_respond`'s 0x1D) **and the initiator
-  frames returned directly by `pq_ratchet_begin` (0x17), `pq_bootstrap_begin` (0x13),
-  and `pq_rekey_begin` (0x1B)** — the latter are easy to miss because they bypass
-  `EncryptResult`, and leaving them plaintext would fingerprint every PQ exchange by its
-  first frame. The round's closing BIND is **not** a side-band frame: it rides the next
+  side-band frame however it reaches the host, all surfaced by
+  `pq_pending_outbound`/`pq_take_pending_outbound`: the responder replies
+  (`pq_ratchet_respond`'s 0x19, `pq_bootstrap_respond`'s 0x15, `pq_rekey_respond`'s 0x1D)
+  **and the initiator frames the session auto-stages on a send — the A.3 EK (0x17) and the
+  A.5 `Upd'` (0x1B), plus the host-driven A.4 `pq_bootstrap_begin` KP (0x13)**. Leaving any
+  of them plaintext would fingerprint every PQ exchange by its first frame. The round's
+  closing BIND is **not** a side-band frame: it rides the next
   message frame's staple and is sealed with the rest of that frame under the classical
   `HeaderKey` (below), so it never lands in this slot.
   - *Pre-A.4 fallback:* the one side-band frame whose recv-PQ group doesn't exist yet
@@ -265,9 +291,10 @@ HeaderKeyPQ(G, e) = exportSecret(label = "germ.network.twomlspq.headerKey.pq.v1"
   frame is sealed here because there is no recv group and thus no symmetric key. The
   operations that could otherwise emit a frame are blocked: `prepare_to_encrypt`
   needs the recv group to stage its proposal, rotation is additionally gated on
-  `peer_confirmed` (both from the wire-format rework), and `pq_ratchet_begin` now
-  returns `SessionNotEstablished` without a recv group. The one thing the initiator
-  *does* emit — its initial welcome — travels the invitation channel (below).
+  `peer_confirmed` (both from the wire-format rework), and the session-driven side-band
+  cannot open a round without both PQ halves live (`pq_halves_live`), so no A.3/A.5 stages
+  pre-establishment. The one thing the initiator *does* emit — its initial welcome —
+  travels the invitation channel (below).
 - The acceptor always has a recv group from `accept()` onward, so *every* acceptor
   frame — including the first, whose staple slot carries `APQWelcome_B` — is
   symmetric, sealed under `HeaderKey(Group_A, join epoch)`. The initiator opens it
@@ -390,8 +417,9 @@ Header encryption hides the leading tag byte, so the host cannot route a raw blo
   `forwarded(spawn_token)` is untouched — it takes the token, not bytes.
 - **Outbound is sealed inside the library** at every exit: `EncryptResult
   .cipher_text`, `pending_outbound()` (the acceptor's symmetric-sealed return welcome,
-  the initiator's HPKE envelope), `pq_take_pending_outbound()`, and the direct returns
-  of `pq_ratchet_begin` / `pq_bootstrap_begin` / `pq_rekey_begin`. The exported
+  the initiator's HPKE envelope), `pq_pending_outbound()`/`pq_take_pending_outbound()`
+  (the auto-staged A.3/A.5 frames and the responder replies), and the host-driven
+  `pq_bootstrap_begin` return. The exported
   `hpke_seal_to_key_package` / `hpke_open` pair stays for other stacks; the main path
   uses `initiate(…)` / `set_initial_app_payload` / `open_initial`.
 - **Archive**: both receive windows (`recv_header_keys`, `recv_header_keys_pq`) ride
@@ -406,8 +434,12 @@ blobs, hybrid confidentiality for the metadata layer, whole-frame splice resista
 against network adversaries, and — because the outer keys are symmetric and shared —
 the same deniability shape as the inner protocol.
 
-Does not provide: length or timing obfuscation (padding stays a host concern);
-third-party-verifiable authenticity (either key-holder can forge the outer layer —
+Does not provide: timing obfuscation, or general traffic-analysis resistance beyond the
+opt-in side-band sizing. (Length is now partly addressed: with `set_pad_target`, a side-band
+frame pads up to its co-stapled message so the two are size-indistinguishable — see **Frame
+length prefix & padding**. It does not hide *that* a side-band round occurred, and the message
+stream itself is unpadded.) Also not provided: third-party-verifiable authenticity (either
+key-holder can forge the outer layer —
 by design; the inner MLS authentication is the arbiter); sender anonymity against
 the rendezvous server within an epoch (routing already reveals the channel); and
 protection of the very first envelope against a break of ML-KEM alone — see open
@@ -432,8 +464,9 @@ never has.
    captures the PQ header key into `recv_header_keys_pq` at each `pq_epoch` advance
    (`initiate`, `pq_bootstrap_respond`, `pq_bootstrap_bind`, `pq_ratchet_bind`,
    `pq_rekey_respond`, `pq_rekey_apply`); seal at every outbound exit (`encrypt` / `pending_outbound`
-   classical; the `pq_*_begin` returns and `pq_take_pending_outbound` via
-   `seal_side_band`); `pq_ratchet_begin` guarded on the recv group; `open_incoming`
+   classical; `pq_bootstrap_begin` and `pq_pending_outbound`/`pq_take_pending_outbound` via
+   `seal_side_band`, whose `seal_with` carries the length prefix + optional `pad_target` padding);
+   the session-driven `maybe_stage_next_round` auto-opens A.3/A.5 from `encrypt`; `open_incoming`
    with `OpenedFrameKind`; `process_incoming` and the `pq_*` receivers `open_or_raw`
    their input.
 3. First frame: `set_initial_app_payload` attaches the app-layer welcome, and the library
