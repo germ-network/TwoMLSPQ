@@ -43,6 +43,7 @@ struct PQInvitationReceiveTests {
 		// initiating session, which pre-commits it at `initiate`).
 		let initiatorKp = try initiator.generateKeyPackage(suite: .x25519Chacha())
 
+		let dedicatedId: ClientID = .mock()
 		let (acceptorSession, stapled) = try invitation.receive(
 			sendGroupWelcome: welcome,
 			remoteKeyPackage: initiatorKp,
@@ -50,23 +51,28 @@ struct PQInvitationReceiveTests {
 			remoteClientId: initiator.clientId().bytes,
 			welcomeToken: WelcomeToken(TypedDigest(prefix: .sha256, over: welcome)),
 			stapledMessage: nil,
-			newClientId: .mock()
+			newClientId: dedicatedId
 		)
 		#expect(stapled == nil)
 
-		// Complete establishment: the acceptor's first frame staples its return
-		// welcome; the initiator processes it in-band.
+		// Contract 26: the born-dedicated acceptor installs its signed delegation, then
+		// its first frame staples the ENVELOPED welcome; the initiator PAUSES on the
+		// 0x0B handoff, verifies it, and resumes — adopting the dedicated principal.
+		try acceptorSession.installMockEstablishmentEnvelope()
 		_ = try acceptorSession.prepareToEncrypt(proposing: nil)
 		let back = try acceptorSession.encrypt(appMessage: "hello back".utf8Data)
 		let received = try #require(
-			try initiatorSession.processIncoming(ciphertext: back.cipherText)
+			try approveEstablishmentRaw(
+				initiator: initiatorSession, ciphertext: back.cipherText, dedicatedId: dedicatedId)
 		)
 		#expect(received.applicationMessage?.appMessageData == "hello back".utf8Data)
 
 		// And a routine round now that the initiator is fully established.
 		_ = try initiatorSession.prepareToEncrypt(proposing: nil)
 		let routine = try initiatorSession.encrypt(appMessage: "routine".utf8Data)
-		let decrypted = try acceptorSession.processIncoming(ciphertext: routine.cipherText)
+		guard case .decrypted(let decrypted) =
+			try acceptorSession.processIncoming(ciphertext: routine.cipherText)
+		else { Issue.record("unexpected establishment pause"); throw TestErrors.unexpected }
 		#expect(
 			try decrypted.tryUnwrap.applicationMessage.tryUnwrap.appMessageData
 				== "routine".utf8Data
@@ -197,6 +203,7 @@ struct PQInvitationReceiveTests {
 
 		// The invitation was not consumed by the rejected receive: the genuine
 		// commitment establishes on the same welcome, and the session round-trips.
+		let dedicatedId: ClientID = .mock()
 		let (acceptorSession, stapled) = try invitation.receive(
 			sendGroupWelcome: welcome,
 			remoteKeyPackage: initiatorKp,
@@ -204,14 +211,16 @@ struct PQInvitationReceiveTests {
 			remoteClientId: initiator.clientId().bytes,
 			welcomeToken: token,
 			stapledMessage: nil,
-			newClientId: .mock()
+			newClientId: dedicatedId
 		)
 		#expect(stapled == nil)
 
+		try acceptorSession.installMockEstablishmentEnvelope()
 		_ = try acceptorSession.prepareToEncrypt(proposing: nil)
 		let back = try acceptorSession.encrypt(appMessage: "established".utf8Data)
 		let received = try #require(
-			try initiatorSession.processIncoming(ciphertext: back.cipherText)
+			try approveEstablishmentRaw(
+				initiator: initiatorSession, ciphertext: back.cipherText, dedicatedId: dedicatedId)
 		)
 		#expect(received.applicationMessage?.appMessageData == "established".utf8Data)
 	}

@@ -131,6 +131,33 @@ extension SessionError {
 				code = .bindApplyFailed
 			case .BindDischargeFailed:
 				code = .bindDischargeFailed
+			case .EstablishmentEnvelopeRequired:
+				// Contract 26, dual meaning by surface (like BootstrapKpMismatch):
+				switch surface {
+				case .processIncoming, .forwarded:
+					// Initiator: a bare welcome whose creator differs from the invitation
+					// identity — a born-dedicated establishment must arrive enveloped.
+					code = .establishmentEnvelopeRequired
+					detail = "a born-dedicated establishment arrived un-enveloped (creator "
+						+ "leaf differs from the invitation identity); refused so an "
+						+ "undelegated credential cannot be admitted on the weld alone."
+				default:
+					// Acceptor: an emission door was driven before the signed delegation
+					// was installed — a caller-sequencing bug.
+					code = .sequenceViolation
+					detail = "born-dedicated session is non-emittable until "
+						+ "installEstablishmentEnvelope supplies the signed delegation; "
+						+ "mint and install it before sending."
+				}
+			case .EstablishmentCreatorMismatch:
+				code = .establishmentCreatorMismatch
+				detail = "the admitted creator id does not match the welcome's creator leaf: "
+					+ "the delegation is genuine but names a different key. The join was "
+					+ "discarded whole; do not retry with the same admittedCreator."
+			case .EstablishmentEnvelopeConflict:
+				code = .establishmentEnvelopeConflict
+				detail = "a different establishment envelope is already installed on this "
+					+ "session; one session binds exactly one envelope."
 			}
 			self.init(code: code, underlying: pq, detail: detail)
 

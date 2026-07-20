@@ -62,7 +62,7 @@ struct LifecycleTests {
 		#expect(try localBase.sendRendezvous() == nil)
 
 		// -- Step 2: the invitation receives — recv group up, send group classical-only.
-		// Born-dedicated (contract 25): the acceptor's send group is created UNDER this dedicated
+		// Born-dedicated (contract 26): the acceptor's send group is created UNDER this dedicated
 		// principal (its creator leaf carries `dedicatedId`), so remote runs as `dedicatedId` from
 		// birth — no founding→dedicated staging.
 		let dedicatedId: ClientID = .mock()
@@ -96,6 +96,11 @@ struct LifecycleTests {
 		#expect(remoteSession.myPrincipalState == .sync(dedicatedId))
 		#expect(remoteSession.theirPrincipalState == localSession.myPrincipalState)
 
+		// Contract 26: the born-dedicated acceptor is non-emittable until its signed
+		// delegation installs. The emission door refuses first.
+		#expect(remoteBase.pendingOutbound() == nil)
+		try remoteSession.installMockEstablishmentEnvelope()
+
 		// Routing: remote can post immediately — its post address is the recv
 		// group's current exporter, which is the same MLS group as the initiator's
 		// send group, so it appears verbatim in the initiator's listen set.
@@ -111,8 +116,10 @@ struct LifecycleTests {
 		#expect(remoteListenAtBirth.sendGroup.pq.bytes.isEmpty)
 		#expect(remoteListenAtBirth.rendezvousByEpoch.first?.epoch == 1)
 
-		// -- Step 3: remote's first frame staples the return welcome; local joins in-band.
-		try remoteSession.send(to: localSession)
+		// -- Step 3: remote's first frame staples the ENVELOPED return welcome; local
+		// PAUSES on the 0x0B handoff, verifies the delegation, and resumes — adopting
+		// the dedicated principal from the creator leaf.
+		try localSession.acceptEstablishment(from: remoteSession, dedicatedId: dedicatedId)
 		// The join adopts the dedicated id from remote's send-group creator leaf (born-dedicated).
 		#expect(localSession.theirPrincipalState == .sync(dedicatedId))
 		#expect(localBase.isEstablished())
@@ -147,7 +154,7 @@ struct LifecycleTests {
 		// epoch: remote's send group is classical-only pre-A.4, so pqEpoch is 0.
 		#expect(updFrame.epochs == APQEpochs(pqEpoch: 0, classicalEpoch: 1))
 		let updDecrypted = try #require(
-			try localSession.processIncoming(ciphertext: updFrame.cipherText))
+			try localSession.decrypt(updFrame.cipherText))
 		let offered = try #require(updDecrypted.proposal)
 		try localSession.queueProposal(digest: offered.digest)
 
@@ -171,7 +178,7 @@ struct LifecycleTests {
 		// Remote applies the commit: its post address migrates to the new epoch's
 		// channel — present in local's listen set — and the old address stays listed
 		// so in-flight traffic posted before the migration still lands.
-		_ = try remoteSession.processIncoming(ciphertext: commitFrame.cipherText)
+		_ = try remoteSession.decrypt(commitFrame.cipherText)
 		let remotePostAfterCommit = try #require(try remoteBase.sendRendezvous())
 		#expect(remotePostAfterCommit.bytes != remotePostBeforeCommit.bytes)
 		#expect(
@@ -299,7 +306,7 @@ struct LifecycleTests {
 		_ = try remoteSession.prepareToEncrypt(proposing: nil)
 		let postRatchetFrame = try remoteSession.encrypt(appMessage: Data("post-ratchet".utf8))
 		let postRatchet = try #require(
-			try localSession.processIncoming(ciphertext: postRatchetFrame.cipherText))
+			try localSession.decrypt(postRatchetFrame.cipherText))
 		#expect(try postRatchet.applicationMessage.tryUnwrap.appMessageData == Data("post-ratchet".utf8))
 	}
 

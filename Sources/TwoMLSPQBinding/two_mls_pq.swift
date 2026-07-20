@@ -1835,9 +1835,34 @@ public protocol TwoMlsPqSessionProtocol: AnyObject, Sendable {
      * 0x01) while it is still the current staple — for the host to bind into its
      * app-layer identity envelope at reply time (e.g. sign over the welcome + the
      * return key package, then attach the result via `set_initial_app_payload`).
-     * `None` once the first send-group commit replaced the staple. Read-only.
+     * On a born-dedicated acceptor this is the welcome the establishment envelope
+     * must sign over — read it, mint, then `install_establishment_envelope`.
+     * `None` once the first send-group commit replaced the staple (or, on a
+     * born-dedicated acceptor, once the install wrapped it). Read-only.
      */
     func initialWelcome()  -> Data?
+    
+    /**
+     * Contract 26: install the host's signed establishment envelope on a
+     * born-dedicated acceptor. The blob is opaque here — the host minted it by
+     * signing over the `initial_welcome()` bytes plus its delegation artifact —
+     * and from this call on, every establishment staple and standalone delivery
+     * carries the `[envelope][welcome]` handoff framing instead of the bare
+     * welcome, and the emission doors open.
+     *
+     * One envelope per session: re-installing the SAME bytes is an idempotent
+     * no-op; DIFFERENT bytes are `EstablishmentEnvelopeConflict` (loud — the
+     * envelope's signatures bind this session's welcome, so a second distinct
+     * envelope can only be a host bug). `SessionNotReady` when the session owes
+     * no envelope (not born-dedicated, or the host already let the staple move
+     * on — neither occurs in the intended receive→mint→install sequence).
+     *
+     * CAPTURE ORDERING: capture/persist the session AFTER this call (the same
+     * rule as `set_initial_app_payload`) — the envelope rides the archive, and
+     * the app's own admission-side discipline depends on the persisted session
+     * carrying it.
+     */
+    func installEstablishmentEnvelope(envelope: Data) throws 
     
     /**
      * Attach the persistence hook (see [`crate::ArchiveSink`]) this session pushes to after
@@ -1861,7 +1886,10 @@ public protocol TwoMlsPqSessionProtocol: AnyObject, Sendable {
     
     /**
      * Welcome bytes to deliver to the remote party to complete group establishment.
-     * Returns `None` once consumed or when both groups are live.
+     * Returns `None` once consumed or when both groups are live. A born-dedicated
+     * session returns `None` until its establishment envelope installs — this is an
+     * emission door, and the parked frame is exactly the welcome the envelope must
+     * wrap (the un-enveloped form would be hard-rejected by the peer).
      */
     func pendingOutbound()  -> Data?
     
@@ -2012,7 +2040,31 @@ public protocol TwoMlsPqSessionProtocol: AnyObject, Sendable {
      */
     func processIncoming(ciphertext: Data) throws  -> DecryptResult?
     
-    func processIncomingInner(ciphertext: Data) throws  -> DecryptResult?
+    /**
+     * Contract 26: the approved RE-FEED of a frame that previously paused as
+     * `pending_establishment`. Stateless — the crate held nothing between the pause
+     * and this call; the SAME ciphertext is simply presented again with the host's
+     * verification verdict:
+     * - `approved_envelope_digest` — `sha256` of the `pending_establishment.envelope`
+     * blob the host VERIFIED (the DIGEST, not the blob).
+     * - `approved_welcome_digest` — `sha256` of the `pending_establishment.welcome`
+     * bytes the host verified the envelope's signatures AGAINST (the DIGEST, not
+     * the bytes). Both sections of the arriving frame must hash to their approved
+     * digests, closing the TOCTOU on the WHOLE frame: approve frame A, deliver a
+     * frame differing in either section, and it pauses again rather than joining —
+     * without the welcome half, a deviating acceptor could pair the approved
+     * envelope with a different joinable welcome under the same delegated id.
+     * - `expected_creator` — the dedicated client id the host read out of the
+     * verified delegation. The joined creator leaf must equal it
+     * (`EstablishmentCreatorMismatch` otherwise — a security rejection; the join
+     * is discarded whole).
+     *
+     * ORDERING (load-bearing for the host): the join consumes the establishment —
+     * later re-staples dedup idempotently and never pause again — so the host must
+     * durably ADMIT the verified credential BEFORE calling this. The converse crash
+     * order heals (an un-re-fed frame re-pauses on the next delivery).
+     */
+    func processIncomingApproved(ciphertext: Data, approvedEnvelopeDigest: Data, approvedWelcomeDigest: Data, expectedCreator: Data) throws  -> DecryptResult?
     
     /**
      * The SHA-256 of the receive group's classical (message-half) group id — the
@@ -2491,7 +2543,10 @@ open func hasReceiveGroup() -> Bool  {
      * 0x01) while it is still the current staple — for the host to bind into its
      * app-layer identity envelope at reply time (e.g. sign over the welcome + the
      * return key package, then attach the result via `set_initial_app_payload`).
-     * `None` once the first send-group commit replaced the staple. Read-only.
+     * On a born-dedicated acceptor this is the welcome the establishment envelope
+     * must sign over — read it, mint, then `install_establishment_envelope`.
+     * `None` once the first send-group commit replaced the staple (or, on a
+     * born-dedicated acceptor, once the install wrapped it). Read-only.
      */
 open func initialWelcome() -> Data?  {
     return try!  FfiConverterOptionData.lift(try! rustCall() {
@@ -2499,6 +2554,34 @@ open func initialWelcome() -> Data?  {
             self.uniffiCloneHandle(),$0
     )
 })
+}
+    
+    /**
+     * Contract 26: install the host's signed establishment envelope on a
+     * born-dedicated acceptor. The blob is opaque here — the host minted it by
+     * signing over the `initial_welcome()` bytes plus its delegation artifact —
+     * and from this call on, every establishment staple and standalone delivery
+     * carries the `[envelope][welcome]` handoff framing instead of the bare
+     * welcome, and the emission doors open.
+     *
+     * One envelope per session: re-installing the SAME bytes is an idempotent
+     * no-op; DIFFERENT bytes are `EstablishmentEnvelopeConflict` (loud — the
+     * envelope's signatures bind this session's welcome, so a second distinct
+     * envelope can only be a host bug). `SessionNotReady` when the session owes
+     * no envelope (not born-dedicated, or the host already let the staple move
+     * on — neither occurs in the intended receive→mint→install sequence).
+     *
+     * CAPTURE ORDERING: capture/persist the session AFTER this call (the same
+     * rule as `set_initial_app_payload`) — the envelope rides the archive, and
+     * the app's own admission-side discipline depends on the persisted session
+     * carrying it.
+     */
+open func installEstablishmentEnvelope(envelope: Data)throws   {try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
+    uniffi_two_mls_pq_fn_method_twomlspqsession_install_establishment_envelope(
+            self.uniffiCloneHandle(),
+        FfiConverterData.lower(envelope),$0
+    )
+}
 }
     
     /**
@@ -2547,7 +2630,10 @@ open func myPrincipalState() -> PrincipalState  {
     
     /**
      * Welcome bytes to deliver to the remote party to complete group establishment.
-     * Returns `None` once consumed or when both groups are live.
+     * Returns `None` once consumed or when both groups are live. A born-dedicated
+     * session returns `None` until its establishment envelope installs — this is an
+     * emission door, and the parked frame is exactly the welcome the envelope must
+     * wrap (the un-enveloped form would be hard-rejected by the peer).
      */
 open func pendingOutbound() -> Data?  {
     return try!  FfiConverterOptionData.lift(try! rustCall() {
@@ -2775,11 +2861,38 @@ open func processIncoming(ciphertext: Data)throws  -> DecryptResult?  {
 })
 }
     
-open func processIncomingInner(ciphertext: Data)throws  -> DecryptResult?  {
+    /**
+     * Contract 26: the approved RE-FEED of a frame that previously paused as
+     * `pending_establishment`. Stateless — the crate held nothing between the pause
+     * and this call; the SAME ciphertext is simply presented again with the host's
+     * verification verdict:
+     * - `approved_envelope_digest` — `sha256` of the `pending_establishment.envelope`
+     * blob the host VERIFIED (the DIGEST, not the blob).
+     * - `approved_welcome_digest` — `sha256` of the `pending_establishment.welcome`
+     * bytes the host verified the envelope's signatures AGAINST (the DIGEST, not
+     * the bytes). Both sections of the arriving frame must hash to their approved
+     * digests, closing the TOCTOU on the WHOLE frame: approve frame A, deliver a
+     * frame differing in either section, and it pauses again rather than joining —
+     * without the welcome half, a deviating acceptor could pair the approved
+     * envelope with a different joinable welcome under the same delegated id.
+     * - `expected_creator` — the dedicated client id the host read out of the
+     * verified delegation. The joined creator leaf must equal it
+     * (`EstablishmentCreatorMismatch` otherwise — a security rejection; the join
+     * is discarded whole).
+     *
+     * ORDERING (load-bearing for the host): the join consumes the establishment —
+     * later re-staples dedup idempotently and never pause again — so the host must
+     * durably ADMIT the verified credential BEFORE calling this. The converse crash
+     * order heals (an un-re-fed frame re-pauses on the next delivery).
+     */
+open func processIncomingApproved(ciphertext: Data, approvedEnvelopeDigest: Data, approvedWelcomeDigest: Data, expectedCreator: Data)throws  -> DecryptResult?  {
     return try  FfiConverterOptionTypeDecryptResult.lift(try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
-    uniffi_two_mls_pq_fn_method_twomlspqsession_process_incoming_inner(
+    uniffi_two_mls_pq_fn_method_twomlspqsession_process_incoming_approved(
             self.uniffiCloneHandle(),
-        FfiConverterData.lower(ciphertext),$0
+        FfiConverterData.lower(ciphertext),
+        FfiConverterData.lower(approvedEnvelopeDigest),
+        FfiConverterData.lower(approvedWelcomeDigest),
+        FfiConverterData.lower(expectedCreator),$0
     )
 })
 }
@@ -3529,18 +3642,28 @@ public func FfiConverterTypeCommitResult_lower(_ value: CommitResult) -> RustBuf
 /**
  * Returned by `process_incoming`. Fields are `None` when not applicable to
  * the message type (e.g. `application_message` is absent for proposals/commits).
+ *
+ * When `pending_establishment` is `Some`, it is the ONLY populated field and
+ * NOTHING WAS PROCESSED: the frame carried a born-dedicated establishment
+ * handoff this session has not yet verified, the pause was a pure parse (no
+ * join, no consumption, no persist), and the frame must be re-presented via
+ * `process_incoming_approved` after the host verifies the envelope. Wrappers
+ * MUST surface this as a distinct, unmissable outcome — not an optional a
+ * caller can ignore.
  */
 public struct DecryptResult: Equatable, Hashable {
     public var applicationMessage: MlsSenderMessage?
     public var proposal: QueuedRemoteProposal?
     public var remoteCommit: CommitResult?
+    public var pendingEstablishment: PendingEstablishment?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(applicationMessage: MlsSenderMessage?, proposal: QueuedRemoteProposal?, remoteCommit: CommitResult?) {
+    public init(applicationMessage: MlsSenderMessage?, proposal: QueuedRemoteProposal?, remoteCommit: CommitResult?, pendingEstablishment: PendingEstablishment?) {
         self.applicationMessage = applicationMessage
         self.proposal = proposal
         self.remoteCommit = remoteCommit
+        self.pendingEstablishment = pendingEstablishment
     }
 
     
@@ -3561,7 +3684,8 @@ public struct FfiConverterTypeDecryptResult: FfiConverterRustBuffer {
             try DecryptResult(
                 applicationMessage: FfiConverterOptionTypeMlsSenderMessage.read(from: &buf), 
                 proposal: FfiConverterOptionTypeQueuedRemoteProposal.read(from: &buf), 
-                remoteCommit: FfiConverterOptionTypeCommitResult.read(from: &buf)
+                remoteCommit: FfiConverterOptionTypeCommitResult.read(from: &buf), 
+                pendingEstablishment: FfiConverterOptionTypePendingEstablishment.read(from: &buf)
         )
     }
 
@@ -3569,6 +3693,7 @@ public struct FfiConverterTypeDecryptResult: FfiConverterRustBuffer {
         FfiConverterOptionTypeMlsSenderMessage.write(value.applicationMessage, into: &buf)
         FfiConverterOptionTypeQueuedRemoteProposal.write(value.proposal, into: &buf)
         FfiConverterOptionTypeCommitResult.write(value.remoteCommit, into: &buf)
+        FfiConverterOptionTypePendingEstablishment.write(value.pendingEstablishment, into: &buf)
     }
 }
 
@@ -4231,6 +4356,88 @@ public func FfiConverterTypeParsedCombinerKeyPackage_lift(_ buf: RustBuffer) thr
 #endif
 public func FfiConverterTypeParsedCombinerKeyPackage_lower(_ value: ParsedCombinerKeyPackage) -> RustBuffer {
     return FfiConverterTypeParsedCombinerKeyPackage.lower(value)
+}
+
+
+/**
+ * Contract 26: the paused surface of a born-dedicated establishment handoff.
+ * The host verifies `envelope` (the acceptor's signed delegation — its
+ * signatures bind the `welcome` bytes) out-of-band of this crate, derives the
+ * delegated creator id from the VERIFIED artifact, then re-presents the same
+ * frame via `process_incoming_approved(ciphertext, approved_envelope_digest:
+ * sha256(envelope), approved_welcome_digest: sha256(welcome),
+ * expected_creator:)` — BOTH digests, over exactly the two fields surfaced
+ * here, so the crate enforces the same (envelope, welcome) pair the host
+ * verified. Never resume a frame whose envelope failed verification — not
+ * resuming IS the rejection (nothing was consumed; the peer re-staples, and
+ * each re-delivery pauses again until the host classifies the session
+ * terminally).
+ */
+public struct PendingEstablishment: Equatable, Hashable {
+    /**
+     * The opaque signed delegation blob, exactly as stapled by the acceptor.
+     */
+    public var envelope: Data
+    /**
+     * The spec-conformant `APQWelcome_A` bytes the envelope signs over — the
+     * input the host's signature verification binds against.
+     */
+    public var welcome: Data
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The opaque signed delegation blob, exactly as stapled by the acceptor.
+         */envelope: Data, 
+        /**
+         * The spec-conformant `APQWelcome_A` bytes the envelope signs over — the
+         * input the host's signature verification binds against.
+         */welcome: Data) {
+        self.envelope = envelope
+        self.welcome = welcome
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension PendingEstablishment: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePendingEstablishment: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PendingEstablishment {
+        return
+            try PendingEstablishment(
+                envelope: FfiConverterData.read(from: &buf), 
+                welcome: FfiConverterData.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: PendingEstablishment, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.envelope, into: &buf)
+        FfiConverterData.write(value.welcome, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePendingEstablishment_lift(_ buf: RustBuffer) throws -> PendingEstablishment {
+    return try FfiConverterTypePendingEstablishment.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePendingEstablishment_lower(_ value: PendingEstablishment) -> RustBuffer {
+    return FfiConverterTypePendingEstablishment.lower(value)
 }
 
 
@@ -5206,9 +5413,37 @@ public enum TwoMlsPqError: Swift.Error, Equatable, Hashable, Foundation.Localize
      * `receive` (wrong length — it could never match anything). Rejected before any
      * group is stood up, so the session state is untouched and the genuine KP′ still
      * completes the round.
-
      */
     case BootstrapKpMismatch
+    /**
+     * Contract 26, born-dedicated establishment. On the ACCEPTOR: a born-dedicated
+     * session tried to emit — `prepare_to_encrypt`/`encrypt`, `pending_outbound`,
+     * or a side-band take — before `install_establishment_envelope` supplied the
+     * signed delegation its staple must carry (an undelegated dedicated credential
+     * never reaches the wire). On the INITIATOR: a BARE welcome's creator leaf
+     * differs from the invitation identity — a born-dedicated welcome must arrive
+     * wrapped in the establishment handoff, so the un-enveloped form is rejected
+     * at the join, fail-closed, with nothing consumed.
+     */
+    case EstablishmentEnvelopeRequired
+    /**
+     * Contract 26. The approved re-feed's `expected_creator` — the dedicated
+     * client id the app read out of the VERIFIED delegation — does not match the
+     * welcome's actual creator leaf: the delegation is genuine but was issued for
+     * a different key than the session actually runs under. A security rejection,
+     * not a retry. The join is discarded whole (memory-only until the success
+     * persist), so nothing was consumed.
+     */
+    case EstablishmentCreatorMismatch
+    /**
+     * Contract 26. `install_establishment_envelope` was called with bytes that
+     * differ from an envelope already installed. One session gets exactly one
+     * envelope (its signatures bind this session's welcome; a second distinct
+     * envelope can only be a host bug), so the conflict is loud rather than a
+     * silent replace. Re-installing the SAME bytes is an idempotent no-op.
+
+     */
+    case EstablishmentEnvelopeConflict
 
     
 
@@ -5264,6 +5499,9 @@ public struct FfiConverterTypeTwoMlsPqError: FfiConverterRustBuffer {
         case 24: return .BindDischargeFailed
         case 25: return .BindApplyFailed
         case 26: return .BootstrapKpMismatch
+        case 27: return .EstablishmentEnvelopeRequired
+        case 28: return .EstablishmentCreatorMismatch
+        case 29: return .EstablishmentEnvelopeConflict
 
          default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -5378,6 +5616,18 @@ public struct FfiConverterTypeTwoMlsPqError: FfiConverterRustBuffer {
         
         case .BootstrapKpMismatch:
             writeInt(&buf, Int32(26))
+        
+        
+        case .EstablishmentEnvelopeRequired:
+            writeInt(&buf, Int32(27))
+        
+        
+        case .EstablishmentCreatorMismatch:
+            writeInt(&buf, Int32(28))
+        
+        
+        case .EstablishmentEnvelopeConflict:
+            writeInt(&buf, Int32(29))
         
         }
     }
@@ -5633,6 +5883,30 @@ fileprivate struct FfiConverterOptionTypeOpenedFrame: FfiConverterRustBuffer {
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeOpenedFrame.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypePendingEstablishment: FfiConverterRustBuffer {
+    typealias SwiftType = PendingEstablishment?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypePendingEstablishment.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypePendingEstablishment.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -5997,7 +6271,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_has_receive_group() != 35549) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_initial_welcome() != 31882) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_initial_welcome() != 13904) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_install_establishment_envelope() != 40753) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_install_sink() != 61277) {
@@ -6012,7 +6289,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_my_principal_state() != 54784) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pending_outbound() != 44057) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pending_outbound() != 9651) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_receive_group_id() != 24855) {
@@ -6048,7 +6325,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_process_incoming() != 61494) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_process_incoming_inner() != 44377) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_process_incoming_approved() != 44354) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_proposal_context() != 63573) {

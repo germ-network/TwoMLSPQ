@@ -176,7 +176,7 @@ import TwoMLSPQBinding
 //     `DuplicateSideBand` when the side-band won the race is the common one). The parked
 //     `Welcome'` rides the acceptor's next `pendingSideBand` hand-out. Invitation archive layout
 //     changed (INVITATION_VERSION 1→2, pre-release hard cut) — a stale blob fails to decode.
-private let expectedBindingContract: UInt64 = 25
+private let expectedBindingContract: UInt64 = 26
 
 enum TwoMLSPQBindingContract {
 	static let verified: Void = {
@@ -348,6 +348,78 @@ public struct PQDecryptResult: Sendable {
 	}
 }
 
+/// The outcome of `processIncoming` (contract 26). A frame is EITHER decrypted
+/// or it is a born-dedicated establishment handoff this session has not yet
+/// admitted — an enum, not an optional field, so the compiler forces every
+/// call site to handle the pause. Ignoring it would silently drop the peer's
+/// entire establishment.
+///
+/// Not `Sendable`: the pause case carries a live session handle (single-driver,
+/// like `PQSession` itself), so the outcome is consumed on the session's own
+/// isolation.
+public enum PQProcessOutcome {
+	/// The frame processed to completion; the payload is what a decrypt yields
+	/// (`nil` for an idempotent re-delivery or a bookkeeping-only frame).
+	case decrypted(PQDecryptResult?)
+	/// The frame carried a born-dedicated establishment handoff and NOTHING was
+	/// processed — a pure parse. Verify the delegation out of band, then resume
+	/// via `PQPendingEstablishment.resume(admittedCreator:)`.
+	case pendingEstablishment(PQPendingEstablishment)
+}
+
+/// The paused surface of a born-dedicated establishment handoff (contract 26).
+/// The host verifies `envelope` — the acceptor's signed delegation, whose
+/// signatures bind `welcome` — against `welcome`, derives the delegated agent
+/// id from the VERIFIED artifact, durably admits it, and only THEN calls
+/// `resume`. Not resuming IS the rejection: nothing was consumed, and the peer
+/// re-staples until the host either resumes or tears the session down.
+///
+/// `resume` re-presents the exact frame and pins the (envelope, welcome) pair
+/// internally, so the caller never handles digests — closing the "which bytes,
+/// which hash" footgun at the type boundary.
+public struct PQPendingEstablishment {
+	public let envelope: Data
+	public let welcome: Data
+	private let ciphertext: Data
+	private let base: TwoMLSPQBinding.TwoMlsPqSession
+
+	init(_ base: TwoMLSPQBinding.PendingEstablishment, ciphertext: Data, session: TwoMLSPQBinding.TwoMlsPqSession) {
+		self.envelope = base.envelope
+		self.welcome = base.welcome
+		self.ciphertext = ciphertext
+		self.base = session
+	}
+
+	/// Resume after verifying the delegation and durably admitting the credential.
+	///
+	/// - `admittedCreator`: the agent id the host read out of the VERIFIED
+	///   delegation. The crate requires the welcome's creator leaf to equal it
+	///   (`.establishmentCreatorMismatch` otherwise — a security rejection, not
+	///   a retry).
+	///
+	/// ORDERING (load-bearing): the join consumes the establishment — later
+	/// re-staples dedup and never pause again — so ADMIT + PERSIST the credential
+	/// BEFORE calling this. The converse crash order heals (an un-resumed frame
+	/// re-pauses on the next delivery).
+	public func resume(
+		admittedCreator: ClientID
+	) throws(SessionError) -> PQDecryptResult? {
+		try mapPQErrors(.processIncoming) {
+			// The digests match the crate's `sha256` exactly — `TypedDigest(.sha256,
+			// over:)` is raw SHA-256, the same primitive `crate::sha256` emits (the
+			// contract-version canary catches a suite change). Computed here from the
+			// surfaced bytes, so the pair is always the one the host verified.
+			try base.processIncomingApproved(
+				ciphertext: ciphertext,
+				approvedEnvelopeDigest: TypedDigest(prefix: .sha256, over: envelope).digest,
+				approvedWelcomeDigest: TypedDigest(prefix: .sha256, over: welcome).digest,
+				expectedCreator: admittedCreator
+			)
+			.map(PQDecryptResult.init)
+		}
+	}
+}
+
 // MARK: - Session
 
 
@@ -402,6 +474,34 @@ public struct PQSession {
 		// `.sinkAlreadyInstalled` on a second call.
 		try mapPQErrors(.installSink) {
 			try base.installSink(sink: PQSinkAdapter(sink))
+		}
+	}
+
+	// MARK: Born-dedicated establishment (contract 26)
+
+	/// The bare, spec-conformant `APQWelcome_A` this born-dedicated acceptor
+	/// must sign its establishment delegation over. Read it, mint the signed
+	/// handoff (binding `sha256(welcome)`), then `installEstablishmentEnvelope`.
+	/// `nil` once installed (the staple then carries the enveloped form) or on a
+	/// session that owes no delegation (nil topology / initiator).
+	public var pendingEstablishmentWelcome: Data? {
+		base.initialWelcome()
+	}
+
+	/// Install the host's signed establishment delegation on a born-dedicated
+	/// acceptor (contract 26). The blob is opaque to the backend — the host
+	/// minted it by signing over `pendingEstablishmentWelcome`. Until this is
+	/// called the session is non-emittable at every door; after it, the staple
+	/// carries the enveloped welcome and sends proceed.
+	///
+	/// One envelope per session: re-installing the SAME bytes is a no-op;
+	/// different bytes throw `.establishmentEnvelopeConflict`. CAPTURE ORDERING:
+	/// persist the session AFTER this call (the envelope rides the archive).
+	public func installEstablishmentEnvelope(
+		_ envelope: Data
+	) throws(SessionError) {
+		try mapPQErrors(.receive) {
+			try base.installEstablishmentEnvelope(envelope: envelope)
 		}
 	}
 
@@ -469,14 +569,22 @@ public struct PQSession {
 
 	public func processIncoming(
 		ciphertext: Data
-	) throws(SessionError) -> PQDecryptResult? {
+	) throws(SessionError) -> PQProcessOutcome {
 		// `.misroutedFrame` if a PQ side-band frame lands here (route it to
 		// `ingest`); `.decryptionFailed` is transient (retry); `.epochDesync`
 		// means re-establish. After a `.retryLater` failure, reconcile identity
 		// via `theirPrincipalState` — a staple may have applied.
+		//
+		// Contract 26: a `.pendingEstablishment` outcome means the frame is a
+		// born-dedicated establishment handoff and NOTHING was processed — verify
+		// the delegation and resume via the returned handle; see `PQProcessOutcome`.
 		try mapPQErrors(.processIncoming) {
-			try base.processIncoming(ciphertext: ciphertext)
-				.map(PQDecryptResult.init)
+			let raw = try base.processIncoming(ciphertext: ciphertext)
+			if let pending = raw?.pendingEstablishment {
+				return .pendingEstablishment(
+					PQPendingEstablishment(pending, ciphertext: ciphertext, session: base))
+			}
+			return .decrypted(try raw.map(PQDecryptResult.init))
 		}
 	}
 
@@ -1016,9 +1124,13 @@ public struct PQInvitation {
 		// currency `processIncoming` yields) — the caller must deliver it; a
 		// re-delivered copy of this frame cannot yield it again.
 		let stapled: PQSenderMessage? = stapledMessage.flatMap { staple in
-			guard let result = try? session.processIncoming(ciphertext: staple)
+			// This is the ACCEPTOR consuming the initiator's pre-establishment app
+			// staple ([0x09]/[0x13]) — never a `0x0B` establishment handoff (that
+			// flows the other direction), so a pause here is impossible; treat any
+			// non-`.decrypted` outcome as the same fail-open drop as a decrypt error.
+			guard case .decrypted(let result)? = try? session.processIncoming(ciphertext: staple)
 			else { return nil }
-			return result.applicationMessage
+			return result?.applicationMessage
 		}
 
 		return (session, stapled)
