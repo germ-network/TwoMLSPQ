@@ -10,6 +10,13 @@ import PackageDescription
 //     (`buildIos/TwoMLSPQ.xcframework`) — no release needed to test a wire change.
 //   • External consumers (the app resolving a git tag) get the pinned url+checksum,
 //     which the release workflow rewrites to each new release.
+// RELEASE CONVENTION — the `url` + `checksum` below must always name an ALREADY-RELEASED tag
+// with that release's real, CI-computed checksum. NEVER pre-bump them to the next, unreleased
+// version: `release-artifacts.yml`'s finalize job pins the NEW tag itself on publish (it builds
+// the zip on the pinned runner, so the checksum only exists then), and its idempotency guard
+// SKIPS build+pin+upload when the url already names the tag being finalized. A hand-pre-pinned
+// url therefore ships a release with NO asset — the url 404s. Leave these lagging; the workflow
+// pins each tag forward. (v0.10.0 was shipped asset-less exactly this way; see the guard fix.)
 // EITHER WAY, keep `Sources/TwoMLSPQ/two_mls_pq.swift` re-synced from the SAME build
 // as the binary (uniffi embeds a checksum contract verified at init; the
 // `binding_contract_version()` ↔ `expectedBindingContract` canary guards a mismatch).
@@ -23,7 +30,7 @@ let twoMLSPQrs: Target =
 		name: "TwoMLSPQrs",
 		url:
 			"https://github.com/germ-network/TwoMLSPQ/releases/download/v0.10.0/TwoMLSPQ.xcframework.zip",
-		checksum: "3ca1b86d265d2ded4ac78da4b0f26373a68ae65e0d814f542422de509a51c0fd"
+		checksum: "897071cf3ba8fd278c205aa13dcea3303dc01195167dc39e7eabc7510db51dee"
 	)
 
 let package = Package(
