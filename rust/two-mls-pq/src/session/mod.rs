@@ -1787,9 +1787,11 @@ impl TwoMlsPqSession {
     /// One envelope per session: re-installing the SAME bytes is an idempotent
     /// no-op; DIFFERENT bytes are `EstablishmentEnvelopeConflict` (loud — the
     /// envelope's signatures bind this session's welcome, so a second distinct
-    /// envelope can only be a host bug). `SessionNotReady` when the session owes
-    /// no envelope (not born-dedicated, or the host already let the staple move
-    /// on — neither occurs in the intended receive→mint→install sequence).
+    /// envelope can only be a host bug). An EMPTY envelope is
+    /// `EstablishmentEnvelopeRequired` (the wrapper guards it with a clearer
+    /// message). `SessionNotReady` when the session owes no envelope (not
+    /// born-dedicated, or the host already let the staple move on — neither
+    /// occurs in the intended receive→mint→install sequence).
     ///
     /// CAPTURE ORDERING: capture/persist the session AFTER this call (the same
     /// rule as `set_initial_app_payload`) — the envelope rides the archive, and

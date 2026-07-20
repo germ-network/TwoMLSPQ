@@ -400,7 +400,10 @@ public struct PQPendingEstablishment {
 	/// ORDERING (load-bearing): the join consumes the establishment — later
 	/// re-staples dedup and never pause again — so ADMIT + PERSIST the credential
 	/// BEFORE calling this. The converse crash order heals (an un-resumed frame
-	/// re-pauses on the next delivery).
+	/// re-pauses on the next delivery). Resume on the SAME live session the pause
+	/// came from — this handle retains it; do not persist/restore the session
+	/// between pause and resume (that would drive a stale instance, splitting the
+	/// single-driver state). A restore instead re-pauses the re-presented frame.
 	public func resume(
 		admittedCreator: ClientID
 	) throws(SessionError) -> PQDecryptResult? {
@@ -409,13 +412,26 @@ public struct PQPendingEstablishment {
 			// over:)` is raw SHA-256, the same primitive `crate::sha256` emits (the
 			// contract-version canary catches a suite change). Computed here from the
 			// surfaced bytes, so the pair is always the one the host verified.
-			try base.processIncomingApproved(
+			let raw = try base.processIncomingApproved(
 				ciphertext: ciphertext,
 				approvedEnvelopeDigest: TypedDigest(prefix: .sha256, over: envelope).digest,
 				approvedWelcomeDigest: TypedDigest(prefix: .sha256, over: welcome).digest,
 				expectedCreator: admittedCreator
 			)
-			.map(PQDecryptResult.init)
+			// Re-presenting the same captured bytes with digests over those same
+			// bytes cannot re-pause (`covers` matches by construction), so a
+			// pending-establishment result here is a crate/contract invariant
+			// break — surface it loudly rather than flatten it to a benign-looking
+			// all-nil decrypt (the silent-drop class `PQProcessOutcome` exists to
+			// prevent).
+			guard raw?.pendingEstablishment == nil else {
+				throw SessionError(
+					code: .internalError,
+					detail: "process_incoming_approved re-paused on the captured "
+						+ "establishment frame — the approval digests should match by "
+						+ "construction; do not retry, discard the session object")
+			}
+			return try raw.map(PQDecryptResult.init)
 		}
 	}
 }
@@ -495,11 +511,22 @@ public struct PQSession {
 	/// carries the enveloped welcome and sends proceed.
 	///
 	/// One envelope per session: re-installing the SAME bytes is a no-op;
-	/// different bytes throw `.establishmentEnvelopeConflict`. CAPTURE ORDERING:
-	/// persist the session AFTER this call (the envelope rides the archive).
+	/// different bytes throw `.establishmentEnvelopeConflict`. An EMPTY blob is a
+	/// caller bug (`.sequenceViolation`). CAPTURE ORDERING: persist the session
+	/// AFTER this call (the envelope rides the archive).
 	public func installEstablishmentEnvelope(
 		_ envelope: Data
 	) throws(SessionError) {
+		// Guard empty here so the diagnostic names the real bug — the crate maps
+		// an empty blob to its `EstablishmentEnvelopeRequired`, which at the
+		// `.receive` surface reads as "install before sending" (misleading: install
+		// WAS called, just with nothing).
+		guard !envelope.isEmpty else {
+			throw SessionError(
+				code: .sequenceViolation,
+				detail: "establishment envelope must be non-empty (the host-signed "
+					+ "delegation over pendingEstablishmentWelcome)")
+		}
 		try mapPQErrors(.receive) {
 			try base.installEstablishmentEnvelope(envelope: envelope)
 		}
@@ -1097,12 +1124,17 @@ public struct PQInvitation {
 		// invitation state is claimed — redundant with the key-package guard
 		// above by construction, kept so the binding is enforced independently
 		// on both sides of the FFI (defense-in-depth of two, not one).
-		// Contract 25: establish the send group DIRECTLY under the dedicated per-session
-		// principal — `newClientId` becomes the creator leaf's credential, so there is no
-		// founding→dedicated rotation dance (that dance's `stageRotation` is gone from the FFI;
-		// steady-state rotations propose lazily via `prepareToEncrypt(proposing:)`). The peer
-		// adopts the dedicated id from the creator leaf and surfaces it as
-		// `remoteCommit.newSender` when it differs from the invitation identity.
+		// Contract 25/26: a non-nil `newClientId` (differing from the invitation
+		// identity) establishes the send group DIRECTLY under that dedicated
+		// per-session principal — it becomes the creator leaf's credential, so
+		// there is no founding→dedicated rotation dance (that dance's
+		// `stageRotation` is gone from the FFI; steady-state rotations propose
+		// lazily via `prepareToEncrypt(proposing:)`). A dedicated acceptor then
+		// owes its signed delegation before it may emit (contract 26 —
+		// `installEstablishmentEnvelope`), and the peer, once it verifies and
+		// resumes, adopts the dedicated id from the creator leaf and surfaces it as
+		// `remoteCommit.newSender`. A `nil` (or invitation-identity) id is the nil
+		// topology: no dedicated principal, no delegation.
 		// `expectedAppBinding: nil` — unbound (v15's AppBinding): this surface does
 		// not state a binding yet, and the crate never silently accepts a
 		// binding-carrying welcome against a nil expectation.
@@ -1148,6 +1180,14 @@ public struct PQInvitation {
 // actor owning the session) asserts its own Sendable story instead.
 @available(*, unavailable)
 extension PQSession: Sendable {}
+
+// Both carry a live session handle (single-driver), so — like `PQSession` — an
+// unavailable conformance blocks a consumer from re-adding Sendability retroactively
+// (the generated binding object would otherwise make `@unchecked Sendable` compile).
+@available(*, unavailable)
+extension PQProcessOutcome: Sendable {}
+@available(*, unavailable)
+extension PQPendingEstablishment: Sendable {}
 
 // MARK: - Client (stub)
 

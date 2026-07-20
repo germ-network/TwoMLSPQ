@@ -4577,6 +4577,64 @@ fn test_establishment_approval_pins_both_sections() {
     assert_eq!(alice_s.their_principal_state().client_id().bytes, dedicated);
 }
 
+/// Contract 26: the one-envelope-per-session rule. Re-installing the SAME bytes
+/// is an idempotent no-op; DIFFERENT bytes are `EstablishmentEnvelopeConflict`
+/// (a host bug — the signatures bind this session's welcome); an EMPTY blob is
+/// `EstablishmentEnvelopeRequired`; and install on a NON-dedicated (nil-topology)
+/// session is `SessionNotReady` (it owes nothing).
+#[test]
+fn test_install_establishment_envelope_rules() {
+    let d = crate::test_utils::born_dedicated_pending();
+    let envelope = b"the-signed-delegation".to_vec();
+
+    // Empty is refused before anything is touched.
+    assert!(matches!(
+        d.bob.install_establishment_envelope(Vec::new()),
+        Err(TwoMlsPqError::EstablishmentEnvelopeRequired)
+    ));
+
+    // First install succeeds; the same bytes again are an idempotent no-op.
+    assert_ok!(d.bob.install_establishment_envelope(envelope.clone()));
+    assert_ok!(d.bob.install_establishment_envelope(envelope.clone()));
+
+    // Different bytes after an install are a loud conflict — never a silent replace.
+    assert!(matches!(
+        d.bob
+            .install_establishment_envelope(b"a-different-delegation".to_vec()),
+        Err(TwoMlsPqError::EstablishmentEnvelopeConflict)
+    ));
+    // The original still drives establishment (the conflict changed nothing).
+    let frame = assert_some!(d.bob.pending_outbound());
+    assert_some!(crate::test_utils::approve_establishment(
+        &d.alice,
+        frame,
+        &envelope,
+        &d.dedicated
+    ));
+
+    // A nil-topology acceptor owes no envelope: install is SessionNotReady.
+    let (nil_alice, nil_bob) = establish_sessions();
+    let _ = &nil_alice;
+    assert!(matches!(
+        nil_bob.install_establishment_envelope(b"unexpected".to_vec()),
+        Err(TwoMlsPqError::SessionNotReady)
+    ));
+}
+
+/// Contract 26: the PQ side-band emission doors are gated like the message doors —
+/// a born-dedicated acceptor hands out nothing pre-install. (The A.4 side-band only
+/// runs post-establishment, so this gate is defense in depth, but it must hold.)
+#[test]
+fn test_pq_side_band_gated_pre_install() {
+    let d = crate::test_utils::born_dedicated_pending();
+    assert!(d.bob.pq_pending_outbound(SideBandSealing::Fresh).is_none());
+    assert!(d.bob.pq_take_pending_outbound().is_none());
+    // Post-install the gate opens (there is no parked side-band frame yet, so the
+    // result is still None — but for the "nothing owed" reason, not the gate).
+    let _ = crate::test_utils::install_mock_envelope(&d.bob);
+    assert!(d.bob.pq_take_pending_outbound().is_none());
+}
+
 /// Contract 26: an approved re-feed whose `expected_creator` does not match the
 /// welcome's actual creator leaf is `EstablishmentCreatorMismatch` — a security
 /// rejection (the delegation is genuine but names a different key than the group

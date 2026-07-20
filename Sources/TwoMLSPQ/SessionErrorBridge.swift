@@ -49,9 +49,9 @@ enum PQErrorSurface {
 }
 
 extension SessionError {
-	/// Translate one backend error at a known surface. Exhaustive over
-	/// `TwoMlsPqError`'s 25 cases — a binding bump that adds a case fails
-	/// compilation HERE, which is part of the re-sync ritual (see the contract
+	/// Translate one backend error at a known surface. Exhaustive over every
+	/// `TwoMlsPqError` case — a binding bump that adds a case fails compilation
+	/// HERE (no `default`), which is part of the re-sync ritual (see the contract
 	/// ladder in PQSession.swift). LinearEncodingError (from the
 	/// digest lifts) and everything else — including the fileprivate
 	/// UniffiInternalError / rustPanic — fall through to `.internalError`.
