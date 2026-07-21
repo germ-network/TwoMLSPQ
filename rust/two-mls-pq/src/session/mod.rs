@@ -2009,6 +2009,30 @@ impl TwoMlsPqSession {
             },
         })
     }
+
+    /// This session's OWN send-group id — the classical half is present from
+    /// creation, the PQ half empty until its deferred bootstrap (A.3). Unlike
+    /// [`active_session_id`](Self::active_session_id) (a hash of the two client ids,
+    /// shared across the pair) this is a per-endpoint value: each side's send group
+    /// differs, so an adopter keying local state by it never shares an at-rest
+    /// identifier with its peer. The mirror of [`receive_group_id`](Self::receive_group_id)
+    /// (my send group is the peer's receive group).
+    pub fn send_group_id(&self) -> Option<CombinerGroupId> {
+        let inner = self.lock();
+        inner.send_group.as_ref().map(|sg| CombinerGroupId {
+            classical: MlsGroupId {
+                bytes: sg.classical.group_id().to_vec(),
+            },
+            // Empty until the deferred PQ half is bootstrapped (A.3).
+            pq: MlsGroupId {
+                bytes: sg
+                    .pq
+                    .as_ref()
+                    .map(|pq| pq.group_id().to_vec())
+                    .unwrap_or_default(),
+            },
+        })
+    }
 }
 
 #[cfg(test)]

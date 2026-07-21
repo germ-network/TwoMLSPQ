@@ -694,6 +694,17 @@ public struct PQSession {
 		base.receiveGroupId()?.classical.bytes
 	}
 
+	/// This side's OWN send-group classical id — a stable, per-endpoint session
+	/// identifier present from creation. Distinct from `shouldListenOn()` (which
+	/// bundles the same value into a routing/rendezvous tuple): this is the identity
+	/// value on its own, for an adopter that keys local session state by it. It is
+	/// LOCAL — each endpoint's send group differs (my send group is the peer's
+	/// receive group), so it is never a shared-across-peers at-rest identifier, and
+	/// it is NOT `activeSessionId()` (the shared client-id-pair hash).
+	public var localSessionId: GroupID? {
+		base.sendGroupId()?.classical.bytes
+	}
+
 	public func shouldListenOn() throws(SessionError) -> (
 		GroupID, [UInt64: RendezvousID]
 	) {
@@ -1083,7 +1094,8 @@ public struct PQInvitation {
 		remoteClientId: ClientID,
 		welcomeToken: WelcomeToken,
 		stapledMessage: Data?,
-		newClientId: ClientID?
+		newClientId: ClientID?,
+		expectedAppBinding: Data? = nil
 	) throws(SessionError) -> (PQSession, stapled: PQSenderMessage?) {
 		return try mapPQErrors(.receive) {
 		// Contract 26: `newClientId` is optional — `nil` establishes under the
@@ -1143,9 +1155,13 @@ public struct PQInvitation {
 		// resumes, adopts the dedicated id from the creator leaf and surfaces it as
 		// `remoteCommit.newSender`. A `nil` (or invitation-identity) id is the nil
 		// topology: no dedicated principal, no delegation.
-		// `expectedAppBinding: nil` — unbound (v15's AppBinding): this surface does
-		// not state a binding yet, and the crate never silently accepts a
-		// binding-carrying welcome against a nil expectation.
+		// `expectedAppBinding` (v15's AppBinding, contract 15): the app-state binding
+		// this welcome must carry — `Some` requires a byte-equal binding, `nil` (the
+		// default) requires the welcome to carry none. The crate never silently accepts
+		// a binding-carrying welcome against a nil expectation, and verifies BEFORE any
+		// invitation state is claimed, so a mismatch (`.appBindingMismatch`) consumes
+		// nothing. Card sessions pass nil (their weld is the establishment handoff over
+		// the welcome digest); anchor sessions pass their relationship binding.
 		let session = PQSession(
 			try base.receive(
 				welcome: sendGroupWelcome,
@@ -1154,7 +1170,7 @@ public struct PQInvitation {
 				spawnToken: welcomeToken.wireFormat,
 				newClientId: newClientId,
 				expectedRemote: remoteClientId,
-				expectedAppBinding: nil
+				expectedAppBinding: expectedAppBinding
 			))
 
 		// Deliberately fail open on the staple: an untrusted, optional early-delivery
@@ -1247,7 +1263,8 @@ public struct PQClient {
 	}
 
 	public func reply(
-		keyPackageMessage: Data
+		keyPackageMessage: Data,
+		appBinding: Data? = nil
 	) throws(SessionError) -> (
 		sendGroup: PQSession,
 		welcomeMessage: Data,
@@ -1256,10 +1273,15 @@ public struct PQClient {
 	) {
 		return try mapPQErrors(.client) {
 		let pair = try decodeCombinerKeyPackage(bytes: keyPackageMessage)
-		// `appBinding: nil` — unbound (v15's AppBinding); threading a real
-		// relationship binding through the abstract surface is its own follow-up.
+		// `appBinding` (v15's AppBinding, contract 15): opaque relationship-digest bytes
+		// welded into the send group's GroupContext at creation and immutable for the
+		// session's lifetime; the peer verifies it at `receive(expectedAppBinding:)`.
+		// `nil` (the default) is the unbound state. Card sessions pass nil (their weld is
+		// the establishment handoff over the welcome digest); anchor sessions pass their
+		// relationship binding. Pass a digest, never raw identifiers — the crate never
+		// interprets the bytes; an empty (non-nil) binding is rejected.
 		let session = try TwoMlsPqSession.initiate(
-			client: base, theirKeyPackage: pair, appBinding: nil)
+			client: base, theirKeyPackage: pair, appBinding: appBinding)
 		// `welcomeMessage` is the PLAINTEXT APQWelcome (contract 15): the app binds
 		// it — together with `myKeyPackage` and `bootstrapKpCommitment` — into its
 		// signed identity envelope (AnchorWelcome) and hands the result back via
