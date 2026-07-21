@@ -2167,9 +2167,103 @@ fn test_no_message_frame_can_overtake_the_bind() {
 #[test]
 fn test_pq_ratchet_bind_without_begin_is_rejected() {
     let (alice, _bob) = establish_sessions();
+    // A.4 legs are now MLS application messages, so the bind PARSES the frame as an
+    // `MLSMessage` in the guard, before the state check — a non-MLS blob (here the old
+    // bare-CT shape) is rejected as `Mls` at that parse. The state-guard path (a
+    // well-formed CT arriving when we hold no ephemeral) is exercised by the full-round
+    // tests (`test_stale_ciphertext_crossing_rounds_is_rejected`,
+    // `test_three_sequential_pq_ratchets_alternate_and_deliver`).
     let mut ct = vec![super::PQ_CT_TAG];
     ct.extend_from_slice(&[0u8; 1088]);
-    assert_err!(alice.pq_ratchet_bind(ct), TwoMlsPqError::SessionNotReady);
+    assert_err!(alice.pq_ratchet_bind(ct), TwoMlsPqError::Mls);
+}
+
+/// No-wedge, network-attacker case. An attacker who injects a bare `[0x17][ek]` frame (the old
+/// wire shape) used to drive the responder into `Responding`, emitting a CT and stranding the
+/// round on a signature-less frame. Now such a frame — not a valid MLS message in the
+/// responder's mirror — is rejected with NO state change: the routing layer (`open_incoming`)
+/// drops it (it opens under no header-window key), the backstop entry point rejects it at the
+/// `MLSMessage` parse, the responder stays idle, and a real round then completes. This is the
+/// case a network attacker (no group keys) is confined to. The stolen-signing-key / stale-state
+/// PCS case — a message that DOES parse and is validly signed, but at a healed-past epoch — is
+/// covered by `test_stale_epoch_ek_replayed_after_heal_is_rejected` (and R1 at the group level).
+#[test]
+fn test_forged_ek_does_not_wedge_the_responder() {
+    let (alice, bob) = establish_full();
+    // Bob holds the turn (the A.4 initiator); Alice is the responder this attacker targets.
+    assert!(bob.my_pq_turn());
+
+    // A forged EK a network attacker can synthesize WITHOUT any group key: a bare,
+    // unauthenticated frame. The routing layer drops it outright — it opens under no
+    // header-window key — so it never even reaches the responder honestly.
+    let mut forged = vec![super::PQ_EK_TAG];
+    forged.extend_from_slice(&[0x42u8; 1184]);
+    assert!(
+        assert_ok!(alice.open_incoming(forged.clone())).is_none(),
+        "a forged EK must be dropped at the routing layer"
+    );
+    // And the backstop: fed straight to the entry point it is rejected, with no CT produced
+    // and no `Responding` state entered (the old design would have sealed an S here).
+    assert_err!(alice.pq_ratchet_respond(forged), TwoMlsPqError::Mls);
+    assert!(
+        alice.pq_take_pending_outbound().is_none(),
+        "a rejected EK must not leave the responder holding a CT (no wedge)"
+    );
+
+    // The responder was not stranded: a real round drives to completion.
+    ratchet_round(&bob, &alice, b"after-forgery");
+}
+
+/// PCS, the epoch factor at the session layer. An EK that WAS valid at epoch E — a real,
+/// leaf-signed MLS message — is useless once the parties have healed past E. Capture a valid
+/// EK, complete its round (advancing both PQ epochs), then replay the captured EK: the
+/// responder rejects it (its epoch is gone) and is not wedged. This is the group-level R1
+/// behavior (`assumption_a_second_delivery...`, stale-epoch decryption) observed end-to-end
+/// through the session — the reason a stolen signing key does not confer lasting forgery
+/// power once a round the attacker missed has landed.
+#[test]
+fn test_stale_epoch_ek_replayed_after_heal_is_rejected() {
+    let (alice, bob) = establish_full();
+    assert!(bob.my_pq_turn());
+
+    // Bob opens a round; capture the valid, current-epoch EK frame.
+    let ek0 = open_ratchet(&bob, &alice);
+
+    // Complete the round honestly → both send-PQ epochs advance, turn flips to Alice.
+    assert_ok!(alice.pq_ratchet_respond(ek0.clone()));
+    let ct = assert_some!(alice.pq_take_pending_outbound());
+    assert_ok!(bob.pq_ratchet_bind(ct));
+    discharge_bind(&bob, &alice, b"heal");
+
+    // Replaying the now-stale EK is rejected — its epoch no longer exists in Alice's mirror —
+    // and leaves her responder state clean.
+    assert_err!(alice.pq_ratchet_respond(ek0), TwoMlsPqError::Mls);
+    assert!(alice.pq_take_pending_outbound().is_none());
+
+    // A fresh round (Alice now initiates) still completes.
+    ratchet_round(&alice, &bob, b"after-replay");
+}
+
+/// Outer-tag routing discipline: a CT frame handed to `pq_ratchet_respond` (which expects an
+/// EK) and an EK frame handed to `pq_ratchet_bind` (which expects a CT) are both rejected at
+/// the tag check, before any group state is touched — cross-leg splice resistance.
+#[test]
+fn test_a4_legs_reject_cross_fed_tags() {
+    let (alice, bob) = establish_full();
+    assert!(bob.my_pq_turn());
+
+    // A genuine EK and CT from a live round, captured without completing it.
+    let ek = open_ratchet(&bob, &alice);
+    assert_ok!(alice.pq_ratchet_respond(ek.clone()));
+    let ct = assert_some!(alice.pq_take_pending_outbound());
+
+    // Feed each to the wrong entry point → rejected on the outer tag.
+    assert_err!(bob.pq_ratchet_respond(ct.clone()), TwoMlsPqError::Mls);
+    assert_err!(alice.pq_ratchet_bind(ek), TwoMlsPqError::Mls);
+
+    // The real round still closes — the cross-feeds mutated nothing.
+    assert_ok!(bob.pq_ratchet_bind(ct));
+    discharge_bind(&bob, &alice, b"after-crossfeed");
 }
 
 #[test]
@@ -2198,6 +2292,57 @@ fn test_three_sequential_pq_ratchets_alternate_and_deliver() {
         let payload = vec![i as u8; 8];
         ratchet_round(initiator, responder, &payload);
     }
+}
+
+/// Pin the epoch-sync invariant the MLS-framed A.4 legs depend on. Because each leg is now an
+/// MLS application message, the EK only DECRYPTS if the responder's mirror sits at the
+/// initiator's send-PQ epoch. An A.5 re-key advances that epoch WITHOUT being an A.4 round, so
+/// interleaving one between two A.4 rounds is the sharpest test that the turn/bind discipline
+/// keeps the two sides' PQ epochs aligned across a non-A.4 advance. A desync would surface as
+/// `pq_ratchet_respond` erroring inside the following `ratchet_round`.
+#[test]
+fn test_a5_rekey_between_a4_rounds_keeps_next_ek_decryptable() {
+    let (alice, bob) = establish_full();
+    assert!(bob.my_pq_turn(), "Bob holds the turn after bootstrap");
+
+    // Round 1: Bob initiates on BSG-PQ. The turn flips to Alice.
+    ratchet_round(&bob, &alice, b"a4-round-1");
+    assert!(alice.my_pq_turn());
+    assert!(!bob.my_pq_turn());
+
+    // Interleave an A.5 re-key. Its initiator must be the NON-turn-holder (Bob); Alice
+    // (turn-holder) commits Bob's leaf update in HER send-PQ, so this advances ASG-PQ — the
+    // very group Alice's next A.4 EK will ride — without being an A.4 round.
+    let asg_pq_before = alice.epochs().pq_epoch;
+    let new_bob = make_client().client_id();
+    rekey_round(&bob, &alice, new_bob);
+    assert!(
+        alice.epochs().pq_epoch > asg_pq_before,
+        "the re-key must actually advance ASG-PQ, else this test is vacuous"
+    );
+    assert!(
+        alice.my_pq_turn(),
+        "the turn-holder keeps the turn across a re-key it responds to"
+    );
+
+    // Round 2: Alice now initiates on ASG-PQ at its POST-rekey epoch. Her EK must still decrypt
+    // on Bob's mirror — THE INVARIANT. Drive the round explicitly so the EK decrypt is a named
+    // assertion rather than buried in a helper.
+    let ek = open_ratchet(&alice, &bob);
+    // THE INVARIANT: the post-rekey EK must decrypt on Bob's ASG-PQ mirror (epochs aligned).
+    // The re-key's commit on ASG-PQ advanced the epoch this EK rides, and Bob applied that
+    // commit, so his mirror is at the same epoch — the decrypt succeeds. A desync would fail
+    // here with `Mls`.
+    assert_ok!(bob.pq_ratchet_respond(ek));
+    let ct = assert_some!(bob.pq_take_pending_outbound());
+    assert_ok!(alice.pq_ratchet_bind(ct));
+    discharge_bind(&alice, &bob, b"a4-round-2");
+
+    // A message still flows on the re-keyed, PQ-advanced groups — end-to-end liveness intact.
+    // (No third A.4 round back the other way: the re-key rotated Bob, so his send-PQ leaf now
+    // lags his credential, and his next turn correctly auto-stages an A.5 catch-up rather than
+    // an A.4 — a separate path exercised by the A.5 tests.)
+    message_round(&bob, &alice, b"after-interleave");
 }
 
 #[test]

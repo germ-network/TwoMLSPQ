@@ -17,14 +17,25 @@ HPKE plaintext (see "The §A.1 envelope" below).
 | `ESTABLISHMENT_HANDOFF_TAG` | `0x0B` | Born-dedicated establishment staple: `[0x0B][u32-LE len][signed handoff blob][u32-LE len][APQWelcome_A]` — wraps the *unmodified* welcome next to the acceptor's opaque host-signed delegation. A message-path staple form (rides the `0x03` staple slot and standalone delivery), but banded here because it exists only during establishment |
 | `PQ_BOOTSTRAP_KP_TAG` | `0x13` | Bootstrap: PQ key package for the deferred send-group half |
 | `PQ_BOOTSTRAP_WELCOME_TAG` | `0x15` | Bootstrap: the new PQ group's Welcome (PQ-groups-only; no classical commit) |
-| `PQ_EK_TAG` | `0x17` | PQ ratchet: ML-KEM encapsulation key |
-| `PQ_CT_TAG` | `0x19` | PQ ratchet: ML-KEM ciphertext **plus** the AEAD-sealed injected secret — `[u32-LE enc_len][enc][sealed]`, not a bare KEM ciphertext (the seal makes ML-KEM implicit rejection an explicit failure) |
+| `PQ_EK_TAG` | `0x17` | PQ ratchet: the ML-KEM encapsulation key, carried as an **MLS application message** in the initiator's send-PQ group — `[0x17][MLSMessage]`, the message's authenticated content being `[0x17][ek]`. MLS then authenticates the leg by leaf signature **and** current-epoch proof (see below) |
+| `PQ_CT_TAG` | `0x19` | PQ ratchet: the ML-KEM ciphertext **plus** the AEAD-sealed injected secret (`[u32-LE enc_len][enc][sealed]`, not a bare KEM ciphertext — the seal makes ML-KEM implicit rejection an explicit failure), likewise carried as an MLS application message: `[0x19][MLSMessage]`, content `[0x19][enc ∥ sealed]` |
 | `PQ_REKEY_UPD_TAG` | `0x1B` | PQ re-key: initiator's `Upd'` proposal |
 | `PQ_REKEY_COMMIT_TAG` | `0x1D` | PQ re-key: the responder's `Commit'` |
 
 There is no bind tag: a round's closing bind is the **message-frame staple** (the
 `APQPrivateMessage` above), not a side-band frame, so every side-band frame is answered by
 its round's next leg.
+
+**Why the A.4 legs are MLS messages, not bare bytes.** Wrapping the EK and CT as MLS
+application messages in the initiator's send-PQ group (rather than shipping the raw key
+bytes) is what gives each leg the same two-factor authentication MLS gives every member
+message: a **leaf signature** and proof of the **current epoch's** secrets (the receive
+ratchet won't decrypt without them). Following the MLS convention of signature, this closes a post-compromise gap the bare frame had:
+a stolen signing key **alone** can no longer forge a leg the peer will act on, because the
+attacker also lacks the current epoch secrets once a round they missed has healed the group.
+The seal over the injected secret is unchanged and still does its own job (the explicit
+receipt); the MLS framing is purely the authentication layer. See
+[Protocol Flows §A.4](./protocol-flows.md) and `pq_ops::process_a4_leg`.
 
 **Length prefix & padding (inside the seal).** These tagged frames are the AEAD *plaintext*; the
 symmetric header seal wraps each as `[u32-LE frame_len][frame][optional zero padding]` (see

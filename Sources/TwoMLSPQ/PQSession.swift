@@ -176,7 +176,15 @@ import TwoMLSPQBinding
 //     `DuplicateSideBand` when the side-band won the race is the common one). The parked
 //     `Welcome'` rides the acceptor's next `pendingSideBand` hand-out. Invitation archive layout
 //     changed (INVITATION_VERSION 1→2, pre-release hard cut) — a stale blob fails to decode.
-private let expectedBindingContract: UInt64 = 26
+// v27 (contract 27): the A.4 ratchet legs are authenticated. The EK (0x17) and CT (0x19)
+//     side-band frames now carry an MLS application message in the initiator's send-PQ group
+//     (`[tag][MLSMessage]`) instead of raw key bytes, so each leg is authenticated by a leaf
+//     signature AND current-epoch proof — a stolen signing key alone can no longer forge a leg
+//     the peer acts on, and a forged/stale EK no longer wedges the responder. WIRE-BREAKING for
+//     the side-band (re-pairing required); no Swift API or error change. The `pqRatchet*`
+//     signatures are unchanged — only their FFI checksums moved (docstring metadata), so the
+//     vendored binding was re-synced.
+private let expectedBindingContract: UInt64 = 27
 
 enum TwoMLSPQBindingContract {
 	static let verified: Void = {

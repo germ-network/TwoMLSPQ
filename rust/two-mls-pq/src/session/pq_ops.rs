@@ -35,6 +35,77 @@ pub(in crate::session) enum PqInflight {
     RekeyResponded,
 }
 
+/// Authenticate an inbound A.4 leg (the EK or the CT) delivered as an MLS **application
+/// message** in `group`, and return its payload (the ek bytes, or the `[enc][sealed S]`
+/// wire_ct). Framing the legs as MLS messages is what gives A.4 the same two-factor
+/// authentication MLS gives every member message — a leaf **signature** AND proof of the
+/// **current epoch's** secrets (the receive ratchet won't decrypt otherwise) — so a stolen
+/// signing key alone can no longer forge a leg the peer will act on (the PCS property a bare
+/// signature lacked).
+///
+/// MUTATES `group`: `process_incoming_message` advances the sender's receive ratchet,
+/// consuming this leg's generation. Two rules follow, both load-bearing (see the R1 tests in
+/// `apq/tests/r1_mls_assumptions.rs`):
+///   1. Call this only from INSIDE the persist closure and only after the guard phase has
+///      confirmed the leg is expected — a re-sent leg must be caught by the `pq_inflight`
+///      guard BEFORE it reaches here, because a replayed application frame does not
+///      re-decrypt (mls-rs replay protection), it errors.
+///   2. On the wire the leg is header-sealed; a network tamper breaks the OUTER seal and is
+///      dropped at `open_incoming` before mls-rs is invoked. That matters because a frame
+///      with valid sender-data but corrupt content would consume its generation here — so the
+///      header seal, not this function, is what keeps a network attacker from stranding a
+///      generation.
+///
+/// The peer-sender check is belt-and-braces over mls-rs's own `CantProcessMessageFromSelf`:
+/// in a two-party group a successfully processed application message is necessarily the
+/// peer's, but the leg kind is only meaningful from the peer, so we assert it.
+fn process_a4_leg(
+    group: &mut crate::key_package_store::PqMlsGroup,
+    inner_tag: u8,
+    msg: MlsMessage,
+) -> Result<Vec<u8>> {
+    let my_index = group.current_member_index();
+    let desc = match group
+        .process_incoming_message(msg)
+        .map_err(|_| TwoMlsPqError::Mls)?
+    {
+        ReceivedMessage::ApplicationMessage(desc) => desc,
+        _ => return Err(TwoMlsPqError::Mls),
+    };
+    if desc.sender_index == my_index {
+        return Err(TwoMlsPqError::Mls);
+    }
+    let (&tag, payload) = desc.data().split_first().ok_or(TwoMlsPqError::Mls)?;
+    if tag != inner_tag {
+        return Err(TwoMlsPqError::Mls);
+    }
+    Ok(payload.to_vec())
+}
+
+/// Encode an A.4 leg's authenticated CONTENT: the domain tag then the payload
+/// (`[0x17][ek]` or `[0x19][wire_ct]`). This is the plaintext handed to
+/// `encrypt_application_message`, so the tag is covered by the MLS signature — binding the
+/// leg's KIND into what is authenticated, not just its routing.
+fn encode_a4_leg_content(inner_tag: u8, payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + payload.len());
+    out.push(inner_tag);
+    out.extend_from_slice(payload);
+    out
+}
+
+/// Wrap a produced MLS application message as an outbound side-band frame: the routing tag
+/// then the `MLSMessage` bytes (`[0x17][mls]` / `[0x19][mls]`). The outer tag routes at
+/// `open_incoming`/`pq_frame_kind`; the inner (authenticated) tag guides parsing after the
+/// group decrypts it — the same transport-routes-then-inner-tag-parses discipline the §A.1
+/// envelope follows.
+fn encode_a4_leg_frame(outer_tag: u8, mls: &MlsMessage) -> Result<Vec<u8>> {
+    let mls_bytes = mls.to_bytes().map_err(|_| TwoMlsPqError::Mls)?;
+    let mut frame = Vec::with_capacity(1 + mls_bytes.len());
+    frame.push(outer_tag);
+    frame.extend_from_slice(&mls_bytes);
+    Ok(frame)
+}
+
 /// Require that a processed proposal is an Update from the peer's leaf — the only
 /// proposal kind members of this protocol ever exchange. An MLS Update always covers
 /// its sender's own leaf, so a member sender other than ourselves pins it to the one
@@ -104,13 +175,34 @@ pub(in crate::session) fn retire_stale_pins(inner: &SessionInner) {
 // inside a caller's `mutate_and_persist`, so the staged state is persisted with the send.
 impl SessionInner {
     /// A.4 leg 1: generate an ML-KEM ephemeral, hold its decapsulation key, and park the EK
-    /// frame (tag 0x17). Caller persists.
+    /// frame (tag 0x17) — the EK carried as an MLS **application message** in our send-PQ, so
+    /// the peer authenticates it (leaf signature + current-epoch secrets) before responding.
+    ///
+    /// `encrypt_application_message` advances our send-PQ **application** ratchet (not its
+    /// epoch — no commit), so unlike the old bare-frame stage this mutates PQ-group state the
+    /// `Core` blob omits: `maybe_stage_next_round` now reports a staged A.4 the same as an A.5
+    /// so the caller follows with a `Checkpoint`. Built once and retained — every re-send only
+    /// re-seals the OUTER header layer; the inner MLS message (and its generation) is fixed, so
+    /// re-sends stay idempotent and are caught by the responder's `pq_inflight` guard.
     fn stage_ratchet(&mut self) -> Result<()> {
         let eph = apq::pq_ratchet::generate_ephemeral(&providers::pq_kem()?)?;
-        let mut msg = vec![PQ_EK_TAG];
-        msg.extend_from_slice(&eph.encapsulation_key());
+        let content = encode_a4_leg_content(PQ_EK_TAG, &eph.encapsulation_key());
+        let send_pq = self
+            .send_group
+            .as_mut()
+            .and_then(|g| g.pq.as_mut())
+            .ok_or(TwoMlsPqError::SessionNotReady)?;
+        // `encrypt_application_message` refuses (`CommitRequired`) if the group holds an
+        // uncommitted by-ref proposal. It never does here: the only by-ref proposal a PQ group
+        // sees is an A.5 `Upd'`, which `pq_rekey_respond` commits in the same closure, and this
+        // stage is gated on `pq_inflight.is_none()` (see `maybe_stage_next_round`) — so no A.5 is
+        // mid-round. Best-effort regardless: a failure just leaves the slot empty for the next send.
+        let mls = send_pq
+            .encrypt_application_message(&content, Vec::new())
+            .map_err(|_| TwoMlsPqError::Mls)?;
+        let frame = encode_a4_leg_frame(PQ_EK_TAG, &mls)?;
         self.pq_inflight = Some(PqInflight::Initiating(eph));
-        self.pending_side_band = Some(RetainedFrame::unsealed(msg));
+        self.pending_side_band = Some(RetainedFrame::unsealed(frame));
         Ok(())
     }
 
@@ -170,10 +262,11 @@ impl SessionInner {
     /// failure leaves the slot empty for the next send to retry. No-op unless fully post-A.3, the
     /// turn is ours, nothing is in flight, no bind is owed, and nothing is already staged.
     ///
-    /// Returns `true` iff it staged an A.5 — which mutated the recv-PQ group (a pending update +
-    /// its new leaf secret), state the caller's `Core` push omits, so the caller must follow with
-    /// a `Checkpoint`. A staged A.4 (or a no-op / staging failure) returns `false`: its ephemeral
-    /// rides `pq_inflight`, which the `Core` blob carries.
+    /// Returns `true` iff it staged a round that mutated PQ-group state the caller's `Core`
+    /// push omits — so the caller must follow with a `Checkpoint`. That is now BOTH an A.5 (a
+    /// pending update + its new leaf secret in the recv-PQ group) AND an A.4 (the EK is an MLS
+    /// application message, so staging it advanced the send-PQ application ratchet — see
+    /// `stage_ratchet`). Only a no-op or a staging failure returns `false`.
     pub(in crate::session) fn maybe_stage_next_round(&mut self) -> bool {
         if !self.pq_turn_mine
             || !self.pq_halves_live()
@@ -187,30 +280,39 @@ impl SessionInner {
             let id = self.client.client_id();
             self.stage_rekey(Some(id)).is_ok()
         } else {
-            let _ = self.stage_ratchet();
-            false
+            self.stage_ratchet().is_ok()
         }
     }
 }
 
 #[uniffi::export]
 impl TwoMlsPqSession {
-    /// Responder — SEAL a fresh secret to the initiator's EK (bound to our current PQ epoch),
-    /// hold it, and return the ciphertext message (tag 0x19). The secret is random and sealed
-    /// rather than the KEM output itself, so the initiator's open is an explicit receipt (see
+    /// Responder — authenticate the initiator's EK, SEAL a fresh secret to it (bound to our
+    /// current PQ epoch), hold it, and park the ciphertext message (tag 0x19, itself an MLS
+    /// application message). The secret is random and sealed rather than the KEM output
+    /// itself, so the initiator's open is an explicit receipt (see
     /// `apq::pq_ratchet::seal_injected_secret`).
+    ///
+    /// The EK arrives as an MLS application message in our recv-PQ mirror; decrypting it (in
+    /// the closure) is what authenticates it — a leaf signature AND proof of the current epoch,
+    /// so a stolen signing key alone cannot forge an EK we will answer (see `process_a4_leg`).
     pub fn pq_ratchet_respond(&self, ek_msg: Vec<u8>) -> Result<()> {
-        // Guard-first (see `pq_ratchet_begin`): validate the frame and check the turn/slot
-        // state before the persist choke point, so a replayed or ill-timed EK frame can't force
-        // a full-Checkpoint push for a no-op. Frame validation comes first to preserve the
-        // precedence a stranger's blob is rejected as `Mls` before the state is consulted.
-        let ek = {
+        // Guard-first (see `pq_ratchet_begin`): parse the frame and check the turn/slot state
+        // before the persist choke point, so a replayed or ill-timed EK can't force a
+        // full-Checkpoint push for a no-op. Parse comes first to preserve the precedence a
+        // stranger's blob is rejected as `Mls` before the state is consulted. The parse is
+        // structural ONLY (`MlsMessage::from_bytes` mutates nothing); the mutating decrypt runs
+        // in the closure — this is what makes the `pq_inflight` gate, NOT the frame
+        // re-decrypting, the thing that discards a re-send (a replayed application frame does
+        // not re-decrypt; R1(a) in `apq/tests/r1_mls_assumptions.rs`).
+        let ek_leg = {
             let inner = self.lock();
             let ek_msg = inner.open_or_raw(ek_msg);
-            let (&tag, ek) = ek_msg.split_first().ok_or(TwoMlsPqError::Mls)?;
+            let (&tag, mls_bytes) = ek_msg.split_first().ok_or(TwoMlsPqError::Mls)?;
             if tag != PQ_EK_TAG {
                 return Err(TwoMlsPqError::Mls);
             }
+            let ek_leg = MlsMessage::from_bytes(mls_bytes).map_err(|_| TwoMlsPqError::Mls)?;
             // `pq_inflight` alone gates a double-respond (a first one parks `Responding`).
             // Slot occupancy is deliberately not a gate: frames are retained for re-send,
             // so occupancy is round progress, not "busy" — and a duplicate EK re-sent by
@@ -225,9 +327,23 @@ impl TwoMlsPqSession {
                 Some(_) => return Err(TwoMlsPqError::SessionNotReady),
                 None => {}
             }
-            ek.to_vec()
+            ek_leg
         };
         self.mutate_and_persist(crate::BlobKind::Checkpoint, |inner| {
+            // Authenticate + decrypt the EK leg in our recv-PQ mirror. This MUTATES recv-PQ
+            // (consumes the initiator's application generation); it is safe here because the
+            // guard above proved this round is unanswered, so a re-send never reaches this
+            // decrypt to be rejected as a replay. Everything after is either infallible or a
+            // peer-fault (`process_a4_leg`'s tag/sender checks) — an honest peer never trips it,
+            // so the mutating decrypt is followed only by steps that do not strand the round.
+            let ek = {
+                let recv_pq = inner
+                    .recv_group
+                    .as_mut()
+                    .and_then(|g| g.pq.as_mut())
+                    .ok_or(TwoMlsPqError::SessionNotReady)?;
+                process_a4_leg(recv_pq, PQ_EK_TAG, ek_leg)?
+            };
             // The PSK binds the round to the group the secret is injected into — the
             // initiator's send-PQ, which we mirror as our recv-PQ — at its current epoch.
             let psk = {
@@ -238,39 +354,57 @@ impl TwoMlsPqSession {
                     .ok_or(TwoMlsPqError::SessionNotReady)?;
                 ct_seal_psk(recv_pq)?
             };
-            let (s, ct) = apq::pq_ratchet::seal_injected_secret(
+            let (s, wire_ct) = apq::pq_ratchet::seal_injected_secret(
                 &providers::pq_kem()?,
                 &providers::header_aead_suite()?,
                 &ek,
                 &psk,
             )?;
+            // Emit the CT as an MLS application message in the same recv-PQ mirror, so the
+            // initiator authenticates it (our leaf signature + current epoch) before binding.
+            let ct_mls = {
+                let recv_pq = inner
+                    .recv_group
+                    .as_mut()
+                    .and_then(|g| g.pq.as_mut())
+                    .ok_or(TwoMlsPqError::SessionNotReady)?;
+                recv_pq
+                    .encrypt_application_message(
+                        &encode_a4_leg_content(PQ_CT_TAG, &wire_ct),
+                        Vec::new(),
+                    )
+                    .map_err(|_| TwoMlsPqError::Mls)?
+            };
             inner.pq_inflight = Some(PqInflight::Responding(s));
-            let mut msg = vec![PQ_CT_TAG];
-            msg.extend_from_slice(&ct);
             // Parked for re-send until the initiator's stapled bind answers it.
-            inner.pending_side_band = Some(RetainedFrame::unsealed(msg));
+            inner.pending_side_band = Some(RetainedFrame::unsealed(encode_a4_leg_frame(
+                PQ_CT_TAG, &ct_mls,
+            )?));
             Ok(())
         })
     }
 
-    /// Initiator step 2 — decapsulate S and inject it into the send group's PQ half via a
-    /// pathless commit, OWING the classical half: the bind rides our next classical COMMIT
-    /// as an `APQPrivateMessage` staple (see `discharge_owed_bind`), which is also where
-    /// the round's app message travels — an ordinary message frame's own section.
+    /// Initiator step 2 — authenticate + decapsulate the CT, recover S, and inject it into the
+    /// send group's PQ half via a pathless commit, OWING the classical half: the bind rides our
+    /// next classical COMMIT as an `APQPrivateMessage` staple (see `discharge_owed_bind`), which
+    /// is also where the round's app message travels — an ordinary message frame's own section.
     pub fn pq_ratchet_bind(&self, ct_msg: Vec<u8>) -> Result<()> {
-        // Guard-first (see `pq_ratchet_begin`): validate the frame and every turn/slot/staple
-        // precondition — AND open the sealed secret — before the persist choke point. The open
-        // is a PURE read (decapsulate and the exporter mutate nothing), so a displaced,
-        // stale, or misdirected CT is a no-op that neither bumps the seq nor pushes a
-        // Checkpoint, and never reaches the closure's `take` of the held ephemeral. The
-        // opened secret is what the closure commits.
-        let s = {
+        // Guard-first (see `pq_ratchet_begin`): parse the frame and every turn/slot/staple
+        // precondition before the persist choke point, so a displaced, stale, or ill-timed CT
+        // is a no-op that neither bumps the seq nor pushes a Checkpoint. UNLIKE the old bare
+        // frame, decrypting the CT now MUTATES our send-PQ (it is an MLS application message,
+        // and that decrypt is what authenticates it), so it cannot be a guard-phase "pure read"
+        // and moves into the closure — matching `pq_rekey_respond`. The retriable guards below
+        // (`pending_proposal_hash`, `owed_bind`, non-`Initiating`) all still fire HERE, before
+        // any mutation, so those cases stay pure no-ops the host can safely retry.
+        let ct_leg = {
             let inner = self.lock();
             let ct_msg = inner.open_or_raw(ct_msg);
-            let (&tag, wire_ct) = ct_msg.split_first().ok_or(TwoMlsPqError::Mls)?;
+            let (&tag, mls_bytes) = ct_msg.split_first().ok_or(TwoMlsPqError::Mls)?;
             if tag != PQ_CT_TAG {
                 return Err(TwoMlsPqError::Mls);
             }
+            let ct_leg = MlsMessage::from_bytes(mls_bytes).map_err(|_| TwoMlsPqError::Mls)?;
             // No slot check: our own EK is parked here for re-send, and binding is exactly
             // what should replace it. The `Initiating` check below is the real gate.
             //
@@ -293,42 +427,62 @@ impl TwoMlsPqSession {
                 return Err(TwoMlsPqError::SessionNotReady);
             }
             // Only an initiator holding the A.4 ephemeral can bind the ciphertext.
-            let eph = match &inner.pq_inflight {
-                Some(PqInflight::Initiating(eph)) => eph,
+            match &inner.pq_inflight {
+                Some(PqInflight::Initiating(_)) => {}
                 // We already bound: the ephemeral was consumed and the turn passed, so this
-                // is the peer re-sending its CT until our bind lands. Discard.
+                // is the peer re-sending its CT until our bind lands. Discard — and note the
+                // guard is what makes this a no-op, since a replayed application frame would
+                // NOT re-decrypt in the closure below (R1(a)).
                 None if !inner.pq_turn_mine => return Err(TwoMlsPqError::DuplicateSideBand),
                 _ => return Err(TwoMlsPqError::SessionNotReady),
+            }
+            ct_leg
+        };
+        self.mutate_and_persist(crate::BlobKind::Checkpoint, |inner| {
+            // Authenticate + decrypt the CT leg in our send-PQ (MUTATES it — consumes the
+            // responder's application generation). Safe here for the same reason as
+            // `pq_ratchet_respond`: the guard proved the round is still `Initiating`, so a
+            // re-send never reaches this decrypt to be rejected as a replay.
+            let wire_ct = {
+                let send_pq = inner
+                    .send_group
+                    .as_mut()
+                    .and_then(|g| g.pq.as_mut())
+                    .ok_or(TwoMlsPqError::SessionNotReady)?;
+                process_a4_leg(send_pq, PQ_CT_TAG, ct_leg)?
             };
             // OPEN the sealed secret. The PSK binds the group the secret is injected into
             // (our send-PQ) at its current epoch; the AEAD key binds that AND the KEM shared
             // secret, so a CT answering a DIFFERENT ephemeral (a stale round's, re-sent
             // across the bundling window) or a different epoch fails the open EXPLICITLY —
-            // rejected here, ephemeral and PQ leaf intact, where a bare `decapsulate` would
-            // have handed back ML-KEM's implicit-rejection garbage to inject and strand the
-            // round on an unshared secret.
-            let psk = {
-                let send_pq = inner
+            // rejected here, PQ leaf intact, where a bare `decapsulate` would have handed back
+            // ML-KEM's implicit-rejection garbage to inject and strand the round on an
+            // unshared secret. (The MLS decrypt above already advanced the generation; a
+            // failing open past that point means a genuinely misdirected CT — an honest
+            // responder answering our live ephemeral always opens.)
+            let s = {
+                let send_pq_ref = inner
                     .send_group
                     .as_ref()
                     .and_then(|g| g.pq.as_ref())
                     .ok_or(TwoMlsPqError::SessionNotReady)?;
-                ct_seal_psk(send_pq)?
+                let psk = ct_seal_psk(send_pq_ref)?;
+                let eph = match &inner.pq_inflight {
+                    Some(PqInflight::Initiating(eph)) => eph,
+                    _ => return Err(TwoMlsPqError::SessionNotReady),
+                };
+                apq::pq_ratchet::open_injected_secret(
+                    &providers::pq_kem()?,
+                    &providers::header_aead_suite()?,
+                    eph,
+                    &wire_ct,
+                    &psk,
+                )?
             };
-            apq::pq_ratchet::open_injected_secret(
-                &providers::pq_kem()?,
-                &providers::header_aead_suite()?,
-                eph,
-                wire_ct,
-                &psk,
-            )?
-        };
-        self.mutate_and_persist(crate::BlobKind::Checkpoint, |inner| {
             // Capture the departing epoch's PSK before the classical bind commit below.
             inner.remember_send_psk()?;
-            // The ephemeral's only use — the open above — is done; discard it. Defensive
-            // re-check of the state the guard read, which nothing races under sequential
-            // driving.
+            // The ephemeral's only use — the open above — is done; discard it. Re-check of the
+            // state the guard read, which nothing races under sequential driving.
             match inner.pq_inflight.take() {
                 Some(PqInflight::Initiating(_)) => {}
                 other => {

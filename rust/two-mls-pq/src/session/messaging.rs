@@ -1562,11 +1562,11 @@ impl TwoMlsPqSession {
     /// either path — the frame itself carries the welcome; the standalone copy stays
     /// available for hosts that also deliver it separately (processing is idempotent).
     pub fn encrypt(&self, app_message: Vec<u8>) -> Result<EncryptResult> {
-        // Set inside the Core push when the session auto-stages an A.5: that stage mutates the
-        // recv-PQ group (a pending update + its new leaf secret), state the Core blob omits, so
-        // it must be followed by a Checkpoint (below). An A.4 stage leaves it false — its
-        // ephemeral rides `pq_inflight`, which the Core blob carries.
-        let mut staged_rekey = false;
+        // Set inside the Core push when the session auto-stages a PQ round (A.4 or A.5): either
+        // mutates a PQ group the Core blob omits — an A.5's recv-PQ pending update, or an A.4's
+        // send-PQ application-ratchet advance (the EK is now an MLS message) — so it must be
+        // followed by a Checkpoint (below).
+        let mut staged_pq_round = false;
         let result = self.mutate_and_persist(crate::BlobKind::Core, |inner| {
             // Contract 26 emission gate — see `prepare_to_encrypt`. Guarded here too
             // so a host that skips straight to `encrypt` cannot leak the bare staple.
@@ -1633,9 +1633,10 @@ impl TwoMlsPqSession {
             // Session-driven side-band: this send opens the next PQ round when it is our turn
             // and the side-band is idle (A.5 on credential lag, else A.4). Best-effort and
             // send-driven — the staged frame rides this very send's re-staple peek, and it never
-            // fails the message. An A.4's ephemeral is persisted with this Core push; an A.5's
-            // recv-PQ mutation needs the follow-up Checkpoint below.
-            staged_rekey = inner.maybe_stage_next_round();
+            // fails the message. Either kind now mutates a PQ group the Core push omits (an A.5's
+            // recv-PQ pending update, or an A.4's send-PQ application-ratchet advance now that the
+            // EK is an MLS message), so a staged round needs the follow-up Checkpoint below.
+            staged_pq_round = inner.maybe_stage_next_round();
 
             Ok(EncryptResult {
                 cipher_text,
@@ -1645,11 +1646,12 @@ impl TwoMlsPqSession {
                 depends_on_seq: inner.current_staple_seq,
             })
         });
-        // A staged A.5 mutated the recv-PQ group, which the Core push above omits — push a
-        // Checkpoint so the pending update + new leaf secret are durable. This also advances
-        // `state_seq` past the Core, so the app's gate on `state_seq()` before transmitting the
-        // key-material-bearing Upd' naturally waits for the checkpoint that carries it.
-        if result.is_ok() && staged_rekey {
+        // A staged PQ round mutated a PQ group the Core push above omits — push a Checkpoint so
+        // the A.5 pending update + new leaf secret, or the A.4 EK's send-PQ application-ratchet
+        // advance and its retained frame, are durable together. This also advances `state_seq`
+        // past the Core, so the app's gate on `state_seq()` before transmitting a
+        // key-material-bearing frame naturally waits for the checkpoint that carries it.
+        if result.is_ok() && staged_pq_round {
             self.persist_after(crate::BlobKind::Checkpoint);
         }
         result

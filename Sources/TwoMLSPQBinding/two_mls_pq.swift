@@ -2243,18 +2243,23 @@ public protocol TwoMlsPqSessionProtocol: AnyObject, Sendable {
     func pqPendingOutbound(sealing: SideBandSealing)  -> Data?
     
     /**
-     * Initiator step 2 — decapsulate S and inject it into the send group's PQ half via a
-     * pathless commit, OWING the classical half: the bind rides our next classical COMMIT
-     * as an `APQPrivateMessage` staple (see `discharge_owed_bind`), which is also where
-     * the round's app message travels — an ordinary message frame's own section.
+     * Initiator step 2 — authenticate + decapsulate the CT, recover S, and inject it into the
+     * send group's PQ half via a pathless commit, OWING the classical half: the bind rides our
+     * next classical COMMIT as an `APQPrivateMessage` staple (see `discharge_owed_bind`), which
+     * is also where the round's app message travels — an ordinary message frame's own section.
      */
     func pqRatchetBind(ctMsg: Data) throws 
     
     /**
-     * Responder — SEAL a fresh secret to the initiator's EK (bound to our current PQ epoch),
-     * hold it, and return the ciphertext message (tag 0x19). The secret is random and sealed
-     * rather than the KEM output itself, so the initiator's open is an explicit receipt (see
+     * Responder — authenticate the initiator's EK, SEAL a fresh secret to it (bound to our
+     * current PQ epoch), hold it, and park the ciphertext message (tag 0x19, itself an MLS
+     * application message). The secret is random and sealed rather than the KEM output
+     * itself, so the initiator's open is an explicit receipt (see
      * `apq::pq_ratchet::seal_injected_secret`).
+     *
+     * The EK arrives as an MLS application message in our recv-PQ mirror; decrypting it (in
+     * the closure) is what authenticates it — a leaf signature AND proof of the current epoch,
+     * so a stolen signing key alone cannot forge an EK we will answer (see `process_a4_leg`).
      */
     func pqRatchetRespond(ekMsg: Data) throws 
     
@@ -3146,10 +3151,10 @@ open func pqPendingOutbound(sealing: SideBandSealing) -> Data?  {
 }
     
     /**
-     * Initiator step 2 — decapsulate S and inject it into the send group's PQ half via a
-     * pathless commit, OWING the classical half: the bind rides our next classical COMMIT
-     * as an `APQPrivateMessage` staple (see `discharge_owed_bind`), which is also where
-     * the round's app message travels — an ordinary message frame's own section.
+     * Initiator step 2 — authenticate + decapsulate the CT, recover S, and inject it into the
+     * send group's PQ half via a pathless commit, OWING the classical half: the bind rides our
+     * next classical COMMIT as an `APQPrivateMessage` staple (see `discharge_owed_bind`), which
+     * is also where the round's app message travels — an ordinary message frame's own section.
      */
 open func pqRatchetBind(ctMsg: Data)throws   {try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
     uniffi_two_mls_pq_fn_method_twomlspqsession_pq_ratchet_bind(
@@ -3160,10 +3165,15 @@ open func pqRatchetBind(ctMsg: Data)throws   {try rustCallWithError(FfiConverter
 }
     
     /**
-     * Responder — SEAL a fresh secret to the initiator's EK (bound to our current PQ epoch),
-     * hold it, and return the ciphertext message (tag 0x19). The secret is random and sealed
-     * rather than the KEM output itself, so the initiator's open is an explicit receipt (see
+     * Responder — authenticate the initiator's EK, SEAL a fresh secret to it (bound to our
+     * current PQ epoch), hold it, and park the ciphertext message (tag 0x19, itself an MLS
+     * application message). The secret is random and sealed rather than the KEM output
+     * itself, so the initiator's open is an explicit receipt (see
      * `apq::pq_ratchet::seal_injected_secret`).
+     *
+     * The EK arrives as an MLS application message in our recv-PQ mirror; decrypting it (in
+     * the closure) is what authenticates it — a leaf signature AND proof of the current epoch,
+     * so a stolen signing key alone cannot forge an EK we will answer (see `process_a4_leg`).
      */
 open func pqRatchetRespond(ekMsg: Data)throws   {try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
     uniffi_two_mls_pq_fn_method_twomlspqsession_pq_ratchet_respond(
@@ -6379,10 +6389,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_pending_outbound() != 1918) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_ratchet_bind() != 28798) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_ratchet_bind() != 59912) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_ratchet_respond() != 8681) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_ratchet_respond() != 52781) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_receive_broken() != 41138) {
