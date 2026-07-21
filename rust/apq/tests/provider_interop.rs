@@ -10,7 +10,7 @@
 //!      encap/decap, mixed-provider MLS groups, archive blobs, the HPKE envelope (the
 //!      A.1 initial routing header), full APQ combiner sessions instantiated once per
 //!      provider from the generic `CombinerClient` — establishment, APQ-PSK bind, app
-//!      messaging — and an A.3 PQ ratchet round, all crossing providers in both
+//!      messaging — and an A.4 PQ ratchet round, all crossing providers in both
 //!      directions with no multi-process harness.
 
 // Test-only crate: helper fns aren't `#[test]` items, so the workspace's unwrap/panic
@@ -216,7 +216,7 @@ mod cryptokit_interop {
         send_and_check(&mut d_recv.classical, &mut c_send.classical, b"aws->ck");
     }
 
-    /// A full A.3 PQ ratchet round on a cross-provider session: each side runs its own
+    /// A full A.4 PQ ratchet round on a cross-provider session: each side runs its own
     /// provider's ML-KEM for the EK/ct exchange, then the pathless PQ commit and the
     /// classical apq-PSK bind cross providers. Messaging must still flow in the
     /// PQ-refreshed epoch.

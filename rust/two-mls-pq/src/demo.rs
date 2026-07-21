@@ -64,7 +64,7 @@ fn demo_e2e_full_session() {
     // Step 2 — Bob's combiner key package (classical + ML-KEM-768 halves; the published
     // shape Alice initiates to) and Alice's CLASSICAL return key package (§A.1: Bob's
     // send group starts classical-only, so the establishment reply carries only the
-    // classical KP; Alice's PQ KP travels in A.4, hash-bound to the commitment below).
+    // classical KP; Alice's PQ KP travels in A.3, hash-bound to the commitment below).
     let alice_kp = make_classical_kp(&alice);
     let bob_kp = make_combiner_kp(&bob);
     println!("[2] key packages generated (bob: combiner; alice: classical return)");

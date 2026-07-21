@@ -5,13 +5,13 @@
 //! Conformance shape (see the book's psk-binding / group-rules chapters):
 //! - `APQInfo` is written **once, at group creation**, into both halves' GroupContext and
 //!   rides Welcomes automatically. It is never rewritten — a GroupContextExtensions
-//!   proposal would force an updatePath onto the deliberately pathless A.3 bind — so its
+//!   proposal would force an updatePath onto the deliberately pathless A.4 bind — so its
 //!   two epoch fields are creation-time values. Epoch *freshness* is attested per FULL
 //!   commit by the `AppDataUpdate` proposal instead, which receivers verify against the
 //!   actual post-commit epochs of both halves.
-//! - A deferred half (the acceptor's PQ side before the A.4 bootstrap) is recorded with
+//! - A deferred half (the acceptor's PQ side before the A.3 bootstrap) is recorded with
 //!   its epoch field set to [`EPOCH_UNBOUND`] and its group id **pre-allocated**, so the
-//!   id a later A.4 must use is pinned inside the classical half's GroupContext from
+//!   id a later A.3 must use is pinned inside the classical half's GroupContext from
 //!   creation.
 
 use mls_rs::client_builder::MlsConfig;
@@ -50,8 +50,8 @@ pub const APP_BINDING_EXTENSION_TYPE: ExtensionType = ExtensionType::new(0xF0A2)
 pub const APP_DATA_UPDATE: ProposalType = ProposalType::new(0x0008);
 
 /// Epoch sentinel for a half whose binding into its sibling is still pending: the
-/// acceptor's PQ side before A.4 (as seen from the classical half), and the classical
-/// side as recorded by the A.4-created PQ group. Unreachable as a real MLS epoch.
+/// acceptor's PQ side before A.3 (as seen from the classical half), and the classical
+/// side as recorded by the A.3-created PQ group. Unreachable as a real MLS epoch.
 pub const EPOCH_UNBOUND: u64 = u64::MAX;
 
 /// `AppDataUpdateOperation.update` (mls-extensions §AppDataUpdate).
@@ -160,7 +160,7 @@ impl ApqInfo {
     }
 
     /// The identity fields both halves must agree on (everything but the per-half
-    /// creation-time epoch fields, which legitimately differ across a deferred A.4).
+    /// creation-time epoch fields, which legitimately differ across a deferred A.3).
     fn identity_fields_match(&self, other: &Self) -> bool {
         self.t_session_group_id == other.t_session_group_id
             && self.pq_session_group_id == other.pq_session_group_id
@@ -352,7 +352,7 @@ fn verify_classical_half<Cfg: MlsConfig>(
 /// observed epoch; the classical half's `pq_epoch` must match too (it was written with
 /// the pair live).
 ///
-/// Returns the classical half's `ApqInfo` (the authoritative copy for later A.4 checks).
+/// Returns the classical half's `ApqInfo` (the authoritative copy for later A.3 checks).
 pub fn verify_apqinfo_pair<Cfg1: MlsConfig, Cfg2: MlsConfig>(
     classical: &Group<Cfg1>,
     pq: &Group<Cfg2>,
@@ -375,10 +375,10 @@ pub fn verify_apqinfo_pair<Cfg1: MlsConfig, Cfg2: MlsConfig>(
     Ok(info)
 }
 
-/// Joiner-side `APQInfo` verification for the deferred (A.4-pending) shape: the
+/// Joiner-side `APQInfo` verification for the deferred (A.3-pending) shape: the
 /// classical-half checks, plus the extension records the PQ side as pending
 /// (`pq_epoch == EPOCH_UNBOUND`) with a non-empty pre-allocated group id — the id the
-/// A.4 bootstrap must later use. A welcome without an `APQInfo` at all is a downgrade
+/// A.3 bootstrap must later use. A welcome without an `APQInfo` at all is a downgrade
 /// attempt and fails the same way.
 pub fn verify_apqinfo_deferred<Cfg: MlsConfig>(
     classical: &Group<Cfg>,
@@ -391,10 +391,10 @@ pub fn verify_apqinfo_deferred<Cfg: MlsConfig>(
     Ok(info)
 }
 
-/// A.4-side verification of the deferred PQ half's own `APQInfo`: identity fields match
+/// A.3-side verification of the deferred PQ half's own `APQInfo`: identity fields match
 /// the classical half's authoritative copy, the group ids name the actual groups (the
 /// PQ id being the one pre-allocated at establishment), `t_epoch` is the deferred
-/// sentinel (no classical commit rides A.4), and `pq_epoch` matches the observed epoch.
+/// sentinel (no classical commit rides A.3), and `pq_epoch` matches the observed epoch.
 pub fn verify_deferred_pq_info<Cfg: MlsConfig>(
     pq_group: &Group<Cfg>,
     classical_info: &ApqInfo,
@@ -403,7 +403,7 @@ pub fn verify_deferred_pq_info<Cfg: MlsConfig>(
     let pq_info = read_apqinfo(pq_group)?;
     pq_info.check_suites(expected)?;
     // The classical half's copy records its own creation-time view {t: real, pq:
-    // EPOCH_UNBOUND}; the A.4-created PQ half records the mirror {t: EPOCH_UNBOUND,
+    // EPOCH_UNBOUND}; the A.3-created PQ half records the mirror {t: EPOCH_UNBOUND,
     // pq: real}. Identity fields must agree between them.
     if !pq_info.identity_fields_match(classical_info) {
         return Err(CombinerError::ApqInfoMismatch);

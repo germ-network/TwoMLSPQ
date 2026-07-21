@@ -642,14 +642,14 @@ public struct PQSession {
 			// already parsed — surfacing a parse failure as an error would
 			// misgrade garbage as fatal (the session itself is untouched).
 			let opened = try? decodeInitialPlaintext(plaintext: headerDecrypted)
-			// Part 3: `decodeHeader` resolved a parallel A.4 bootstrap KP′ to this
+			// Part 3: `decodeHeader` resolved a parallel A.3 bootstrap KP′ to this
 			// session and routed it here. Stand up our send group's deferred PQ half
 			// around it; the Welcome' parks in the side-band slot and rides our next
 			// `pendingSideBand(sealing:)` hand-out (no PQInbound — the parked reply is
 			// drained by the ordinary re-send path, not `advance`). There is no app
 			// message to deliver. FAIL OPEN like the establishment branch above: this
 			// parallel envelope is a best-effort optimization, and the side-band
-			// `pqBootstrapBegin`/`ingest` path is the AUTHORITATIVE A.4 carrier that
+			// `pqBootstrapBegin`/`ingest` path is the AUTHORITATIVE A.3 carrier that
 			// surfaces a genuine failure — so `DuplicateSideBand` (the common case: the
 			// side-band already answered), a frame the app mis-routed here, and an
 			// unrecoverable round are all swallowed rather than misgraded as fatal.
@@ -677,7 +677,7 @@ public struct PQSession {
 	/// The receive group's classical (message-half) id, or nil before this side
 	/// has joined one (the initiator, before processing the peer's stapled
 	/// return welcome). Same currency as `shouldListenOn()`'s GroupID: the
-	/// stable classical half — the acceptor's PQ half is empty until the A.4
+	/// stable classical half — the acceptor's PQ half is empty until the A.3
 	/// bootstrap. The card role's post-join envelope check compares this
 	/// against the signed `AppWelcome.Content.groupId` (classical parity:
 	/// MultiMLS checks `receiveGroup.groupId == welcome.groupId` inside
@@ -693,7 +693,7 @@ public struct PQSession {
 		let channels = try base.shouldListenOn()
 		// CombinerGroupId carries both halves; the abstraction wants one GroupID.
 		// Use the classical half: it exists from creation for both roles, whereas
-		// the acceptor's PQ half is empty until the A.4 bootstrap — keying app
+		// the acceptor's PQ half is empty until the A.3 bootstrap — keying app
 		// listen-state off it would hand out an empty id that changes mid-session.
 		let groupId = channels.sendGroup.classical.bytes
 		// rendezvousByEpoch has one address per epoch, so keys are unique; the closure is a
@@ -727,10 +727,10 @@ public struct PQSession {
 		base.isFullyEstablished()
 	}
 
-	/// Finish the A.4 bootstrap — stand up the deferred send-group PQ half. This is the ONLY PQ
-	/// side-band round the host initiates. A.3 ratchet and A.5 re-key are session-driven (binding
+	/// Finish the A.3 bootstrap — stand up the deferred send-group PQ half. This is the ONLY PQ
+	/// side-band round the host initiates. A.4 ratchet and A.5 re-key are session-driven (binding
 	/// contract 24): the session opens the next round automatically on the turn holder's next send
-	/// (A.5 as a credential catch-up when the send-PQ leaf lags, else A.3), and the host takes the
+	/// (A.5 as a credential catch-up when the send-PQ leaf lags, else A.4), and the host takes the
 	/// auto-staged frame via `pendingSideBand` / `advance`. There is no host `begin` for them — the
 	/// crate's `pq_ratchet_begin` / `pq_rekey_begin` were removed, so this method is bootstrap-only.
 	///
@@ -753,7 +753,7 @@ public struct PQSession {
 		// Initiator-only, pre-establishment. The crate returns `SessionNotReady`
 		// when there is no pre-committed KP to ship (an acceptor, or a session past
 		// the cutover) — map that to "nothing to ship" rather than an error; a real
-		// seal failure still surfaces. The first call registers the A.4 round and
+		// seal failure still surfaces. The first call registers the A.3 round and
 		// consumes the KP, re-calls re-seal the same frame, so calling it repeatedly
 		// (or keeping `begin(.finishBootstrap)` too) is safe.
 		do {
@@ -805,14 +805,14 @@ public struct PQSession {
 		// switch only ever sees the six side-band kinds, in lifecycle order.
 		switch kind {
 		case .bootstrapKeyPackage:
-			// A.4 leg 1 (we respond): stand up our send group's deferred PQ
+			// A.3 leg 1 (we respond): stand up our send group's deferred PQ
 			// half around the initiator's KP'; the Welcome' parks for `advance`.
 			try base.pqBootstrapRespond(kpMsg: opened.frame)
 			return PQInbound(
 				kind: .finishBootstrap, advancedGroup: .ours,
 				newEpochs: epochs, rotatedCredential: nil)
 		case .bootstrapWelcome:
-			// A.4 leg 2 (we initiated): join the peer's new PQ group, commit
+			// A.3 leg 2 (we initiated): join the peer's new PQ group, commit
 			// our own send-PQ pathlessly, and OWE the classical half — the bind
 			// rides our next classical commit as the staple. `epochs` now reads
 			// pq+1 with classical unchanged; the pair evens out when the bind
@@ -822,13 +822,13 @@ public struct PQSession {
 				kind: .finishBootstrap, advancedGroup: .ours,
 				newEpochs: epochs, rotatedCredential: nil, owesBind: true)
 		case .ratchetEphemeralKey:
-			// A.3 (we respond): seal a fresh secret to the EK; the CT parks.
+			// A.4 (we respond): seal a fresh secret to the EK; the CT parks.
 			try base.pqRatchetRespond(ekMsg: opened.frame)
 			return PQInbound(
 				kind: .ratchet, advancedGroup: .theirs,
 				newEpochs: nil, rotatedCredential: nil)
 		case .ratchetCiphertext:
-			// A.3 (we initiated): open the sealed secret, commit our send-PQ,
+			// A.4 (we initiated): open the sealed secret, commit our send-PQ,
 			// OWE the classical half. The round's app message travels on the
 			// committing round's own message frame — there is no app to pass.
 			try base.pqRatchetBind(ctMsg: opened.frame)
@@ -866,7 +866,7 @@ public struct PQSession {
 	/// hand this out on every send. `.fresh` re-seals per call (re-sends are
 	/// unlinkable on the wire); `.stable` repeats the bytes while the frame
 	/// is unchanged, which chunking requires — but see the liveness bound on
-	/// `SideBandSealing`: a `.stable` pass over the pre-A.4 `BOOTSTRAP_KP`
+	/// `SideBandSealing`: a `.stable` pass over the pre-A.3 `BOOTSTRAP_KP`
 	/// must finish inside the peer's classical header window. Advances no
 	/// protocol state: nothing to persist. Returns nil while a bind is OWED
 	/// — an owed bind is not a side-band frame (it rides the next classical
@@ -994,14 +994,14 @@ public struct PQInvitation {
 		)
 		// Contract 21: `decodeInitialPlaintext` returns `OpenedInitial`, dispatching
 		// on the plaintext's inner tag — the establishment reply and the Part 3
-		// parallel A.4 bootstrap KP′ share the outer §A.1 shape.
+		// parallel A.3 bootstrap KP′ share the outer §A.1 shape.
 		let opened = try decodeInitialPlaintext(plaintext: decrypted)
 		// Part 3: the initiator shipped its pre-committed KP′ as a §A.1 bootstrap
 		// envelope IN PARALLEL with the reply. It carries no session id, but the
 		// invitation pinned `H(KP′) -> spawned group` at `receive`, so it self-routes:
 		// resolve the owed session and hand the frame through the SAME `.forward` path
 		// the establishment replay uses — the spawned session's `forwarded` answers
-		// A.4 via `pqBootstrapRespond`. A frame that resolves to nothing is early (no
+		// A.3 via `pqBootstrapRespond`. A frame that resolves to nothing is early (no
 		// session owes it yet) or bogus.
 		if case .bootstrapKp(let kpFrame) = opened {
 			guard let group = base.bootstrapKpGroupId(kpFrame: kpFrame) else {
@@ -1013,7 +1013,7 @@ public struct PQInvitation {
 				groupId: try DataIdentifier(
 					prefix: .bits256, checkedData: group.bytes),
 				// The envelope PLAINTEXT: `forwarded(headerDecrypted:)` re-parses it
-				// to the verbatim `[0x13][KP′]` frame and answers A.4.
+				// to the verbatim `[0x13][KP′]` frame and answers A.3.
 				mlsMessageData: decrypted)
 		}
 		guard case .establishment(let frame) = opened else {
@@ -1095,7 +1095,7 @@ public struct PQInvitation {
 
 		// v20: `remoteKeyPackage` is the initiator's CLASSICAL return key package (a
 		// bare MLS KeyPackage message), not a combiner blob — its PQ half now travels
-		// in A.4, hash-bound to `bootstrapKpCommitment`.
+		// in A.3, hash-bound to `bootstrapKpCommitment`.
 		// Bind the key package to the authenticated identity from the validated
 		// welcome. The crate's own RemoteIdentityMismatch (via base.receive) maps to
 		// the SAME `.identityMismatch` — one code, both origins.
@@ -1266,12 +1266,12 @@ public struct PQClient {
 				detail: "PQClient.reply — initiate produced no welcome")
 		}
 		// The return-group key package is CLASSICAL-only (§A.1: the acceptor's send
-		// group starts classical-only; our PQ key package travels in A.4). The
+		// group starts classical-only; our PQ key package travels in A.3). The
 		// retaining generate path parks its private half in this live session's own
 		// client store so the return-welcome join can resolve it (an invitation-held
 		// key package would be purged from the client).
 		let myKeyPackage = try base.generateKeyPackage(suite: .x25519Chacha())
-		// The pre-committed A.4 bootstrap KP's hash, minted at `initiate` — Some on
+		// The pre-committed A.3 bootstrap KP's hash, minted at `initiate` — Some on
 		// a fresh initiating session (consumed only at `pqBootstrapBegin`).
 		guard let commitment = session.bootstrapKpCommitment() else {
 			throw SessionError(

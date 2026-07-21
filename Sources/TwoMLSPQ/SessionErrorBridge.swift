@@ -104,15 +104,15 @@ extension SessionError {
 				switch surface {
 				case .receive:
 					// Establishment door: the commitment the host threaded in from
-					// the signed AppWelcome is not a valid H(A.4 key package).
+					// the signed AppWelcome is not a valid H(A.3 key package).
 					detail = "bootstrap-KP commitment is not H(the initiator's PQ "
 						+ "key package): a malformed or mis-read 32-byte value, or a "
 						+ "tampered AppWelcome. The invitation is NOT consumed — "
 						+ "re-read the commitment from the signed envelope and retry."
 				default:
-					// A.4 side-band: a KP′ that hashes to something other than the
+					// A.3 side-band: a KP′ that hashes to something other than the
 					// commitment the signed envelope pinned.
-					detail = "A.4 bootstrap key package (KP′) does not hash to the "
+					detail = "A.3 bootstrap key package (KP′) does not hash to the "
 						+ "commitment the signed establishment envelope carried — a "
 						+ "substituted or tampered KP′. Discard the frame; the genuine "
 						+ "re-stapled KP′ still applies, session state untouched."

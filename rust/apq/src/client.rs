@@ -420,7 +420,7 @@ where
 
     /// A fresh random group id (KDF-extract-sized, matching mls-rs's own default), for
     /// pre-generating a group's id so it can appear inside its own creation-time
-    /// `APQInfo` — including pre-allocating the deferred A.4 PQ half's id.
+    /// `APQInfo` — including pre-allocating the deferred A.3 PQ half's id.
     pub fn random_group_id(&self) -> Result<Vec<u8>> {
         self.classical_cs
             .random_bytes_vec(self.classical_cs.kdf_extract_size())

@@ -171,7 +171,7 @@ pub(crate) mod archive_wire {
         pub(in crate::session) pq_kps: Vec<KeyPackageSecret>,
     }
 
-    /// The initiator's held A.3 ephemeral (`PqInflight::Initiating`) on the wire: the
+    /// The initiator's held A.4 ephemeral (`PqInflight::Initiating`) on the wire: the
     /// decapsulation key (kept `Zeroizing`) and the encapsulation key. Round-trips via
     /// `apq::pq_ratchet::PqEphemeral`'s byte accessors.
     #[derive(MlsSize, MlsEncode, MlsDecode)]
@@ -182,7 +182,7 @@ pub(crate) mod archive_wire {
         pub(in crate::session) ek: Vec<u8>,
     }
 
-    /// The responder's held A.3 shared secret (`PqInflight::Responding`) on the wire.
+    /// The responder's held A.4 shared secret (`PqInflight::Responding`) on the wire.
     /// `Zeroizing` wipes it on drop; a one-field struct so `Option<SecretBlob>` composes
     /// with the byte_vec framing (the `with` module has no Option-awareness).
     #[derive(MlsSize, MlsEncode, MlsDecode)]
@@ -193,8 +193,8 @@ pub(crate) mod archive_wire {
 
     /// The archivable `PqInflight` round state, tag-dispatched by `kind` so all six
     /// variants share one optional-payload struct — the flat-struct style the rest of
-    /// this module uses in place of codec enums. The A.4/A.5 markers carry no secrets
-    /// (their round state lives in the group snapshots); the A.3 variants carry the
+    /// this module uses in place of codec enums. The A.3/A.5 markers carry no secrets
+    /// (their round state lives in the group snapshots); the A.4 variants carry the
     /// round's KEM material (see [`super::TwoMlsPqSession::archive`] for why persisting
     /// it is sound).
     ///
@@ -310,9 +310,9 @@ pub(crate) mod archive_wire {
         pub(in crate::session) initial_their_kp: Option<WireCombinerKp>,
         pub(in crate::session) initial_app_payload: Option<Vec<u8>>,
         pub(in crate::session) initial_return_kp: Option<Vec<u8>>,
-        /// The initiator's pre-committed A.4 bootstrap key package (public bytes).
+        /// The initiator's pre-committed A.3 bootstrap key package (public bytes).
         /// Present from `initiate` until `pq_bootstrap_begin` consumes it, so a session
-        /// restored between reply and A.4 still opens the round with the KP the
+        /// restored between reply and A.3 still opens the round with the KP the
         /// establishment signature committed to. `None` on acceptors.
         pub(in crate::session) bootstrap_kp: Option<Vec<u8>>,
         /// The pre-committed KP's PRIVATE half — session-owned custody (per-client
@@ -399,8 +399,8 @@ fn retained_from_wire(frame: Option<Vec<u8>>) -> Option<RetainedFrame> {
     frame.map(RetainedFrame::unsealed)
 }
 
-/// `PqInflight` → its wire form. The A.3 variants carry the round's KEM material; the
-/// A.4/A.5 markers carry only a discriminant.
+/// `PqInflight` → its wire form. The A.4 variants carry the round's KEM material; the
+/// A.3/A.5 markers carry only a discriminant.
 fn wire_pq_inflight(inflight: &PqInflight) -> archive_wire::WirePqInflight {
     use archive_wire::{PqEphemeralBlob, SecretBlob, WirePqInflight};
     match inflight {
@@ -738,7 +738,7 @@ impl TwoMlsPqSession {
     /// the sender ratchet, which re-derives AEAD keys/nonces for new plaintexts. The
     /// caller owns single-use/latest-only discipline, as with invitation archives.
     ///
-    /// A mid-A.3 PQ round is serialized whole (`Initiating` holds the decapsulation key,
+    /// A mid-A.4 PQ round is serialized whole (`Initiating` holds the decapsulation key,
     /// `Responding` the held shared secret). This does not weaken the ratchet in a way
     /// the archive doesn't already: the blob carries the PSK ledger, epoch secrets, and
     /// leaf signing keys, and the seal-before-persisting contract covers the round

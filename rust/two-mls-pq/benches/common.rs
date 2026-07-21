@@ -40,7 +40,7 @@ pub fn combiner_kp(client: &TwoMlsPqPrincipal) -> CombinerKeyPackage {
 }
 
 /// The initiator's CLASSICAL return key package (§A.1: the return group starts
-/// classical-only; the PQ KP travels in A.4, hash-bound).
+/// classical-only; the PQ KP travels in A.3, hash-bound).
 pub fn classical_kp(client: &TwoMlsPqPrincipal) -> Vec<u8> {
     client
         .generate_key_package(MlsCipherSuite::x25519_chacha())

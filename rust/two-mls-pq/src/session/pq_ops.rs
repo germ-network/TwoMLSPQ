@@ -1,4 +1,4 @@
-//! PQ side-band operations: the A.3 ratchet (pq_ratchet_*), the A.4
+//! PQ side-band operations: the A.4 ratchet (pq_ratchet_*), the A.3
 //! bootstrap of the deferred send-group PQ half (pq_bootstrap_*), and the
 //! A.5 PQ-only re-key (pq_rekey_*), plus the in-flight round state and the
 //! pq turn/outbound accessors. Every method here operates on the PQ frames
@@ -10,17 +10,17 @@ use super::*;
 /// PQ ratchet round state carried between the messages of one exchange.
 ///
 /// Every side-band round registers here, and every `*_begin` gates on it being empty — that
-/// single-occupancy IS the mutual exclusion between A.3, A.4 and A.5. A.4 was long absent
+/// single-occupancy IS the mutual exclusion between A.3, A.4 and A.5. A.3 was long absent
 /// from it, which is exactly why a ratchet round could open during a bootstrap and evict its
 /// irreplaceable frame; being a well-formed round now, it takes its place.
 pub(in crate::session) enum PqInflight {
     /// Initiator holds the ephemeral (decapsulation key) until it receives the ciphertext.
     Initiating(apq::pq_ratchet::PqEphemeral),
-    /// A.4 initiator awaiting the responder's `Welcome'`. Carries nothing: the welcome is
+    /// A.3 initiator awaiting the responder's `Welcome'`. Carries nothing: the welcome is
     /// self-sufficient, and the secret this round injects is exported from the group it
     /// carries rather than held across the round.
     BootstrapInitiated,
-    /// A.4 responder awaiting the initiator's bind — the frame that proves it joined.
+    /// A.3 responder awaiting the initiator's bind — the frame that proves it joined.
     BootstrapResponded,
     /// Responder holds the shared secret until it receives the stapled bind. `Zeroizing` wipes the
     /// secret from memory on drop, whether it is consumed by the bind or abandoned.
@@ -89,21 +89,21 @@ pub(in crate::session) fn retire_stale_pins(inner: &SessionInner) {
     });
 }
 
-// --- Session-driven A.3/A.5 advancement (the side-band is the session's job, not the host's) ---
+// --- Session-driven A.4/A.5 advancement (the side-band is the session's job, not the host's) ---
 //
-// The host never opens A.3/A.5 rounds: it drives A.4 bootstrap, then just sends messages. On
+// The host never opens A.4/A.5 rounds: it drives A.3 bootstrap, then just sends messages. On
 // each send `maybe_stage_next_round` opens the next round automatically when it is our turn and
 // the side-band is idle — A.5 when our send-PQ leaf still lags the canonical identity (a Phase 8
-// classical rotation moved `self.client` and the PQ leaf hasn't caught up), else A.3. Emission is
+// classical rotation moved `self.client` and the PQ leaf hasn't caught up), else A.4. Emission is
 // send-driven and best-effort: the staged frame rides the send that opened it (re-staple peek),
-// and a transient staging failure simply retries on the next send. "A.3 begins immediately" is
+// and a transient staging failure simply retries on the next send. "A.4 begins immediately" is
 // nothing more than the first send after the turn becomes ours.
 //
 // These `stage_*` helpers are the state-mutation cores of `pq_ratchet_begin`/`pq_rekey_begin`
 // minus the seal (the frame is parked UNSEALED — the peek seals it fresh per send). They run
 // inside a caller's `mutate_and_persist`, so the staged state is persisted with the send.
 impl SessionInner {
-    /// A.3 leg 1: generate an ML-KEM ephemeral, hold its decapsulation key, and park the EK
+    /// A.4 leg 1: generate an ML-KEM ephemeral, hold its decapsulation key, and park the EK
     /// frame (tag 0x17). Caller persists.
     fn stage_ratchet(&mut self) -> Result<()> {
         let eph = apq::pq_ratchet::generate_ephemeral(&providers::pq_kem()?)?;
@@ -156,7 +156,7 @@ impl SessionInner {
 
     /// True when our own send-PQ leaf still signs as a principal the session has rotated past
     /// (a Phase 8 classical rotation swapped `self.client`; the PQ leaf lags until an A.5 catch-up
-    /// updatePath). Drives the A.5-vs-A.3 auto-selection; false (no catch-up owed) if unreadable.
+    /// updatePath). Drives the A.5-vs-A.4 auto-selection; false (no catch-up owed) if unreadable.
     fn send_pq_leaf_lags(&self) -> bool {
         let Some(send_pq) = self.send_group.as_ref().and_then(|g| g.pq.as_ref()) else {
             return false;
@@ -166,13 +166,13 @@ impl SessionInner {
     }
 
     /// Open the next PQ side-band round automatically when it is our turn and the side-band is
-    /// idle — A.5 (credential catch-up) if our leaf lags, else A.3. Best-effort: any staging
-    /// failure leaves the slot empty for the next send to retry. No-op unless fully post-A.4, the
+    /// idle — A.5 (credential catch-up) if our leaf lags, else A.4. Best-effort: any staging
+    /// failure leaves the slot empty for the next send to retry. No-op unless fully post-A.3, the
     /// turn is ours, nothing is in flight, no bind is owed, and nothing is already staged.
     ///
     /// Returns `true` iff it staged an A.5 — which mutated the recv-PQ group (a pending update +
     /// its new leaf secret), state the caller's `Core` push omits, so the caller must follow with
-    /// a `Checkpoint`. A staged A.3 (or a no-op / staging failure) returns `false`: its ephemeral
+    /// a `Checkpoint`. A staged A.4 (or a no-op / staging failure) returns `false`: its ephemeral
     /// rides `pq_inflight`, which the `Core` blob carries.
     pub(in crate::session) fn maybe_stage_next_round(&mut self) -> bool {
         if !self.pq_turn_mine
@@ -292,7 +292,7 @@ impl TwoMlsPqSession {
             if inner.owed_bind.is_some() {
                 return Err(TwoMlsPqError::SessionNotReady);
             }
-            // Only an initiator holding the A.3 ephemeral can bind the ciphertext.
+            // Only an initiator holding the A.4 ephemeral can bind the ciphertext.
             let eph = match &inner.pq_inflight {
                 Some(PqInflight::Initiating(eph)) => eph,
                 // We already bound: the ephemeral was consumed and the turn passed, so this
@@ -673,10 +673,10 @@ impl TwoMlsPqSession {
 }
 
 impl SessionInner {
-    /// Register the A.4 bootstrap round around the pre-committed KP frame `msg`
+    /// Register the A.3 bootstrap round around the pre-committed KP frame `msg`
     /// (`[0x13][KP′]`): pin the founding credential eviction-exempt in `mine`, consume the
     /// one-of-a-kind KP, retain the frame as the round's re-send carrier, and open the
-    /// round. The ONE definition of "the A.4 round is open" — both registration entry
+    /// round. The ONE definition of "the A.3 round is open" — both registration entry
     /// points (`pq_bootstrap_begin`, side-band path, and `pq_bootstrap_envelope`, the
     /// Part 3 parallel path) go through here, so what registration MEANS cannot drift
     /// between them. `sealed` seeds the retained frame's `Stable` cache when the caller
@@ -688,7 +688,7 @@ impl SessionInner {
     fn register_bootstrap_round(&mut self, msg: Vec<u8>, sealed: Option<&[u8]>) -> Result<()> {
         // Our OWN establishment credential, carried by this KP. Pin it eviction-exempt
         // in `mine` so the bind can join the Welcome' whose added leaf still bears it —
-        // enough of our own rotations before A.4 would otherwise evict it from `mine`
+        // enough of our own rotations before A.3 would otherwise evict it from `mine`
         // and fail the self-leaf validation on join. Retired symmetrically once A.5
         // catches this leaf up (`retire_stale_pins`).
         let kp = msg.get(1..).ok_or(TwoMlsPqError::Mls)?;
@@ -698,14 +698,14 @@ impl SessionInner {
         // commitment accessor goes quiet (the host read it at reply-composition time).
         self.bootstrap_kp = None;
         // Retain for re-send. A lost KP' is the worst of the three to strand: without
-        // A.4 the session never reaches full establishment, and this frame is what the
+        // A.3 the session never reaches full establishment, and this frame is what the
         // peer's deferred send-PQ half is built around.
         self.pending_side_band = Some(match sealed {
             Some(sealed) => RetainedFrame::seeded(msg, sealed),
             None => RetainedFrame::unsealed(msg),
         });
-        // Register the round. This is what stops A.3/A.5 opening beside a bootstrap —
-        // every `*_begin` gates on `pq_inflight` being empty, and A.4's absence from it
+        // Register the round. This is what stops A.4/A.5 opening beside a bootstrap —
+        // every `*_begin` gates on `pq_inflight` being empty, and A.3's absence from it
         // is precisely why a ratchet round could evict this frame.
         self.pq_inflight = Some(PqInflight::BootstrapInitiated);
         Ok(())
@@ -715,7 +715,7 @@ impl SessionInner {
 #[uniffi::export]
 impl TwoMlsPqSession {
     /// Whose move the PQ side-band is: true when this side owes the next operation.
-    /// The initiator owes the A.4 bootstrap; completing an operation passes the turn.
+    /// The initiator owes the A.3 bootstrap; completing an operation passes the turn.
     pub fn my_pq_turn(&self) -> bool {
         self.lock().pq_turn_mine
     }
@@ -736,9 +736,9 @@ impl TwoMlsPqSession {
     /// when the side-band is quiescent, which is what lets a host send a bare message.
     ///
     /// One frame at most: every side-band round registers in `pq_inflight`, and every
-    /// `*_begin` gates on it, so A.3, A.4 and A.5 are mutually exclusive. (A.4 was once
+    /// `*_begin` gates on it, so A.3, A.4 and A.5 are mutually exclusive. (A.3 was once
     /// absent from that, which let a ratchet round open beside a bootstrap and evict it —
-    /// the reason A.4 is now a well-formed round.)
+    /// the reason A.3 is now a well-formed round.)
     ///
     /// Call it on every send for as long as it returns anything: a side-band frame is the
     /// only carrier of its PQ half, so re-sending is how a dropped one heals (see
@@ -760,7 +760,7 @@ impl TwoMlsPqSession {
     /// from its retained header-key window. That is roomy for the PQ family (`seal_side_band`
     /// seals under recv-PQ, which advances only when the PEER commits — and applying a peer
     /// commit clears this side's retained frame anyway). It is tighter for the one frame that
-    /// takes `seal_side_band`'s classical fallback, the pre-A.4 `BOOTSTRAP_KP`, whose key
+    /// takes `seal_side_band`'s classical fallback, the pre-A.3 `BOOTSTRAP_KP`, whose key
     /// tracks the CLASSICAL epoch that ordinary messaging advances: a `Stable` pass over that
     /// frame wants to finish inside the peer's classical header window. `Fresh` has no such
     /// constraint.
@@ -790,13 +790,13 @@ impl TwoMlsPqSession {
         // can be OCCUPIED then (`pq_bootstrap_envelope` parks the round's `[0x13][KP′]`
         // before any recv group exists). Taking it here would destroy the round's only
         // carrier: the seal below needs a recv group, its failure is swallowed, and the
-        // emptied slot would be persisted — an unhealable A.4 strand. Guard first: leave
+        // emptied slot would be persisted — an unhealable A.3 strand. Guard first: leave
         // the frame parked for `pq_bootstrap_envelope` re-sends and the post-cutover
         // `hand_out`; the §A.1 envelope is the pre-establishment carrier.
         inner.recv_group.as_ref()?;
         let retained = inner.pending_side_band.take()?;
         // Side-band frames seal under the PQ family; with the recv group present (guard
-        // above) the pre-A.4 classical fallback in `seal_side_band` also has its key, so
+        // above) the pre-A.3 classical fallback in `seal_side_band` also has its key, so
         // the seal cannot fail for want of a group.
         let out = inner.seal_side_band(&retained.frame).ok();
         // The take advanced state — persist Core (a side-band frame changes no group).
@@ -815,7 +815,7 @@ impl TwoMlsPqSession {
         out
     }
 
-    /// A.4 initiator — emit this side's PQ key package (tag 0x13) so the peer can stand
+    /// A.3 initiator — emit this side's PQ key package (tag 0x13) so the peer can stand
     /// up its deferred send-group PQ half. The KP is the one PRE-COMMITTED at `initiate`
     /// (never a fresh mint): the peer holds `H(bootstrap_kp)` from the signed
     /// establishment payload and refuses anything else, so these exact bytes are the
@@ -831,7 +831,7 @@ impl TwoMlsPqSession {
     /// Idempotent once the round is registered — by an earlier call, or by the Part 3
     /// parallel `pq_bootstrap_envelope`: it then re-seals and returns the retained
     /// `[0x13][KP′]` frame with no state change and no persist, so a host keeping its
-    /// standard post-establishment A.4 kickoff after adopting the parallel envelope is
+    /// standard post-establishment A.3 kickoff after adopting the parallel envelope is
     /// safe.
     pub fn pq_bootstrap_begin(&self, rotating: Option<ClientId>) -> Result<Vec<u8>> {
         // Guard-first (see `pq_ratchet_begin`): turn, the optional credential handoff, the
@@ -860,7 +860,7 @@ impl TwoMlsPqSession {
             // Round already registered — by an earlier `begin` or by the Part 3 parallel
             // envelope (`pq_bootstrap_envelope`). Re-seal and return the retained frame:
             // a PURE idempotent re-send (no state change, no persist), so a host that
-            // keeps its standard post-establishment A.4 kickoff after adopting the
+            // keeps its standard post-establishment A.3 kickoff after adopting the
             // parallel envelope gets the same frame back instead of an error. This is
             // what makes "begin is idempotent once the round is registered" true.
             if matches!(inner.pq_inflight, Some(PqInflight::BootstrapInitiated)) {
@@ -891,7 +891,7 @@ impl TwoMlsPqSession {
                 .ok_or(TwoMlsPqError::SessionNotReady)?;
             let mut msg = vec![PQ_BOOTSTRAP_KP_TAG];
             msg.extend_from_slice(kp);
-            // Side-band frame. Pre-A.4 our recv-PQ (Group_B.pq) is the group the bootstrap
+            // Side-band frame. Pre-A.3 our recv-PQ (Group_B.pq) is the group the bootstrap
             // is creating, so `seal_side_band` falls back to the classical seal for exactly
             // this frame; the peer opens it from its classical window.
             let sealed = inner.seal_side_band(&msg)?;
@@ -903,7 +903,7 @@ impl TwoMlsPqSession {
         })
     }
 
-    /// Part 3 — parallel KP′ delivery. Emit the initiator's pre-committed A.4 KP′ (the same
+    /// Part 3 — parallel KP′ delivery. Emit the initiator's pre-committed A.3 KP′ (the same
     /// verbatim `[0x13][KP′]` frame `pq_bootstrap_respond` consumes) IN PARALLEL with the
     /// establishment reply, HPKE-sealed to the retained seal target `initial_their_kp` as a
     /// RAW §A.1 blob (`seal_hpke_blob`: `[u32 kem_len][kem_output][ciphertext]`, no sections,
@@ -914,11 +914,11 @@ impl TwoMlsPqSession {
     /// cutover), and `seal_side_band` — the steady-state carrier — needs a recv group that
     /// does not exist yet, which is exactly why this frame rides the HPKE envelope instead.
     ///
-    /// The FIRST emit REGISTERS the A.4 round exactly as `pq_bootstrap_begin` does — the
+    /// The FIRST emit REGISTERS the A.3 round exactly as `pq_bootstrap_begin` does — the
     /// shared `register_bootstrap_round` (`pq_inflight = BootstrapInitiated`, the retained
     /// frame, the eviction-exempt `mine` credential pin) — and persists a Checkpoint, so the
     /// initiator can process an EARLY `Welcome'`: an acceptor that already holds this KP′
-    /// when its return welcome goes out sends `Welcome'` alongside it, and A.4 completes ~one
+    /// when its return welcome goes out sends `Welcome'` alongside it, and A.3 completes ~one
     /// round trip sooner. **Read `bootstrap_kp_commitment()` BEFORE the first emit** — it
     /// consumes the pre-committed KP, and the signed reply must carry the commitment. EVERY
     /// LATER pre-cutover emit is a PURE re-seal of the retained frame — fresh HPKE, no state
@@ -959,7 +959,7 @@ impl TwoMlsPqSession {
                 _ => return Err(TwoMlsPqError::SessionNotReady),
             }
         }
-        // FIRST emit only — register the A.4 round (persist a Checkpoint), sealing the frame
+        // FIRST emit only — register the A.3 round (persist a Checkpoint), sealing the frame
         // built from the pre-committed KP.
         self.mutate_and_persist(crate::BlobKind::Checkpoint, |inner| {
             let their_kp = inner
@@ -999,10 +999,10 @@ impl TwoMlsPqSession {
         })
     }
 
-    /// A.4 responder — stand up the deferred send-group PQ half around the peer's key
+    /// A.3 responder — stand up the deferred send-group PQ half around the peer's key
     /// package and return the bootstrap frame (tag 0x15) carrying its Welcome.
     /// PQ-groups-only: no classical commit rides here — the new half's APQ-PSK reaches
-    /// the classical group at the next A.3 bind. Taking this turn makes the next
+    /// the classical group at the next A.4 bind. Taking this turn makes the next
     /// operation ours.
     pub fn pq_bootstrap_respond(&self, kp_msg: Vec<u8>) -> Result<()> {
         // Guard-first (see `pq_ratchet_begin`): the slot check, the KP suite/identity
@@ -1061,12 +1061,12 @@ impl TwoMlsPqSession {
         self.mutate_and_persist(crate::BlobKind::Checkpoint, |inner| {
             let client = inner.client.clone();
             let suite = inner.suite;
-            // The new PQ half resolves PSKs from the CURRENT client's stores (A.4 runs on
+            // The new PQ half resolves PSKs from the CURRENT client's stores (A.3 runs on
             // the principal a Phase 8 rotation may have installed) — track them.
             inner.track_psk_stores(&client);
             // Pin the peer's ESTABLISHMENT credential (carried in the hash-authenticated
             // bootstrap KP) as eviction-exempt in `theirs`. This leaf is created lazily, so
-            // enough peer rotations before A.4 could have evicted the frozen id from the
+            // enough peer rotations before A.3 could have evicted the frozen id from the
             // credential-history window — `create_group_with_member`'s `validate_member`
             // would then fail `UnknownIdentity` with the committed round unrecoverable. The
             // id was validly authenticated at establishment (the anchor-bound classical
@@ -1087,8 +1087,8 @@ impl TwoMlsPqSession {
                 // The classical half's creation-time APQInfo pre-allocated this PQ half's
                 // group id at establishment: create the group under exactly that id, and
                 // record the mirror view {t: EPOCH_UNBOUND, pq: 1} in the new half's own
-                // APQInfo (no classical commit rides A.4, so its classical epoch is the
-                // deferred sentinel until the next A.3 bind attests both).
+                // APQInfo (no classical commit rides A.3, so its classical epoch is the
+                // deferred sentinel until the next A.4 bind attests both).
                 let classical_info = read_apqinfo(&send.classical)?;
                 let pq_gid = classical_info.pq_session_group_id.clone();
                 let info = ApqInfo::new(
@@ -1104,14 +1104,14 @@ impl TwoMlsPqSession {
                     &[],
                     GroupCreation::new(pq_gid, &info, None)?,
                 )?;
-                // PQ-groups-only (spec A.4): no classical bind here. The new PQ half's
-                // secrecy reaches ASG-cl at the next A.3 ratchet; until then ASG-cl keeps
+                // PQ-groups-only (spec A.3): no classical bind here. The new PQ half's
+                // secrecy reaches ASG-cl at the next A.4 ratchet; until then ASG-cl keeps
                 // the PQ-derived security chained in at establishment.
                 send.set_pq(pq_group, client.combiner());
                 encode_bootstrap_welcome(pq_welcome)
             };
-            // The turn is NOT taken here. A.4 has a leg to apply now, so it passes on the
-            // same rule A.3 and A.5 follow: we take it applying the stapled bind (the
+            // The turn is NOT taken here. A.3 has a leg to apply now, so it passes on the
+            // same rule A.4 and A.5 follow: we take it applying the stapled bind (the
             // staple arm in `process_incoming`), by which point the bind has proved this
             // welcome landed. Taking it at our own send is what left us opening a ratchet
             // round beside an unconfirmed bootstrap — the collision this leg exists to
@@ -1127,19 +1127,19 @@ impl TwoMlsPqSession {
         })
     }
 
-    /// A.4 initiator, leg 3 — join the peer's new PQ group (our key package's private
+    /// A.3 initiator, leg 3 — join the peer's new PQ group (our key package's private
     /// material is retained in this client), then CLOSE the round with a bind: export the
     /// cross-party secret from the group we just joined, inject it into our own send-PQ with
     /// a pathless commit, and chain the exported apq_psk into our classical half.
     ///
-    /// This is A.3's bind (`bind_with_secret`) — the only difference is where the secret
+    /// This is A.4's bind (`bind_with_secret`) — the only difference is where the secret
     /// comes from: an exporter off the joined group rather than a KEM decapsulation. Two
     /// things fall out of that, and they are the reason the leg exists:
     ///
     /// - **The receipt is free.** The secret is derivable only from INSIDE the welcomed
     ///   group, so a bind that applies at all proves we joined. The peer re-derives it
     ///   rather than receiving it, so nothing about it goes on the wire.
-    /// - **A.4 becomes a well-formed round** (initiator → responder → initiator, as A.3 and
+    /// - **A.3 becomes a well-formed round** (initiator → responder → initiator, as A.4 and
     ///   A.5 are), so the usual rule applies unchanged: we relinquish at this terminal send
     ///   and the peer takes the turn on applying it. Before this leg existed the peer took
     ///   the turn at its own send, and would open a ratchet round beside a bootstrap it had
@@ -1195,13 +1195,13 @@ impl TwoMlsPqSession {
             // the peer hits the epoch-ahead desync with zero loss on the wire. Retriable: bind
             // after `encrypt`.
             //
-            // A.4 shares `bind_with_secret` with A.3, so it always had A.3's hazard — in a
-            // sharper form. A.3's trigger is a CT the host asked for; A.4's is an INBOUND
+            // A.3 shares `bind_with_secret` with A.4, so it always had A.4's hazard — in a
+            // sharper form. A.4's trigger is a CT the host asked for; A.3's is an INBOUND
             // welcome, so a host that prepares a round and then receives it before its
             // `encrypt` arrives here without having done anything wrong, and the ordering is
             // not its to control.
             //
-            // Ordered after the duplicate check, where A.3 puts its guard first: a re-sent
+            // Ordered after the duplicate check, where A.4 puts its guard first: a re-sent
             // welcome for a round we already closed is a discard whatever our staple state is,
             // and answering it with a retriable SessionNotReady would invite the host to retry
             // a round that is over.
@@ -1274,12 +1274,12 @@ impl TwoMlsPqSession {
             // domain), so it never goes on the wire.
             let s = Zeroizing::new(inner.export_cross_from_recv_pq()?.psk().as_ref().to_vec());
 
-            // As A.3 (`pq_ratchet_bind`), which this shares `commit_pq_and_owe_bind` with:
+            // As A.4 (`pq_ratchet_bind`), which this shares `commit_pq_and_owe_bind` with:
             // commit the PQ half, owe the classical one, park NOTHING in `pending_side_band`.
             // The two commits ride our next classical COMMIT as an APQPrivateMessage staple —
             // the message path — and the staple's re-send until superseded heals a lost one.
             inner.commit_pq_and_owe_bind(&s)?;
-            // A.4's round is over for us as far as the slot is concerned; the owed bind is
+            // A.3's round is over for us as far as the slot is concerned; the owed bind is
             // tracked by `owed_bind`, not here.
             inner.pq_inflight = None;
             // Our KP' is spent — the welcome we just joined answered it (see

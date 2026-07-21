@@ -43,7 +43,7 @@ use super::*;
 //                                  order: bootstrap, then ratchet, then re-key. 6 of 16.
 //
 // Banding is what makes "the side-band is 0x13–0x31" a claim that survives growth, and it
-// was bought by a renumber: the tags were allocation-ordered, so appending the A.4 bind past
+// was bought by a renumber: the tags were allocation-ordered, so appending the A.3 bind past
 // the end left the side-band non-contiguous and silently falsified five "0x05–0x11" range
 // shorthands across the code and book. Prefer `pq_frame_kind` to a range test regardless —
 // but a range written in prose should at least not be a lie.
@@ -108,7 +108,7 @@ pub(crate) const ESTABLISHMENT_HANDOFF_TAG: u8 = 0x0B;
 
 // ── Band: PQ side-band (0x13–0x31, 6 of 16 used) ────────────────────────────────────
 // Exactly the tags `pq_frame_kind` classifies, ordered by lifecycle: a session bootstraps
-// its deferred PQ half once (A.4), then ratchets it repeatedly (A.3), and re-keys it
+// its deferred PQ half once (A.3), then ratchets it repeatedly (A.4), and re-keys it
 // occasionally (A.5). Note the section numbers do NOT follow that order — the spec numbers
 // are historical; renumbering them is a separate, deferred change.
 //
@@ -116,15 +116,15 @@ pub(crate) const ESTABLISHMENT_HANDOFF_TAG: u8 = 0x0B;
 // §7 APQPrivateMessage, whose tag lives in the message-path band), so every side-band
 // frame below is answered by the round's next leg and none is terminal.
 
-/// A.4 bootstrap: this side's PQ key package, sent so the peer can stand up its deferred
+/// A.3 bootstrap: this side's PQ key package, sent so the peer can stand up its deferred
 /// send-group PQ half.
 pub(crate) const PQ_BOOTSTRAP_KP_TAG: u8 = 0x13;
 
-/// A.4 bootstrap reply: the new PQ group's welcome. PQ-groups-only — no classical commit
+/// A.3 bootstrap reply: the new PQ group's welcome. PQ-groups-only — no classical commit
 /// rides here; the initiator's stapled bind is what reaches a classical group.
 pub(crate) const PQ_BOOTSTRAP_WELCOME_TAG: u8 = 0x15;
 
-// PQ ratchet (book: Protocol Flows §A.3), cryptokit only: the initiator's ML-KEM
+// PQ ratchet (book: Protocol Flows §A.4), cryptokit only: the initiator's ML-KEM
 // encapsulation key, and the responder's ciphertext — the KEM encapsulation plus the
 // AEAD-sealed injected secret (`[u32 enc_len][enc][sealed]`, opened by
 // `apq::pq_ratchet::open_injected_secret`), not a bare KEM ciphertext. The round closes
@@ -162,13 +162,13 @@ pub(crate) fn encode_pre_establishment_app(app: &[u8]) -> Vec<u8> {
 /// staple, so it reaches the host as an ordinary message frame for `process_incoming`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum PqFrameKind {
-    /// 0x13 — A.4 bootstrap: this side's PQ key package.
+    /// 0x13 — A.3 bootstrap: this side's PQ key package.
     BootstrapKeyPackage,
-    /// 0x15 — A.4 bootstrap: the reply (the new PQ group's welcome).
+    /// 0x15 — A.3 bootstrap: the reply (the new PQ group's welcome).
     BootstrapWelcome,
-    /// 0x17 — A.3 ratchet: the initiator's ML-KEM encapsulation key.
+    /// 0x17 — A.4 ratchet: the initiator's ML-KEM encapsulation key.
     RatchetEphemeralKey,
-    /// 0x19 — A.3 ratchet: the responder's ciphertext.
+    /// 0x19 — A.4 ratchet: the responder's ciphertext.
     RatchetCiphertext,
     /// 0x1B — A.5 rekey: the initiator's Upd' proposal.
     RekeyUpdate,
@@ -316,7 +316,7 @@ pub(crate) fn decode_establishment_handoff(bytes: &[u8]) -> Result<(Vec<u8>, Vec
     Ok((envelope, welcome))
 }
 
-/// Encode the A.4 bootstrap reply: `[tag][pq_welcome…]`. PQ-groups-only per the spec — no
+/// Encode the A.3 bootstrap reply: `[tag][pq_welcome…]`. PQ-groups-only per the spec — no
 /// classical commit rides along; the initiator's stapled bind carries the classical half.
 pub(crate) fn encode_bootstrap_welcome(pq_welcome: Vec<u8>) -> Vec<u8> {
     let mut out = Vec::with_capacity(1 + pq_welcome.len());
@@ -333,7 +333,7 @@ pub(crate) fn decode_bootstrap_welcome(bytes: &[u8]) -> Result<Vec<u8>> {
     Ok(rest.to_vec())
 }
 
-/// Encode the A.5 rekey reply: `[tag][Commit' bytes]` — one payload, like the A.4
+/// Encode the A.5 rekey reply: `[tag][Commit' bytes]` — one payload, like the A.3
 /// welcome reply it is the sibling of. The old second section (the counter-Upd') died
 /// with the counter-proposal: the round's last leg is the initiator's stapled ack, not
 /// another side-band commit.

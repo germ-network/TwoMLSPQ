@@ -75,7 +75,7 @@ pub struct PartySequence {
     /// Credentials held ADMISSIBLE (and valid as a successor `pred`) regardless of the
     /// [`CREDENTIAL_HISTORY_WINDOW`] eviction — for a credential that a live leaf still
     /// carries but the rolling window would otherwise drop. The acute case: a deferred
-    /// A.4 bootstrap leaf carries the peer's frozen ESTABLISHMENT credential, which
+    /// A.3 bootstrap leaf carries the peer's frozen ESTABLISHMENT credential, which
     /// enough peer rotations would evict before that leaf is created / caught up. Pinned
     /// (older than all `history`) at bootstrap create, retired once A.5 rotates the leaf
     /// onto the current credential. Only widens ADMISSION (`known_ids`) and lets an

@@ -31,7 +31,7 @@ pub(crate) fn make_classical_kp(client: &TwoMlsPqPrincipal) -> Vec<u8> {
     assert_ok!(client.generate_key_package(crate::MlsCipherSuite::x25519_chacha()))
 }
 
-/// The initiator session's A.4 bootstrap KP commitment, as the host would carry it in
+/// The initiator session's A.3 bootstrap KP commitment, as the host would carry it in
 /// the signed establishment payload and the acceptor would thread it into `receive`.
 pub(crate) fn commitment_of(session: &TwoMlsPqSession) -> Vec<u8> {
     assert_some!(session.bootstrap_kp_commitment())

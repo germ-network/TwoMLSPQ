@@ -135,7 +135,7 @@ impl MlsRules for TwoMlsRules {
             }
         }
 
-        // Every PSK is external (the A.3 injected secret S) or application (the
+        // Every PSK is external (the A.4 injected secret S) or application (the
         // draft-02 apq_psk / Germ cross-party bindings); this protocol never resumes
         // groups. A proposal for which both accessors are `None` is a resumption PSK.
         if proposals.psk_proposals().iter().any(|p| {
@@ -147,7 +147,7 @@ impl MlsRules for TwoMlsRules {
         match roster.members_iter().count() {
             // The creation commit: the lone creator adds the single peer. This is how
             // every half is born (`create_group_with_member` — classical groups at
-            // establishment, PQ groups at the A.4 bootstrap); external PSKs may ride
+            // establishment, PQ groups at the A.3 bootstrap); external PSKs may ride
             // it (the bound send group's cross-party / APQ PSKs).
             1 => {
                 if proposals.add_proposals().len() != 1 || !proposals.update_proposals().is_empty()

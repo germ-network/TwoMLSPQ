@@ -29,7 +29,7 @@ fn main() {
 
     // §A.1 pre-establishment app frames (v15): each send is a fresh envelope
     // re-stapling the establishment sections plus the app message. Bare shape
-    // (welcome + CLASSICAL return-KP sections — v20: the PQ KP travels in A.4,
+    // (welcome + CLASSICAL return-KP sections — v20: the PQ KP travels in A.3,
     // hash-bound) vs self-sufficient host payload (which replaces the bare sections —
     // here a thin wrapper over the welcome; a real identity envelope also carries the
     // return KP + the bootstrap KP commitment + signatures).
@@ -110,7 +110,7 @@ fn main() {
         (staple_len, prop_len, app_len, bv.len(), bv_bytes)
     };
 
-    // PQ ratchet (book: Protocol Flows §A.3) — fresh session pair.
+    // PQ ratchet (book: Protocol Flows §A.4) — fresh session pair.
     let (pq_ek, pq_ct, pq_bind, pq_commit_len, cl_commit_len, staple_len) = {
         let a = client();
         let b = client();
@@ -134,7 +134,7 @@ fn main() {
         let wb = b_s.pending_outbound().unwrap();
         a_s.process_incoming(wb).unwrap();
 
-        // A.4 bootstrap so both PQ halves are live — send-driven A.3 opens only post-A.4.
+        // A.3 bootstrap so both PQ halves are live — send-driven A.4 opens only post-A.3.
         let kp = a_s.pq_bootstrap_begin(None).unwrap();
         b_s.pq_bootstrap_respond(kp).unwrap();
         let welcome = b_s.pq_take_pending_outbound().unwrap();
@@ -149,7 +149,7 @@ fn main() {
         let boot_disc = a_s.encrypt(b"boot-disc".to_vec()).unwrap();
         b_s.process_incoming(boot_disc.cipher_text).unwrap();
 
-        // A.3 is session-driven now: Bob (the turn holder) opens the round by SENDING an ordinary
+        // A.4 is session-driven now: Bob (the turn holder) opens the round by SENDING an ordinary
         // message, which auto-stages the EK; Alice responds, Bob binds.
         b_s.prepare_to_encrypt(None).unwrap();
         let opener = b_s.encrypt(b"a3-open".to_vec()).unwrap();
@@ -221,7 +221,7 @@ fn main() {
     );
 
     {
-        println!("--- PQ ratchet (book: Protocol Flows §A.3) ---");
+        println!("--- PQ ratchet (book: Protocol Flows §A.4) ---");
         println!("PQ EK message (0x17, sealed) : {:>6} B", pq_ek);
         println!("PQ ct message (0x19, sealed) : {:>6} B", pq_ct);
         println!("bind frame (0x03 + staple)   : {:>6} B", pq_bind);

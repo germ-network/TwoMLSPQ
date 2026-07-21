@@ -53,7 +53,7 @@ In its place we have two PQ operations:
     
     One round re-keys ONE group; the turn alternation brings the other group’s round next. The large updatePath commit happens in isolation on the PQ group, otherwise we block the classical ratchet on transmitting it — only the small pathless ack rides the classical staple.
 
-**Who opens a round — the session, not the host.** The host never selects or opens A.3/A.5; the session self-drives them. Whenever it is our turn, the PQ side-band is idle, and both halves are live (post-A.4), the next `encrypt` opens the next round automatically: an **A.5 re-key** if our send-PQ leaf still lags the canonical (classically committed) identity — the credential catch-up, announcing that identity — else an **A.3 ratchet**. Opening is send-driven and best-effort (a transient staging failure just retries on the next send), and the frame it stages rides that same send's re-staple. So the abstract "initiator (Alice) sends…" above is, concretely, *Alice's next ordinary message once the turn is hers*. One subtlety: a rotation that lands while an A.3 is already staged does not upgrade that A.3 to an A.5 mid-flight — the catch-up defers to the following turn.
+**Who opens a round — the session, not the host.** The host never selects or opens A.4/A.5; the session self-drives them. Whenever it is our turn, the PQ side-band is idle, and both halves are live (post-A.3), the next `encrypt` opens the next round automatically: an **A.5 re-key** if our send-PQ leaf still lags the canonical (classically committed) identity — the credential catch-up, announcing that identity — else an **A.4 ratchet**. Opening is send-driven and best-effort (a transient staging failure just retries on the next send), and the frame it stages rides that same send's re-staple. So the abstract "initiator (Alice) sends…" above is, concretely, *Alice's next ordinary message once the turn is hers*. One subtlety: a rotation that lands while an A.4 is already staged does not upgrade that A.4 to an A.5 mid-flight — the catch-up defers to the following turn.
 
 1. Session establishment
     1. Bob posts an APQ keyPackage
@@ -67,7 +67,7 @@ Now we have two independent state machines.
     1. The classical ratchet proceeds exactly as in TwoMLS, exchanging rounds of AppMessage + Proposal + Commit, all stapled together
     2. A sender commits to its send group only when it is **licensed** to (see Evidence-gating below), and only when it has something to commit: a peer proposal its app has approved (`queue_proposal`), or an owed PQ bind to discharge. Until then each frame re-staples the latest commit, and app messages keep flowing in the current epoch
     3. Such a commit also re-injects a cross-party PSK exported from the sender's receive group (the TwoMLS binding), but only when that group has **advanced** since the sender last bound it — i.e. when the peer has produced new entropy to entangle with (a peer commit or a PQ ratchet). Re-binding an unadvanced peer epoch would add nothing, so a commit with no new peer entropy carries no cross-party PSK (it still refreshes the sender's own leaf via the updatePath, and folds the peer's Update if it carries one). This is what keeps the two send groups entangled with each other's *current* state, rather than re-stating a binding already in force.
-    4. Credential rotation rides this same ratchet (the TwoMLS AS): staged candidate credentials travel in the stapled Update proposals, the peer's approval of a proposal is the authorization, and the peer's commit canonicalizes the winner — the PQ leaves only catch up later (A.4/A.5)
+    4. Credential rotation rides this same ratchet (the TwoMLS AS): staged candidate credentials travel in the stapled Update proposals, the peer's approval of a proposal is the authorization, and the peer's commit canonicalizes the winner — the PQ leaves only catch up later (A.3/A.5)
 
 ### Evidence-gating: at most one commit outstanding, per direction
 
@@ -207,7 +207,7 @@ sequenceDiagram
     Bob-)Bob: Constructs the PQ half of his send group from Alice's keyPackage,<br/>under his current — already dedicated — principal (no credential change here)
     Bob-)Alice: (in place of a Commit) Welcome (for that PQ half), as a side-band frame
     Alice-)Alice: Joins the PQ half of Bob's send group via the Welcome
-    Alice-)Bob: Closes the round with a bind, exactly as the PQ ratchet's — S comes from a group exporter<br/>off the joined group's birth epoch rather than a KEM exchange. The bind rides her next<br/>classical COMMIT as the APQPrivateMessage staple (granular detail in A.4)
+    Alice-)Bob: Closes the round with a bind, exactly as the PQ ratchet's — S comes from a group exporter<br/>off the joined group's birth epoch rather than a KEM exchange. The bind rides her next<br/>classical COMMIT as the APQPrivateMessage staple (granular detail in A.3)
     Bob-)Bob: Derives the same S, applies both halves from the staple → Bob is now the initiator
     Note over Alice,Bob: The turn flips when Bob APPLIES the stapled bind — the initiator relinquishes at its<br/>terminal send, the responder takes the turn on applying it. Bob's dedicated principal<br/>was selected at session establishment (see above), not in this step.
 ```
@@ -295,7 +295,7 @@ it into the classical group as a **PreSharedKey** proposal.
 > [Wire Format](./wire-format.md) chapter the draft-02 conformance. Two
 > deliberate deviations remain: `APQInfo` is written once at creation and
 > never rewritten — epoch freshness lives in the per-commit `AppDataUpdate`,
-> not a rewritten extension — and the A.3 injected secret `S` is Germ's own
+> not a rewritten extension — and the A.4 injected secret `S` is Germ's own
 > addition, an `external(1)` PSK with id `LE-u64(epoch) ‖ group_id ‖ 0x52`,
 > kept disjoint from the exported application ids.
 
@@ -324,13 +324,13 @@ FULL commit and does not use that pair. Our three operations, by name:
   TwoMLS PSK **when the peer's send group has advanced** since the last binding
   (otherwise it carries no PSK — see §Classical Ratchet). In -02's terms, a
   PARTIAL commit.
-- **PQ ratchet bind** (A.3) — both halves advance: a path-less PSK-injection
+- **PQ ratchet bind** (A.4) — both halves advance: a path-less PSK-injection
   Commit' (cheap — no per-member PQ ciphertexts) plus the classical commit
   importing the re-exported `apq_psk`, carried together as the -02 `APQPrivateMessage`
   the message frame staples. Introduces PQ Post-Compromise Security.
 - **PQ re-key** (A.5) — ONE updatePath Commit' in the PQ group alone (the
   expensive leaf rotation, run rarely, off the classical ratchet's critical
-  path), answered by the initiator's ack — which is structurally the A.3 bind:
+  path), answered by the initiator's ack — which is structurally the A.4 bind:
   a path-less partial Commit' plus its classical partner, stapled as one
   `APQPrivateMessage`. One round re-keys one group; the turn alternation
   covers the other.
@@ -360,9 +360,9 @@ sequenceDiagram
     Alice->>Alice: Export apq_psk from ASG-PQ (Safe Extensions, component 0xFF01)
     Alice->>Alice: [ASG-cl] Add(Bob KP) + PSK=apq_psk + Commit → ASG-cl epoch 1 (PQ-seeded)
 
-    Alice->>Bob: One HPKE envelope [ app payload ∥ APQ Welcome = { Welcome' [ASG-PQ], Welcome(PSK) [ASG-cl] } ],<br/>sealed to the PQ EK in Bob's KP'. The signed app payload carries: the welcome pair, Alice's CLASSICAL<br/>return KP (for Bob's Add(Alice) into BSG-cl), and H(Alice's KP') — the PQ keyPackage itself travels<br/>in A.4 and must verify against this signed hash
+    Alice->>Bob: One HPKE envelope [ app payload ∥ APQ Welcome = { Welcome' [ASG-PQ], Welcome(PSK) [ASG-cl] } ],<br/>sealed to the PQ EK in Bob's KP'. The signed app payload carries: the welcome pair, Alice's CLASSICAL<br/>return KP (for Bob's Add(Alice) into BSG-cl), and H(Alice's KP') — the PQ keyPackage itself travels<br/>in A.3 and must verify against this signed hash
     Alice->>Bob: App messages [ASG-cl] — each re-wrapped in a fresh HPKE envelope to Bob's KP' (as the initial frame above),<br/>re-stapling the APQ Welcome — any single one is a complete establishment vector (Bob can join and read it),<br/>so the initial frame need not survive. Alice has no receiving group to header-seal against until she joins BSG-cl —<br/>after that she header-seals, re-stapling the Welcome until her first commit
-    Alice-->>Bob: (parallel) A.4 bootstrap KP frame [0x13][KP'] in its OWN fresh HPKE envelope, coin-flipped onto the outbox with the reply.<br/>Same raw-blob outer shape as the reply (no outer tag) — Bob holds it in memory until establishment, then feeds pq_bootstrap_respond (A.4)
+    Alice-->>Bob: (parallel) A.3 bootstrap KP frame [0x13][KP'] in its OWN fresh HPKE envelope, coin-flipped onto the outbox with the reply.<br/>Same raw-blob outer shape as the reply (no outer tag) — Bob holds it in memory until establishment, then feeds pq_bootstrap_respond (A.3)
 
     Note over Bob: Join Alice's send group (both halves)
     Bob->>Bob: Process Welcome' → join ASG-PQ, then Welcome(PSK) → join ASG-cl
@@ -372,15 +372,15 @@ sequenceDiagram
     Bob->>Bob: Export key from ASG-cl
     Bob->>Bob: [BSG-cl] Create group + Add(Alice) seeded with PSK from ASG-cl → BSG-cl epoch 1,<br/>created under the dedicated principal
     Bob->>Bob: Mint the signed establishment handoff (identity/anchor delegates the dedicated key,<br/>binding sha256(Welcome)) and install it → staple becomes [0x0B][blob][Welcome]. Non-emittable until installed.
-    Note over Alice,Bob: BSG-PQ is deferred so Bob can send app messages immediately (see A.4).<br/>Alice PAUSES on the 0x0B staple, verifies the delegation, then re-feeds to adopt Bob's dedicated principal.
+    Note over Alice,Bob: BSG-PQ is deferred so Bob can send app messages immediately (see A.3).<br/>Alice PAUSES on the 0x0B staple, verifies the delegation, then re-feeds to adopt Bob's dedicated principal.
 ```
 
-**The return key package is classical-only; the PQ key package travels in A.4, hash-bound.**
-Bob's send group is created classical-only (BSG-PQ is deferred to A.4), so the establishment
+**The return key package is classical-only; the PQ key package travels in A.3, hash-bound.**
+Bob's send group is created classical-only (BSG-PQ is deferred to A.3), so the establishment
 envelope needs to carry only Alice's classical return key package. Alice's PQ key package for
-BSG-PQ is delivered where it is consumed — A.4's first side-band leg — and the signed app
+BSG-PQ is delivered where it is consumed — A.3's first side-band leg — and the signed app
 payload binds it in advance: it carries a hash of the PQ key package, and Bob verifies the
-key package A.4 delivers against that hash before constructing BSG-PQ around it. The binding
+key package A.3 delivers against that hash before constructing BSG-PQ around it. The binding
 is what roots the PQ leaf in the signed identity envelope: the side-band channel is
 confidential to the established peer, but a bare MLS key package message carries no anchor
 signature of its own.
@@ -393,7 +393,7 @@ The implementation matches: `initiate` pre-commits the bootstrap key package
 When the commitment is pinned it REPLACES the names-the-established-peer equality: it is
 strictly stronger (it pins the exact committed bytes, identity included), and unlike the
 live-principal check it still admits the committed KP after a Phase 8 rotation that
-completed before A.4 ran — the KP′ then carries the establishment credential, and A.5
+completed before A.3 ran — the KP′ then carries the establishment credential, and A.5
 hands the PQ leaves to the rotated one (PQ leaves lag credentials by design).
 
 **One envelope, two shapes (either/or).** The "∥" above is not concatenation. A host app
@@ -437,18 +437,18 @@ channel already routes it to the HPKE opener and an outer tag would only fingerp
 frames carry PQ material. The HPKE plaintext LEADS with an authenticated tag that selects the
 frame kind: `ESTABLISHMENT_VECTOR_TAG` (`0x07`) for the reply's four sections
 (`[app_payload][welcome][return_key_package][stapled_message]`), or `PQ_BOOTSTRAP_KP_TAG`
-(`0x13`) for the verbatim A.4 bootstrap KP. This is the same discipline the tag space follows
+(`0x13`) for the verbatim A.3 bootstrap KP. This is the same discipline the tag space follows
 throughout — transport limits which keys decrypt, then the inner authenticated tag guides
 parsing (like the `0x03` message frame's `0x01`/`0x00` staple slot). Because the KP bytes are
 pre-committed at `initiate` (`pq_bootstrap_envelope`), the initiator ships that KP frame IN
 PARALLEL with the reply — its own fresh HPKE blob, coin-flipped onto the outbox — so an
 acceptor already holding the KP′ when its return welcome goes out sends `Welcome'` alongside it
-and A.4 completes ~one round trip sooner. The first emit registers the A.4 round exactly as
+and A.3 completes ~one round trip sooner. The first emit registers the A.3 round exactly as
 `pq_bootstrap_begin` does; every later pre-establishment send re-seals the retained frame under
 a fresh HPKE ephemeral (unlinkable) without advancing state. The acceptor holds an
 early-arriving KP frame in memory, unarchived, and applies it only after the AppWelcome
 verifies and the hash matches — the apply gate is structural (`pq_bootstrap_respond` cannot run
-before `receive` creates the session). See A.4.
+before `receive` creates the session). See A.3.
 
 **The envelope seal binds the declared suite.** Every §A.1 HPKE seal/open passes the
 declared suite's framing bytes — `[version][classical suite][pq suite]` — as AAD, **derived
@@ -467,7 +467,7 @@ sequenceDiagram
     participant Alice
     participant Bob
 
-    Note over Alice,Bob: App data + leaf updates ride the classical groups only.<br/>PQ groups stay idle — PQ security is retained from the last PQ ratchet bind (A.3) / PQ re-key (A.5).<br/>Credential rotation rides these same Upd proposals (TwoMLS AS): a staged candidate's<br/>credential travels in Upd(self) — the peer's approval authorizes it and the peer's commit canonicalizes it.
+    Note over Alice,Bob: App data + leaf updates ride the classical groups only.<br/>PQ groups stay idle — PQ security is retained from the last PQ ratchet bind (A.4) / PQ re-key (A.5).<br/>Credential rotation rides these same Upd proposals (TwoMLS AS): a staged candidate's<br/>credential travels in Upd(self) — the peer's approval authorizes it and the peer's commit canonicalizes it.
 
     Note over Alice,Bob: Alice round
     Alice->>Alice: [ASG-cl] If an app-approved Upd(Bob) is queued: Commit(Upd(Bob) [+ PSK from BSG-cl iff BSG-cl advanced]) → new epoch.<br/>Otherwise no commit — the previous Commit is re-stapled.
@@ -480,7 +480,77 @@ sequenceDiagram
     Alice->>Alice: Apply Commit to [BSG-cl] (if new), decrypt app msg, surface Upd(Bob) for approval
 ```
 
-### A.3 PQ ratchet (granular) — PQ partial commit (no updatePath) + classical commit, stapled
+### A.3 Finish PQ setup (granular) — bootstrap BSG-PQ (Alice initiates)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Alice
+    participant Bob
+
+    Note over Alice,Bob: BSG is classical-only after establishment. Create BSG-PQ via a<br/>variation of PQ re-key. Alice goes first.
+
+    Alice-)Bob: PQ keyPackage KP'(Alice) for BSG-PQ, side-band frame  (in place of a Proposal).<br/>KP' must name the established peer, else the bootstrap is rejected.
+    Bob-)Bob: [BSG-PQ] Create group + Add'(KP' Alice) + Commit',<br/>under Bob's current — already dedicated — principal
+    Bob-)Alice: Welcome' [BSG-PQ], side-band frame  (in place of a Commit)
+    Alice-)Alice: Join [BSG-PQ] via Welcome'
+
+    Note over Alice,Bob: Alice closes the round with a bind, exactly as in A.4 — the only<br/>difference is where S comes from: a group exporter rather than a KEM exchange.
+
+    Alice-)Alice: Export S from the birth epoch of [BSG-PQ] (cross-party domain)
+    Alice-)Alice: [ASG-PQ] PSK=S + Commit' (no updatePath — PARTIAL) → pq_epoch++
+
+    Note over Alice,Bob: Half-committed, exactly as in A.4 — and it matters more here, since<br/>the trigger is INBOUND: a welcome arrived, which says nothing about whether Alice<br/>has anything to send. Committing classically on arrival would advance her epoch<br/>with no frame to carry the bind across.
+
+    Alice-)Alice: (at the next classical COMMIT) export apq_psk from the reserved ASG-PQ epoch
+    Alice-)Alice: [ASG-cl] PSK=apq_psk + Commit, folding Bob's approved Upd → classical epoch++
+    Alice-)Bob: Ordinary message frame — staple = APQPrivateMessage (t_message = the classical Commit, pq_message = Commit'), plus Upd(Alice) + app
+    Bob-)Bob: Derive the same S from [BSG-PQ] — same epoch, same domain — then from the staple<br/>apply pq_message to [ASG-PQ], then t_message to [ASG-cl]
+    Note over Alice,Bob: Both send groups are now full APQ groups. Bob's dedicated principal was<br/>adopted at establishment (A.1) — if a rotation has since been canonicalized in the classical<br/>ratchet (A.2), the new PQ leaves simply carry the current credential (catch-up). BSG-PQ binds<br/>into BSG-cl at the next PQ ratchet (A.4, run by Bob on his send group) — classical never blocks<br/>on PQ, so this defers freshness, not liveness. Turn flips — Bob is now the initiator.
+```
+
+**Parallel pre-delivery.** The KP′ of step 1 is the one pre-committed at establishment
+(`initiate` mints it; A.1's signed payload carries its hash), so it need not wait for the
+round to open post-establishment. The initiator ships it IN PARALLEL with the A.1 reply, in
+its own fresh HPKE envelope (`pq_bootstrap_envelope`) — same raw-blob outer shape as the reply,
+told apart by the inner `0x13` tag. An acceptor that already holds the KP′ when its return
+welcome goes out runs step 2 immediately and sends `Welcome'` (step 3) alongside the return
+welcome, so A.3 completes ~one round trip sooner. Emitting the parallel frame registers the
+round on the initiator (so `pq_bootstrap_begin` becomes idempotent — it re-seals and returns
+the retained frame instead of registering again — and an early `Welcome'` is
+already expected); the acceptor holds an early KP frame in memory, unarchived, applying it only
+after the AppWelcome verifies and the hash matches — the apply gate is structural
+(`pq_bootstrap_respond` cannot run before `receive` creates the session). If the parallel frame
+is dropped, the round self-heals: the initiator re-sends it pre-establishment and falls back to
+the steady-state side-band (step 1 above) after the cutover.
+
+**Routing the parallel frame on the acceptor.** The envelope carries no session id, and one
+reusable invitation spawns many sessions, so the acceptor cannot route the KP′ by transport
+address. It self-routes by content: the invitation keeps a commitment table (`H(KP′) → spawned
+group id`, populated at `receive` from the commitment it was already given), and
+`bootstrap_kp_group_id(kp_frame)` hashes the framed KP′ to resolve the owning session — the
+bootstrap-KP counterpart of `forward_group_id`/`processed_welcome_group_id`. Because the table
+key is `H(KP′)`, a frame that resolves can never fail `pq_bootstrap_respond`'s own hash check.
+
+**Why the bind leg exists.** Without it A.3 is the only two-leg operation, and the turn has to
+pass at Bob's *send* rather than at an apply — so Bob's next send would open the next A.4 round
+(advancement is send-driven) while his own Welcome' is still unconfirmed, and the two operations
+contend. The bind makes A.3 a well-formed round (initiator → responder → initiator, as A.4 and A.5
+already are), so the usual rule applies unchanged: **the initiator relinquishes at its terminal
+send, the responder takes the turn on applying it.**
+
+**The receipt is free.** S is derivable only from *inside* [BSG-PQ], so a bind that applies at all
+is proof Alice joined — the confirmation is a side effect of entropy Alice had to chain anyway,
+not a payload. An ack frame would prove the same thing and do no work. Both parties derive the
+same S independently from the same (group, epoch, domain), so it is never transmitted.
+
+**Ordering constraint.** The exporter leaf is consumed on first export, so A.3's bind spends the
+cross-party leaf of [BSG-PQ]'s birth epoch — on **both** sides, each in its own copy: Alice
+exports it from her recv mirror to build the bind, and Bob exports it from his send group to
+apply it. A later A.5 re-key must not re-export that epoch from either. (Both watermarks are
+load-bearing; omitting the responder's makes the next re-key fail on a consumed leaf.)
+
+### A.4 PQ ratchet (granular) — PQ partial commit (no updatePath) + classical commit, stapled
 
 ```mermaid
 sequenceDiagram
@@ -515,7 +585,7 @@ rather than held.
 
 The classical half is the opposite. Applying it advances the epoch Alice's ordinary traffic
 rides, onto a commit whose `apq_psk` the peer can only derive from this bind's PQ half. Applied
-at the trigger, every frame Alice sends before the bind lands is undeliverable — and in A.4 the
+at the trigger, every frame Alice sends before the bind lands is undeliverable — and in A.3 the
 trigger is inbound, so she may have nothing to send at all.
 
 Note what is NOT held: `apq_psk` is exported at the commit that consumes it, not at the trigger.
@@ -563,76 +633,6 @@ takes the epochs meanwhile. Hence two rules while a bind is owed:
 So PQ never holds up classical — non-committing rounds send ordinary frames throughout — while
 classical may in principle hold up the PQ ratchet. In practice it does not: the peer proposes an
 `Upd` on every frame, and folding one is exactly what makes a classical round commit.
-
-### A.4 Finish PQ setup (granular) — bootstrap BSG-PQ (Alice initiates)
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant Alice
-    participant Bob
-
-    Note over Alice,Bob: BSG is classical-only after establishment. Create BSG-PQ via a<br/>variation of PQ re-key. Alice goes first.
-
-    Alice-)Bob: PQ keyPackage KP'(Alice) for BSG-PQ, side-band frame  (in place of a Proposal).<br/>KP' must name the established peer, else the bootstrap is rejected.
-    Bob-)Bob: [BSG-PQ] Create group + Add'(KP' Alice) + Commit',<br/>under Bob's current — already dedicated — principal
-    Bob-)Alice: Welcome' [BSG-PQ], side-band frame  (in place of a Commit)
-    Alice-)Alice: Join [BSG-PQ] via Welcome'
-
-    Note over Alice,Bob: Alice closes the round with a bind, exactly as in A.3 — the only<br/>difference is where S comes from: a group exporter rather than a KEM exchange.
-
-    Alice-)Alice: Export S from the birth epoch of [BSG-PQ] (cross-party domain)
-    Alice-)Alice: [ASG-PQ] PSK=S + Commit' (no updatePath — PARTIAL) → pq_epoch++
-
-    Note over Alice,Bob: Half-committed, exactly as in A.3 — and it matters more here, since<br/>the trigger is INBOUND: a welcome arrived, which says nothing about whether Alice<br/>has anything to send. Committing classically on arrival would advance her epoch<br/>with no frame to carry the bind across.
-
-    Alice-)Alice: (at the next classical COMMIT) export apq_psk from the reserved ASG-PQ epoch
-    Alice-)Alice: [ASG-cl] PSK=apq_psk + Commit, folding Bob's approved Upd → classical epoch++
-    Alice-)Bob: Ordinary message frame — staple = APQPrivateMessage (t_message = the classical Commit, pq_message = Commit'), plus Upd(Alice) + app
-    Bob-)Bob: Derive the same S from [BSG-PQ] — same epoch, same domain — then from the staple<br/>apply pq_message to [ASG-PQ], then t_message to [ASG-cl]
-    Note over Alice,Bob: Both send groups are now full APQ groups. Bob's dedicated principal was<br/>adopted at establishment (A.1) — if a rotation has since been canonicalized in the classical<br/>ratchet (A.2), the new PQ leaves simply carry the current credential (catch-up). BSG-PQ binds<br/>into BSG-cl at the next PQ ratchet (A.3, run by Bob on his send group) — classical never blocks<br/>on PQ, so this defers freshness, not liveness. Turn flips — Bob is now the initiator.
-```
-
-**Parallel pre-delivery.** The KP′ of step 1 is the one pre-committed at establishment
-(`initiate` mints it; A.1's signed payload carries its hash), so it need not wait for the
-round to open post-establishment. The initiator ships it IN PARALLEL with the A.1 reply, in
-its own fresh HPKE envelope (`pq_bootstrap_envelope`) — same raw-blob outer shape as the reply,
-told apart by the inner `0x13` tag. An acceptor that already holds the KP′ when its return
-welcome goes out runs step 2 immediately and sends `Welcome'` (step 3) alongside the return
-welcome, so A.4 completes ~one round trip sooner. Emitting the parallel frame registers the
-round on the initiator (so `pq_bootstrap_begin` becomes idempotent — it re-seals and returns
-the retained frame instead of registering again — and an early `Welcome'` is
-already expected); the acceptor holds an early KP frame in memory, unarchived, applying it only
-after the AppWelcome verifies and the hash matches — the apply gate is structural
-(`pq_bootstrap_respond` cannot run before `receive` creates the session). If the parallel frame
-is dropped, the round self-heals: the initiator re-sends it pre-establishment and falls back to
-the steady-state side-band (step 1 above) after the cutover.
-
-**Routing the parallel frame on the acceptor.** The envelope carries no session id, and one
-reusable invitation spawns many sessions, so the acceptor cannot route the KP′ by transport
-address. It self-routes by content: the invitation keeps a commitment table (`H(KP′) → spawned
-group id`, populated at `receive` from the commitment it was already given), and
-`bootstrap_kp_group_id(kp_frame)` hashes the framed KP′ to resolve the owning session — the
-bootstrap-KP counterpart of `forward_group_id`/`processed_welcome_group_id`. Because the table
-key is `H(KP′)`, a frame that resolves can never fail `pq_bootstrap_respond`'s own hash check.
-
-**Why the bind leg exists.** Without it A.4 is the only two-leg operation, and the turn has to
-pass at Bob's *send* rather than at an apply — so Bob's next send would open the next A.3 round
-(advancement is send-driven) while his own Welcome' is still unconfirmed, and the two operations
-contend. The bind makes A.4 a well-formed round (initiator → responder → initiator, as A.3 and A.5
-already are), so the usual rule applies unchanged: **the initiator relinquishes at its terminal
-send, the responder takes the turn on applying it.**
-
-**The receipt is free.** S is derivable only from *inside* [BSG-PQ], so a bind that applies at all
-is proof Alice joined — the confirmation is a side effect of entropy Alice had to chain anyway,
-not a payload. An ack frame would prove the same thing and do no work. Both parties derive the
-same S independently from the same (group, epoch, domain), so it is never transmitted.
-
-**Ordering constraint.** The exporter leaf is consumed on first export, so A.4's bind spends the
-cross-party leaf of [BSG-PQ]'s birth epoch — on **both** sides, each in its own copy: Alice
-exports it from her recv mirror to build the bind, and Bob exports it from his send group to
-apply it. A later A.5 re-key must not re-export that epoch from either. (Both watermarks are
-load-bearing; omitting the responder's makes the next re-key fail on a consumed leaf.)
 
 ### A.5 PQ re-key (granular) — the one updatePath commit, isolated from classical
 

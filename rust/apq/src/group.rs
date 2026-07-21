@@ -52,7 +52,7 @@ where
     P: CryptoProvider + Clone,
 {
     pub classical: MlsGroup<S, C>,
-    /// `None` while the PQ half is deferred: an acceptor's send group before the A.4
+    /// `None` while the PQ half is deferred: an acceptor's send group before the A.3
     /// bootstrap, and the initiator's recv group mirroring it.
     pub pq: Option<PqMlsGroup<S, P>>,
     // Group-state and PSK storage handles of the client that created/joined each half. An
@@ -98,7 +98,7 @@ where
         }
     }
 
-    /// Attach a deferred (A.4) PQ half that was created/joined by `client`, capturing the
+    /// Attach a deferred (A.3) PQ half that was created/joined by `client`, capturing the
     /// storage handles it resolves through. The classical half's handles are untouched —
     /// they stay with the client that originally produced that half.
     pub fn set_pq(&mut self, pq: PqMlsGroup<S, P>, client: &CombinerClient<S, C, P>) {
@@ -740,9 +740,9 @@ where
     Ok(group)
 }
 
-/// Create the acceptor's bound send group (Group_B) with the PQ half deferred (A.4):
+/// Create the acceptor's bound send group (Group_B) with the PQ half deferred (A.3):
 /// classical only, bound to the cross-party TwoMLS-PSK from the recv group — the sole path
-/// by which this classical-only send group inherits post-quantum protection before A.4 (the
+/// by which this classical-only send group inherits post-quantum protection before A.3 (the
 /// recv group's classical half is PQ-seeded via its own `apq_psk`). The heavy PQ half is
 /// stood up later by the bootstrap flow, off the handshake critical path. `app_binding` is
 /// the optional app-state binding for the classical GroupContext — the caller mirrors the
@@ -764,7 +764,7 @@ where
     let psk_cross = export_and_register_psk(recv_classical, client, PskDomain::CrossParty)?;
     // Pre-allocate the deferred PQ half's group id now: it is pinned inside the
     // classical half's APQInfo (durable in GroupContext, riding the Welcome), and the
-    // A.4 bootstrap must later create the PQ group under exactly this id. The PQ epoch
+    // A.3 bootstrap must later create the PQ group under exactly this id. The PQ epoch
     // is the deferred sentinel; this classical-only creation is a -02 PARTIAL, so no
     // AppDataUpdate rides it.
     let suite = client.cipher_suite();

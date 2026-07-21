@@ -22,7 +22,7 @@
    bound by a cross-party PSK exported from Group_A's classical half — Group_B's PQ
    half is deferred to the bootstrap (below), so Bob can send immediately.
    `new_client_id` selects an optional **dedicated per-session principal** at
-   establishment: Group_B (and later its A.4 PQ half) is created under a freshly-minted
+   establishment: Group_B (and later its A.3 PQ half) is created under a freshly-minted
    principal with that id, so Alice sees the dedicated principal as the creator leaf of
    the very welcome she joins from — no first-frame rotation is needed. Alice adopts the id
    on the joining frame, surfacing it as `remote_commit.new_sender`; authenticity rides
@@ -46,11 +46,11 @@ epochs must line up as they do. A single **turn** alternates between the parties
 initiator owes the bootstrap; completing an operation passes the turn to the peer
 (`my_pq_turn()`), and only one operation may be in flight at a time.
 
-**The host drives only the A.4 bootstrap and then ordinary sends — the SESSION self-drives A.3
+**The host drives only the A.3 bootstrap and then ordinary sends — the SESSION self-drives A.4
 and A.5.** There is no `begin(.ratchet/.rekey)` for the host to call: on each `encrypt`, when it
 is our turn and the side-band is idle, the session opens the next round automatically — an **A.5**
 re-key when our send-PQ leaf still lags the canonical (classically committed) identity, else an
-**A.3** ratchet. "A.3 begins immediately" is just the first send after the turn becomes ours; the
+**A.4** ratchet. "A.4 begins immediately" is just the first send after the turn becomes ours; the
 ratchet then ping-pongs, turn-gated so the two sides never both open at once. Staging is
 best-effort (a transient KEM/proposal failure simply retries on the next send) and the staged
 frame rides that send's re-staple peek (`pq_pending_outbound`), so the host's role is
@@ -75,7 +75,7 @@ frame rides that send's re-staple peek (`pq_pending_outbound`), so the host's ro
   (`0x19`), and the closing bind rides the next message frame's staple.
 - **PQ re-key** (`0x1B`/`0x1D`, then a stapled bind) — updatePath commits run on the two
   send groups' PQ halves **alone**, so the classical ratchet is never blocked behind a large
-  ML-KEM updatePath. It is not a host call either: the session opens it in place of an A.3 when
+  ML-KEM updatePath. It is not a host call either: the session opens it in place of an A.4 when
   our send-PQ leaf still lags the canonical principal (a Phase 8 classical rotation moved the
   session client; the PQ leaf catches up here), announcing that principal as the handoff. The
   initiator's send auto-stages `Upd'(self)` into the PQ half of the peer's send group (`0x1B`);
@@ -84,7 +84,7 @@ frame rides that send's re-staple peek (`pq_pending_outbound`), so the host's ro
   send group. The round's third leg is not a side-band frame: the initiator acks with a pathless
   partial commit stapled onto its next classical commit (`pq_rekey_apply`), a FULL commit whose
   `AppDataUpdate` reconciles the bumped `pq_epoch` **in-round**. (One credential catch-up can defer
-  a round when an A.3 is already in flight — a staged A.3 is not upgraded mid-flight; the A.5 fires
+  a round when an A.4 is already in flight — a staged A.4 is not upgraded mid-flight; the A.5 fires
   on the next turn.)
 
 ## Routing
@@ -155,7 +155,7 @@ A stapled commit *ahead* of the receive group's next epoch fails with `EpochDesy
 before the app ciphertext is touched: the peer advanced more than one commit past us
 and the bridging commit no longer rides any frame — re-establish territory,
 distinguishable from a transient `DecryptionFailed` (e.g. a message frame that
-overtook its A.3 BIND, which succeeds on retry once the BIND lands).
+overtook its A.4 BIND, which succeeds on retry once the BIND lands).
 
 ## Remote proposals & the folding commit
 
@@ -184,11 +184,11 @@ dropped (the peer may commit any of them); staging beyond the in-flight window p
 the request in a single deferred slot and proposes it on the next routine round once a
 slot frees. On the receiver, `queue_proposal` is a single-occupancy latest-wins tally
 (`queued_remote_successor()` reveals it), epoch-locked so it is dropped when the send
-epoch advances by an A.3 bind.
+epoch advances by an A.4 bind.
 
 The winner's other leaves **lag and catch up**: the proposer's own send-group leaf
 moves at its next approved commit (the peer observes `new_sender` on that staple, and
-message attribution follows); the PQ leaves catch up at the next A.4/A.5 handoff (the
+message attribution follows); the PQ leaves catch up at the next A.3/A.5 handoff (the
 session self-drives this — when a rotation leaves the send-PQ leaf lagging, the next A.5
 it opens announces the session's *current*, already-canonical principal as the handoff,
 and the handoff's new leaf carries that credential); the acceptor's recv-group leaf
