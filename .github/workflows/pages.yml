@@ -31,20 +31,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Same mdBook release the CI "Build book" job pins (ci.yml), so the deployed output
-      # matches what CI validates.
+      # mdBook 0.5.x is required: mdbook-mermaid 0.17 speaks the post-0.4 preprocessor
+      # protocol, and pairing it with mdBook 0.4.x fails the build with the mermaid
+      # preprocessor's "Unable to parse the input". This intentionally differs from ci.yml's
+      # 0.4.40 "Build book" job, which does not run the mermaid preprocessor at all.
       - name: Install mdBook
         run: |
-          curl -fsSL https://github.com/rust-lang/mdBook/releases/download/v0.4.40/mdbook-v0.4.40-x86_64-unknown-linux-gnu.tar.gz \
+          curl -fsSL https://github.com/rust-lang/mdBook/releases/download/v0.5.4/mdbook-v0.5.4-x86_64-unknown-linux-gnu.tar.gz \
             | tar -xz -C /usr/local/bin
           chmod +x /usr/local/bin/mdbook
 
       # book.toml declares `[preprocessor.mermaid] command = "mdbook-mermaid"`, so the binary
-      # must be on PATH or `mdbook build` fails with "preprocessor 'mermaid' not found". The
-      # committed book/mermaid*.js do the client-side rendering; this only rewraps the fences.
-      # (Swap to a pinned release binary if the ~1-2 min compile is a concern.)
+      # must be on PATH or `mdbook build` fails with "preprocessor 'mermaid' not found". Pinned
+      # to the version that pairs with the mdBook above; the committed book/mermaid*.js do the
+      # client-side rendering, this only rewraps the fences.
       - name: Install mdbook-mermaid
-        run: cargo install mdbook-mermaid --locked
+        run: cargo install mdbook-mermaid --version 0.17.0 --locked
 
       - name: Build book
         run: mdbook build book
