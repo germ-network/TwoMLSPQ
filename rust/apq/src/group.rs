@@ -255,7 +255,11 @@ fn decode_apq_pair(bytes: &[u8], expect_tag: u8) -> Result<(Vec<u8>, Vec<u8>)> {
     }
     let a_len = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
     let rest = &rest[4..];
-    if rest.len() < a_len + 4 {
+    // Need `a_len` bytes for `a` plus 4 for the following `b_len` prefix. Compare against
+    // the remaining length rather than `a_len + 4`, whose addition would wrap on a 32-bit
+    // `usize` for an attacker-chosen length — wrapping small, slipping past the guard, and
+    // panicking on the out-of-bounds `rest[..a_len]` below. The `< 4` keeps the subtraction safe.
+    if rest.len() < 4 || rest.len() - 4 < a_len {
         return Err(CombinerError::Mls);
     }
     let a = rest[..a_len].to_vec();
@@ -336,7 +340,8 @@ impl ExportedPsk {
     pub fn psk_id(&self) -> &[u8] {
         &self.psk_id
     }
-    /// The store key the PSK value is installed under (`0x03 ‖ component_id ‖ psk_id`).
+    /// The store key the PSK value is installed under
+    /// (`0x03 ‖ component_id ‖ len ‖ psk_id`).
     pub fn storage_id(&self) -> &ExternalPskId {
         &self.storage_id
     }
@@ -1202,6 +1207,28 @@ mod tests {
             );
         }
         assert!(decode_apq_private_message(&[]).is_err());
+    }
+
+    /// A length prefix is untrusted bytes and must be rejected cleanly, never trusted into a
+    /// slice. The first-field bounds check compares against the remaining length rather than
+    /// `a_len + 4`, whose addition wraps on a 32-bit `usize` — slipping an oversized `a_len`
+    /// past the guard and into a panicking out-of-bounds slice. Built by hand because
+    /// `encode_apq_pair` only ever emits truthful lengths.
+    #[test]
+    fn test_apq_pair_rejects_oversized_length_prefix() {
+        // [tag][a_len = u32::MAX][short body] — a_len far exceeds what is present.
+        let mut blob = vec![APQ_PRIVATE_MESSAGE_TAG];
+        blob.extend_from_slice(&u32::MAX.to_le_bytes());
+        blob.extend_from_slice(&[0u8; 8]);
+        assert!(decode_apq_private_message(&blob).is_err());
+
+        // A truthful first field, then an oversized second-field (`b_len`) prefix.
+        let mut blob = vec![APQ_PRIVATE_MESSAGE_TAG];
+        blob.extend_from_slice(&2u32.to_le_bytes());
+        blob.extend_from_slice(&[1, 2]);
+        blob.extend_from_slice(&u32::MAX.to_le_bytes());
+        blob.push(9);
+        assert!(decode_apq_private_message(&blob).is_err());
     }
 
     #[test]
