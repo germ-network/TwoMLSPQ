@@ -1,0 +1,67 @@
+name: Pages
+
+# Build the mdBook and deploy it to GitHub Pages.
+# Requires: Settings -> Pages -> Build and deployment -> Source = "GitHub Actions".
+on:
+  push:
+    branches: [main]
+    # Only rebuild when the book or this workflow changes.
+    paths:
+      - "book/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch: {}
+
+# Least privilege: the deploy job needs to write Pages and mint an OIDC token; nothing writes
+# to the repo.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deploy at a time. Do NOT cancel an in-progress deploy (GitHub Pages guidance) — let it
+# finish rather than leave a half-published site.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build book
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same mdBook release the CI "Build book" job pins (ci.yml), so the deployed output
+      # matches what CI validates.
+      - name: Install mdBook
+        run: |
+          curl -fsSL https://github.com/rust-lang/mdBook/releases/download/v0.4.40/mdbook-v0.4.40-x86_64-unknown-linux-gnu.tar.gz \
+            | tar -xz -C /usr/local/bin
+          chmod +x /usr/local/bin/mdbook
+
+      # book.toml declares `[preprocessor.mermaid] command = "mdbook-mermaid"`, so the binary
+      # must be on PATH or `mdbook build` fails with "preprocessor 'mermaid' not found". The
+      # committed book/mermaid*.js do the client-side rendering; this only rewraps the fences.
+      # (Swap to a pinned release binary if the ~1-2 min compile is a concern.)
+      - name: Install mdbook-mermaid
+        run: cargo install mdbook-mermaid --locked
+
+      - name: Build book
+        run: mdbook build book
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: book/book
+
+  deploy:
+    name: Deploy to Pages
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4

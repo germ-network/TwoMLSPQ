@@ -7,7 +7,10 @@ src = "src"
 [output.html]
 default-theme = "navy"
 additional-js = ["mermaid.min.js", "mermaid-init.js"]
-# git-repository-url = "https://github.com/germ-network/TwoMLS"
+# Project Pages serves the book from a subpath: https://germ-network.github.io/TwoMLSPQ/.
+# Without this, the print page, 404 page, and search base resolve to the domain root and 404.
+site-url = "/TwoMLSPQ/"
+# git-repository-url = "https://github.com/germ-network/TwoMLSPQ"
 
 [preprocessor.mermaid]
 command = "mdbook-mermaid"
