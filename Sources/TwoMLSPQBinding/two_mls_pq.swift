@@ -1898,6 +1898,17 @@ public protocol TwoMlsPqSessionProtocol: AnyObject, Sendable {
     func receiveGroupId()  -> CombinerGroupId?
     
     /**
+     * This session's OWN send-group id — the classical half is present from
+     * creation, the PQ half empty until its deferred bootstrap (A.3). Unlike
+     * [`active_session_id`](Self::active_session_id) (a hash of the two client ids,
+     * shared across the pair) this is a per-endpoint value: each side's send group
+     * differs, so an adopter keying local state by it never shares an at-rest
+     * identifier with its peer. The mirror of [`receive_group_id`](Self::receive_group_id)
+     * (my send group is the peer's receive group).
+     */
+    func sendGroupId()  -> CombinerGroupId?
+    
+    /**
      * Attach (or replace) the host's app-layer welcome on this initiated session. The
      * payload MUST be establishment-self-sufficient — it carries the MLS welcome
      * (`initial_welcome`), the initiator's CLASSICAL return key package, and the
@@ -2657,6 +2668,23 @@ open func pendingOutbound() -> Data?  {
 open func receiveGroupId() -> CombinerGroupId?  {
     return try!  FfiConverterOptionTypeCombinerGroupId.lift(try! rustCall() {
     uniffi_two_mls_pq_fn_method_twomlspqsession_receive_group_id(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * This session's OWN send-group id — the classical half is present from
+     * creation, the PQ half empty until its deferred bootstrap (A.3). Unlike
+     * [`active_session_id`](Self::active_session_id) (a hash of the two client ids,
+     * shared across the pair) this is a per-endpoint value: each side's send group
+     * differs, so an adopter keying local state by it never shares an at-rest
+     * identifier with its peer. The mirror of [`receive_group_id`](Self::receive_group_id)
+     * (my send group is the peer's receive group).
+     */
+open func sendGroupId() -> CombinerGroupId?  {
+    return try!  FfiConverterOptionTypeCombinerGroupId.lift(try! rustCall() {
+    uniffi_two_mls_pq_fn_method_twomlspqsession_send_group_id(
             self.uniffiCloneHandle(),$0
     )
 })
@@ -6321,6 +6349,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_receive_group_id() != 24855) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_send_group_id() != 56157) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_set_initial_app_payload() != 22701) {
