@@ -344,6 +344,16 @@ pub const ESTABLISHMENT_VECTOR_TAG: u8 = 0x07;
 ///   re-stapled on every initiator frame until establishment; hand it to the spawned
 ///   session's `process_incoming` AFTER the join (fail-open: it is an optional early
 ///   delivery — the sender re-sends until its first commit).
+///
+/// The BARE shape (`welcome` + `return_key_package`, no `app_payload`) is deliberately NOT
+/// establishment-self-sufficient — it carries no bootstrap-KP-commitment section. That is by
+/// design, not an omission: the commitment is only meaningful read from the host's SIGNED
+/// establishment payload, so the acceptor always receives it as a required SEPARATE argument
+/// to `receive`/`accept` (`bootstrap_kp_commitment`), delivered by the host out-of-band. A
+/// commitment section here would put security-load-bearing bytes on the envelope's
+/// UNAUTHENTICATED channel (see `seal_initial_envelope`), and would need a fifth
+/// `InitialFrame` field — an FFI shape change. So the bare shape stays a routing/transport
+/// hint; the app path is unaffected, since it uses the self-sufficient `app_payload`.
 #[derive(Debug, uniffi::Record)]
 pub struct InitialFrame {
     pub app_payload: Option<Vec<u8>>,
@@ -410,7 +420,12 @@ pub(crate) fn seal_hpke_blob(
 /// `welcome`/`return_key_package` sections are omitted by the composer — the caller
 /// passes exactly one of the two shapes. All consequential state
 /// keys off the signed, JOINED welcome (the invitation's `processed` ledger); sections
-/// outside `app_payload` are unauthenticated routing/establishment hints.
+/// outside `app_payload` are unauthenticated routing/establishment hints. In particular
+/// NEITHER shape carries the bootstrap-KP commitment on this channel: the self-sufficient
+/// `app_payload` embeds it inside its own signed envelope, and the bare shape relies on the
+/// host to deliver it out-of-band as the `bootstrap_kp_commitment` argument to
+/// `receive`/`accept`. An unauthenticated envelope section would be the wrong home for a
+/// value `pq_bootstrap_respond` anchors ML-KEM key material to.
 ///
 /// Framing — HPKE plaintext: `[ESTABLISHMENT_VECTOR_TAG]` then four u32-LE length-prefixed
 /// sections `[app_payload][welcome][return_key_package][stapled_message]`, empty = absent, no

@@ -419,7 +419,22 @@ struct SessionInner {
     /// just-in-time into the CURRENT client's store by `pq_bootstrap_bind` immediately
     /// before the join (the `inject_send_psks` pattern: the mls-rs stores are ephemeral
     /// plumbing) and consumed on success. Initiator-only.
-    bootstrap_kp_secret: Option<crate::key_package_store::KeyPackageSecret>,
+    ///
+    /// TWIN-FIELD INVARIANT with `bootstrap_kp`: both are set together at `initiate`
+    /// and both are `None` post-bind, but they do NOT clear together. `initiate` sets
+    /// both; `pq_bootstrap_begin` (or the parallel `pq_bootstrap_envelope`) consumes the
+    /// PUBLIC half while the secret persists — a session archived across the whole
+    /// begin↔bind window rides with `bootstrap_kp = None` and this secret still `Some`.
+    /// Only the bind clears the secret. So the enforceable direction is one-way:
+    /// `bootstrap_kp.is_some()` ⇒ this is `Some` (the public bytes never outlive the
+    /// private half). `session_from_wire` rejects a violating archive as `ArchiveInvalid`.
+    ///
+    /// Behind an `Arc` so the per-push archive encode shares this ~8 KB value by handle
+    /// instead of deep-cloning it on every checkpoint/core push; the secret is never
+    /// mutated in place, only replaced (`initiate`) or cleared (`pq_bootstrap_bind`), so
+    /// sharing is sound. The inner `HpkeSecretKey`s stay `ZeroizeOnDrop`, wiping when the
+    /// last handle drops at the bind-time clear.
+    bootstrap_kp_secret: Option<Arc<crate::key_package_store::KeyPackageSecret>>,
     /// The acceptor's pinned `H(initiator's PQ keyPackage)`, threaded in from the signed
     /// establishment payload via `receive`/`accept`. `pq_bootstrap_respond` refuses to
     /// stand up BSG-PQ around a KP′ that hashes to anything else
@@ -428,7 +443,7 @@ struct SessionInner {
     /// committed bytes, identity included), and unlike the live-principal equality it
     /// still admits the committed KP after a Phase 8 rotation (PQ leaves lag
     /// credentials by design; A.5 catches them up). Acceptor-only; rides the archive.
-    expected_bootstrap_kp_commitment: Option<Vec<u8>>,
+    expected_bootstrap_kp_commitment: Option<BootstrapKpCommitment>,
     /// Contract 26 (born-dedicated): this session's send group was created under a
     /// dedicated per-session principal whose credential differs from the invitation
     /// identity, so its establishment staple must carry the host's signed delegation
@@ -458,6 +473,32 @@ struct SessionInner {
     /// restore, so the first side-band seal before any `encrypt` is unpadded (bounded/harmless
     /// given send-ordering).
     last_message_frame_len: u64,
+}
+
+/// The acceptor's pinned 32-byte SHA-256 commitment `H(initiator's PQ keyPackage)`.
+/// Constructible only from exactly 32 bytes (`from_bytes`), so "we hold a commitment" and
+/// "it is the right length" become the same fact and cannot drift — the length check moves
+/// from the call sites into the type. The invitation-side `BootstrapCommitments` routing
+/// map deliberately stays `Vec<u8>`-keyed: its keys are already either `sha256` outputs or
+/// commitments this newtype validated upstream, so converting it would only churn the
+/// invitation wire for no additional safety.
+pub(in crate::session) struct BootstrapKpCommitment([u8; 32]);
+
+impl BootstrapKpCommitment {
+    /// Lift raw bytes into a commitment, or `None` if they are not exactly 32 bytes.
+    pub(in crate::session) fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        bytes.try_into().ok().map(Self)
+    }
+
+    /// Whether `kp` hashes to this commitment — the `pq_bootstrap_respond` pin check.
+    pub(in crate::session) fn matches(&self, kp: &[u8]) -> bool {
+        crate::sha256(kp) == self.0
+    }
+
+    /// The raw 32 bytes, for re-serialization onto the archive wire.
+    pub(in crate::session) fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
 }
 
 /// Ledger depth for `send_psk_ledger`: one entry per send-group epoch. The peer references
@@ -1423,7 +1464,7 @@ impl TwoMlsPqSession {
                 };
                 pq_store.remove_entry(&secret.0);
                 inner.bootstrap_kp = Some(kp);
-                inner.bootstrap_kp_secret = Some(secret);
+                inner.bootstrap_kp_secret = Some(Arc::new(secret));
             }
             let envelope = inner.compose_initial_envelope(None)?;
             inner.pending_outbound = Some(envelope);
@@ -1523,10 +1564,10 @@ impl TwoMlsPqSession {
         }
         // A commitment of the wrong length could never match any KP′ — reject it here,
         // before any state is touched, rather than let it surface as a confusing A.3
-        // failure long after establishment.
-        if bootstrap_kp_commitment.len() != 32 {
-            return Err(TwoMlsPqError::BootstrapKpMismatch);
-        }
+        // failure long after establishment. Lifting into the newtype IS the length check
+        // (it accepts only 32 bytes), and the live field carries the type from here on.
+        let bootstrap_kp_commitment = BootstrapKpCommitment::from_bytes(&bootstrap_kp_commitment)
+            .ok_or(TwoMlsPqError::BootstrapKpMismatch)?;
         // The return key package is classical-only by design (§A.1): the send group this
         // side is about to create starts with no PQ half, and the initiator's PQ key
         // package arrives in A.3, pinned by `bootstrap_kp_commitment`.
@@ -1869,10 +1910,12 @@ impl TwoMlsPqSession {
     /// package travels in A.3, pinned by `bootstrap_kp_commitment`) for the BARE
     /// envelope shape (no self-sufficient `set_initial_app_payload`):
     /// pre-establishment envelopes then carry `[welcome][return_kp]`, so any single
-    /// frame is a complete establishment vector for the invitation holder. Unused when
-    /// a host payload is attached (the payload carries the key package itself). Same
-    /// guards, capture ordering, and envelope regeneration as
-    /// `set_initial_app_payload`.
+    /// frame is a complete establishment vector for the invitation holder — "complete"
+    /// meaning the classical establishment itself: the bare shape deliberately carries no
+    /// bootstrap-KP commitment (see [`crate::key_packages::InitialFrame`]), which the host supplies
+    /// out-of-band as the separate `bootstrap_kp_commitment` argument to `receive`/`accept`.
+    /// Unused when a host payload is attached (the payload carries the key package itself).
+    /// Same guards, capture ordering, and envelope regeneration as `set_initial_app_payload`.
     pub fn set_initial_return_key_package(&self, key_package: Vec<u8>) -> Result<()> {
         self.set_initial_field(|inner| inner.initial_return_kp = Some(key_package))
     }

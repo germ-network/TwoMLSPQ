@@ -1038,9 +1038,9 @@ impl TwoMlsPqSession {
             // history window (PQ leaves lag credentials by design; A.5 catches them up).
             let expected = inner
                 .expected_bootstrap_kp_commitment
-                .as_deref()
+                .as_ref()
                 .ok_or(TwoMlsPqError::SessionNotReady)?;
-            if crate::sha256(kp) != expected {
+            if !expected.matches(kp) {
                 return Err(TwoMlsPqError::BootstrapKpMismatch);
             }
             // Our send-PQ half must not already be up (checked last, matching the original body
@@ -1238,10 +1238,12 @@ impl TwoMlsPqSession {
                 // store is ephemeral plumbing, the session is the custodian — and on a
                 // FAILED join the session copy is untouched, so a retriable failure
                 // (e.g. an early Welcome' before the classical join) retries intact.
-                let injected = inner.bootstrap_kp_secret.clone();
+                let injected = inner.bootstrap_kp_secret.clone(); // Arc handle, not a deep copy
                 let store = client.combiner().pq_kp_store();
                 if let Some(secret) = injected.as_ref() {
-                    store.insert_entry(secret.clone());
+                    // The one deep clone of the ~8 KB secret: the ephemeral store copy,
+                    // removed again right after the join.
+                    store.insert_entry((**secret).clone());
                 }
                 let joined = join_group_from_welcome(client.pq(), &pq_welcome);
                 if let Some(secret) = injected.as_ref() {

@@ -223,6 +223,107 @@ fn test_precommitted_bootstrap_kp_survives_restore() {
     assert!(bob.is_fully_established());
 }
 
+/// F2 negative: the bootstrap twin-field invariant is enforced on restore. The public KP
+/// bytes may never outlive the private half, so an archive with `bootstrap_kp = Some` and
+/// `bootstrap_kp_secret = None` is rejected as `ArchiveInvalid`. (The reverse — secret alone —
+/// is the legitimate mid-A.3 window and is admitted; see
+/// `test_archive_mid_a3_window_completes_after_restore`.)
+#[test]
+fn test_archive_rejects_bootstrap_kp_without_secret() {
+    use mls_rs::mls_rs_codec::{MlsDecode, MlsEncode};
+
+    let (alice, _bob) = establish_sessions();
+    let archive = assert_ok!(alice.archive());
+    let mut rest = &archive.bytes[5..];
+    let mut wire = assert_ok!(super::archive_wire::SessionArchive::mls_decode(&mut rest));
+    // A fresh initiator holds both halves of the pre-committed KP.
+    assert!(wire.bootstrap_kp.is_some());
+    assert!(wire.bootstrap_kp_secret.is_some());
+    // Drop only the private half → the forbidden public-without-private state.
+    wire.bootstrap_kp_secret = None;
+    let mut bytes = archive.bytes[..5].to_vec();
+    assert_ok!(wire.mls_encode(&mut bytes));
+    assert_err!(
+        TwoMlsPqSession::from_archive(crate::Archive { bytes }),
+        TwoMlsPqError::ArchiveInvalid
+    );
+}
+
+/// F3 restore validation: the acceptor's pinned commitment is length-checked on decode. A
+/// wire value that is not exactly 32 bytes can never match any KP′, so `session_from_wire`
+/// rejects it as `ArchiveInvalid` when lifting it into `BootstrapKpCommitment` — the same
+/// 32-byte fact the `receive`/`accept` path enforces at ingress (`BootstrapKpMismatch`).
+#[test]
+fn test_archive_rejects_wrong_length_bootstrap_commitment() {
+    use mls_rs::mls_rs_codec::{MlsDecode, MlsEncode};
+
+    let (_alice, bob) = establish_sessions();
+    let archive = assert_ok!(bob.archive());
+    let mut rest = &archive.bytes[5..];
+    let mut wire = assert_ok!(super::archive_wire::SessionArchive::mls_decode(&mut rest));
+    // The acceptor pinned the initiator's commitment at establishment.
+    assert!(wire.expected_bootstrap_kp_commitment.is_some());
+    wire.expected_bootstrap_kp_commitment = Some(vec![0u8; 31]);
+    let mut bytes = archive.bytes[..5].to_vec();
+    assert_ok!(wire.mls_encode(&mut bytes));
+    assert_err!(
+        TwoMlsPqSession::from_archive(crate::Archive { bytes }),
+        TwoMlsPqError::ArchiveInvalid
+    );
+}
+
+/// F2 positive window + F4 Arc round-trip: archiving DURING the begin↔bind window (public
+/// half already consumed by `pq_bootstrap_begin`, secret still held) is admitted, and the
+/// Arc-wrapped secret survives the push/restore so the restored initiator still joins the
+/// Welcome' and completes the round.
+#[test]
+fn test_archive_mid_a3_window_completes_after_restore() {
+    let (alice, bob) = establish_sessions();
+    // Open the window: `begin` consumes the public KP bytes; the secret persists.
+    let kp = assert_ok!(alice.pq_bootstrap_begin(None));
+    let restored = round_trip(&alice);
+    drop(alice);
+
+    assert_ok!(bob.pq_bootstrap_respond(kp));
+    let welcome = assert_some!(bob.pq_take_pending_outbound());
+    // The restored (Arc-decoded) secret resolves the Welcome' across the jump.
+    assert_ok!(restored.pq_bootstrap_bind(welcome));
+    discharge_bind(&restored, &bob, b"mid-a3-window");
+    assert!(restored.is_fully_established());
+    assert!(bob.is_fully_established());
+}
+
+/// F3/F4 no-bump proof: the `BootstrapKpCommitment` conversion and the `ArcKpSecret` codec
+/// delegation are byte-transparent — decoding an archive body and re-encoding it reproduces
+/// the exact bytes, for both an initiator (secret present) and an acceptor (commitment
+/// present). Varint decode enforces minimal encoding, so this pins the wire layout unchanged.
+#[test]
+fn test_archive_reencode_is_byte_identical() {
+    use mls_rs::mls_rs_codec::{MlsDecode, MlsEncode};
+
+    let (alice, bob) = establish_sessions();
+    for session in [&alice, &bob] {
+        let archive = assert_ok!(session.archive());
+        let body = &archive.bytes[5..];
+        let mut rest = body;
+        let wire = assert_ok!(super::archive_wire::SessionArchive::mls_decode(&mut rest));
+        let mut reencoded = Vec::new();
+        assert_ok!(wire.mls_encode(&mut reencoded));
+        assert_eq!(reencoded.as_slice(), body);
+    }
+}
+
+/// Monotonic-advance ratchet for `SESSION_ARCHIVE_VERSION`. The emitted archive's version
+/// byte is pinned so it cannot move silently: editing this literal is legal ONLY upward and
+/// ONLY in lockstep with a real archive layout or acceptance-semantics change (see the
+/// constant's doc). A surprise failure here means the wire moved without a version bump.
+#[test]
+fn test_session_archive_version_is_pinned() {
+    let (alice, _bob) = establish_sessions();
+    let archive = assert_ok!(alice.archive());
+    assert_eq!(archive.bytes[0], 2);
+}
+
 /// The pre-committed bootstrap KP carries the FROZEN establishment credential. Enough
 /// peer rotations before a deferred A.3 evict that id from the acceptor's
 /// credential-history window — but the acceptor PINS it (eviction-exempt) from the

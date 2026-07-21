@@ -6,32 +6,61 @@
 
 use super::*;
 
-// The session archive layout version. The byte covers the WHOLE layout. Still pre-release, so
-// a layout change need not bump it — an archive from an older/other build simply fails to
-// decode (`ArchiveInvalid`) and is regenerated; no migration.
-// The header carries the concrete `ApqCipherSuite` pair (4 bytes, classical then pq,
-// big-endian) in place of the old PQ-mode byte: the suite is a stored session property, and a
-// restored archive whose pair differs from this build's pinned suite fails loudly.
+// The session archive layout version. The byte covers the WHOLE layout. There is still no
+// cross-version archive compatibility — an archive from another build simply fails to decode
+// (`ArchiveInvalid`) and is regenerated; no migration. The header also carries the concrete
+// `ApqCipherSuite` pair (4 bytes, classical then pq, big-endian) in place of the old PQ-mode
+// byte: the suite is a stored session property, and a restored archive whose pair differs
+// from this build's pinned suite fails loudly.
 //
-// PRE-RELEASE FLOOR RESET (2026-07-13, with the §A.1 pre-establishment-sends layout
-// change — the wire gained the initiator's retained envelope state `initial_their_kp` /
-// `initial_app_payload` / `initial_return_kp`, so a session captured at birth restores
-// send-ready; all three are None once established and on acceptors): the v1–v10 ladder
-// this byte accumulated carried no compatibility value (every bump was a hard cut; the
-// history stays in git), so the byte returns to the floor. Blobs from every prior cut
-// wear bytes 2–10 and fail the header check; ancient v1-era layouts are additionally
-// rejected structurally (the staple first-byte check in `session_from_wire`, whose
-// fields pre-v2 bytes could otherwise alias into).
-const SESSION_ARCHIVE_VERSION: u8 = 1;
+// MONOTONIC FROM HERE ON. Every change to the archive's layout OR its acceptance semantics
+// (a new field, a reshaped field, or a tightened restore-time validation) bumps this byte by
+// one. The byte never resets and never reuses a value — even though nothing needs to *read*
+// an old value (the hard cut means old blobs just fail), a monotonic version is the honest
+// record of "this layout is not that layout", and a distinct byte keeps two builds' blobs
+// from ever being mistaken for each other. This ends the earlier pre-release convention of
+// leaving the byte untouched (and the 2026-07-13 floor reset to 1); those and the original
+// v1–v10 ladder stay in git as history. Ancient pre-v2 layouts remain rejected structurally
+// too (the staple first-byte check in `session_from_wire`, whose fields their bytes could
+// otherwise alias into).
+//
+// v2 (this change): restore-time validation tightened — the bootstrap twin-field invariant
+// and the 32-byte commitment length are now enforced on decode (see `session_from_wire`).
+const SESSION_ARCHIVE_VERSION: u8 = 2;
 
 // In its own module because the derive-generated impls reference the std `Result`, which
 // the crate-local `Result` alias would shadow (same pattern as `invitation::wire`).
 pub(crate) mod archive_wire {
+    use std::sync::Arc;
+
     use mls_rs::mls_rs_codec::{self, MlsDecode, MlsEncode, MlsSize};
     use mls_rs::psk::{ExternalPskId, PreSharedKey};
     use zeroize::Zeroizing;
 
     use crate::key_package_store::KeyPackageSecret;
+
+    /// The session-owned pre-committed A.3 bootstrap KP secret, held behind an `Arc` so the
+    /// per-push archive encode shares the live session's ~8 KB value by handle rather than
+    /// deep-cloning it on every checkpoint/core push (mls-rs-codec has no `Arc` impls, so
+    /// the wrapper delegates: encode/size defer to the inner `KeyPackageSecret`, producing
+    /// byte-identical wire output, and decode owns a fresh value wrapped in a new `Arc`).
+    pub(in crate::session) struct ArcKpSecret(pub(in crate::session) Arc<KeyPackageSecret>);
+
+    impl MlsSize for ArcKpSecret {
+        fn mls_encoded_len(&self) -> usize {
+            self.0.as_ref().mls_encoded_len()
+        }
+    }
+    impl MlsEncode for ArcKpSecret {
+        fn mls_encode(&self, writer: &mut Vec<u8>) -> Result<(), mls_rs_codec::Error> {
+            self.0.as_ref().mls_encode(writer)
+        }
+    }
+    impl MlsDecode for ArcKpSecret {
+        fn mls_decode(reader: &mut &[u8]) -> Result<Self, mls_rs_codec::Error> {
+            KeyPackageSecret::mls_decode(reader).map(|s| Self(Arc::new(s)))
+        }
+    }
 
     /// One exported mls-rs group snapshot (plaintext secret material — the enclosing
     /// archive carries the sealing obligation, see [`super::TwoMlsPqSession::archive`]).
@@ -314,6 +343,13 @@ pub(crate) mod archive_wire {
         /// Present from `initiate` until `pq_bootstrap_begin` consumes it, so a session
         /// restored between reply and A.3 still opens the round with the KP the
         /// establishment signature committed to. `None` on acceptors.
+        ///
+        /// TWIN-FIELD INVARIANT with `bootstrap_kp_secret`: the public bytes never
+        /// outlive the private half. Registration (`pq_bootstrap_begin`) clears the
+        /// public half while the secret persists through the whole begin↔bind window, so
+        /// the reverse (secret alone) is a legitimate persisted state and only
+        /// `bootstrap_kp.is_some() && bootstrap_kp_secret.is_none()` is rejected on
+        /// restore (see `session_from_wire`).
         pub(in crate::session) bootstrap_kp: Option<Vec<u8>>,
         /// The pre-committed KP's PRIVATE half — session-owned custody (per-client
         /// `SigningIdentityBlob.pq_kps` would be dropped by a Phase 8 client swap, and
@@ -321,11 +357,14 @@ pub(crate) mod archive_wire {
         /// around the KP regardless of rotations). Present from `initiate` until the
         /// `pq_bootstrap_bind` join consumes it. `None` on acceptors. Secret material,
         /// like the group snapshots: the enclosing archive carries the sealing
-        /// obligation.
-        pub(in crate::session) bootstrap_kp_secret: Option<KeyPackageSecret>,
+        /// obligation. Wrapped in `Arc` (`ArcKpSecret`) so the encode borrows rather than
+        /// deep-copies; the wire bytes are exactly the inner `KeyPackageSecret`'s.
+        pub(in crate::session) bootstrap_kp_secret: Option<ArcKpSecret>,
         /// The acceptor's pinned `H(initiator's PQ keyPackage)` from the signed
         /// establishment payload, enforced at `pq_bootstrap_respond`. `None` on
-        /// initiators.
+        /// initiators. Raw 32 bytes on the wire; the live session lifts it into a
+        /// `BootstrapKpCommitment` on restore, rejecting any other length as
+        /// `ArchiveInvalid` (see `session_from_wire`).
         pub(in crate::session) expected_bootstrap_kp_commitment: Option<Vec<u8>>,
         /// Contract 26: born-dedicated — this session owes a signed establishment
         /// envelope before it may emit. A restored pre-install session must keep
@@ -560,6 +599,21 @@ fn session_from_wire(wire: archive_wire::SessionArchive) -> Result<Arc<TwoMlsPqS
     ) {
         return Err(TwoMlsPqError::ArchiveInvalid);
     }
+    // Twin-field invariant (see `SessionInner::bootstrap_kp_secret`): the public bootstrap
+    // KP bytes never outlive the private half. The reverse — secret without public — is the
+    // legitimate mid-A.3 window (registration consumes the public bytes; the bind consumes
+    // the secret), so only the one-way implication is checkable.
+    if wire.bootstrap_kp.is_some() && wire.bootstrap_kp_secret.is_none() {
+        return Err(TwoMlsPqError::ArchiveInvalid);
+    }
+    // Lift the acceptor's pinned commitment into its length-checked live form; a wire value
+    // of any other length is a corrupt or forged archive.
+    let expected_bootstrap_kp_commitment = match wire.expected_bootstrap_kp_commitment {
+        None => None,
+        Some(c) => {
+            Some(BootstrapKpCommitment::from_bytes(&c).ok_or(TwoMlsPqError::ArchiveInvalid)?)
+        }
+    };
 
     let my_state = principal_state_from_wire(wire.my_state);
     let their_state = principal_state_from_wire(wire.their_state);
@@ -699,8 +753,8 @@ fn session_from_wire(wire: archive_wire::SessionArchive) -> Result<Arc<TwoMlsPqS
             initial_app_payload: wire.initial_app_payload,
             initial_return_kp: wire.initial_return_kp,
             bootstrap_kp: wire.bootstrap_kp,
-            bootstrap_kp_secret: wire.bootstrap_kp_secret,
-            expected_bootstrap_kp_commitment: wire.expected_bootstrap_kp_commitment,
+            bootstrap_kp_secret: wire.bootstrap_kp_secret.map(|s| s.0),
+            expected_bootstrap_kp_commitment,
             // Contract 26: a restored pre-install born-dedicated session keeps
             // refusing the emission doors (the flag rides the archive precisely
             // so a restore cannot reopen them).
@@ -923,8 +977,14 @@ fn build_archive_wire(
             initial_app_payload: inner.initial_app_payload.clone(),
             initial_return_kp: inner.initial_return_kp.clone(),
             bootstrap_kp: inner.bootstrap_kp.clone(),
-            bootstrap_kp_secret: inner.bootstrap_kp_secret.clone(),
-            expected_bootstrap_kp_commitment: inner.expected_bootstrap_kp_commitment.clone(),
+            bootstrap_kp_secret: inner
+                .bootstrap_kp_secret
+                .as_ref()
+                .map(|s| archive_wire::ArcKpSecret(Arc::clone(s))),
+            expected_bootstrap_kp_commitment: inner
+                .expected_bootstrap_kp_commitment
+                .as_ref()
+                .map(|c| c.as_bytes().to_vec()),
             requires_establishment_envelope: inner.requires_establishment_envelope,
             establishment_envelope: inner.establishment_envelope.clone(),
         };
