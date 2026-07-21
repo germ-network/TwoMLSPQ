@@ -1,6 +1,10 @@
 # TwoMLSPQ
 
-Germ Network's implementation of 1:1 encrypted messaging sessions built on two asymmetric MLS send groups (Distributed MLS — draft-xue-distributed-mls).
+Germ Network's implementation of 1:1 aysnc, end-to-end encrypted messaging sessions,
+built on MLS. It implements a triple ratchet
+(symmetric encryption, asymmetric classical encryption, asymmetric PQ encryption) for forward
+secrecy and post-compromise security. It further bundles MLS handshake plane messages so that
+there is no dependency among in-flight messages, and applies header encryption to the bundle.
 
 This repository holds the whole stack: the Rust/UniFFI core under [`rust/`](rust/), and
 the hand-written Swift wrapper (**AbstractTwoMLS**) that consumes it — `Package.swift`,

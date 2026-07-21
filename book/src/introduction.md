@@ -1,31 +1,36 @@
 # Introduction
 
+TwoMLSPQ is a Rust implementation of a PQ triple ratchet with header encryption.
+Its interface is exported through UniFFI.
+We provide a swift build script, and a swift package that wraps the FFI API in
+Swift Concurrency-friendly types.
+
 TwoMLSPQ is a Rust + UniFFI library implementing 1:1 post-quantum end-to-end
-encryption on top of **two asymmetric MLS send groups**, one per party. Each send
+encryption on top of **two send groups**, one per party. Each send
 group is implemented as an **APQ group** — a classical MLS group and a PQ MLS group
 bound by a PSK chain, following `draft-ietf-mls-combiner-02` and instantiated with
 ML-KEM-768 (FIPS 203).
 
-It does not replace the classical MLS stack; it sits alongside it and covers the
-post-quantum gap for direct (1:1) conversations.
-
 ## Where it sits
 
 ```
-iOS App
-  └─ CommProtocol (Swift)        DIDs · Anchors · Agent keys · routing
-       └─ TwoMLSPQ (this crate)  sessions · two send groups (APQ groups)
-            └─ mls-rs            MLS group state · key schedules
-                 └─ crypto       X25519/ChaCha (classical) · ML-KEM-768 (PQ)
+App
+		TwoMLSPQ(Swift Package) Swift API
+    		└─ TwoMLSPQ (rust crate)  sessions · two send groups (APQ groups)
+        		└─ mls-rs            MLS group state · key schedules
+              		└─ crypto       X25519/ChaCha (classical) · ML-KEM-768 (PQ)
+        └─ CommProtocol (Swift)        TypedDigest
+
 ```
 
-CommProtocol owns identity (DIDs, anchor keys) and hands TwoMLSPQ the opaque **`ClientId`**
-of one of its **agents** — identity bytes, not a key. TwoMLSPQ has no notion of agents; it
-builds a **`TwoMlsPqPrincipal`** for that ClientId, minting a fresh MLS leaf signing key
-internally (the key is independent of the ClientId — *principal* is this library's
-CommProtocol-agnostic name for the credential-scoped signer CommProtocol calls an agent, and
-the `Agent ↔ Principal` mapping is documented at the AbstractTwoMLS boundary). The ClientId
-is carried as the MLS Basic Credential — identity trust comes from the app layer, not an
+The Swift package does pull in CommProtocol for a TypedDigest to express hash digests in its
+API without making them opaque bytes. It does not otherwise depend on CommProtocol's identities
+and exposes an MLS client interface of basic credentials.
+
+The app hands TwoMLSPQ the opaque **`ClientId`** of one of its **agents** — identity bytes.
+TwoMLSPQ builds a **`TwoMlsPqPrincipal`** for that ClientId, minting a fresh MLS leaf signing key
+internally. The ClientId is carried as the MLS Basic Credential — identity trust comes
+from the app layer, not an
 external Authentication Service — and the signing key that authenticates the leaf lives
 inside this library and never crosses the boundary. Everything above the ClientId is outside
 this library's boundary.
