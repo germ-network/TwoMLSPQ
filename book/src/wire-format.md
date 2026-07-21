@@ -52,8 +52,8 @@ only AFTER HPKE-open, by the authenticated leading tag of the plaintext:
 
 - `ESTABLISHMENT_VECTOR_TAG` (`0x07`) → the establishment reply — four u32-LE
   length-prefixed sections `[app_payload][welcome][return_key_package][stapled_message]`.
-- `PQ_BOOTSTRAP_KP_TAG` (`0x13`) → the parallel-delivered A.4 bootstrap KP frame, carried
-  verbatim (`[0x13][KP′]`) — the same side-band frame steady-state A.4 uses, only its outer
+- `PQ_BOOTSTRAP_KP_TAG` (`0x13`) → the parallel-delivered A.3 bootstrap KP frame, carried
+  verbatim (`[0x13][KP′]`) — the same side-band frame steady-state A.3 uses, only its outer
   framing differs (HPKE envelope here vs. header-sealed side-band later).
 
 This is the same discipline the whole tag space follows: the transport path limits which keys
@@ -106,9 +106,9 @@ checks `pq_frame_kind` against it over all 256 bytes. A range test would be unso
 reserved byte is *in* `0x13`–`0x31`, so "in range ⟺ classified" would wave through a reserve
 that quietly started routing.
 
-Note the side-band's lifecycle order does **not** match the spec's section numbers (A.4
-bootstrap precedes A.3 ratchet): the classifier is ordered by lifecycle, the section
-numbers by their own scheme.
+The side-band's lifecycle order now matches the spec's section numbers: the classifier is
+ordered by lifecycle (A.3 bootstrap, then A.4 ratchet, then A.5 re-key), and the section
+numbers follow that same order — tag `0x13`/`0x17`/`0x1B` line up with §A.3/§A.4/§A.5.
 
 Each multi-section frame uses a `u32`-LE length prefix per embedded field. Hosts
 classify PQ side-band frames via the exported `pq_frame_kind` (never by matching raw
@@ -164,7 +164,7 @@ hundred bytes.
 The unavoidably large staples are the APQ welcomes, and only until the first commit:
 
 - the **acceptor** staples only a classical-half welcome (~1 KB) — its PQ group is
-  deferred to the A.4 bootstrap for exactly this reason;
+  deferred to the A.3 bootstrap for exactly this reason;
 - the **initiator** re-staples its full two-half APQ welcome (ML-KEM-sized, several
   KB) on every frame until its first commit — a window that is app-gated (it closes
   when the first peer proposal is approved and committed) and whose repeats the peer

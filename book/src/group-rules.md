@@ -12,7 +12,7 @@ reusable layer: an `MlsRules` filter every client is built with
 1. **Exactly two members, fixed at creation.** The *creation commit* is the one
    permitted Add: the creator, alone in the group, adds the single peer and nothing
    else. That is how every half is born — the classical halves at establishment, the
-   acceptor's PQ half at the A.4 bootstrap (`create_group_with_member`). Once the
+   acceptor's PQ half at the A.3 bootstrap (`create_group_with_member`). Once the
    roster is two: no Add, Remove, ReInit, ExternalInit, or GroupContextExtensions,
    ever; no external commits; no external senders. The **only** custom proposal ever
    admitted is the draft-02 `AppDataUpdate` (type `0x0008`) that attests new epochs in a
@@ -24,7 +24,7 @@ reusable layer: an `MlsRules` filter every client is built with
    pins it to the peer.
 3. **Application and external PSKs only, never resumption.** The APQ-PSK and
    cross-party TwoMLS-PSK are imported as `application(3)` PSKs (draft-02 §6.2); the
-   A.3 injected secret rides an `external(1)` PSK. Resumption PSKs are never used (this
+   A.4 injected secret rides an `external(1)` PSK. Resumption PSKs are never used (this
    protocol never resumes groups). See [PSK Binding](./psk-binding.md).
 4. **Basic credentials only, evolving along the app-defined sequence.** Each leaf's
    credential is the member's opaque ClientId, and it may change only per the TwoMLS
@@ -34,7 +34,7 @@ reusable layer: an `MlsRules` filter every client is built with
    (the staple re-rides every frame).
 6. **Establishment binds identities.** A combiner key package's two halves must name
    one ClientId; the welcome's creator leaf must equal the key package's identity at
-   `receive`/`accept`; an A.4 bootstrap key package must match the hash commitment the
+   `receive`/`accept`; an A.3 bootstrap key package must match the hash commitment the
    initiator pinned at `initiate` and the acceptor recorded at `receive`
    (`BootstrapKpMismatch`) — which binds the exact KP′, stronger than a names-the-peer
    equality, while its leaf identity is still AS-validated at group creation.
@@ -49,11 +49,11 @@ reusable layer: an `MlsRules` filter every client is built with
    both cipher suites, and the creation-time epochs — written at creation, riding the
    Welcome, and **never rewritten** (rewriting it would need a GroupContextExtensions
    proposal, which rule 1 forbids — and which would force an updatePath onto the
-   otherwise-pathless A.3 bind). Epoch freshness rides the `AppDataUpdate` in each FULL
+   otherwise-pathless A.4 bind). Epoch freshness rides the `AppDataUpdate` in each FULL
    commit instead: both halves carry it, the two copies must agree, and each must attest
    its group's *actual* new epoch. A.5 re-keys are PQ-only and their side-band `Commit'` carries no `AppDataUpdate`
    (an attestation smuggled into one is rejected); the bumped `pq_epoch` reconciles
-   **in-round**, in the FULL commit the initiator staples as the round's ack. The deferred A.4 PQ group id is pre-allocated in the classical half's
+   **in-round**, in the FULL commit the initiator staples as the round's ack. The deferred A.3 PQ group id is pre-allocated in the classical half's
    `APQInfo` with its epoch set to `EPOCH_UNBOUND` until the bootstrap lands.
 8. **The AppBinding is written once and verified at every join.** A session is
    definitionally bound to its two agents, but agents are *mutable* (the rotation
@@ -89,10 +89,10 @@ checks each cover ingress the others cannot see.
 | No Add/Remove/ReInit/GCE post-creation | rejected on build **and** on receive (a peer commit carrying one is vetoed before it applies) | post-commit `ensure_two_party` backstop |
 | Custom proposals: only `AppDataUpdate` (`0x0008`) | ≤ 1 custom proposal, correct type, committer-sent, strict-decoded, same-half epoch == `context.epoch + 1`; any other custom type rejected | presence/cross-half agreement and actual-epoch match verified in the session (`apply_bind`), before app decrypt |
 | ≤ 1 Update, peer's own leaf only | sender ≠ committer on every folded Update | `require_peer_update` at ingest rejects anything that isn't the peer's own-leaf Update *before* it enters a cache — the stapled proposal (`queue_proposal`) and the A.5 opener (`pq_rekey_respond`); the A.5 ack (`pq_rekey_apply`) ingests a `Commit'`, not a proposal, so its folded Update is vetoed instead by the mls-rs rules filter (sender ≠ committer) |
-| Application/external PSKs, never resumption | resumption rejected; external **or** application accepted | PSK ids are minted internally (`export_psk`); application PSKs carry the APQ/cross-party bindings, the A.3 injected secret stays external |
+| Application/external PSKs, never resumption | resumption rejected; external **or** application accepted | PSK ids are minted internally (`export_psk`); application PSKs carry the APQ/cross-party bindings, the A.4 injected secret stays external |
 | No external commits/senders | `CommitSource::NewMember` rejected | external senders never configured |
 | Epoch discipline | — | staple-epoch compare in `process_incoming` (`EpochDesync` / skip) |
-| Identity binding at establishment | — | `expected_remote` pre-claim check; creator-leaf ≡ key-package check at join; A.4 bootstrap KP hash-commitment check (`BootstrapKpMismatch`) |
+| Identity binding at establishment | — | `expected_remote` pre-claim check; creator-leaf ≡ key-package check at join; A.3 bootstrap KP hash-commitment check (`BootstrapKpMismatch`) |
 | App-state binding at establishment | GCE ban keeps it immutable post-creation | `verify_app_binding` against `expected_app_binding` at `receive`/`accept` (post-join, pre-claim) and against the session's own binding at the initiator's return-welcome join; `verify_pq_half_unbound` at every PQ-half join (the binding lives on the classical halves only); empty bindings rejected at creation and as expectations (all `AppBindingMismatch`); leaf capability advertisement keeps uncapable leaves out of bound groups |
 
 Two properties worth naming:
@@ -132,7 +132,7 @@ sequence is driven by the classical ratchet itself:
    leaves the group's proposal cache **untouched** (it re-applies the one approved
    proposal only at commit), so a rejected approval is a no-op and a replacement never
    accumulates a second Update. The tally is epoch-locked: it is dropped when our send
-   epoch advances by an A.3 bind, and the app re-approves from the peer's fresh offer
+   epoch advances by an A.4 bind, and the app re-approves from the peer's fresh offer
    (the receiver may freely drop — the proposer re-sends every round).
 3. **The commit defines the canonical next credential.** When the receiver's commit
    folds the chosen Upd, that credential becomes the sender's canonical identity
@@ -142,7 +142,7 @@ sequence is driven by the classical ratchet itself:
    authorizations expire.
 4. **Everything else lags and catches up.** The sender's own send-group leaf moves at
    its next approved commit (the peer observes `new_sender`); the PQ leaves catch up
-   at the next A.4/A.5 handoff; the acceptor's recv-group leaf converges from the
+   at the next A.3/A.5 handoff; the acceptor's recv-group leaf converges from the
    invitation identity to the dedicated principal via its first committed Upd.
    The AS validates every catch-up against the sequence *history*
    (`CREDENTIAL_HISTORY_WINDOW = 8` canonical steps) — a lagging leaf may only

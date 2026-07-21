@@ -1,4 +1,4 @@
-//! Germ PQ ratchet (two-mls-pq book: Protocol Flows §A.3): fresh ML-KEM entropy is injected into
+//! Germ PQ ratchet (two-mls-pq book: Protocol Flows §A.4): fresh ML-KEM entropy is injected into
 //! the PQ group via a *pathless* PSK commit, then re-exported into the classical group, so the
 //! whole bind is cheap and staple-able to an app message — no per-round PQ updatePath.
 //!
@@ -51,7 +51,7 @@ impl PqEphemeral {
     }
 
     /// Rebuild an ephemeral from its serialised decapsulation and encapsulation key
-    /// bytes (an initiator-side mid-A.3 archive restore). The bytes are wrapped, not
+    /// bytes (an initiator-side mid-A.4 archive restore). The bytes are wrapped, not
     /// validated: a corrupt pair simply fails to recover the peer's S in [`decapsulate`].
     pub fn from_bytes(dk: &[u8], ek: &[u8]) -> Self {
         Self {

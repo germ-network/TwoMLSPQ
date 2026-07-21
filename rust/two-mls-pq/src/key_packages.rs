@@ -337,13 +337,23 @@ pub const ESTABLISHMENT_VECTOR_TAG: u8 = 0x07;
 /// - `welcome` — the bare MLS `APQWelcome_A` to hand to `receive` (no app payload).
 /// - `return_key_package` — the initiator's CLASSICAL return key package, a bare MLS
 ///   KeyPackage message handed to `receive` as-is (§A.1: the return group starts
-///   classical-only; the initiator's PQ key package travels in A.4, pinned by the
+///   classical-only; the initiator's PQ key package travels in A.3, pinned by the
 ///   bootstrap KP commitment).
 /// - `stapled_message` — a pre-establishment app message (`[0x09][ASG-cl ciphertext]` —
 ///   sealed in the initiator's send group),
 ///   re-stapled on every initiator frame until establishment; hand it to the spawned
 ///   session's `process_incoming` AFTER the join (fail-open: it is an optional early
 ///   delivery — the sender re-sends until its first commit).
+///
+/// The BARE shape (`welcome` + `return_key_package`, no `app_payload`) is deliberately NOT
+/// establishment-self-sufficient — it carries no bootstrap-KP-commitment section. That is by
+/// design, not an omission: the commitment is only meaningful read from the host's SIGNED
+/// establishment payload, so the acceptor always receives it as a required SEPARATE argument
+/// to `receive`/`accept` (`bootstrap_kp_commitment`), delivered by the host out-of-band. A
+/// commitment section here would put security-load-bearing bytes on the envelope's
+/// UNAUTHENTICATED channel (see `seal_initial_envelope`), and would need a fifth
+/// `InitialFrame` field — an FFI shape change. So the bare shape stays a routing/transport
+/// hint; the app path is unaffected, since it uses the self-sufficient `app_payload`.
 #[derive(Debug, uniffi::Record)]
 pub struct InitialFrame {
     pub app_payload: Option<Vec<u8>>,
@@ -362,10 +372,10 @@ pub enum OpenedInitial {
     /// Leading tag `ESTABLISHMENT_VECTOR_TAG` (0x07): the establishment reply's four optional
     /// sections (see [`InitialFrame`]).
     Establishment { frame: InitialFrame },
-    /// Leading tag `PQ_BOOTSTRAP_KP_TAG` (0x13): the initiator's A.4 bootstrap frame delivered
+    /// Leading tag `PQ_BOOTSTRAP_KP_TAG` (0x13): the initiator's A.3 bootstrap frame delivered
     /// IN PARALLEL with the reply (Part 3). The pre-commitment fixed the KP bytes at
-    /// `initiate`, so the initiator ships its A.4 KP′ alongside the establishment reply
-    /// instead of waiting a round trip for A.4's first send. `frame` is the VERBATIM
+    /// `initiate`, so the initiator ships its A.3 KP′ alongside the establishment reply
+    /// instead of waiting a round trip for A.3's first send. `frame` is the VERBATIM
     /// `[0x13][KP′ …]` side-band frame `pq_bootstrap_respond` consumes — only the OUTER
     /// framing differed (the §A.1 HPKE envelope here vs. the header-sealed side-band in
     /// steady state). The receiver holds it UNTIL the reply establishes the session, then
@@ -410,7 +420,12 @@ pub(crate) fn seal_hpke_blob(
 /// `welcome`/`return_key_package` sections are omitted by the composer — the caller
 /// passes exactly one of the two shapes. All consequential state
 /// keys off the signed, JOINED welcome (the invitation's `processed` ledger); sections
-/// outside `app_payload` are unauthenticated routing/establishment hints.
+/// outside `app_payload` are unauthenticated routing/establishment hints. In particular
+/// NEITHER shape carries the bootstrap-KP commitment on this channel: the self-sufficient
+/// `app_payload` embeds it inside its own signed envelope, and the bare shape relies on the
+/// host to deliver it out-of-band as the `bootstrap_kp_commitment` argument to
+/// `receive`/`accept`. An unauthenticated envelope section would be the wrong home for a
+/// value `pq_bootstrap_respond` anchors ML-KEM key material to.
 ///
 /// Framing — HPKE plaintext: `[ESTABLISHMENT_VECTOR_TAG]` then four u32-LE length-prefixed
 /// sections `[app_payload][welcome][return_key_package][stapled_message]`, empty = absent, no
@@ -779,7 +794,7 @@ impl TwoMlsPqInvitation {
     /// `their_classical_key_package` is the initiator's CLASSICAL return key package —
     /// a bare MLS KeyPackage message, not a combiner blob (§A.1: the send group this
     /// call creates starts classical-only, so classical is all it needs; the
-    /// initiator's PQ key package arrives later, in the A.4 side-band).
+    /// initiator's PQ key package arrives later, in the A.3 side-band).
     /// `bootstrap_kp_commitment` is `H(initiator's PQ keyPackage)` from the SIGNED
     /// establishment payload: `pq_bootstrap_respond` refuses to stand up the PQ half
     /// around a KP′ that hashes to anything else (`BootstrapKpMismatch`), anchoring the
@@ -972,9 +987,9 @@ impl TwoMlsPqInvitation {
     }
 
     /// Resolve a §A.1 bootstrap-KP frame against the bootstrap-commitment table: `Some` names the
-    /// receive group (classical, message-half id) of the session that owes A.4 for this exact KP′
+    /// receive group (classical, message-half id) of the session that owes A.3 for this exact KP′
     /// — route the frame to that session's `pq_bootstrap_respond`. `None` means no spawned session
-    /// ever pinned this KP′ (unknown or garbage — discard). Note the table is NOT pruned on A.4
+    /// ever pinned this KP′ (unknown or garbage — discard). Note the table is NOT pruned on A.3
     /// completion (the invitation cannot observe session state), so a KP′ whose session already
     /// answered still resolves here; the duplicate is a benign no-op at `pq_bootstrap_respond`
     /// (`DuplicateSideBand`), not a `None`. Lets a KP′ delivered as a bootstrap envelope

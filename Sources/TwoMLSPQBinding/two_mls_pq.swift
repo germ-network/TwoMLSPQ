@@ -1047,9 +1047,9 @@ public protocol TwoMlsPqInvitationProtocol: AnyObject, Sendable {
     
     /**
      * Resolve a §A.1 bootstrap-KP frame against the bootstrap-commitment table: `Some` names the
-     * receive group (classical, message-half id) of the session that owes A.4 for this exact KP′
+     * receive group (classical, message-half id) of the session that owes A.3 for this exact KP′
      * — route the frame to that session's `pq_bootstrap_respond`. `None` means no spawned session
-     * ever pinned this KP′ (unknown or garbage — discard). Note the table is NOT pruned on A.4
+     * ever pinned this KP′ (unknown or garbage — discard). Note the table is NOT pruned on A.3
      * completion (the invitation cannot observe session state), so a KP′ whose session already
      * answered still resolves here; the duplicate is a benign no-op at `pq_bootstrap_respond`
      * (`DuplicateSideBand`), not a `None`. Lets a KP′ delivered as a bootstrap envelope
@@ -1163,7 +1163,7 @@ public protocol TwoMlsPqInvitationProtocol: AnyObject, Sendable {
      * `their_classical_key_package` is the initiator's CLASSICAL return key package —
      * a bare MLS KeyPackage message, not a combiner blob (§A.1: the send group this
      * call creates starts classical-only, so classical is all it needs; the
-     * initiator's PQ key package arrives later, in the A.4 side-band).
+     * initiator's PQ key package arrives later, in the A.3 side-band).
      * `bootstrap_kp_commitment` is `H(initiator's PQ keyPackage)` from the SIGNED
      * establishment payload: `pq_bootstrap_respond` refuses to stand up the PQ half
      * around a KP′ that hashes to anything else (`BootstrapKpMismatch`), anchoring the
@@ -1270,9 +1270,9 @@ public static func restore(archive: Data)throws  -> TwoMlsPqInvitation  {
     
     /**
      * Resolve a §A.1 bootstrap-KP frame against the bootstrap-commitment table: `Some` names the
-     * receive group (classical, message-half id) of the session that owes A.4 for this exact KP′
+     * receive group (classical, message-half id) of the session that owes A.3 for this exact KP′
      * — route the frame to that session's `pq_bootstrap_respond`. `None` means no spawned session
-     * ever pinned this KP′ (unknown or garbage — discard). Note the table is NOT pruned on A.4
+     * ever pinned this KP′ (unknown or garbage — discard). Note the table is NOT pruned on A.3
      * completion (the invitation cannot observe session state), so a KP′ whose session already
      * answered still resolves here; the duplicate is a benign no-op at `pq_bootstrap_respond`
      * (`DuplicateSideBand`), not a `None`. Lets a KP′ delivered as a bootstrap envelope
@@ -1442,7 +1442,7 @@ open func processedWelcomeGroupId(welcome: Data) -> MlsGroupId?  {
      * `their_classical_key_package` is the initiator's CLASSICAL return key package —
      * a bare MLS KeyPackage message, not a combiner blob (§A.1: the send group this
      * call creates starts classical-only, so classical is all it needs; the
-     * initiator's PQ key package arrives later, in the A.4 side-band).
+     * initiator's PQ key package arrives later, in the A.3 side-band).
      * `bootstrap_kp_commitment` is `H(initiator's PQ keyPackage)` from the SIGNED
      * establishment payload: `pq_bootstrap_respond` refuses to stand up the PQ half
      * around a KP′ that hashes to anything else (`BootstrapKpMismatch`), anchoring the
@@ -1806,7 +1806,7 @@ public protocol TwoMlsPqSessionProtocol: AnyObject, Sendable {
     func appBinding() throws  -> Data?
     
     /**
-     * `H(bootstrap_kp)` — the SHA-256 commitment to the A.4 bootstrap key package this
+     * `H(bootstrap_kp)` — the SHA-256 commitment to the A.3 bootstrap key package this
      * session pre-committed at `initiate`. The host binds it inside its SIGNED
      * establishment payload (next to the classical return key package), and the peer
      * threads it back through `receive`/`accept`, where `pq_bootstrap_respond`
@@ -1878,7 +1878,7 @@ public protocol TwoMlsPqSessionProtocol: AnyObject, Sendable {
     func isEstablished()  -> Bool
     
     /**
-     * True once both directions' PQ halves are live (post-A.4 bootstrap).
+     * True once both directions' PQ halves are live (post-A.3 bootstrap).
      */
     func isFullyEstablished()  -> Bool
     
@@ -1915,7 +1915,7 @@ public protocol TwoMlsPqSessionProtocol: AnyObject, Sendable {
     /**
      * Attach the initiator's CLASSICAL return key package (a bare MLS KeyPackage
      * message — §A.1: the acceptor's send group starts classical-only, and the PQ key
-     * package travels in A.4, pinned by `bootstrap_kp_commitment`) for the BARE
+     * package travels in A.3, pinned by `bootstrap_kp_commitment`) for the BARE
      * envelope shape (no self-sufficient `set_initial_app_payload`):
      * pre-establishment envelopes then carry `[welcome][return_kp]`, so any single
      * frame is a complete establishment vector for the invitation holder. Unused when
@@ -2071,7 +2071,7 @@ public protocol TwoMlsPqSessionProtocol: AnyObject, Sendable {
      * binding context for identity introductions, matching the classical backend's
      * convention and `QueuedRemoteProposal.context`. Always the classical half:
      * message ordering rides it, and it exists from establishment (the PQ half may
-     * still be deferred pre-A.4).
+     * still be deferred pre-A.3).
      */
     func proposalContext()  -> Data?
     
@@ -2088,7 +2088,7 @@ public protocol TwoMlsPqSessionProtocol: AnyObject, Sendable {
      * tally), or `None`. Lets the app decide whether a newly-received proposal should
      * replace it (queue the newer one) or be kept (do nothing); the library's own
      * policy is latest-wins, and the slot is cleared when the send epoch advances (a
-     * fold or an A.3 bind).
+     * fold or an A.4 bind).
      */
     func queuedRemoteSuccessor()  -> ClientId?
     
@@ -2111,12 +2111,12 @@ public protocol TwoMlsPqSessionProtocol: AnyObject, Sendable {
     
     /**
      * Whose move the PQ side-band is: true when this side owes the next operation.
-     * The initiator owes the A.4 bootstrap; completing an operation passes the turn.
+     * The initiator owes the A.3 bootstrap; completing an operation passes the turn.
      */
     func myPqTurn()  -> Bool
     
     /**
-     * A.4 initiator — emit this side's PQ key package (tag 0x13) so the peer can stand
+     * A.3 initiator — emit this side's PQ key package (tag 0x13) so the peer can stand
      * up its deferred send-group PQ half. The KP is the one PRE-COMMITTED at `initiate`
      * (never a fresh mint): the peer holds `H(bootstrap_kp)` from the signed
      * establishment payload and refuses anything else, so these exact bytes are the
@@ -2132,25 +2132,25 @@ public protocol TwoMlsPqSessionProtocol: AnyObject, Sendable {
      * Idempotent once the round is registered — by an earlier call, or by the Part 3
      * parallel `pq_bootstrap_envelope`: it then re-seals and returns the retained
      * `[0x13][KP′]` frame with no state change and no persist, so a host keeping its
-     * standard post-establishment A.4 kickoff after adopting the parallel envelope is
+     * standard post-establishment A.3 kickoff after adopting the parallel envelope is
      * safe.
      */
     func pqBootstrapBegin(rotating: ClientId?) throws  -> Data
     
     /**
-     * A.4 initiator, leg 3 — join the peer's new PQ group (our key package's private
+     * A.3 initiator, leg 3 — join the peer's new PQ group (our key package's private
      * material is retained in this client), then CLOSE the round with a bind: export the
      * cross-party secret from the group we just joined, inject it into our own send-PQ with
      * a pathless commit, and chain the exported apq_psk into our classical half.
      *
-     * This is A.3's bind (`bind_with_secret`) — the only difference is where the secret
+     * This is A.4's bind (`bind_with_secret`) — the only difference is where the secret
      * comes from: an exporter off the joined group rather than a KEM decapsulation. Two
      * things fall out of that, and they are the reason the leg exists:
      *
      * - **The receipt is free.** The secret is derivable only from INSIDE the welcomed
      * group, so a bind that applies at all proves we joined. The peer re-derives it
      * rather than receiving it, so nothing about it goes on the wire.
-     * - **A.4 becomes a well-formed round** (initiator → responder → initiator, as A.3 and
+     * - **A.3 becomes a well-formed round** (initiator → responder → initiator, as A.4 and
      * A.5 are), so the usual rule applies unchanged: we relinquish at this terminal send
      * and the peer takes the turn on applying it. Before this leg existed the peer took
      * the turn at its own send, and would open a ratchet round beside a bootstrap it had
@@ -2159,7 +2159,7 @@ public protocol TwoMlsPqSessionProtocol: AnyObject, Sendable {
     func pqBootstrapBind(welcomeMsg: Data) throws 
     
     /**
-     * Part 3 — parallel KP′ delivery. Emit the initiator's pre-committed A.4 KP′ (the same
+     * Part 3 — parallel KP′ delivery. Emit the initiator's pre-committed A.3 KP′ (the same
      * verbatim `[0x13][KP′]` frame `pq_bootstrap_respond` consumes) IN PARALLEL with the
      * establishment reply, HPKE-sealed to the retained seal target `initial_their_kp` as a
      * RAW §A.1 blob (`seal_hpke_blob`: `[u32 kem_len][kem_output][ciphertext]`, no sections,
@@ -2170,11 +2170,11 @@ public protocol TwoMlsPqSessionProtocol: AnyObject, Sendable {
      * cutover), and `seal_side_band` — the steady-state carrier — needs a recv group that
      * does not exist yet, which is exactly why this frame rides the HPKE envelope instead.
      *
-     * The FIRST emit REGISTERS the A.4 round exactly as `pq_bootstrap_begin` does — the
+     * The FIRST emit REGISTERS the A.3 round exactly as `pq_bootstrap_begin` does — the
      * shared `register_bootstrap_round` (`pq_inflight = BootstrapInitiated`, the retained
      * frame, the eviction-exempt `mine` credential pin) — and persists a Checkpoint, so the
      * initiator can process an EARLY `Welcome'`: an acceptor that already holds this KP′
-     * when its return welcome goes out sends `Welcome'` alongside it, and A.4 completes ~one
+     * when its return welcome goes out sends `Welcome'` alongside it, and A.3 completes ~one
      * round trip sooner. **Read `bootstrap_kp_commitment()` BEFORE the first emit** — it
      * consumes the pre-committed KP, and the signed reply must carry the commitment. EVERY
      * LATER pre-cutover emit is a PURE re-seal of the retained frame — fresh HPKE, no state
@@ -2193,10 +2193,10 @@ public protocol TwoMlsPqSessionProtocol: AnyObject, Sendable {
     func pqBootstrapEnvelope() throws  -> Data
     
     /**
-     * A.4 responder — stand up the deferred send-group PQ half around the peer's key
+     * A.3 responder — stand up the deferred send-group PQ half around the peer's key
      * package and return the bootstrap frame (tag 0x15) carrying its Welcome.
      * PQ-groups-only: no classical commit rides here — the new half's APQ-PSK reaches
-     * the classical group at the next A.3 bind. Taking this turn makes the next
+     * the classical group at the next A.4 bind. Taking this turn makes the next
      * operation ours.
      */
     func pqBootstrapRespond(kpMsg: Data) throws 
@@ -2207,9 +2207,9 @@ public protocol TwoMlsPqSessionProtocol: AnyObject, Sendable {
      * when the side-band is quiescent, which is what lets a host send a bare message.
      *
      * One frame at most: every side-band round registers in `pq_inflight`, and every
-     * `*_begin` gates on it, so A.3, A.4 and A.5 are mutually exclusive. (A.4 was once
+     * `*_begin` gates on it, so A.3, A.4 and A.5 are mutually exclusive. (A.3 was once
      * absent from that, which let a ratchet round open beside a bootstrap and evict it —
-     * the reason A.4 is now a well-formed round.)
+     * the reason A.3 is now a well-formed round.)
      *
      * Call it on every send for as long as it returns anything: a side-band frame is the
      * only carrier of its PQ half, so re-sending is how a dropped one heals (see
@@ -2231,7 +2231,7 @@ public protocol TwoMlsPqSessionProtocol: AnyObject, Sendable {
      * from its retained header-key window. That is roomy for the PQ family (`seal_side_band`
      * seals under recv-PQ, which advances only when the PEER commits — and applying a peer
      * commit clears this side's retained frame anyway). It is tighter for the one frame that
-     * takes `seal_side_band`'s classical fallback, the pre-A.4 `BOOTSTRAP_KP`, whose key
+     * takes `seal_side_band`'s classical fallback, the pre-A.3 `BOOTSTRAP_KP`, whose key
      * tracks the CLASSICAL epoch that ordinary messaging advances: a `Stable` pass over that
      * frame wants to finish inside the peer's classical header window. `Fresh` has no such
      * constraint.
@@ -2378,7 +2378,7 @@ open class TwoMlsPqSession: TwoMlsPqSessionProtocol, @unchecked Sendable {
      * once the join has consumed the invitation key package (so nothing migrates into the
      * session archive). Do NOT reuse one `TwoMlsPqPrincipal` for both `initiate` and a direct
      * `accept` — `initiate` retains its return-group key package in that same store (for the
-     * peer's return welcome), and this clear would drop it. (The pre-committed A.4 bootstrap
+     * peer's return welcome), and this clear would drop it. (The pre-committed A.3 bootstrap
      * KP is immune: its secret is SESSION-owned, held out of the store precisely so no store
      * lifecycle — this purge, or a Phase 8 client swap — can strand the committed round.)
      * The normal entry point, `TwoMlsPqInvitation::receive`, always builds a fresh
@@ -2393,7 +2393,7 @@ open class TwoMlsPqSession: TwoMlsPqSessionProtocol, @unchecked Sendable {
      * `their_classical_key_package` is the initiator's CLASSICAL return key package (a
      * bare MLS KeyPackage message — §A.1: the return group starts classical-only), and
      * `bootstrap_kp_commitment` is `H(initiator's PQ keyPackage)` from the SIGNED
-     * establishment payload — the A.4 bootstrap KP′ must hash to it before BSG-PQ is
+     * establishment payload — the A.3 bootstrap KP′ must hash to it before BSG-PQ is
      * built around it (see `pq_bootstrap_respond`).
      */
 public static func accept(client: TwoMlsPqPrincipal, welcome: Data, theirClassicalKeyPackage: Data, bootstrapKpCommitment: Data, expectedAppBinding: Data?)throws  -> TwoMlsPqSession  {
@@ -2496,7 +2496,7 @@ open func appBinding()throws  -> Data?  {
 }
     
     /**
-     * `H(bootstrap_kp)` — the SHA-256 commitment to the A.4 bootstrap key package this
+     * `H(bootstrap_kp)` — the SHA-256 commitment to the A.3 bootstrap key package this
      * session pre-committed at `initiate`. The host binds it inside its SIGNED
      * establishment payload (next to the classical return key package), and the peer
      * threads it back through `receive`/`accept`, where `pq_bootstrap_respond`
@@ -2610,7 +2610,7 @@ open func isEstablished() -> Bool  {
 }
     
     /**
-     * True once both directions' PQ halves are live (post-A.4 bootstrap).
+     * True once both directions' PQ halves are live (post-A.3 bootstrap).
      */
 open func isFullyEstablished() -> Bool  {
     return try!  FfiConverterBool.lift(try! rustCall() {
@@ -2677,7 +2677,7 @@ open func setInitialAppPayload(payload: Data)throws   {try rustCallWithError(Ffi
     /**
      * Attach the initiator's CLASSICAL return key package (a bare MLS KeyPackage
      * message — §A.1: the acceptor's send group starts classical-only, and the PQ key
-     * package travels in A.4, pinned by `bootstrap_kp_commitment`) for the BARE
+     * package travels in A.3, pinned by `bootstrap_kp_commitment`) for the BARE
      * envelope shape (no self-sufficient `set_initial_app_payload`):
      * pre-establishment envelopes then carry `[welcome][return_kp]`, so any single
      * frame is a complete establishment vector for the invitation holder. Unused when
@@ -2902,7 +2902,7 @@ open func processIncomingApproved(ciphertext: Data, approvedEnvelopeDigest: Data
      * binding context for identity introductions, matching the classical backend's
      * convention and `QueuedRemoteProposal.context`. Always the classical half:
      * message ordering rides it, and it exists from establishment (the PQ half may
-     * still be deferred pre-A.4).
+     * still be deferred pre-A.3).
      */
 open func proposalContext() -> Data?  {
     return try!  FfiConverterOptionData.lift(try! rustCall() {
@@ -2931,7 +2931,7 @@ open func queueProposal(digest: Data)throws   {try rustCallWithError(FfiConverte
      * tally), or `None`. Lets the app decide whether a newly-received proposal should
      * replace it (queue the newer one) or be kept (do nothing); the library's own
      * policy is latest-wins, and the slot is cleared when the send epoch advances (a
-     * fold or an A.3 bind).
+     * fold or an A.4 bind).
      */
 open func queuedRemoteSuccessor() -> ClientId?  {
     return try!  FfiConverterOptionTypeClientId.lift(try! rustCall() {
@@ -2972,7 +2972,7 @@ open func shouldListenOn()throws  -> ListenChannels  {
     
     /**
      * Whose move the PQ side-band is: true when this side owes the next operation.
-     * The initiator owes the A.4 bootstrap; completing an operation passes the turn.
+     * The initiator owes the A.3 bootstrap; completing an operation passes the turn.
      */
 open func myPqTurn() -> Bool  {
     return try!  FfiConverterBool.lift(try! rustCall() {
@@ -2983,7 +2983,7 @@ open func myPqTurn() -> Bool  {
 }
     
     /**
-     * A.4 initiator — emit this side's PQ key package (tag 0x13) so the peer can stand
+     * A.3 initiator — emit this side's PQ key package (tag 0x13) so the peer can stand
      * up its deferred send-group PQ half. The KP is the one PRE-COMMITTED at `initiate`
      * (never a fresh mint): the peer holds `H(bootstrap_kp)` from the signed
      * establishment payload and refuses anything else, so these exact bytes are the
@@ -2999,7 +2999,7 @@ open func myPqTurn() -> Bool  {
      * Idempotent once the round is registered — by an earlier call, or by the Part 3
      * parallel `pq_bootstrap_envelope`: it then re-seals and returns the retained
      * `[0x13][KP′]` frame with no state change and no persist, so a host keeping its
-     * standard post-establishment A.4 kickoff after adopting the parallel envelope is
+     * standard post-establishment A.3 kickoff after adopting the parallel envelope is
      * safe.
      */
 open func pqBootstrapBegin(rotating: ClientId?)throws  -> Data  {
@@ -3012,19 +3012,19 @@ open func pqBootstrapBegin(rotating: ClientId?)throws  -> Data  {
 }
     
     /**
-     * A.4 initiator, leg 3 — join the peer's new PQ group (our key package's private
+     * A.3 initiator, leg 3 — join the peer's new PQ group (our key package's private
      * material is retained in this client), then CLOSE the round with a bind: export the
      * cross-party secret from the group we just joined, inject it into our own send-PQ with
      * a pathless commit, and chain the exported apq_psk into our classical half.
      *
-     * This is A.3's bind (`bind_with_secret`) — the only difference is where the secret
+     * This is A.4's bind (`bind_with_secret`) — the only difference is where the secret
      * comes from: an exporter off the joined group rather than a KEM decapsulation. Two
      * things fall out of that, and they are the reason the leg exists:
      *
      * - **The receipt is free.** The secret is derivable only from INSIDE the welcomed
      * group, so a bind that applies at all proves we joined. The peer re-derives it
      * rather than receiving it, so nothing about it goes on the wire.
-     * - **A.4 becomes a well-formed round** (initiator → responder → initiator, as A.3 and
+     * - **A.3 becomes a well-formed round** (initiator → responder → initiator, as A.4 and
      * A.5 are), so the usual rule applies unchanged: we relinquish at this terminal send
      * and the peer takes the turn on applying it. Before this leg existed the peer took
      * the turn at its own send, and would open a ratchet round beside a bootstrap it had
@@ -3039,7 +3039,7 @@ open func pqBootstrapBind(welcomeMsg: Data)throws   {try rustCallWithError(FfiCo
 }
     
     /**
-     * Part 3 — parallel KP′ delivery. Emit the initiator's pre-committed A.4 KP′ (the same
+     * Part 3 — parallel KP′ delivery. Emit the initiator's pre-committed A.3 KP′ (the same
      * verbatim `[0x13][KP′]` frame `pq_bootstrap_respond` consumes) IN PARALLEL with the
      * establishment reply, HPKE-sealed to the retained seal target `initial_their_kp` as a
      * RAW §A.1 blob (`seal_hpke_blob`: `[u32 kem_len][kem_output][ciphertext]`, no sections,
@@ -3050,11 +3050,11 @@ open func pqBootstrapBind(welcomeMsg: Data)throws   {try rustCallWithError(FfiCo
      * cutover), and `seal_side_band` — the steady-state carrier — needs a recv group that
      * does not exist yet, which is exactly why this frame rides the HPKE envelope instead.
      *
-     * The FIRST emit REGISTERS the A.4 round exactly as `pq_bootstrap_begin` does — the
+     * The FIRST emit REGISTERS the A.3 round exactly as `pq_bootstrap_begin` does — the
      * shared `register_bootstrap_round` (`pq_inflight = BootstrapInitiated`, the retained
      * frame, the eviction-exempt `mine` credential pin) — and persists a Checkpoint, so the
      * initiator can process an EARLY `Welcome'`: an acceptor that already holds this KP′
-     * when its return welcome goes out sends `Welcome'` alongside it, and A.4 completes ~one
+     * when its return welcome goes out sends `Welcome'` alongside it, and A.3 completes ~one
      * round trip sooner. **Read `bootstrap_kp_commitment()` BEFORE the first emit** — it
      * consumes the pre-committed KP, and the signed reply must carry the commitment. EVERY
      * LATER pre-cutover emit is a PURE re-seal of the retained frame — fresh HPKE, no state
@@ -3079,10 +3079,10 @@ open func pqBootstrapEnvelope()throws  -> Data  {
 }
     
     /**
-     * A.4 responder — stand up the deferred send-group PQ half around the peer's key
+     * A.3 responder — stand up the deferred send-group PQ half around the peer's key
      * package and return the bootstrap frame (tag 0x15) carrying its Welcome.
      * PQ-groups-only: no classical commit rides here — the new half's APQ-PSK reaches
-     * the classical group at the next A.3 bind. Taking this turn makes the next
+     * the classical group at the next A.4 bind. Taking this turn makes the next
      * operation ours.
      */
 open func pqBootstrapRespond(kpMsg: Data)throws   {try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
@@ -3099,9 +3099,9 @@ open func pqBootstrapRespond(kpMsg: Data)throws   {try rustCallWithError(FfiConv
      * when the side-band is quiescent, which is what lets a host send a bare message.
      *
      * One frame at most: every side-band round registers in `pq_inflight`, and every
-     * `*_begin` gates on it, so A.3, A.4 and A.5 are mutually exclusive. (A.4 was once
+     * `*_begin` gates on it, so A.3, A.4 and A.5 are mutually exclusive. (A.3 was once
      * absent from that, which let a ratchet round open beside a bootstrap and evict it —
-     * the reason A.4 is now a well-formed round.)
+     * the reason A.3 is now a well-formed round.)
      *
      * Call it on every send for as long as it returns anything: a side-band frame is the
      * only carrier of its PQ half, so re-sending is how a dropped one heals (see
@@ -3123,7 +3123,7 @@ open func pqBootstrapRespond(kpMsg: Data)throws   {try rustCallWithError(FfiConv
      * from its retained header-key window. That is roomy for the PQ family (`seal_side_band`
      * seals under recv-PQ, which advances only when the PEER commits — and applying a peer
      * commit clears this side's retained frame anyway). It is tighter for the one frame that
-     * takes `seal_side_band`'s classical fallback, the pre-A.4 `BOOTSTRAP_KP`, whose key
+     * takes `seal_side_band`'s classical fallback, the pre-A.3 `BOOTSTRAP_KP`, whose key
      * tracks the CLASSICAL epoch that ordinary messaging advances: a `Stable` pass over that
      * frame wants to finish inside the peer's classical header window. `Fresh` has no such
      * constraint.
@@ -3940,7 +3940,7 @@ public func FfiConverterTypeHpkeSealed_lower(_ value: HpkeSealed) -> RustBuffer 
  * - `welcome` — the bare MLS `APQWelcome_A` to hand to `receive` (no app payload).
  * - `return_key_package` — the initiator's CLASSICAL return key package, a bare MLS
  * KeyPackage message handed to `receive` as-is (§A.1: the return group starts
- * classical-only; the initiator's PQ key package travels in A.4, pinned by the
+ * classical-only; the initiator's PQ key package travels in A.3, pinned by the
  * bootstrap KP commitment).
  * - `stapled_message` — a pre-establishment app message (`[0x09][ASG-cl ciphertext]` —
  * sealed in the initiator's send group),
@@ -4885,10 +4885,10 @@ public enum OpenedInitial: Equatable, Hashable {
     case establishment(frame: InitialFrame
     )
     /**
-     * Leading tag `PQ_BOOTSTRAP_KP_TAG` (0x13): the initiator's A.4 bootstrap frame delivered
+     * Leading tag `PQ_BOOTSTRAP_KP_TAG` (0x13): the initiator's A.3 bootstrap frame delivered
      * IN PARALLEL with the reply (Part 3). The pre-commitment fixed the KP bytes at
-     * `initiate`, so the initiator ships its A.4 KP′ alongside the establishment reply
-     * instead of waiting a round trip for A.4's first send. `frame` is the VERBATIM
+     * `initiate`, so the initiator ships its A.3 KP′ alongside the establishment reply
+     * instead of waiting a round trip for A.3's first send. `frame` is the VERBATIM
      * `[0x13][KP′ …]` side-band frame `pq_bootstrap_respond` consumes — only the OUTER
      * framing differed (the §A.1 HPKE envelope here vs. the header-sealed side-band in
      * steady state). The receiver holds it UNTIL the reply establishes the session, then
@@ -4977,19 +4977,19 @@ public func FfiConverterTypeOpenedInitial_lower(_ value: OpenedInitial) -> RustB
 public enum PqFrameKind: Equatable, Hashable {
     
     /**
-     * 0x13 — A.4 bootstrap: this side's PQ key package.
+     * 0x13 — A.3 bootstrap: this side's PQ key package.
      */
     case bootstrapKeyPackage
     /**
-     * 0x15 — A.4 bootstrap: the reply (the new PQ group's welcome).
+     * 0x15 — A.3 bootstrap: the reply (the new PQ group's welcome).
      */
     case bootstrapWelcome
     /**
-     * 0x17 — A.3 ratchet: the initiator's ML-KEM encapsulation key.
+     * 0x17 — A.4 ratchet: the initiator's ML-KEM encapsulation key.
      */
     case ratchetEphemeralKey
     /**
-     * 0x19 — A.3 ratchet: the responder's ciphertext.
+     * 0x19 — A.4 ratchet: the responder's ciphertext.
      */
     case ratchetCiphertext
     /**
@@ -5340,7 +5340,7 @@ public enum TwoMlsPqError: Swift.Error, Equatable, Hashable, Foundation.Localize
      * An establishment identity failed to match: the remote's key package does not carry
      * the identity the caller said it expects (`receive(expected_remote:)` — checked
      * before any invitation state is claimed, so the invitation stays fully reusable),
-     * the welcome's creator leaf does not match the supplied key package, or an A.4
+     * the welcome's creator leaf does not match the supplied key package, or an A.3
      * bootstrap key package names a principal that is not the established peer.
      */
     case RemoteIdentityMismatch
@@ -5355,7 +5355,7 @@ public enum TwoMlsPqError: Swift.Error, Equatable, Hashable, Foundation.Localize
     /**
      * The draft -02 bookkeeping failed verification: an `APQInfo` GroupContext extension
      * is missing or inconsistent across a pair's halves (a welcome without one is a
-     * downgrade attempt), an A.4 group id does not match the id pre-allocated at
+     * downgrade attempt), an A.3 group id does not match the id pre-allocated at
      * establishment, or an `AppDataUpdate` epoch attestation does not match the actual
      * post-commit epochs of both groups.
      */
@@ -5404,7 +5404,7 @@ public enum TwoMlsPqError: Swift.Error, Equatable, Hashable, Foundation.Localize
      */
     case BindApplyFailed
     /**
-     * The A.4 bootstrap key package does not match the commitment pinned at
+     * The A.3 bootstrap key package does not match the commitment pinned at
      * establishment. The acceptor received `H(initiator's PQ keyPackage)` inside the
      * signed establishment payload (threaded in via `receive(bootstrap_kp_commitment:)`),
      * and the KP′ that arrived on the side-band hashes to something else — a substituted

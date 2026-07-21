@@ -33,8 +33,8 @@ public enum PQTurn: Sendable, Equatable { case weInitiate, theyInitiate }
 /// Disambiguates the three PQ flows, which the old `received(pqProposal:)`/`received(pqCommit:)`
 /// pair collapsed together.
 public enum PQOperationKind: Sendable, Equatable {
-	case ratchet  // A.3 — KEM EK/CT, PSK injection, no updatePath, staple-able
-	case finishBootstrap  // A.4 — stand up the deferred ASG-PQ
+	case ratchet  // A.4 — KEM EK/CT, PSK injection, no updatePath, staple-able
+	case finishBootstrap  // A.3 — stand up the deferred ASG-PQ
 	case rekey  // A.5 — updatePath commit (+ credential rotation), isolated
 }
 
@@ -58,7 +58,7 @@ public struct PQOutbound: Sendable {
 /// The correlation-vs-chunking trade is even, but `.stable` also carries a LIVENESS bound
 /// `.fresh` does not: the cached seal keeps the epoch it was first sealed at. That is roomy for
 /// PQ-sealed frames (the key advances only when the peer commits), but the one frame sealed under
-/// the CLASSICAL fallback key — the pre-A.4 `BOOTSTRAP_KP`, whose epoch ordinary messaging
+/// the CLASSICAL fallback key — the pre-A.3 `BOOTSTRAP_KP`, whose epoch ordinary messaging
 /// advances — must complete its `.stable` pass inside the peer's classical header window, or the
 /// reassembled frame opens for no key and re-handing the same bytes never heals.
 public enum SideBandSealing: Sendable, Equatable {
@@ -79,7 +79,7 @@ public struct PQInbound: Sendable {
 	/// answers "what are MY epochs now", not "what did the advanced group move to" — and on a
 	/// closing leg our own pq half HAS moved even when `advancedGroup == .theirs` (see above).
 	public let newEpochs: APQEpochs?
-	public let rotatedCredential: ClientID?  // A.4/A.5 principal handoff
+	public let rotatedCredential: ClientID?  // A.3/A.5 principal handoff
 	/// TRUE on every closing leg (`.bootstrapWelcome`, `.ratchetCiphertext`, `.rekeyCommit`
 	/// ingests): our send-PQ committed eagerly and the classical half is now OWED — it discharges
 	/// only inside our next classical COMMIT (v19: which a current-epoch peer offer licenses). The

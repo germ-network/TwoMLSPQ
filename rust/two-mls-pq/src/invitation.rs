@@ -46,7 +46,7 @@ pub(crate) type ProcessedWelcomes = BTreeMap<Vec<u8>, Vec<u8>>;
 /// The bootstrap-commitment routing table: `H(initiator's PQ bootstrap key package)` — the same
 /// 32-byte commitment `receive` was given and pinned — → the spawned session's receive-group
 /// classical (message-half) id. Lets a KP′ that arrives as a §A.1 bootstrap envelope (contract 21,
-/// carrying no session id) self-route to the session that owes A.4: `bootstrap_kp_group_id` hashes
+/// carrying no session id) self-route to the session that owes A.3: `bootstrap_kp_group_id` hashes
 /// the framed KP′ and resolves it here. Content-keyed like `processed`; distinct so the two
 /// preimages (welcome bytes vs. bootstrap KP) never collide.
 pub(crate) type BootstrapCommitments = BTreeMap<Vec<u8>, Vec<u8>>;

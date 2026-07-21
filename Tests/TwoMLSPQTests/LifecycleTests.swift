@@ -29,7 +29,7 @@ struct LifecycleTests {
 	@Test func testExchange() async throws {
 		// -- Step 1: initiator forms its APQ send group and mints the plaintext welcome.
 		// The concrete `reply` returns the PLAINTEXT APQWelcome (contract 15) plus the
-		// return-group key package and the A.4 bootstrap commitment — the app seals the
+		// return-group key package and the A.3 bootstrap commitment — the app seals the
 		// welcome into its signed identity envelope and hands it back via
 		// createTwoMLSGroup; this bare harness delivers it plaintext (as PQInvitationTests
 		// does), so there is no sealed §A.1 envelope to inspect here.
@@ -47,7 +47,7 @@ struct LifecycleTests {
 		#expect(localBase.epochs() == ApqEpochs(pqEpoch: 1, classicalEpoch: 1))
 		// The §A.1 bootstrap envelope is parked at initiate and NOT consumed by this
 		// plaintext harness (no createTwoMLSGroup) — it stays available as the take-once
-		// outbound, and A.4's `begin(.finishBootstrap)` (step 5) carries the same KP′.
+		// outbound, and A.3's `begin(.finishBootstrap)` (step 5) carries the same KP′.
 		#expect(localBase.pendingOutbound() != nil)
 
 		// Routing: listening works from birth — addresses derive from our send
@@ -80,7 +80,7 @@ struct LifecycleTests {
 
 		#expect(remoteBase.isEstablished())
 		#expect(remoteBase.hasReceiveGroup())
-		// The send-group PQ half is deferred (A.4): established, but not fully.
+		// The send-group PQ half is deferred (A.3): established, but not fully.
 		#expect(!remoteBase.isFullyEstablished())
 		#expect(!remoteBase.myPqTurn())
 		#expect(remoteBase.epochs() == ApqEpochs(pqEpoch: 0, classicalEpoch: 1))
@@ -110,7 +110,7 @@ struct LifecycleTests {
 			localListenAtBirth.rendezvousByEpoch
 				.contains { $0.rendezvousId.bytes == remotePost.bytes })
 		// Remote listens on its own send group: classical id only — the PQ half
-		// is the deferred A.4 slot.
+		// is the deferred A.3 slot.
 		let remoteListenAtBirth = try remoteBase.shouldListenOn()
 		#expect(!remoteListenAtBirth.sendGroup.classical.bytes.isEmpty)
 		#expect(remoteListenAtBirth.sendGroup.pq.bytes.isEmpty)
@@ -151,7 +151,7 @@ struct LifecycleTests {
 		let updFrame = try remoteSession.encrypt(appMessage: Data("upd".utf8))
 
 		// The encrypt result reports the true APQ pair, not a duplicated single
-		// epoch: remote's send group is classical-only pre-A.4, so pqEpoch is 0.
+		// epoch: remote's send group is classical-only pre-A.3, so pqEpoch is 0.
 		#expect(updFrame.epochs == APQEpochs(pqEpoch: 0, classicalEpoch: 1))
 		let updDecrypted = try #require(
 			try localSession.decrypt(updFrame.cipherText))
@@ -192,7 +192,7 @@ struct LifecycleTests {
 		#expect(try postAddressMatches(poster: localBase, listener: remoteBase))
 		#expect(try postAddressMatches(poster: remoteBase, listener: localBase))
 
-		// -- Step 5: A.4 bootstrap. Local owes it (holds the turn).
+		// -- Step 5: A.3 bootstrap. Local owes it (holds the turn).
 		#expect(localSession.turn == .weInitiate)
 		#expect(remoteSession.turn == .theyInitiate)
 		let kp = try localSession.finishBootstrap(rotating: nil)
@@ -205,14 +205,14 @@ struct LifecycleTests {
 		let inbound = try remoteSession.ingest(kp.payload)
 		#expect(inbound.kind == .finishBootstrap)
 		// Responding stands the PQ half up immediately: new PQ group at epoch 1. The
-		// classical epoch is untouched — the responder's half of A.4 is PQ-groups-only;
+		// classical epoch is untouched — the responder's half of A.3 is PQ-groups-only;
 		// the initiator's closing bind is what reaches a classical group, and it rides
 		// the initiator's next classical commit as the message-frame staple (v18).
 		#expect(remoteBase.isFullyEstablished())
 		#expect(remoteBase.epochs().pqEpoch == 1)
 		#expect(remoteBase.epochs().classicalEpoch == remoteClassicalBefore)
 
-		// Routing: A.4 is PQ-groups-only — no classical commit, so no new listen
+		// Routing: A.3 is PQ-groups-only — no classical commit, so no new listen
 		// addresses — but the send group now advertises its PQ half's id.
 		let remoteListenAfterBootstrap = try remoteBase.shouldListenOn()
 		#expect(
@@ -245,7 +245,7 @@ struct LifecycleTests {
 		// that staples the bind — not at the trigger.
 		#expect(try #require(localBase.receiveGroupId()).pq.bytes.isEmpty == false)
 		#expect(localBase.myPqTurn())
-		// A.4's closing leg is real work on the initiator (v18): joining the welcomed
+		// A.3's closing leg is real work on the initiator (v18): joining the welcomed
 		// group exports the cross-party secret, which commits local's OWN send-PQ
 		// pathlessly. The classical half is OWED — it rides the next classical commit.
 		#expect(localBase.epochs().pqEpoch == 2)
@@ -266,13 +266,13 @@ struct LifecycleTests {
 		#expect(try postAddressMatches(poster: localBase, listener: remoteBase))
 		#expect(try postAddressMatches(poster: remoteBase, listener: localBase))
 
-		// -- Step 7: A.3 ratchet — SESSION-DRIVEN (contract 24). There is no host
-		// `begin(.ratchet)`: Remote holds the turn (local's A.4 completion passed it),
+		// -- Step 7: A.4 ratchet — SESSION-DRIVEN (contract 24). There is no host
+		// `begin(.ratchet)`: Remote holds the turn (local's A.3 completion passed it),
 		// so Remote's next ordinary SEND auto-stages the EK, taken via `pendingSideBand`.
 		// (A.5 as a rotation credential catch-up is exercised in the Rust crate suite.)
 		#expect(remoteSession.turn == .weInitiate)
 		let remotePqBeforeRatchet = remoteBase.epochs().pqEpoch
-		try remoteSession.send(to: localSession) // opener — auto-stages Remote's A.3 EK
+		try remoteSession.send(to: localSession) // opener — auto-stages Remote's A.4 EK
 		let ratchetEk = try #require(remoteSession.pendingSideBand(sealing: .fresh))
 		// EK frame — classify by opening the seal (wire tag sealed, v7).
 		#expect(try localBase.openIncoming(blob: ratchetEk)?.kind == .pqSideBand(kind: .ratchetEphemeralKey))

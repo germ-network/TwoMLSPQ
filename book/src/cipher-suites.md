@@ -10,9 +10,9 @@ decision is a *facet* read from it:
 | Facet | Drawn from | Drives |
 |-------|-----------|--------|
 | `pair()` | both halves | group construction (`crypto_config`), the wire suite id (invitation/session archive headers, `APQInfo`), the APQ mode |
-| `hpke()` | the **PQ half** | the §A.1 establishment envelope and the parallel A.4 bootstrap-KP envelope (sealed to the PQ EK in the published KP′) |
-| `header_aead()` | the **classical half's AEAD** | the outer seal on every rendezvous-channel frame and the A.3 injected-secret seal. ChaCha20-Poly1305's 256-bit key has the strongest post-quantum margin — notably better than the PQ suite's AES-128-GCM — which is why the PQ side-band too is sealed with the classical AEAD |
-| `digest()` | the **classical half's hash** | every digest the crate emits: session ids, welcome digests, proposal/app AAD, the A.4 bootstrap-KP commitment (SHA-256, dispatched infallibly) |
+| `hpke()` | the **PQ half** | the §A.1 establishment envelope and the parallel A.3 bootstrap-KP envelope (sealed to the PQ EK in the published KP′) |
+| `header_aead()` | the **classical half's AEAD** | the outer seal on every rendezvous-channel frame and the A.4 injected-secret seal. ChaCha20-Poly1305's 256-bit key has the strongest post-quantum margin — notably better than the PQ suite's AES-128-GCM — which is why the PQ side-band too is sealed with the classical AEAD |
+| `digest()` | the **classical half's hash** | every digest the crate emits: session ids, welcome digests, proposal/app AAD, the A.3 bootstrap-KP commitment (SHA-256, dispatched infallibly) |
 
 The header AEAD is a facet of the one declaration, not an independent configuration point:
 changing any facet means declaring a new `TwoMlsSuite` variant, and both parties must run

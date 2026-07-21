@@ -5,7 +5,7 @@ of one APQ group — this is what makes a send group hybrid: an attacker must br
 classical half *and* the ML-KEM-768 half to break a session. The **cross-party
 TwoMLS-PSK** ties one party's send group to the group it receives on, so the two
 directions of a session share fate. The **injected-secret PSK** carries the per-round
-ML-KEM entropy of the A.3 ratchet.
+ML-KEM entropy of the A.4 ratchet.
 
 The first two follow `draft-ietf-mls-combiner-02` §6.2 exactly: they are derived with
 the **Safe Extensions** recipe of `draft-ietf-mls-extensions-08` §4.4 and imported as
@@ -97,9 +97,9 @@ Establishment seeds the watermark to the epoch it bound at creation, so the acce
 first routine commit — which would otherwise redundantly re-bind the peer at the epoch
 establishment already covered — correctly skips. The establishment cross-party PSK is
 load-bearing: it is the sole PQ-protection path for the acceptor's classical-only send
-group before the A.4 bootstrap.
+group before the A.3 bootstrap.
 
-The APQ-PSK refreshes on the A.3 ratchet: fresh ML-KEM entropy is injected into the
+The APQ-PSK refreshes on the A.4 ratchet: fresh ML-KEM entropy is injected into the
 send group's PQ half, and the re-exported APQ-PSK (component `0xFF01`) is bound into the
 classical half's commit in the same round.
 
@@ -110,9 +110,9 @@ other while their updatePaths rotate the leaves. These exports are event-driven 
 guarded by the PQ watermarks (`last_cross_injected_pq`, `last_send_pq_exported`) so a
 re-key round never re-exports a consumed PQ leaf.
 
-## The injected-secret PSK (A.3 KEM entropy)
+## The injected-secret PSK (A.4 KEM entropy)
 
-The A.3 ratchet's per-round secret `S` — the shared secret of an out-of-band ML-KEM
+The A.4 ratchet's per-round secret `S` — the shared secret of an out-of-band ML-KEM
 encapsulation — is injected as an **`external(1)` PSK**, not an application PSK. It is
 externally-sourced entropy rather than an exporter-derived value, so it keeps its own
 structural id `LE-u64(epoch) ‖ group_id ‖ 0x52` in both recipe phases. The trailing

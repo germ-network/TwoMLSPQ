@@ -58,7 +58,7 @@ fn test_pq_bootstrap_completes_deferred_halves() {
     );
 }
 
-/// A re-sent A.4 welcome, after the initiator has already joined and bound, is a discardable
+/// A re-sent A.3 welcome, after the initiator has already joined and bound, is a discardable
 /// `DuplicateSideBand` — not the retriable `SessionNotReady` that would invite the host to
 /// retry a bootstrap that is over. The responder re-staples its welcome until the stapled
 /// bind lands, so these re-sends are steady-state, and the initiator's recv-PQ being up is
@@ -111,7 +111,7 @@ fn test_pq_bootstrap_respond_rejects_wrong_suite_key_package() {
     );
 }
 
-/// The A.4 KP′ must hash to the commitment pinned at establishment: a substituted PQ key
+/// The A.3 KP′ must hash to the commitment pinned at establishment: a substituted PQ key
 /// package — valid suite, honest shape, wrong bytes — is rejected before any group is
 /// stood up, and the genuine pre-committed KP still completes the round. This is the
 /// check that anchors the ML-KEM key material to the SIGNED establishment payload: the
@@ -159,7 +159,7 @@ fn test_bootstrap_kp_commitment_lifecycle() {
 
 /// A commitment of the wrong length could never match any KP′ — `receive` rejects it up
 /// front (before any invitation state is claimed) rather than letting it surface as a
-/// confusing A.4 failure long after establishment.
+/// confusing A.3 failure long after establishment.
 #[test]
 fn test_receive_rejects_malformed_commitment() {
     use crate::key_packages::TwoMlsPqInvitation;
@@ -199,7 +199,7 @@ fn test_receive_rejects_malformed_commitment() {
     ));
 }
 
-/// The pre-committed bootstrap KP survives a restore between reply and A.4: the public
+/// The pre-committed bootstrap KP survives a restore between reply and A.3: the public
 /// bytes ride the session archive and the private material rides the client's retaining
 /// key-package store inside it, so a restored-at-establishment initiator still opens the
 /// round with the KP the establishment signature committed to — and can join the
@@ -223,8 +223,109 @@ fn test_precommitted_bootstrap_kp_survives_restore() {
     assert!(bob.is_fully_established());
 }
 
+/// F2 negative: the bootstrap twin-field invariant is enforced on restore. The public KP
+/// bytes may never outlive the private half, so an archive with `bootstrap_kp = Some` and
+/// `bootstrap_kp_secret = None` is rejected as `ArchiveInvalid`. (The reverse — secret alone —
+/// is the legitimate mid-A.3 window and is admitted; see
+/// `test_archive_mid_a3_window_completes_after_restore`.)
+#[test]
+fn test_archive_rejects_bootstrap_kp_without_secret() {
+    use mls_rs::mls_rs_codec::{MlsDecode, MlsEncode};
+
+    let (alice, _bob) = establish_sessions();
+    let archive = assert_ok!(alice.archive());
+    let mut rest = &archive.bytes[5..];
+    let mut wire = assert_ok!(super::archive_wire::SessionArchive::mls_decode(&mut rest));
+    // A fresh initiator holds both halves of the pre-committed KP.
+    assert!(wire.bootstrap_kp.is_some());
+    assert!(wire.bootstrap_kp_secret.is_some());
+    // Drop only the private half → the forbidden public-without-private state.
+    wire.bootstrap_kp_secret = None;
+    let mut bytes = archive.bytes[..5].to_vec();
+    assert_ok!(wire.mls_encode(&mut bytes));
+    assert_err!(
+        TwoMlsPqSession::from_archive(crate::Archive { bytes }),
+        TwoMlsPqError::ArchiveInvalid
+    );
+}
+
+/// F3 restore validation: the acceptor's pinned commitment is length-checked on decode. A
+/// wire value that is not exactly 32 bytes can never match any KP′, so `session_from_wire`
+/// rejects it as `ArchiveInvalid` when lifting it into `BootstrapKpCommitment` — the same
+/// 32-byte fact the `receive`/`accept` path enforces at ingress (`BootstrapKpMismatch`).
+#[test]
+fn test_archive_rejects_wrong_length_bootstrap_commitment() {
+    use mls_rs::mls_rs_codec::{MlsDecode, MlsEncode};
+
+    let (_alice, bob) = establish_sessions();
+    let archive = assert_ok!(bob.archive());
+    let mut rest = &archive.bytes[5..];
+    let mut wire = assert_ok!(super::archive_wire::SessionArchive::mls_decode(&mut rest));
+    // The acceptor pinned the initiator's commitment at establishment.
+    assert!(wire.expected_bootstrap_kp_commitment.is_some());
+    wire.expected_bootstrap_kp_commitment = Some(vec![0u8; 31]);
+    let mut bytes = archive.bytes[..5].to_vec();
+    assert_ok!(wire.mls_encode(&mut bytes));
+    assert_err!(
+        TwoMlsPqSession::from_archive(crate::Archive { bytes }),
+        TwoMlsPqError::ArchiveInvalid
+    );
+}
+
+/// F2 positive window + F4 Arc round-trip: archiving DURING the begin↔bind window (public
+/// half already consumed by `pq_bootstrap_begin`, secret still held) is admitted, and the
+/// Arc-wrapped secret survives the push/restore so the restored initiator still joins the
+/// Welcome' and completes the round.
+#[test]
+fn test_archive_mid_a3_window_completes_after_restore() {
+    let (alice, bob) = establish_sessions();
+    // Open the window: `begin` consumes the public KP bytes; the secret persists.
+    let kp = assert_ok!(alice.pq_bootstrap_begin(None));
+    let restored = round_trip(&alice);
+    drop(alice);
+
+    assert_ok!(bob.pq_bootstrap_respond(kp));
+    let welcome = assert_some!(bob.pq_take_pending_outbound());
+    // The restored (Arc-decoded) secret resolves the Welcome' across the jump.
+    assert_ok!(restored.pq_bootstrap_bind(welcome));
+    discharge_bind(&restored, &bob, b"mid-a3-window");
+    assert!(restored.is_fully_established());
+    assert!(bob.is_fully_established());
+}
+
+/// F3/F4 no-bump proof: the `BootstrapKpCommitment` conversion and the `ArcKpSecret` codec
+/// delegation are byte-transparent — decoding an archive body and re-encoding it reproduces
+/// the exact bytes, for both an initiator (secret present) and an acceptor (commitment
+/// present). Varint decode enforces minimal encoding, so this pins the wire layout unchanged.
+#[test]
+fn test_archive_reencode_is_byte_identical() {
+    use mls_rs::mls_rs_codec::{MlsDecode, MlsEncode};
+
+    let (alice, bob) = establish_sessions();
+    for session in [&alice, &bob] {
+        let archive = assert_ok!(session.archive());
+        let body = &archive.bytes[5..];
+        let mut rest = body;
+        let wire = assert_ok!(super::archive_wire::SessionArchive::mls_decode(&mut rest));
+        let mut reencoded = Vec::new();
+        assert_ok!(wire.mls_encode(&mut reencoded));
+        assert_eq!(reencoded.as_slice(), body);
+    }
+}
+
+/// Monotonic-advance ratchet for `SESSION_ARCHIVE_VERSION`. The emitted archive's version
+/// byte is pinned so it cannot move silently: editing this literal is legal ONLY upward and
+/// ONLY in lockstep with a real archive layout or acceptance-semantics change (see the
+/// constant's doc). A surprise failure here means the wire moved without a version bump.
+#[test]
+fn test_session_archive_version_is_pinned() {
+    let (alice, _bob) = establish_sessions();
+    let archive = assert_ok!(alice.archive());
+    assert_eq!(archive.bytes[0], 2);
+}
+
 /// The pre-committed bootstrap KP carries the FROZEN establishment credential. Enough
-/// peer rotations before a deferred A.4 evict that id from the acceptor's
+/// peer rotations before a deferred A.3 evict that id from the acceptor's
 /// credential-history window — but the acceptor PINS it (eviction-exempt) from the
 /// hash-authenticated KP, so `validate_member` still admits the lazily-created leaf and
 /// the round completes. Without the pin this wedges: `UnknownIdentity` → opaque `Mls`,
@@ -361,7 +462,7 @@ fn test_routing_available_from_birth_post_after_establishment() {
         bob_post.bytes,
         listen_a.rendezvous_by_epoch[0].rendezvous_id.bytes
     );
-    // The acceptor's own send group listens too — classical-only pre-A.4.
+    // The acceptor's own send group listens too — classical-only pre-A.3.
     let listen_b = assert_ok!(bob_s.should_listen_on());
     assert!(!listen_b.send_group.classical.bytes.is_empty());
     assert!(listen_b.send_group.pq.bytes.is_empty());
@@ -560,7 +661,7 @@ fn test_queue_proposal_declared_mismatch_is_noop() {
 fn test_never_approving_app_still_discharges_its_bind() {
     let (alice, bob) = establish_full();
 
-    // Bob holds the turn: he opens an A.3 round with a send and runs it to the trigger. PQ
+    // Bob holds the turn: he opens an A.4 round with a send and runs it to the trigger. PQ
     // moves, classical is owed.
     let before = bob.epochs();
     let ek = open_ratchet(&bob, &alice);
@@ -720,7 +821,7 @@ fn test_forged_high_epoch_offer_does_not_license() {
 #[test]
 fn test_rotation_canonicalized_by_a_discharging_commit() {
     let (alice, bob) = establish_full();
-    // Bob holds the turn after A.4: he opens an A.3 round with a send and binds, so his next
+    // Bob holds the turn after A.3: he opens an A.4 round with a send and binds, so his next
     // COMMITTING round is the one that must discharge it.
     let ek = open_ratchet(&bob, &alice);
     assert_ok!(alice.pq_ratchet_respond(ek));
@@ -785,7 +886,7 @@ fn test_rotation_canonicalized_by_a_discharging_commit() {
 #[test]
 fn test_queued_proposal_survives_bind_and_folds_with_discharge() {
     let (alice, bob) = establish_full();
-    // Bob holds the turn: he opens an A.3 round with a send BEFORE any proposal is queued
+    // Bob holds the turn: he opens an A.4 round with a send BEFORE any proposal is queued
     // (a queued proposal would make the opener COMMIT instead of staging the ratchet).
     let ek = open_ratchet(&bob, &alice);
 
@@ -798,7 +899,7 @@ fn test_queued_proposal_survives_bind_and_folds_with_discharge() {
     assert_ok!(bob.queue_proposal(assert_some!(got.proposal).digest));
     assert_eq!(bob.queued_remote_successor(), Some(id_a.clone()));
 
-    // Complete the A.3 up to the bind: PQ moves, classical is owed, and the tally is untouched.
+    // Complete the A.4 up to the bind: PQ moves, classical is owed, and the tally is untouched.
     assert_ok!(alice.pq_ratchet_respond(ek));
     let ct = assert_some!(alice.pq_take_pending_outbound());
     assert_ok!(bob.pq_ratchet_bind(ct));
@@ -1086,7 +1187,7 @@ fn test_listen_window_follows_mls_rs_epoch_retention() {
 fn test_encrypt_result_reports_apq_epoch_pair() {
     let (alice, bob) = establish_sessions();
 
-    // Acceptor pre-A.4: classical-only send group — pq epoch 0, not a
+    // Acceptor pre-A.3: classical-only send group — pq epoch 0, not a
     // duplicate of the classical epoch.
     assert_ok!(bob.prepare_to_encrypt(None));
     let upd = assert_ok!(bob.encrypt(b"upd".to_vec()));
@@ -1112,7 +1213,7 @@ fn test_encrypt_result_reports_apq_epoch_pair() {
 #[test]
 fn test_encrypt_epochs_diverge_post_bootstrap() {
     let (alice, bob) = establish_full();
-    // Post-A.4 the acceptor's send group has its PQ half (epoch 1); a commit
+    // Post-A.3 the acceptor's send group has its PQ half (epoch 1); a commit
     // round moves classical to 2 while pq stays 1 — the pair diverges and
     // encrypt reports it faithfully.
     assert_ok!(alice.prepare_to_encrypt(None));
@@ -1176,7 +1277,7 @@ fn test_pq_ratchet_discharge_mints_new_listen_address() {
     let (alice, bob) = establish_full();
     let before = assert_ok!(bob.should_listen_on()).rendezvous_by_epoch.len();
 
-    // Bob holds the turn: he opens an A.3 to the trigger. The PQ commit touches nothing
+    // Bob holds the turn: he opens an A.4 to the trigger. The PQ commit touches nothing
     // classical, so no new address yet — the listen map tracks the classical epoch, which
     // is owed.
     let ek = open_ratchet(&bob, &alice);
@@ -1216,9 +1317,9 @@ fn open_rekey(initiator: &Arc<TwoMlsPqSession>, responder: &Arc<TwoMlsPqSession>
 /// to make its send-PQ leaf lag, then lets sends carry the catch-up.
 ///
 /// `initiator` must be the NON-turn-holder (`responder` holds the turn). The rotation's
-/// canonicalize is sent by the turn-holding responder, which auto-stages one incidental A.3 —
-/// the one-round catch-up deferral (a staged A.3 can't be upgraded to A.5 mid-flight). Draining
-/// that A.3 passes the turn to the initiator, whose next send then auto-stages the A.5 Upd'
+/// canonicalize is sent by the turn-holding responder, which auto-stages one incidental A.4 —
+/// the one-round catch-up deferral (a staged A.4 can't be upgraded to A.5 mid-flight). Draining
+/// that A.4 passes the turn to the initiator, whose next send then auto-stages the A.5 Upd'
 /// announcing `new_id`. Upd' -> Commit' -> the stapled ack closes it (turn back to the responder).
 fn rekey_round(
     initiator: &Arc<TwoMlsPqSession>,
@@ -1234,7 +1335,7 @@ fn rekey_round(
 
 /// Drive a rotation-driven A.5 up to — but not through — the initiator's apply, returning the
 /// responder's Commit' frame (its `pq_rekey_respond` reply). Same preconditions and mechanics as
-/// [`rekey_round`]: `initiator` must be the NON-turn-holder; the rotation's incidental A.3 is
+/// [`rekey_round`]: `initiator` must be the NON-turn-holder; the rotation's incidental A.4 is
 /// drained, then the initiator's send auto-stages the A.5 Upd' announcing `new_id`, and the
 /// responder answers with its Commit'. Used where a test needs to interpose on the apply.
 fn rekey_to_commit(
@@ -1243,10 +1344,10 @@ fn rekey_to_commit(
     new_id: crate::ClientId,
 ) -> Vec<u8> {
     // Rotate the initiator (it does not hold the turn, so its rotate-send stages nothing; the
-    // responder's canonicalize send stages the incidental A.3).
+    // responder's canonicalize send stages the incidental A.4).
     rotate_round(initiator, responder, new_id.clone());
 
-    // Drain the responder's incidental A.3 (the catch-up deferral) — the turn passes to the
+    // Drain the responder's incidental A.4 (the catch-up deferral) — the turn passes to the
     // initiator, whose leaf now lags the rotated principal.
     let ek = assert_some!(responder.pq_pending_outbound(SideBandSealing::Fresh));
     assert_ok!(initiator.pq_ratchet_respond(ek));
@@ -1268,13 +1369,13 @@ fn rekey_to_commit(
     assert_some!(responder.pq_take_pending_outbound())
 }
 
-/// Send-driven A.3 open. The session no longer exposes a ratchet `begin`: the turn holder
+/// Send-driven A.4 open. The session no longer exposes a ratchet `begin`: the turn holder
 /// opens a round simply by SENDING an ordinary message, and `encrypt`'s `maybe_stage_next_round`
-/// auto-stages the A.3 EK into the side-band slot. This helper does that send (delivering the
+/// auto-stages the A.4 EK into the side-band slot. This helper does that send (delivering the
 /// opener to `responder`) and returns the peeked EK for the responder to answer.
 ///
 /// Preconditions the caller must meet, since they are exactly what the auto-driver gates on:
-/// `initiator` is post-A.4 (both PQ halves live), holds the turn, and has nothing queued (a
+/// `initiator` is post-A.3 (both PQ halves live), holds the turn, and has nothing queued (a
 /// queued proposal would make the opener COMMIT instead of a plain message) — so open a round
 /// before queuing, not after.
 fn open_ratchet(initiator: &Arc<TwoMlsPqSession>, responder: &Arc<TwoMlsPqSession>) -> Vec<u8> {
@@ -1284,7 +1385,7 @@ fn open_ratchet(initiator: &Arc<TwoMlsPqSession>, responder: &Arc<TwoMlsPqSessio
     assert_some!(initiator.pq_pending_outbound(SideBandSealing::Fresh))
 }
 
-/// Drive one full A.3 ratchet with `initiator` holding the turn: EK → CT → the
+/// Drive one full A.4 ratchet with `initiator` holding the turn: EK → CT → the
 /// stapled bind, delivered by the discharge round (`app` is asserted through to the
 /// responder by `discharge_bind`).
 fn ratchet_round(initiator: &Arc<TwoMlsPqSession>, responder: &Arc<TwoMlsPqSession>, app: &[u8]) {
@@ -1295,7 +1396,7 @@ fn ratchet_round(initiator: &Arc<TwoMlsPqSession>, responder: &Arc<TwoMlsPqSessi
     discharge_bind(initiator, responder, app);
 }
 
-/// A ROTATED party can discharge its owed A.3 bind via the BARE v19 license (no approved fold)
+/// A ROTATED party can discharge its owed A.4 bind via the BARE v19 license (no approved fold)
 /// and the peer opens the frame. The discharge commit carries the party's own-leaf credential
 /// handoff (`set_new_signing_identity`) but no folded Update to force an updatePath; mls-rs does
 /// not treat a new signing identity as path-forcing, so without the `TwoMlsRules::commit_options`
@@ -1305,11 +1406,11 @@ fn ratchet_round(initiator: &Arc<TwoMlsPqSession>, responder: &Arc<TwoMlsPqSessi
 #[test]
 fn test_rotated_party_license_discharge_delivers_handoff() {
     let (alice, bob) = establish_full();
-    // Rotate the A.3 initiator; its send-group leaf now lags the new principal.
+    // Rotate the A.4 initiator; its send-group leaf now lags the new principal.
     let new_bob = make_client().client_id();
     rotate_round(&bob, &alice, new_bob.clone());
 
-    // Bob opens an A.3 ratchet and ends OWING the bind.
+    // Bob opens an A.4 ratchet and ends OWING the bind.
     let ek = open_ratchet(&bob, &alice);
     assert_ok!(alice.pq_ratchet_respond(ek));
     let ct = assert_some!(alice.pq_take_pending_outbound());
@@ -1417,8 +1518,8 @@ fn test_pq_rekey_then_ratchet_still_works() {
     let (alice, bob) = establish_full();
     let new_alice = make_client().client_id();
     rekey_round(&alice, &bob, new_alice);
-    // A.3 ratchet after a rekey: Bob holds the turn (the rekey responder) and his leaf does not
-    // lag, so his next send drives an ordinary A.3.
+    // A.4 ratchet after a rekey: Bob holds the turn (the rekey responder) and his leaf does not
+    // lag, so his next send drives an ordinary A.4.
     ratchet_round(&bob, &alice, b"post-rekey-ratchet");
 }
 
@@ -1549,7 +1650,7 @@ fn test_pq_rekey_rotation_hands_pq_leaf_to_new_principal() {
 /// Phase 8 swaps the session client, but the existing groups keep resolving
 /// external PSKs from the stores of the clients that created them. Every
 /// PSK-carrying flow must still work after a rotation — this pins the
-/// psk_stores registry (a plain rekey, an A.3 ratchet, and a full classical
+/// psk_stores registry (a plain rekey, an A.4 ratchet, and a full classical
 /// commit round, all post-rotation, no credential handoff involved).
 #[test]
 fn test_psk_flows_survive_rotation() {
@@ -1560,7 +1661,7 @@ fn test_psk_flows_survive_rotation() {
     let new_alice = make_client().client_id();
     rekey_round(&alice, &bob, new_alice);
 
-    // A.3 ratchet with the rotated side (Alice) responding — Bob holds the turn now.
+    // A.4 ratchet with the rotated side (Alice) responding — Bob holds the turn now.
     ratchet_round(&bob, &alice, b"post-rotation-ratchet");
 
     // Full classical commit round: Alice staples an Upd that Bob approves and commits with a
@@ -1591,7 +1692,7 @@ fn test_pq_bootstrap_begin_rotating_requires_current_agent() {
     );
 
     // After a Phase 8 rotation the bootstrap accepts the handoff id, and the KP' it
-    // emits — the pre-committed one, per the v20 pin — completes A.4 as usual: the
+    // emits — the pre-committed one, per the v20 pin — completes A.3 as usual: the
     // peer's hash check admits the establishment-credential KP (the commitment
     // outranks the live-principal equality), and the bind joins the Welcome' because
     // the KP's private half is SESSION-owned and injected just-in-time — a
@@ -1610,7 +1711,7 @@ fn test_pq_bootstrap_begin_rotating_requires_current_agent() {
 }
 
 #[test]
-fn test_a4_bootstrap_mints_no_listen_addresses_but_advertises_pq_id() {
+fn test_a3_bootstrap_mints_no_listen_addresses_but_advertises_pq_id() {
     let (alice, bob) = establish_sessions();
     let bob_before = assert_ok!(bob.should_listen_on());
     assert!(bob_before.send_group.pq.bytes.is_empty());
@@ -1621,7 +1722,7 @@ fn test_a4_bootstrap_mints_no_listen_addresses_but_advertises_pq_id() {
     assert_ok!(alice.pq_bootstrap_bind(welcome));
     discharge_bind(&alice, &bob, b"bootstrap-bind");
 
-    // The acceptor's side of A.4 is PQ-groups-only: Bob's send group commits nothing
+    // The acceptor's side of A.3 is PQ-groups-only: Bob's send group commits nothing
     // classical (Alice's discharge advances HER classical), so his listen addresses
     // are untouched — but his send group now advertises its PQ half.
     let bob_after = assert_ok!(bob.should_listen_on());
@@ -1641,7 +1742,7 @@ fn test_a4_bootstrap_mints_no_listen_addresses_but_advertises_pq_id() {
 /// The classical half is the opposite. Applying it advances the epoch Alice's ordinary
 /// traffic rides, onto a commit whose `apq_psk` the peer can only derive from the bind's PQ
 /// half. Applied at the trigger, every frame Alice sends before the bind lands is
-/// undeliverable — and for A.4 the trigger is INBOUND, so she may have nothing to send at
+/// undeliverable — and for A.3 the trigger is INBOUND, so she may have nothing to send at
 /// all. So the trigger leaves 2/1, and the classical COMMIT that discharges the bind
 /// makes it 2/2.
 #[test]
@@ -1649,7 +1750,7 @@ fn test_bind_moves_pq_and_owes_classical() {
     let (alice, bob) = establish_full();
     let before = bob.epochs();
 
-    // Bob holds the turn: he opens the A.3 with a send, Alice responds, Bob binds.
+    // Bob holds the turn: he opens the A.4 with a send, Alice responds, Bob binds.
     let ek = open_ratchet(&bob, &alice);
     assert_ok!(alice.pq_ratchet_respond(ek));
     let ct = assert_some!(alice.pq_take_pending_outbound());
@@ -1675,7 +1776,7 @@ fn test_bind_moves_pq_and_owes_classical() {
 #[test]
 fn test_ordinary_discharge_is_not_flagged_fatal() {
     let (alice, bob) = establish_full();
-    // Bob holds the turn: a clean A.3 round through its discharge — no error, no fatal wrapper.
+    // Bob holds the turn: a clean A.4 round through its discharge — no error, no fatal wrapper.
     ratchet_round(&bob, &alice, b"clean");
     // A plain fold with nothing owed still commits normally.
     approved_commit_round(&bob, &alice);
@@ -1693,7 +1794,7 @@ fn test_ordinary_discharge_is_not_flagged_fatal() {
 fn test_failed_bind_apply_breaks_receive_not_send_and_heals_on_restore() {
     let (alice, bob) = establish_full();
 
-    // Bob holds the turn after A.4, so he opens the round with a send; Alice responds and holds S.
+    // Bob holds the turn after A.3, so he opens the round with a send; Alice responds and holds S.
     let ek = open_ratchet(&bob, &alice);
     assert_ok!(alice.pq_ratchet_respond(ek));
     let ct = assert_some!(alice.pq_take_pending_outbound());
@@ -1716,7 +1817,7 @@ fn test_failed_bind_apply_breaks_receive_not_send_and_heals_on_restore() {
         let mut inner = alice.lock();
         assert!(
             matches!(inner.pq_inflight, Some(super::PqInflight::Responding(_))),
-            "Alice should hold S as the A.3 responder"
+            "Alice should hold S as the A.4 responder"
         );
         if let Some(super::PqInflight::Responding(s)) = inner.pq_inflight.as_mut() {
             s[0] ^= 0xFF;
@@ -1777,7 +1878,7 @@ fn test_failed_bind_apply_breaks_receive_not_send_and_heals_on_restore() {
 #[test]
 fn test_discharge_refuses_a_violated_reservation() {
     let (alice, bob) = establish_full();
-    // Bob holds the turn: he opens the A.3 with a send, Alice responds, Bob binds.
+    // Bob holds the turn: he opens the A.4 with a send, Alice responds, Bob binds.
     let ek = open_ratchet(&bob, &alice);
     assert_ok!(alice.pq_ratchet_respond(ek));
     let ct = assert_some!(alice.pq_take_pending_outbound());
@@ -1813,7 +1914,7 @@ fn test_discharge_refuses_a_violated_reservation() {
 #[test]
 fn test_archive_mid_hold_discharges_after_restore() {
     let (alice, bob) = establish_full();
-    // Bob holds the turn: he opens the A.3 with a send, Alice responds, Bob binds.
+    // Bob holds the turn: he opens the A.4 with a send, Alice responds, Bob binds.
     let ek = open_ratchet(&bob, &alice);
     assert_ok!(alice.pq_ratchet_respond(ek));
     let ct = assert_some!(alice.pq_take_pending_outbound());
@@ -1893,20 +1994,20 @@ fn test_pq_ratchet_completes_after_principal_rotation() {
     let new_bob = make_client().client_id();
     rotate_round(&bob, &alice, new_bob);
 
-    // A full A.3 round after both rotations: the injected-secret and apq PSKs must land in the
+    // A full A.4 round after both rotations: the injected-secret and apq PSKs must land in the
     // stores the group halves actually resolve from (captured at group creation), not the
     // rotated-in client's. Bob holds the turn, so he drives it.
     ratchet_round(&bob, &alice, b"pq-after-rotation");
 }
 
-/// Complete the A.4 bootstrap after establishment so both directions are full
+/// Complete the A.3 bootstrap after establishment so both directions are full
 /// APQ — required before the deferred acceptor side can ratchet.
-/// Drive A.4 to completion the way a re-staple host does: through the retained PEEK, not
+/// Drive A.3 to completion the way a re-staple host does: through the retained PEEK, not
 /// `pq_take_pending_outbound`.
 ///
 /// This matters more than it looks. The take empties the slot, so a take-driven helper
 /// cannot see anything that goes wrong with a RETAINED bootstrap frame — which is how the
-/// A.4/A.3 slot collision hid from the entire suite. (Bob's welcome is retained until the
+/// A.3/A.4 slot collision hid from the entire suite. (Bob's welcome is retained until the
 /// stapled bind lands; applying the staple in `discharge_bind` is what clears it, so the
 /// helper leaves both slots empty.)
 fn establish_full() -> (Arc<TwoMlsPqSession>, Arc<TwoMlsPqSession>) {
@@ -1914,7 +2015,7 @@ fn establish_full() -> (Arc<TwoMlsPqSession>, Arc<TwoMlsPqSession>) {
     let kp = assert_ok!(alice.pq_bootstrap_begin(None));
     assert_ok!(bob.pq_bootstrap_respond(kp));
     let welcome = assert_some!(bob.pq_pending_outbound(SideBandSealing::Fresh));
-    // A.4's third leg: joining commits Alice's send-PQ and OWES the classical half, which
+    // A.3's third leg: joining commits Alice's send-PQ and OWES the classical half, which
     // her next committing round carries as an APQPrivateMessage staple.
     assert_ok!(alice.pq_bootstrap_bind(welcome));
     discharge_bind(&alice, &bob, b"bootstrap-bind");
@@ -1979,13 +2080,13 @@ fn test_pq_ratchet_bind_guarded_while_commit_staged() {
     discharge_bind(&bob, &alice, b"app");
 }
 
-/// A.4's bind calls the same `commit_pq_and_owe_bind` as A.3's, so it carries the identical
+/// A.3's bind calls the same `commit_pq_and_owe_bind` as A.4's, so it carries the identical
 /// hazard: a prepared-but-unsent classical commit is sitting in `current_staple` waiting for
 /// its `encrypt`, and the bind's commit would fire out from under it. A displaced commit
 /// never rides a frame again, so the peer hits the epoch-ahead desync with zero loss on the
 /// wire.
 ///
-/// A.3 guards this; A.4 did not. The exposure is worse here, because A.4's trigger is
+/// A.4 guards this; A.3 did not. The exposure is worse here, because A.3's trigger is
 /// INBOUND: a host that prepares a round and then receives the peer's welcome before its
 /// `encrypt` hits this without doing anything wrong, and the ordering is not its to control.
 #[test]
@@ -2028,7 +2129,7 @@ fn test_no_message_frame_can_overtake_the_bind() {
     // evidence watermark stays behind his own send epoch. This is the only state in which a
     // mid-hold frame could try to overtake the bind: with the turn-holder freshly licensed,
     // an owed bind simply discharges on the next round. The committing send also auto-stages
-    // Bob's A.3 EK.
+    // Bob's A.4 EK.
     assert_ok!(alice.prepare_to_encrypt(None));
     let offer = assert_ok!(alice.encrypt(b"offer".to_vec()));
     let got = assert_some!(assert_ok!(bob.process_incoming(offer.cipher_text)));
@@ -2037,7 +2138,7 @@ fn test_no_message_frame_can_overtake_the_bind() {
     let committed = assert_ok!(bob.encrypt(b"committed".to_vec()));
     assert_some!(assert_ok!(alice.process_incoming(committed.cipher_text))); // Alice applies it
 
-    // Bob's A.3 round up to the trigger: PQ committed, classical owed.
+    // Bob's A.4 round up to the trigger: PQ committed, classical owed.
     let ek = assert_some!(bob.pq_pending_outbound(SideBandSealing::Fresh));
     assert_ok!(alice.pq_ratchet_respond(ek));
     let ct = assert_some!(alice.pq_take_pending_outbound());
@@ -2170,7 +2271,7 @@ fn test_accept_with_invalid_welcome_bytes_returns_error() {
             bob,
             vec![0xFF; 32],
             alice_kp,
-            vec![0u8; 32], // no A.4 in this test — any 32-byte commitment passes the length gate
+            vec![0u8; 32], // no A.3 in this test — any 32-byte commitment passes the length gate
             None
         ),
         TwoMlsPqError::Mls
@@ -2414,7 +2515,7 @@ fn test_push_persistence_smoke() {
         sink.kinds()
     );
 
-    // A PQ side-band round (A.3 ratchet) pushes Checkpoint(s).
+    // A PQ side-band round (A.4 ratchet) pushes Checkpoint(s).
     ratchet_round(&bob, &alice, b"pq-round");
     assert!(
         sink.kinds()
@@ -2477,7 +2578,7 @@ fn test_guard_first_rejection_neither_pushes_nor_bumps() {
     );
 
     // (2) Checkpoint path — a peer-replayable side-band frame that fails its guard. Bob opens an
-    // A.3 with a send; Alice's respond is a real mutation (pushes a Checkpoint). A REPLAY of the
+    // A.4 with a send; Alice's respond is a real mutation (pushes a Checkpoint). A REPLAY of the
     // same EK — the peer re-sending it until Alice's CT lands — is the amplifier class: it is
     // rejected as a duplicate ABOVE the persist choke point, so it must neither bump `state_seq`
     // nor push a second full ML-KEM Checkpoint for a no-op.
@@ -2538,7 +2639,7 @@ fn test_staged_a5_survives_core_only_push_restore() {
     let sink = Arc::new(RecordingSink::default());
     assert_ok!(alice.install_sink(sink.clone()));
 
-    // Rotate Alice (the non-turn-holder) and drain Bob's incidental A.3 — the turn passes to
+    // Rotate Alice (the non-turn-holder) and drain Bob's incidental A.4 — the turn passes to
     // Alice and her send-PQ leaf now lags. The discharge's apply pushes the last checkpoint.
     let new_alice = make_client().client_id();
     rotate_round(&alice, &bob, new_alice.clone());
@@ -2645,7 +2746,7 @@ fn test_archive_round_trips_fully_established_session() {
     let restored = round_trip(&alice_session);
     assert!(restored.is_fully_established());
 
-    // The PQ side-band still runs: a full A.3 ratchet round against the restored
+    // The PQ side-band still runs: a full A.4 ratchet round against the restored
     // side (Bob holds the turn after the bootstrap).
     ratchet_round(&bob_session, &restored, b"pq-after-restore");
     message_round(&restored, &bob_session, b"classical-after-pq");
@@ -2843,7 +2944,7 @@ fn test_archive_mid_rekey_round_completes_after_restore() {
     discharge_bind(&alice_session, &bob_session, b"bootstrap-bind");
 
     // Make Bob the rekey initiator (the non-turn-holder): flip the turn to Alice, rotate Bob so
-    // his leaf lags, and drain the deferral A.3 back to Bob.
+    // his leaf lags, and drain the deferral A.4 back to Bob.
     ratchet_round(&bob_session, &alice_session, b"flip");
     let new_bob = make_client().client_id();
     rotate_round(&bob_session, &alice_session, new_bob.clone());
@@ -2930,11 +3031,11 @@ fn test_stage_rotation_same_id_is_idempotent() {
     assert_ok!(alice_session.encrypt(b"candidate-two".to_vec()));
 }
 
-/// Total archive #2: archive mid-A.3 as the INITIATOR (after the send that opened the round,
+/// Total archive #2: archive mid-A.4 as the INITIATOR (after the send that opened the round,
 /// before the ciphertext arrives). The held ephemeral survives the jump, so the restored
 /// initiator binds the responder's ciphertext and the round completes.
 #[test]
-fn test_archive_mid_a3_as_initiator_completes_after_restore() {
+fn test_archive_mid_a4_as_initiator_completes_after_restore() {
     let (alice_session, bob_session) = establish_sessions();
     let kp = assert_ok!(alice_session.pq_bootstrap_begin(None));
     assert_ok!(bob_session.pq_bootstrap_respond(kp));
@@ -2942,7 +3043,7 @@ fn test_archive_mid_a3_as_initiator_completes_after_restore() {
     assert_ok!(alice_session.pq_bootstrap_bind(welcome));
     discharge_bind(&alice_session, &bob_session, b"bootstrap-bind");
 
-    // Bob holds the turn after the bootstrap: he is the A.3 initiator, opening it with a send.
+    // Bob holds the turn after the bootstrap: he is the A.4 initiator, opening it with a send.
     let ek = open_ratchet(&bob_session, &alice_session);
     // Archive Bob mid-round (Initiating, holding the ephemeral) before the ct arrives.
     let restored_bob = round_trip(&bob_session);
@@ -2955,12 +3056,12 @@ fn test_archive_mid_a3_as_initiator_completes_after_restore() {
     message_round(&restored_bob, &alice_session, b"classical-after-jump");
 }
 
-/// Total archive #3: archive mid-A.3 as the RESPONDER (after `pq_ratchet_respond`,
+/// Total archive #3: archive mid-A.4 as the RESPONDER (after `pq_ratchet_respond`,
 /// holding the shared secret S). S survives the jump, so the restored responder
 /// applies the initiator's stapled bind cleanly — the desync that discarding S would
 /// cause is exactly why S must be serialized.
 #[test]
-fn test_archive_mid_a3_as_responder_completes_after_restore() {
+fn test_archive_mid_a4_as_responder_completes_after_restore() {
     let (alice_session, bob_session) = establish_sessions();
     let kp = assert_ok!(alice_session.pq_bootstrap_begin(None));
     assert_ok!(bob_session.pq_bootstrap_respond(kp));
@@ -3743,7 +3844,7 @@ fn test_header_key_len_matches_aead() {
 fn test_side_band_padding_equalizes_with_message() {
     let (alice, bob) = establish_full();
     bob.set_pad_target(Some(3072));
-    // A message under the cap: the co-stapled A.3 EK (naturally smaller) pads up to it exactly.
+    // A message under the cap: the co-stapled A.4 EK (naturally smaller) pads up to it exactly.
     assert_ok!(bob.prepare_to_encrypt(None));
     let msg = assert_ok!(bob.encrypt(vec![7u8; 500]));
     let ek = assert_some!(bob.pq_pending_outbound(SideBandSealing::Fresh));
@@ -3798,7 +3899,7 @@ fn test_no_pad_target_leaves_frames_natural() {
 }
 
 /// Feature B: padding only ever GROWS a frame. A frame naturally larger than the target keeps its
-/// natural size (the A.4 welcome / A.5 Commit' case, stood in for by a target below the EK size).
+/// natural size (the A.3 welcome / A.5 Commit' case, stood in for by a target below the EK size).
 #[test]
 fn test_side_band_padding_never_shrinks_a_larger_frame() {
     let (_a1, natural_sess) = establish_full();
@@ -3820,7 +3921,7 @@ fn test_side_band_padding_never_shrinks_a_larger_frame() {
     );
 }
 
-/// full A.3 round drives end-to-end through sealed frames.
+/// full A.4 round drives end-to-end through sealed frames.
 #[test]
 fn test_sealed_side_band_opens_and_classifies() {
     let (alice, bob) = establish_full();
@@ -3846,7 +3947,7 @@ fn test_sealed_side_band_opens_and_classifies() {
 #[test]
 fn test_side_band_survives_classical_churn() {
     let (alice, bob) = establish_full();
-    // Flip the turn to Alice so she can open the A.3 by sending (Bob holds it after bootstrap).
+    // Flip the turn to Alice so she can open the A.4 by sending (Bob holds it after bootstrap).
     ratchet_round(&bob, &alice, b"flip");
 
     // Capture two pre-churn frames Bob will try to open later: a message frame
@@ -3885,7 +3986,7 @@ fn test_side_band_survives_classical_churn() {
     );
 }
 
-/// The pre-A.4 BOOTSTRAP_KP has no recv-PQ group yet, so it falls back to the
+/// The pre-A.3 BOOTSTRAP_KP has no recv-PQ group yet, so it falls back to the
 /// classical seal and opens via the classical window — still classifying as the
 /// bootstrap side-band frame.
 #[test]
@@ -4033,7 +4134,7 @@ fn test_bootstrap_kp_envelope_roundtrips() {
     )));
     let bob_kp = bob_inv.combiner_key_package();
 
-    // The verbatim 0x13 A.4 frame; the envelope never interprets it past the leading tag.
+    // The verbatim 0x13 A.3 frame; the envelope never interprets it past the leading tag.
     let mut kp_frame = vec![super::PQ_BOOTSTRAP_KP_TAG];
     kp_frame.extend_from_slice(b"opaque-a4-bootstrap-frame");
     let sealed = assert_ok!(crate::key_packages::seal_hpke_blob(&bob_kp, &kp_frame));
@@ -4061,15 +4162,15 @@ fn test_all_empty_initial_envelope_rejected() {
     assert!(bob_inv.open_initial(sealed).is_err());
 }
 
-/// Part 3 end-to-end: the initiator delivers its A.4 KP′ IN PARALLEL with the establishment
-/// reply, and A.4 completes with NO separate post-establishment `pq_bootstrap_begin` round.
+/// Part 3 end-to-end: the initiator delivers its A.3 KP′ IN PARALLEL with the establishment
+/// reply, and A.3 completes with NO separate post-establishment `pq_bootstrap_begin` round.
 /// The acceptor opens the early bootstrap-only envelope, HOLDS the KP′ until the reply
 /// establishes its session, then feeds it to `pq_bootstrap_respond` and sends `Welcome'`
-/// alongside its return welcome; the initiator — whose emit registered the A.4 round and
+/// alongside its return welcome; the initiator — whose emit registered the A.3 round and
 /// carried it through the establishment cutover — binds the early `Welcome'`. Proves the
 /// verbatim carriage into `respond` and that the round registration survives the cutover.
 #[test]
-fn test_parallel_bootstrap_completes_a4_without_a_begin_round() {
+fn test_parallel_bootstrap_completes_a3_without_a_begin_round() {
     use crate::key_packages::TwoMlsPqInvitation;
     let alice = make_client();
     let bob = make_client();
@@ -4110,7 +4211,7 @@ fn test_parallel_bootstrap_completes_a4_without_a_begin_round() {
     let return_welcome = assert_some!(bob_s.pending_outbound());
 
     // Alice establishes off the return welcome, then binds the EARLY Welcome' — her emit
-    // registered the A.4 round, so no separate `pq_bootstrap_begin` was ever called.
+    // registered the A.3 round, so no separate `pq_bootstrap_begin` was ever called.
     assert_ok!(alice_s.process_incoming(return_welcome));
     assert!(alice_s.is_established());
     assert_ok!(alice_s.pq_bootstrap_bind(welcome_prime));
@@ -4121,7 +4222,7 @@ fn test_parallel_bootstrap_completes_a4_without_a_begin_round() {
     assert!(bob_s.epochs().pq_epoch > 0);
 }
 
-/// Part 3 delta #3 — retriability of an EARLY `Welcome'`. Registering the A.4 round at emit
+/// Part 3 delta #3 — retriability of an EARLY `Welcome'`. Registering the A.3 round at emit
 /// (pre-establishment) makes it reachable for a reordered `Welcome'` to arrive before the
 /// initiator has joined its classical half. Binding it then is a NON-CORRUPTING, retriable
 /// failure (guard-first — the pre-committed secret is never spent), and the SAME welcome
@@ -4182,7 +4283,7 @@ fn test_parallel_bootstrap_welcome_before_establishment_is_retriable() {
 /// `pq_take_pending_outbound` in the pre-establishment window the parallel envelope creates
 /// is a guarded no-op, NOT a destructive take: there is no side-band to take from yet, and
 /// the parked `[0x13][KP′]` is the round's only carrier (an unguarded take would swallow the
-/// doomed seal and persist the stranded slot — an unhealable A.4).
+/// doomed seal and persist the stranded slot — an unhealable A.3).
 #[test]
 fn test_take_pending_outbound_pre_establishment_leaves_bootstrap_round_intact() {
     use crate::key_packages::TwoMlsPqInvitation;
@@ -4225,9 +4326,9 @@ fn test_take_pending_outbound_pre_establishment_leaves_bootstrap_round_intact() 
     assert!(bob_s.is_fully_established());
 }
 
-/// After the parallel envelope registered the A.4 round, `pq_bootstrap_begin` is IDEMPOTENT —
+/// After the parallel envelope registered the A.3 round, `pq_bootstrap_begin` is IDEMPOTENT —
 /// it re-seals and returns the retained frame (no state change) instead of erroring — so a
-/// host that keeps its standard post-establishment A.4 kickoff after adopting the parallel
+/// host that keeps its standard post-establishment A.3 kickoff after adopting the parallel
 /// envelope self-heals a dropped parallel frame through the classic flow.
 #[test]
 fn test_bootstrap_begin_idempotent_after_parallel_envelope() {
@@ -4271,7 +4372,7 @@ fn test_bootstrap_begin_idempotent_after_parallel_envelope() {
 }
 
 /// Part 3 — register-once, re-seal-per-send PURE. The first `pq_bootstrap_envelope` registers
-/// the A.4 round (one Checkpoint); every later pre-cutover emit re-seals the SAME retained KP′
+/// the A.3 round (one Checkpoint); every later pre-cutover emit re-seals the SAME retained KP′
 /// under a FRESH HPKE ephemeral (distinct ciphertext, unlinkable) WITHOUT advancing state — so
 /// no extra Checkpoint is pushed. Both envelopes open to the identical verbatim `[0x13][KP′]`.
 #[test]
@@ -4295,7 +4396,7 @@ fn test_parallel_bootstrap_envelope_reseals_fresh_without_extra_checkpoint() {
     assert_eq!(
         sink.kinds(),
         vec![crate::BlobKind::Checkpoint, crate::BlobKind::Checkpoint],
-        "the first emit registers the A.4 round with a Checkpoint"
+        "the first emit registers the A.3 round with a Checkpoint"
     );
 
     // Second emit is a PURE re-seal → fresh ciphertext, NO extra Checkpoint.
@@ -4622,7 +4723,7 @@ fn test_install_establishment_envelope_rules() {
 }
 
 /// Contract 26: the PQ side-band emission doors are gated like the message doors —
-/// a born-dedicated acceptor hands out nothing pre-install. (The A.4 side-band only
+/// a born-dedicated acceptor hands out nothing pre-install. (The A.3 side-band only
 /// runs post-establishment, so this gate is defense in depth, but it must hold.)
 #[test]
 fn test_pq_side_band_gated_pre_install() {
@@ -4867,9 +4968,9 @@ fn test_envelope_outlives_until_initiator_joins() {
 /// The dedicated-principal session drives the full lifecycle: cross-party PSK
 /// refreshes (folding commits in both directions — the acceptor's recv group lives on
 /// the invitation-derived client's stores while its send group lives on the
-/// dedicated client's, so this proves `register_psk` reaches both), the A.4
+/// dedicated client's, so this proves `register_psk` reaches both), the A.3
 /// bootstrap (the PQ half is created under the dedicated principal too — no
-/// credential catch-up rekey needed), an A.3 ratchet round, and archive/restore.
+/// credential catch-up rekey needed), an A.4 ratchet round, and archive/restore.
 #[test]
 fn test_dedicated_principal_full_lifecycle() {
     use crate::key_packages::TwoMlsPqInvitation;
@@ -4940,7 +5041,7 @@ fn test_dedicated_principal_full_lifecycle() {
         b"full-b".to_vec()
     );
 
-    // A.4 bootstrap: Bob's deferred send-PQ half is created by the dedicated client.
+    // A.3 bootstrap: Bob's deferred send-PQ half is created by the dedicated client.
     let kp = assert_ok!(alice_s.pq_bootstrap_begin(None));
     assert_ok!(bob_s.pq_bootstrap_respond(kp));
     let welcome = assert_some!(bob_s.pq_take_pending_outbound());
@@ -4949,7 +5050,7 @@ fn test_dedicated_principal_full_lifecycle() {
     assert!(alice_s.is_fully_established());
     assert!(bob_s.is_fully_established());
 
-    // A.3 ratchet round end-to-end.
+    // A.4 ratchet round end-to-end.
     ratchet_round(&bob_s, &alice_s, b"pq-app");
 
     // Archive/restore of the dedicated-principal acceptor: the archive carries the
@@ -5543,7 +5644,7 @@ fn test_epoch_ahead_staple_surfaces_desync() {
     // Freeze a stale copy of Bob. A LOSSY LINK can no longer produce a two-ahead
     // staple: every classical commit is fold-gated (it needs a peer proposal at the
     // current epoch), so a second commit cannot exist until the peer provably applied
-    // the first — the old construction rode the A.3 bind's unilateral classical
+    // the first — the old construction rode the A.4 bind's unilateral classical
     // commit, which is gone. A receiver restored from a stale archive is what still
     // meets one.
     let stale_bob = round_trip(&bob_session);
@@ -6178,7 +6279,7 @@ fn test_process_incoming_bare_mls_and_unknown_tags_rejected() {
     );
     // A byte the space does not assign at all (0x31 — past every band; see frames.rs) fails
     // loudly too. This must stay UNALLOCATED, and has now drifted twice: it read 0x13 until
-    // the tag renumber made that the A.3 bind, then 0x19 until banding made that the A.3
+    // the tag renumber made that the A.4 bind, then 0x19 until banding made that the A.4
     // ciphertext. A side-band tag reaching process_incoming returns SessionNotReady — the
     // host is meant to route those by `pq_frame_kind` — which is a different rejection than
     // the one under test, so the assertion would still pass while testing nothing.
@@ -6295,10 +6396,10 @@ fn test_establishment_carries_apqinfo_with_deferred_sentinel() {
     }
 }
 
-/// A.4 stands the deferred PQ half up under exactly the group id the classical
+/// A.3 stands the deferred PQ half up under exactly the group id the classical
 /// half's APQInfo pre-allocated at establishment.
 #[test]
-fn test_a4_uses_preallocated_pq_group_id() {
+fn test_a3_uses_preallocated_pq_group_id() {
     use apq::component::read_apqinfo;
     let (alice, bob) = establish_confirmed_sessions();
 
@@ -6338,14 +6439,14 @@ fn test_apqinfo_deferred_verifier_rejects_bound_pq_epoch() {
     assert!(verify_apqinfo_deferred(&send.classical, inner.suite).is_err());
 }
 
-/// The A.3 bind is a -02 FULL: each round carries the AppDataUpdate in both halves,
+/// The A.4 bind is a -02 FULL: each round carries the AppDataUpdate in both halves,
 /// and the staple arm verifies the two copies agree AND match the actual post-apply
 /// epochs of both groups before decrypting the frame's app message — so a clean
 /// delivery is proof the attestation verified end to end. Both directions
 /// (turn-flipped) exercise it. (The epoch-arithmetic rejection itself is unit-tested
 /// at the apq layer, where a mismatched attestation can be crafted directly.)
 #[test]
-fn test_a3_bind_full_round_verifies_attestation_both_directions() {
+fn test_a4_bind_full_round_verifies_attestation_both_directions() {
     let (alice, bob) = establish_full();
     // Bob holds the turn after bootstrap, so he goes first.
     ratchet_round(&bob, &alice, b"b-to-a");
@@ -6657,7 +6758,7 @@ fn test_welcome_with_pq_half_binding_rejected() {
         bob_inv.receive(
             crafted,
             alice_kp.clone(),
-            vec![0u8; 32], // no A.4 in this test — any 32-byte commitment passes the length gate
+            vec![0u8; 32], // no A.3 in this test — any 32-byte commitment passes the length gate
             b"token".to_vec(),
             None,
             None,
@@ -6694,7 +6795,7 @@ fn test_welcome_with_pq_half_binding_rejected() {
 #[test]
 fn test_pq_pending_outbound_peek_is_repeatable_and_non_consuming() {
     let (alice, bob) = establish_full();
-    // Bob holds the turn: his send opens the A.3, staging the EK.
+    // Bob holds the turn: his send opens the A.4, staging the EK.
     let _ = open_ratchet(&bob, &alice);
 
     // Three peeks, three sealed frames — each independently openable by the peer.
@@ -6895,7 +6996,7 @@ fn test_stable_seal_is_invalidated_when_the_frame_advances() {
     discharge_bind(&alice, &bob, b"round-two");
 }
 
-/// The A.4 begin-return / Stable-base agreement: its KP' is minted
+/// The A.3 begin-return / Stable-base agreement: its KP' is minted
 /// pre-establishment and is the one frame sealed classically, so it takes a different path
 /// through `seal_side_band` and is worth pinning separately.
 #[test]
@@ -6903,12 +7004,12 @@ fn test_bootstrap_begin_return_matches_the_stable_base() {
     let (alice, bob) = establish_confirmed_sessions();
     let returned = assert_ok!(alice.pq_bootstrap_begin(None));
     let peeked = assert_some!(alice.pq_pending_outbound(SideBandSealing::Stable));
-    assert_eq!(returned, peeked, "A.4 begin disagrees with the Stable base");
+    assert_eq!(returned, peeked, "A.3 begin disagrees with the Stable base");
     assert_ok!(bob.pq_bootstrap_respond(returned));
 }
 
 // ===========================================================================
-// A.4 as a well-formed round
+// A.3 as a well-formed round
 // ===========================================================================
 //
 // There is no terminal-frame retirement section any more, and that is the point: every

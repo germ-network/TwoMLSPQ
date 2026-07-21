@@ -37,7 +37,7 @@ pub(in crate::session) fn rendezvous_secret(
 //     the classical epoch — `header_key` / `recv_header_keys`;
 //   * PQ side-band frames (0x13–0x1D) seal under the PQ half's exporter, keyed by
 //     `pq_epoch` — `header_key_pq` / `recv_header_keys_pq`.
-// The one exception is the pre-A.4 BOOTSTRAP_KP, whose recv-PQ group does not exist yet;
+// The one exception is the pre-A.3 BOOTSTRAP_KP, whose recv-PQ group does not exist yet;
 // it falls back to the classical seal (see `SessionInner::seal_side_band`).
 //
 // The two families only choose which group HALF derives the key; the AEAD that consumes
@@ -48,7 +48,7 @@ pub(in crate::session) fn rendezvous_secret(
 // it), but its cipher changes only by declaring a new suite variant.
 pub(in crate::session) const HEADER_KEY_LABEL: &[u8] = b"germ.network.twomlspq.headerKey.v1";
 pub(in crate::session) const HEADER_KEY_PQ_LABEL: &[u8] = b"germ.network.twomlspq.headerKey.pq.v1";
-/// Exporter label for the A.3 CT-seal PSK — the epoch-bound secret that keys the seal over
+/// Exporter label for the A.4 CT-seal PSK — the epoch-bound secret that keys the seal over
 /// the round's injected secret (see `apq::pq_ratchet::seal_injected_secret`). The plain
 /// REPEATABLE exporter, deliberately not `SafeExport`: both parties derive it independently
 /// and a stale ciphertext must be able to fail its open without a one-shot leaf it could
@@ -93,7 +93,7 @@ pub(in crate::session) fn header_key_pq(
         .map_err(|_| TwoMlsPqError::Mls)
 }
 
-/// The A.3 CT-seal PSK for `group` at its CURRENT epoch: the repeatable exporter under
+/// The A.4 CT-seal PSK for `group` at its CURRENT epoch: the repeatable exporter under
 /// [`CT_SEAL_PSK_LABEL`]. Both parties call this on their own copy of the group the round's
 /// secret is injected into (the initiator's send-PQ / the responder's recv-PQ mirror) — same
 /// group, same epoch, same value — and each round is at a distinct epoch, so the PSK is the
@@ -141,7 +141,7 @@ impl EstablishmentApproval {
 impl SessionInner {
     /// Capture the send group's classical-half rendezvous exporter at its current epoch.
     /// Idempotent per epoch. Called wherever that epoch can advance — group creation,
-    /// the A.2/rotation commits in `prepare_to_encrypt`, the A.3 bind — and from
+    /// the A.2/rotation commits in `prepare_to_encrypt`, the A.4 bind — and from
     /// `should_listen_on` as a backstop.
     ///
     /// The listen window follows mls-rs's own epoch retention rather than a second,
@@ -182,9 +182,9 @@ impl SessionInner {
 
     /// Capture my send-PQ group's header key at its current `pq_epoch` into the PQ
     /// receive window. Idempotent per `pq_epoch`; a no-op until the send-PQ half exists
-    /// (deferred on the acceptor until the A.4 bootstrap). Called wherever the send-PQ
+    /// (deferred on the acceptor until the A.3 bootstrap). Called wherever the send-PQ
     /// group is created or its `pq_epoch` advances — group creation (`initiate`,
-    /// `pq_bootstrap_respond`), the A.3 bind (`pq_ratchet_bind`), and the A.5 commits
+    /// `pq_bootstrap_respond`), the A.4 bind (`pq_ratchet_bind`), and the A.5 commits
     /// (`pq_rekey_respond` / `pq_rekey_apply`). Retention is a plain keep-newest window
     /// (these are session-owned secrets; the PQ side-band has no rendezvous and no
     /// mls-rs-retention story to follow).
@@ -227,7 +227,7 @@ impl SessionInner {
     /// Seal a PQ side-band frame under the PQ family — `header_key_pq(recv_group.pq)` at
     /// its current `pq_epoch`, the peer opening it from its own send-PQ window. Falls back
     /// to the classical `seal` when the recv-PQ group does not exist yet: the only such
-    /// frame is the pre-A.4 `BOOTSTRAP_KP` (its recv-PQ is the group the bootstrap is
+    /// frame is the pre-A.3 `BOOTSTRAP_KP` (its recv-PQ is the group the bootstrap is
     /// creating), a one-time establishment frame whose cadence is irrelevant, and the
     /// receiver opens it from its classical window via the dual-window `try_open`.
     pub(in crate::session) fn seal_side_band(&self, frame: &[u8]) -> Result<Vec<u8>> {
@@ -241,7 +241,7 @@ impl SessionInner {
                 frame,
                 self.side_band_pad_to(frame.len()),
             ),
-            // pre-A.4 BOOTSTRAP_KP: classical fallback, never padded.
+            // pre-A.3 BOOTSTRAP_KP: classical fallback, never padded.
             None => self.seal(frame),
         }
     }
@@ -249,7 +249,7 @@ impl SessionInner {
     /// The target frame-body length for a padded side-band seal (Feature B). With a `pad_target`
     /// intent of `Some(n)`, grow the frame up to `min(n, last_message_frame_len)` — the co-stapled
     /// message's size, capped at the push-payload budget `n` — but never SHRINK: a frame already
-    /// larger than that target (an A.4 welcome, an A.5 Commit') keeps its natural size. Absent
+    /// larger than that target (an A.3 welcome, an A.5 Commit') keeps its natural size. Absent
     /// (`None`, the default), no padding — the frame goes out at its natural size.
     fn side_band_pad_to(&self, frame_len: usize) -> usize {
         match self.pad_target {
@@ -315,7 +315,7 @@ impl SessionInner {
         let (nonce, ct) = blob.split_at(nonce_size);
         // Both families use the same AEAD; only the key set differs. A message frame
         // authenticates only under a classical-window key and a side-band frame only
-        // under a PQ-window key (the pre-A.4 BOOTSTRAP_KP under classical), so trying
+        // under a PQ-window key (the pre-A.3 BOOTSTRAP_KP under classical), so trying
         // both windows resolves either without ambiguity. Newest epoch first in each.
         let windows = [&self.recv_header_keys, &self.recv_header_keys_pq];
         for keys in windows {
@@ -892,7 +892,7 @@ impl SessionInner {
         self.current_staple_seq = self.state_seq;
         // This fold advanced our send epoch, so any still-unapproved offer is now
         // bound to the prior epoch — drop it (the queued one was consumed by the
-        // caller's `take`). Mirrors the A.3 bind's clear; the peer re-proposes at the
+        // caller's `take`). Mirrors the A.4 bind's clear; the peer re-proposes at the
         // new epoch once it sees this commit's staple.
         self.offered_proposal = None;
         Ok(())
@@ -1166,9 +1166,9 @@ impl TwoMlsPqSession {
                     StapleAction::Apply => {
                         let stores = inner.psk_stores.clone();
                         // Where S comes from is the one thing the three rounds do not
-                        // share. A.3's responder has held it since `encapsulate`; A.4's and
+                        // share. A.4's responder has held it since `encapsulate`; A.3's and
                         // A.5's re-derive it by exporting CrossParty from their OWN send-PQ
-                        // at its current epoch — A.4 at the birth epoch of the group it
+                        // at its current epoch — A.3 at the birth epoch of the group it
                         // created, A.5 at the epoch its own Commit' produced. Same group,
                         // epoch and domain as the initiator's export, so both sides get the
                         // same value and it never crosses the wire.
@@ -1262,13 +1262,13 @@ impl TwoMlsPqSession {
                                         }
                                         // Preserve the transient, retriable semantics of a
                                         // staple that cannot process YET (e.g. a message
-                                        // frame overtaking its A.3 BIND).
+                                        // frame overtaking its A.4 BIND).
                                         _ => TwoMlsPqError::DecryptionFailed,
                                     });
                                 }
                             };
                         // A staple commit is normally a PARTIAL (no AppDataUpdate); one
-                        // that DOES attest (a bare attestation commit, or an A.3 bind
+                        // that DOES attest (a bare attestation commit, or an A.4 bind
                         // classical half applied out of band) must attest truthfully:
                         // the actual post-apply classical epoch and the recv-PQ's actual
                         // current epoch.
@@ -1564,7 +1564,7 @@ impl TwoMlsPqSession {
     pub fn encrypt(&self, app_message: Vec<u8>) -> Result<EncryptResult> {
         // Set inside the Core push when the session auto-stages an A.5: that stage mutates the
         // recv-PQ group (a pending update + its new leaf secret), state the Core blob omits, so
-        // it must be followed by a Checkpoint (below). An A.3 stage leaves it false — its
+        // it must be followed by a Checkpoint (below). An A.4 stage leaves it false — its
         // ephemeral rides `pq_inflight`, which the Core blob carries.
         let mut staged_rekey = false;
         let result = self.mutate_and_persist(crate::BlobKind::Core, |inner| {
@@ -1631,9 +1631,9 @@ impl TwoMlsPqSession {
             };
 
             // Session-driven side-band: this send opens the next PQ round when it is our turn
-            // and the side-band is idle (A.5 on credential lag, else A.3). Best-effort and
+            // and the side-band is idle (A.5 on credential lag, else A.4). Best-effort and
             // send-driven — the staged frame rides this very send's re-staple peek, and it never
-            // fails the message. An A.3's ephemeral is persisted with this Core push; an A.5's
+            // fails the message. An A.4's ephemeral is persisted with this Core push; an A.5's
             // recv-PQ mutation needs the follow-up Checkpoint below.
             staged_rekey = inner.maybe_stage_next_round();
 
@@ -1752,7 +1752,7 @@ impl TwoMlsPqSession {
     /// binding context for identity introductions, matching the classical backend's
     /// convention and `QueuedRemoteProposal.context`. Always the classical half:
     /// message ordering rides it, and it exists from establishment (the PQ half may
-    /// still be deferred pre-A.4).
+    /// still be deferred pre-A.3).
     pub fn proposal_context(&self) -> Option<Vec<u8>> {
         let inner = self.lock();
         inner
@@ -1821,7 +1821,7 @@ impl TwoMlsPqSession {
     /// tally), or `None`. Lets the app decide whether a newly-received proposal should
     /// replace it (queue the newer one) or be kept (do nothing); the library's own
     /// policy is latest-wins, and the slot is cleared when the send epoch advances (a
-    /// fold or an A.3 bind).
+    /// fold or an A.4 bind).
     pub fn queued_remote_successor(&self) -> Option<ClientId> {
         self.lock()
             .queued_proposal
@@ -1870,7 +1870,7 @@ impl TwoMlsPqSession {
             classical: MlsGroupId {
                 bytes: send.classical.group_id().to_vec(),
             },
-            // Empty until the deferred PQ half is bootstrapped (A.4).
+            // Empty until the deferred PQ half is bootstrapped (A.3).
             pq: MlsGroupId {
                 bytes: send
                     .pq

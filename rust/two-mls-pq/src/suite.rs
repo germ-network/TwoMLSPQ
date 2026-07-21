@@ -2,7 +2,7 @@
 //! choice reads from.
 //!
 //! A session's cryptography is not a set of independent knobs: the group pair,
-//! the §A.1/A.4 envelope HPKE, the header-encryption AEAD, and the protocol
+//! the §A.1/A.3 envelope HPKE, the header-encryption AEAD, and the protocol
 //! digest are facets of a single named configuration, declared here as
 //! [`TwoMlsSuite`] and pinned for the build as [`TwoMlsSuite::CURRENT`]. The
 //! facets:
@@ -11,15 +11,15 @@
 //!     (`crypto_config`, and the wire suite id the invitation/session archives
 //!     and the `APQInfo` extension carry).
 //!   * **hpke** — the suite backing the §A.1 establishment envelope and the
-//!     parallel A.4 bootstrap-KP envelope: the **PQ half** (the envelope is
+//!     parallel A.3 bootstrap-KP envelope: the **PQ half** (the envelope is
 //!     sealed to the PQ EK in the published KP′).
 //!   * **header AEAD** — the outer seal on every rendezvous-channel frame and
-//!     the A.3 injected-secret seal: the **classical half's AEAD**
+//!     the A.4 injected-secret seal: the **classical half's AEAD**
 //!     (ChaCha20-Poly1305 — its 256-bit key has the strongest post-quantum
 //!     margin, notably better than the PQ suite's AES-128-GCM, which is why the
 //!     PQ side-band too is sealed with it).
 //!   * **digest** — the hash behind every digest the crate emits (session ids,
-//!     welcome digests, proposal/app AAD, the A.4 bootstrap-KP commitment): the
+//!     welcome digests, proposal/app AAD, the A.3 bootstrap-KP commitment): the
 //!     **classical half's hash** (SHA-256), one coherent classical family.
 //!
 //! The enum's public life starts at the key-package posting: each half of a
@@ -66,13 +66,13 @@ impl TwoMlsSuite {
         }
     }
 
-    /// The suite backing the §A.1/A.4 envelope HPKE: the PQ half (the envelope
+    /// The suite backing the §A.1/A.3 envelope HPKE: the PQ half (the envelope
     /// is sealed to the PQ EK in the published KP′).
     pub(crate) const fn hpke(self) -> CipherSuite {
         self.pair().pq
     }
 
-    /// The suite whose AEAD seals every rendezvous-channel frame (and the A.3
+    /// The suite whose AEAD seals every rendezvous-channel frame (and the A.4
     /// injected secret): the classical half. See the module doc for why the
     /// classical AEAD covers the PQ side-band too.
     pub(crate) const fn header_aead(self) -> CipherSuite {

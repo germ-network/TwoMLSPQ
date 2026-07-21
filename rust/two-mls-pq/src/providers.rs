@@ -135,7 +135,7 @@ mod tests {
     /// is ML-KEM-768 BY TYPE (`MlKem768Kem`), not derived from the declared suite the way
     /// the awslc branch's `MlKemKem::new(pq_cipher_suite())` is. If this fires, a new
     /// `TwoMlsSuite` variant changed the `hpke` facet — update the cryptokit `PqKem`
-    /// alias to match, or the two backends silently run different A.3 ratchet KEMs.
+    /// alias to match, or the two backends silently run different A.4 ratchet KEMs.
     #[test]
     fn pq_kem_type_pin_matches_declared_suite() {
         assert_eq!(

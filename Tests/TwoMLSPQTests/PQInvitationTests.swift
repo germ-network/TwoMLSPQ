@@ -39,7 +39,7 @@ struct PQInvitationReceiveTests {
 		// retaining generate path — the initiator's live session joins the return welcome
 		// through its own client store, unlike an invitation-held key package.
 		// v20: the return KP is the initiator's CLASSICAL bare KeyPackage (its PQ half
-		// now travels in A.4, hash-bound to `bootstrapKpCommitment` — sourced from the
+		// now travels in A.3, hash-bound to `bootstrapKpCommitment` — sourced from the
 		// initiating session, which pre-commits it at `initiate`).
 		let initiatorKp = try initiator.generateKeyPackage(suite: .x25519Chacha())
 

@@ -787,7 +787,7 @@ pub enum TwoMlsPqError {
     /// An establishment identity failed to match: the remote's key package does not carry
     /// the identity the caller said it expects (`receive(expected_remote:)` — checked
     /// before any invitation state is claimed, so the invitation stays fully reusable),
-    /// the welcome's creator leaf does not match the supplied key package, or an A.4
+    /// the welcome's creator leaf does not match the supplied key package, or an A.3
     /// bootstrap key package names a principal that is not the established peer.
     #[error("remote identity does not match the expected principal")]
     RemoteIdentityMismatch,
@@ -800,7 +800,7 @@ pub enum TwoMlsPqError {
     CredentialRejected,
     /// The draft -02 bookkeeping failed verification: an `APQInfo` GroupContext extension
     /// is missing or inconsistent across a pair's halves (a welcome without one is a
-    /// downgrade attempt), an A.4 group id does not match the id pre-allocated at
+    /// downgrade attempt), an A.3 group id does not match the id pre-allocated at
     /// establishment, or an `AppDataUpdate` epoch attestation does not match the actual
     /// post-commit epochs of both groups.
     #[error("APQInfo missing or inconsistent")]
@@ -845,7 +845,7 @@ pub enum TwoMlsPqError {
     /// (`pq_receive_broken`) rather than only thrown.
     #[error("bind apply failed with the round secret consumed; receive is broken until restore")]
     BindApplyFailed,
-    /// The A.4 bootstrap key package does not match the commitment pinned at
+    /// The A.3 bootstrap key package does not match the commitment pinned at
     /// establishment. The acceptor received `H(initiator's PQ keyPackage)` inside the
     /// signed establishment payload (threaded in via `receive(bootstrap_kp_commitment:)`),
     /// and the KP′ that arrived on the side-band hashes to something else — a substituted

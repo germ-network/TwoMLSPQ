@@ -114,7 +114,7 @@ impl SyntheticKeyPackageStore {
     }
 
     /// Insert one key package's private material — the SESSION-owned custody path (the
-    /// pre-committed A.4 bootstrap KP secret is injected just-in-time before the
+    /// pre-committed A.3 bootstrap KP secret is injected just-in-time before the
     /// Welcome' join, mirroring how `inject_send_psks` fills the PSK stores).
     pub(crate) fn insert_entry(&self, secret: KeyPackageSecret) {
         self.do_insert(secret.0, secret.1);

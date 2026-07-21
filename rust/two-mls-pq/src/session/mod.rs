@@ -61,7 +61,7 @@ use crate::providers;
 /// would not. Near-moot for the PQ family (`seal_side_band` seals under recv-PQ, which
 /// advances only when the PEER commits, and applying a peer commit clears the retained
 /// frame anyway; the peer's `recv_pq_header_keys` window covers the rest). The exception is
-/// the one frame taking the classical fallback, the pre-A.4 `BOOTSTRAP_KP`: its key tracks
+/// the one frame taking the classical fallback, the pre-A.3 `BOOTSTRAP_KP`: its key tracks
 /// the CLASSICAL epoch that ordinary messaging advances, so a long `Stable` pass over it
 /// could age past the peer's classical window. `Fresh` never meets this.
 /// A PQ commit that has landed, waiting for the classical commit that binds its entropy into
@@ -174,7 +174,7 @@ struct SessionInner {
     pending_outbound: Option<Vec<u8>>,
     pending_proposal_hash: Option<Vec<u8>>,
     /// The staple every outbound message frame carries: the send group's latest classical
-    /// commit (ratchet, rotation, or A.3 bind), or — until the first commit exists — the
+    /// commit (ratchet, rotation, or A.4 bind), or — until the first commit exists — the
     /// send group's own APQWelcome. Never empty once the send group exists; re-sent on
     /// every frame so any single received frame heals the peer up to our current epoch.
     current_staple: Vec<u8>,
@@ -264,7 +264,7 @@ struct SessionInner {
     ///     would strand `t_epoch` one behind, and the peer would reject the bind pre-apply
     ///     with our PQ leaf already spent.
     owed_bind: Option<OwedBind>,
-    /// Whose move the PQ side-band is: the initiator owes the A.4 bootstrap; thereafter
+    /// Whose move the PQ side-band is: the initiator owes the A.3 bootstrap; thereafter
     /// completing an operation passes the turn to the peer.
     pq_turn_mine: bool,
     /// Set when applying a peer's bind staple failed AFTER the round's secret was consumed
@@ -295,7 +295,7 @@ struct SessionInner {
     /// commit; the acceptor is seeded at establishment, which binds the peer's epoch 1).
     /// The cross-party injection is **event-driven**: a full commit re-injects only when the
     /// peer's send group has advanced past this watermark — i.e. there is new peer entropy to
-    /// entangle with (a peer full commit or an A.3 bind, both of which advance the peer's
+    /// entangle with (a peer full commit or an A.4 bind, both of which advance the peer's
     /// classical epoch). Re-injecting an unchanged epoch would derive the identical
     /// `SafeExportSecret` leaf (consumed, and adding no entropy), so we skip it. Rides the
     /// archive so a restore does not re-bind an epoch already bound.
@@ -364,7 +364,7 @@ struct SessionInner {
     send_group_storage: PersistableGroupStorage,
     /// Every PSK store backing one of this session's group configs: the constructing
     /// client's stores, plus the stores of any later client that joins or stands up a
-    /// group half (the A.4 bootstrap and the return-welcome join run on the CURRENT
+    /// group half (the A.3 bootstrap and the return-welcome join run on the CURRENT
     /// principal, which a Phase 8 rotation may have replaced since construction). External
     /// PSKs are registered into ALL of these (`register_psk`): an mls-rs group resolves
     /// PSKs from the store of the client that created it, so registering only through
@@ -398,16 +398,16 @@ struct SessionInner {
     /// the bare-section envelope shape (no `initial_app_payload` — hosts that deliver
     /// establishment material unwrapped; see `set_initial_return_key_package`). Classical
     /// only by design (§A.1): the acceptor's send group starts classical-only, and the
-    /// initiator's PQ key package travels later, in the A.4 side-band, hash-bound to
+    /// initiator's PQ key package travels later, in the A.3 side-band, hash-bound to
     /// `bootstrap_kp`. Initiator-only; cleared at the establishment cutover; rides the
     /// archive.
     initial_return_kp: Option<Vec<u8>>,
-    /// The initiator's PRE-COMMITTED A.4 bootstrap key package (PQ suite), minted at
+    /// The initiator's PRE-COMMITTED A.3 bootstrap key package (PQ suite), minted at
     /// `initiate` so the host can pin `H(bootstrap_kp)` inside its signed establishment
     /// payload (`bootstrap_kp_commitment()`). `pq_bootstrap_begin` sends exactly these
     /// bytes — never a fresh mint — so the KP′ the peer builds BSG-PQ around is the one
     /// the establishment signature committed to. These public bytes ride the archive so
-    /// a session restored between reply and A.4 still opens the round with the committed
+    /// a session restored between reply and A.3 still opens the round with the committed
     /// KP. Initiator-only; consumed at `begin` (the retained side-band frame carries it
     /// from then on).
     bootstrap_kp: Option<Vec<u8>>,
@@ -419,7 +419,22 @@ struct SessionInner {
     /// just-in-time into the CURRENT client's store by `pq_bootstrap_bind` immediately
     /// before the join (the `inject_send_psks` pattern: the mls-rs stores are ephemeral
     /// plumbing) and consumed on success. Initiator-only.
-    bootstrap_kp_secret: Option<crate::key_package_store::KeyPackageSecret>,
+    ///
+    /// TWIN-FIELD INVARIANT with `bootstrap_kp`: both are set together at `initiate`
+    /// and both are `None` post-bind, but they do NOT clear together. `initiate` sets
+    /// both; `pq_bootstrap_begin` (or the parallel `pq_bootstrap_envelope`) consumes the
+    /// PUBLIC half while the secret persists — a session archived across the whole
+    /// begin↔bind window rides with `bootstrap_kp = None` and this secret still `Some`.
+    /// Only the bind clears the secret. So the enforceable direction is one-way:
+    /// `bootstrap_kp.is_some()` ⇒ this is `Some` (the public bytes never outlive the
+    /// private half). `session_from_wire` rejects a violating archive as `ArchiveInvalid`.
+    ///
+    /// Behind an `Arc` so the per-push archive encode shares this ~8 KB value by handle
+    /// instead of deep-cloning it on every checkpoint/core push; the secret is never
+    /// mutated in place, only replaced (`initiate`) or cleared (`pq_bootstrap_bind`), so
+    /// sharing is sound. The inner `HpkeSecretKey`s stay `ZeroizeOnDrop`, wiping when the
+    /// last handle drops at the bind-time clear.
+    bootstrap_kp_secret: Option<Arc<crate::key_package_store::KeyPackageSecret>>,
     /// The acceptor's pinned `H(initiator's PQ keyPackage)`, threaded in from the signed
     /// establishment payload via `receive`/`accept`. `pq_bootstrap_respond` refuses to
     /// stand up BSG-PQ around a KP′ that hashes to anything else
@@ -428,7 +443,7 @@ struct SessionInner {
     /// committed bytes, identity included), and unlike the live-principal equality it
     /// still admits the committed KP after a Phase 8 rotation (PQ leaves lag
     /// credentials by design; A.5 catches them up). Acceptor-only; rides the archive.
-    expected_bootstrap_kp_commitment: Option<Vec<u8>>,
+    expected_bootstrap_kp_commitment: Option<BootstrapKpCommitment>,
     /// Contract 26 (born-dedicated): this session's send group was created under a
     /// dedicated per-session principal whose credential differs from the invitation
     /// identity, so its establishment staple must carry the host's signed delegation
@@ -458,6 +473,32 @@ struct SessionInner {
     /// restore, so the first side-band seal before any `encrypt` is unpadded (bounded/harmless
     /// given send-ordering).
     last_message_frame_len: u64,
+}
+
+/// The acceptor's pinned 32-byte SHA-256 commitment `H(initiator's PQ keyPackage)`.
+/// Constructible only from exactly 32 bytes (`from_bytes`), so "we hold a commitment" and
+/// "it is the right length" become the same fact and cannot drift — the length check moves
+/// from the call sites into the type. The invitation-side `BootstrapCommitments` routing
+/// map deliberately stays `Vec<u8>`-keyed: its keys are already either `sha256` outputs or
+/// commitments this newtype validated upstream, so converting it would only churn the
+/// invitation wire for no additional safety.
+pub(in crate::session) struct BootstrapKpCommitment([u8; 32]);
+
+impl BootstrapKpCommitment {
+    /// Lift raw bytes into a commitment, or `None` if they are not exactly 32 bytes.
+    pub(in crate::session) fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        bytes.try_into().ok().map(Self)
+    }
+
+    /// Whether `kp` hashes to this commitment — the `pq_bootstrap_respond` pin check.
+    pub(in crate::session) fn matches(&self, kp: &[u8]) -> bool {
+        crate::sha256(kp) == self.0
+    }
+
+    /// The raw 32 bytes, for re-serialization onto the archive wire.
+    pub(in crate::session) fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
 }
 
 /// Ledger depth for `send_psk_ledger`: one entry per send-group epoch. The peer references
@@ -509,7 +550,7 @@ fn apq_epochs(group: &CombinerGroup) -> crate::ApqEpochs {
 }
 
 impl SessionInner {
-    /// Both PQ halves live — i.e. A.4 has completed on this side. The inner-lock twin of
+    /// Both PQ halves live — i.e. A.3 has completed on this side. The inner-lock twin of
     /// [`TwoMlsPqSession::is_fully_established`], for guards that already hold the lock.
     fn pq_halves_live(&self) -> bool {
         matches!(
@@ -554,7 +595,7 @@ impl SessionInner {
 
     /// The send-PQ twin of [`SessionInner::export_cross_from_recv_pq`], stamping
     /// `last_send_pq_exported`. Used where WE are the party whose send-PQ the round rekeyed
-    /// (A.4's/A.5's responder re-deriving S, A.5's initiator pre-registering for the peer).
+    /// (A.3's/A.5's responder re-deriving S, A.5's initiator pre-registering for the peer).
     fn export_cross_from_send_pq(&mut self) -> Result<ExportedPsk> {
         let (exported, epoch) = {
             let send_pq = self
@@ -572,16 +613,16 @@ impl SessionInner {
     /// The trigger half of the bind both A.3 and A.4 close their round with: inject `s` into
     /// our send-PQ with a pathless commit, and OWE the classical half.
     ///
-    /// The rounds differ ONLY in where `s` comes from — A.3 decapsulates it from the peer's
-    /// CT, A.4 exports it from the group it just joined — so everything from here down is
-    /// shared. That is the point: A.4's bind is not *like* A.3's, it IS A.3's.
+    /// The rounds differ ONLY in where `s` comes from — A.4 decapsulates it from the peer's
+    /// CT, A.3 exports it from the group it just joined — so everything from here down is
+    /// shared. That is the point: A.3's bind is not *like* A.4's, it IS A.4's.
     ///
     /// **Why the halves split here.** The PQ half has no choice: `apq_psk` is exported from
     /// its POST-commit epoch, so the classical commit cannot even be built until the PQ one
     /// has applied. The classical half is the opposite — applying it advances the epoch our
     /// ordinary traffic rides, onto a commit whose `apq_psk` the peer can only derive from
     /// this bind's PQ half. Applied here, every frame we send before the bind lands would be
-    /// undeliverable; and for A.4 the trigger is INBOUND (a welcome arrived), which says
+    /// undeliverable; and for A.3 the trigger is INBOUND (a welcome arrived), which says
     /// nothing about whether we have anything to send at all. So the classical commit waits
     /// for the next classical COMMIT and rides it — see `discharge_owed_bind`.
     ///
@@ -718,8 +759,8 @@ impl SessionInner {
     /// keeping the precondition inside the latched region is what makes an inject failure land
     /// there rather than escape unlatched.
     ///
-    /// As with `commit_pq_and_owe_bind`, the rounds differ only in where `s` came from: A.3
-    /// held it from encapsulating, A.4 re-derives it by exporting from its own copy of the
+    /// As with `commit_pq_and_owe_bind`, the rounds differ only in where `s` came from: A.4
+    /// held it from encapsulating, A.3 re-derives it by exporting from its own copy of the
     /// group it created. Everything below is identical.
     fn apply_bind(
         &mut self,
@@ -827,7 +868,7 @@ impl SessionInner {
     }
 
     /// Track `client`'s PSK stores so future `register_psk` calls reach any group half
-    /// this client creates or joins for the session (A.4 bootstrap, return-welcome join).
+    /// this client creates or joins for the session (A.3 bootstrap, return-welcome join).
     /// Idempotent per client: the common paths re-track the construction client, and
     /// only a Phase 8 rotation actually introduces new stores.
     fn track_psk_stores(&mut self, client: &Arc<TwoMlsPqPrincipal>) {
@@ -892,7 +933,7 @@ impl SessionInner {
             .combiner()
             .auth_view()
             .with(|core| core.adopting = true);
-        // An empty PQ slot is the acceptor's deferred (A.4) return welcome: join the
+        // An empty PQ slot is the acceptor's deferred (A.3) return welcome: join the
         // classical group only; the PQ half arrives with the bootstrap flow.
         let suite = self.suite;
         let joined: Result<CombinerGroup> = (|| {
@@ -900,7 +941,7 @@ impl SessionInner {
                 let classical = join_group_from_welcome(client.classical(), &classical_welcome)?;
                 // -02 joiner verification, deferred shape: the classical half's APQInfo
                 // must record the PQ side as pending (EPOCH_UNBOUND) with a non-empty
-                // pre-allocated group id — the id the A.4 bootstrap must later use. A
+                // pre-allocated group id — the id the A.3 bootstrap must later use. A
                 // welcome without an APQInfo at all is a downgrade attempt.
                 verify_apqinfo_deferred(&classical, suite)?;
                 Ok(CombinerGroup::from_client(
@@ -936,7 +977,7 @@ impl SessionInner {
         // binding — the acceptor mirrors the (verified) binding of the welcome it replies
         // to, so on an honest peer both directions match. An absent or different binding
         // here is a strip/downgrade or wrong-relationship welcome, refused before any
-        // session state adopts the join. Covers both the deferred (A.4) and full-pair
+        // session state adopts the join. Covers both the deferred (A.3) and full-pair
         // welcome shapes; the binding lives on the classical half.
         let own_binding = match self.send_group.as_ref() {
             Some(send) => read_app_binding(&send.classical)?,
@@ -1178,7 +1219,7 @@ fn check_welcome_suite(welcome: &[u8], expected: mls_rs::CipherSuite) -> Result<
 }
 
 /// Validate a bootstrap PQ key package's cipher suite against the expected value before a group
-/// is stood up around it — the A.4 key-package counterpart to [`check_welcome_suite`], so a
+/// is stood up around it — the A.3 key-package counterpart to [`check_welcome_suite`], so a
 /// mismatched peer KP fails early as `CipherSuiteMismatch` instead of deep inside mls-rs.
 fn check_key_package_suite(kp: &[u8], expected: mls_rs::CipherSuite) -> Result<()> {
     let parsed = parse_mls_key_package(kp.to_vec())?;
@@ -1203,7 +1244,7 @@ fn map_credential_err(e: mls_rs::error::MlsError) -> TwoMlsPqError {
 }
 
 /// Validate the cipher suite(s) in an APQ welcome's already-decoded halves against the session's
-/// expected pair. An empty PQ half (the acceptor's A.4-deferred return welcome) validates the
+/// expected pair. An empty PQ half (the acceptor's A.3-deferred return welcome) validates the
 /// classical half only.
 fn validate_welcome_halves(
     expected: apq::ApqCipherSuite,
@@ -1394,7 +1435,7 @@ impl TwoMlsPqSession {
             // current app message.
             let mut inner = session.lock();
             inner.initial_their_kp = Some(their_key_package);
-            // Pre-commit the A.4 bootstrap key package (§A.1): mint it NOW, so the host
+            // Pre-commit the A.3 bootstrap key package (§A.1): mint it NOW, so the host
             // can pin H(bootstrap_kp) inside the signed establishment payload it is about
             // to compose (`bootstrap_kp_commitment()`). Custody is SESSION-OWNED: the
             // signed commitment obligates this session to produce — and be able to join —
@@ -1415,7 +1456,7 @@ impl TwoMlsPqSession {
                 // store-global capture slot recorded a concurrent generate/injection on
                 // this shared client. Fail loudly rather than `pop()` the last insert and
                 // silently pair the signed commitment with the wrong secret (an
-                // unjoinable A.4 round the peer has already pinned).
+                // unjoinable A.3 round the peer has already pinned).
                 let mut captured = captured.into_iter();
                 let secret = match (captured.next(), captured.next()) {
                     (Some(secret), None) => secret,
@@ -1423,7 +1464,7 @@ impl TwoMlsPqSession {
                 };
                 pq_store.remove_entry(&secret.0);
                 inner.bootstrap_kp = Some(kp);
-                inner.bootstrap_kp_secret = Some(secret);
+                inner.bootstrap_kp_secret = Some(Arc::new(secret));
             }
             let envelope = inner.compose_initial_envelope(None)?;
             inner.pending_outbound = Some(envelope);
@@ -1431,7 +1472,7 @@ impl TwoMlsPqSession {
         // Seed the PSK ledger with the send group's establishment epoch, and capture
         // the establishment epoch's listen address (and the send-PQ header key when the
         // send-PQ half exists — the initiator's does at `initiate`; the acceptor's is
-        // deferred to the A.4 bootstrap, so this is a no-op there).
+        // deferred to the A.3 bootstrap, so this is a no-op there).
         session.lock().remember_send_psk()?;
         session.lock().record_listen_rendezvous()?;
         session.lock().record_pq_header_key()?;
@@ -1445,7 +1486,7 @@ impl TwoMlsPqSession {
     /// once the join has consumed the invitation key package (so nothing migrates into the
     /// session archive). Do NOT reuse one `TwoMlsPqPrincipal` for both `initiate` and a direct
     /// `accept` — `initiate` retains its return-group key package in that same store (for the
-    /// peer's return welcome), and this clear would drop it. (The pre-committed A.4 bootstrap
+    /// peer's return welcome), and this clear would drop it. (The pre-committed A.3 bootstrap
     /// KP is immune: its secret is SESSION-owned, held out of the store precisely so no store
     /// lifecycle — this purge, or a Phase 8 client swap — can strand the committed round.)
     /// The normal entry point, `TwoMlsPqInvitation::receive`, always builds a fresh
@@ -1460,7 +1501,7 @@ impl TwoMlsPqSession {
     /// `their_classical_key_package` is the initiator's CLASSICAL return key package (a
     /// bare MLS KeyPackage message — §A.1: the return group starts classical-only), and
     /// `bootstrap_kp_commitment` is `H(initiator's PQ keyPackage)` from the SIGNED
-    /// establishment payload — the A.4 bootstrap KP′ must hash to it before BSG-PQ is
+    /// establishment payload — the A.3 bootstrap KP′ must hash to it before BSG-PQ is
     /// built around it (see `pq_bootstrap_respond`).
     #[uniffi::constructor]
     pub fn accept(
@@ -1522,14 +1563,14 @@ impl TwoMlsPqSession {
             return Err(TwoMlsPqError::AppBindingMismatch);
         }
         // A commitment of the wrong length could never match any KP′ — reject it here,
-        // before any state is touched, rather than let it surface as a confusing A.4
-        // failure long after establishment.
-        if bootstrap_kp_commitment.len() != 32 {
-            return Err(TwoMlsPqError::BootstrapKpMismatch);
-        }
+        // before any state is touched, rather than let it surface as a confusing A.3
+        // failure long after establishment. Lifting into the newtype IS the length check
+        // (it accepts only 32 bytes), and the live field carries the type from here on.
+        let bootstrap_kp_commitment = BootstrapKpCommitment::from_bytes(&bootstrap_kp_commitment)
+            .ok_or(TwoMlsPqError::BootstrapKpMismatch)?;
         // The return key package is classical-only by design (§A.1): the send group this
         // side is about to create starts with no PQ half, and the initiator's PQ key
-        // package arrives in A.4, pinned by `bootstrap_kp_commitment`.
+        // package arrives in A.3, pinned by `bootstrap_kp_commitment`.
         check_key_package_suite(
             &their_classical_key_package,
             client.combiner().cipher_suite().classical,
@@ -1594,7 +1635,7 @@ impl TwoMlsPqSession {
         // which keeps its own captured material and rebuilds a fresh serving store per `receive`.
         client.combiner().classical_kp_store().purge_all();
         client.combiner().pq_kp_store().purge_all();
-        // A.4: the send group's PQ half is deferred — classical only, bound to the
+        // A.3: the send group's PQ half is deferred — classical only, bound to the
         // cross-party PSK. The bootstrap flow stands it up off the critical path, so the
         // return welcome carries an empty PQ slot. Created under the dedicated session
         // principal when one was supplied: its ClientId becomes the creator leaf
@@ -1656,7 +1697,7 @@ impl TwoMlsPqSession {
         // PSK that seeds our send group's PQ inheritance). Record the watermark so the first
         // routine full commit does not redundantly re-bind that same, unadvanced epoch.
         session.lock().last_cross_injected = Some(recv_cross_epoch);
-        // Pin the initiator's A.4 bootstrap KP commitment (from the SIGNED establishment
+        // Pin the initiator's A.3 bootstrap KP commitment (from the SIGNED establishment
         // payload): `pq_bootstrap_respond` refuses to stand up BSG-PQ around a KP′ that
         // hashes to anything else.
         session.lock().expected_bootstrap_kp_commitment = Some(bootstrap_kp_commitment);
@@ -1668,7 +1709,7 @@ impl TwoMlsPqSession {
         // Seed the PSK ledger with the send group's establishment epoch, and capture
         // the establishment epoch's listen address (and the send-PQ header key when the
         // send-PQ half exists — the initiator's does at `initiate`; the acceptor's is
-        // deferred to the A.4 bootstrap, so this is a no-op there).
+        // deferred to the A.3 bootstrap, so this is a no-op there).
         session.lock().remember_send_psk()?;
         session.lock().record_listen_rendezvous()?;
         session.lock().record_pq_header_key()?;
@@ -1866,18 +1907,20 @@ impl TwoMlsPqSession {
 
     /// Attach the initiator's CLASSICAL return key package (a bare MLS KeyPackage
     /// message — §A.1: the acceptor's send group starts classical-only, and the PQ key
-    /// package travels in A.4, pinned by `bootstrap_kp_commitment`) for the BARE
+    /// package travels in A.3, pinned by `bootstrap_kp_commitment`) for the BARE
     /// envelope shape (no self-sufficient `set_initial_app_payload`):
     /// pre-establishment envelopes then carry `[welcome][return_kp]`, so any single
-    /// frame is a complete establishment vector for the invitation holder. Unused when
-    /// a host payload is attached (the payload carries the key package itself). Same
-    /// guards, capture ordering, and envelope regeneration as
-    /// `set_initial_app_payload`.
+    /// frame is a complete establishment vector for the invitation holder — "complete"
+    /// meaning the classical establishment itself: the bare shape deliberately carries no
+    /// bootstrap-KP commitment (see [`crate::key_packages::InitialFrame`]), which the host supplies
+    /// out-of-band as the separate `bootstrap_kp_commitment` argument to `receive`/`accept`.
+    /// Unused when a host payload is attached (the payload carries the key package itself).
+    /// Same guards, capture ordering, and envelope regeneration as `set_initial_app_payload`.
     pub fn set_initial_return_key_package(&self, key_package: Vec<u8>) -> Result<()> {
         self.set_initial_field(|inner| inner.initial_return_kp = Some(key_package))
     }
 
-    /// `H(bootstrap_kp)` — the SHA-256 commitment to the A.4 bootstrap key package this
+    /// `H(bootstrap_kp)` — the SHA-256 commitment to the A.3 bootstrap key package this
     /// session pre-committed at `initiate`. The host binds it inside its SIGNED
     /// establishment payload (next to the classical return key package), and the peer
     /// threads it back through `receive`/`accept`, where `pq_bootstrap_respond`
@@ -1894,7 +1937,7 @@ impl TwoMlsPqSession {
         self.lock().bootstrap_kp.as_deref().map(crate::sha256)
     }
 
-    /// True once both directions' PQ halves are live (post-A.4 bootstrap).
+    /// True once both directions' PQ halves are live (post-A.3 bootstrap).
     pub fn is_fully_established(&self) -> bool {
         self.lock().pq_halves_live()
     }
@@ -1956,7 +1999,7 @@ impl TwoMlsPqSession {
             classical: MlsGroupId {
                 bytes: rg.classical.group_id().to_vec(),
             },
-            // Empty until the deferred PQ half is bootstrapped (A.4).
+            // Empty until the deferred PQ half is bootstrapped (A.3).
             pq: MlsGroupId {
                 bytes: rg
                     .pq

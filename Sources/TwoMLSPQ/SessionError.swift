@@ -43,7 +43,7 @@ public struct SessionError: Error, Sendable {
 	}
 
 	public enum Code: Sendable, Equatable, Hashable {
-		/// Transient decrypt failure (a frame overtook its A.3 bind, or a replay/tamper) —
+		/// Transient decrypt failure (a frame overtook its A.4 bind, or a replay/tamper) —
 		/// redelivery heals it.
 		case decryptionFailed
 		/// A duplicate or already-consumed frame from a string-only backend (reserved for the
@@ -93,7 +93,7 @@ public struct SessionError: Error, Sendable {
 		/// The remote key package's credential doesn't match the authenticated identity. The
 		/// invitation is NOT consumed.
 		case identityMismatch
-		/// The A.4 bootstrap key package does not match the commitment the establishment payload
+		/// The A.3 bootstrap key package does not match the commitment the establishment payload
 		/// signed (`H(initiator's PQ keyPackage)`, threaded into `receive`). A substituted/tampered
 		/// KP′, or a malformed commitment — never honest traffic; the round is rejected before any
 		/// group is stood up, session state untouched.
@@ -159,7 +159,7 @@ public struct SessionError: Error, Sendable {
 				return .retryLater
 			case .staleFrame, .duplicateWelcome, .duplicateSideBand,
 				.unopenableFrame, .malformedFrame, .bootstrapKpMismatch:
-				// A.4 KP′ not matching the signed commitment: drop the bad frame, the session is
+				// A.3 KP′ not matching the signed commitment: drop the bad frame, the session is
 				// intact and the genuine re-stapled KP′ still works.
 				return .discardFrame
 			case .epochDesync, .bindDischargeFailed:
