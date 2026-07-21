@@ -1087,6 +1087,29 @@ public struct PQInvitation {
 		}
 	}
 
+	/// Unbound receive — the `AbstractTwoMLS.Invitation.receive` witness (a default on the
+	/// `expectedAppBinding:` overload below cannot serve as the protocol witness). Forwards.
+	public func receive(
+		sendGroupWelcome: Data,
+		remoteKeyPackage: Data,
+		bootstrapKpCommitment: Data,
+		remoteClientId: ClientID,
+		welcomeToken: WelcomeToken,
+		stapledMessage: Data?,
+		newClientId: ClientID?
+	) throws(SessionError) -> (PQSession, stapled: PQSenderMessage?) {
+		try receive(
+			sendGroupWelcome: sendGroupWelcome,
+			remoteKeyPackage: remoteKeyPackage,
+			bootstrapKpCommitment: bootstrapKpCommitment,
+			remoteClientId: remoteClientId,
+			welcomeToken: welcomeToken,
+			stapledMessage: stapledMessage,
+			newClientId: newClientId,
+			expectedAppBinding: nil
+		)
+	}
+
 	public func receive(
 		sendGroupWelcome: Data,
 		remoteKeyPackage: Data,
@@ -1095,7 +1118,7 @@ public struct PQInvitation {
 		welcomeToken: WelcomeToken,
 		stapledMessage: Data?,
 		newClientId: ClientID?,
-		expectedAppBinding: Data? = nil
+		expectedAppBinding: Data?
 	) throws(SessionError) -> (PQSession, stapled: PQSenderMessage?) {
 		return try mapPQErrors(.receive) {
 		// Contract 26: `newClientId` is optional — `nil` establishes under the
@@ -1262,9 +1285,24 @@ public struct PQClient {
 		[0x0003, 0xFDEA]
 	}
 
+	/// Unbound reply — the `AbstractTwoMLS.Client.reply` witness. A default on the
+	/// `appBinding:` overload below cannot serve as the protocol witness (Swift matches
+	/// witnesses by exact parameter list, not by call-site defaulting), so the unbound
+	/// entry point is spelled out and forwards.
+	public func reply(
+		keyPackageMessage: Data
+	) throws(SessionError) -> (
+		sendGroup: PQSession,
+		welcomeMessage: Data,
+		myKeyPackage: Data,
+		bootstrapKpCommitment: Data
+	) {
+		try reply(keyPackageMessage: keyPackageMessage, appBinding: nil)
+	}
+
 	public func reply(
 		keyPackageMessage: Data,
-		appBinding: Data? = nil
+		appBinding: Data?
 	) throws(SessionError) -> (
 		sendGroup: PQSession,
 		welcomeMessage: Data,
