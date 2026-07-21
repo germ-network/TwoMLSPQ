@@ -1853,9 +1853,11 @@ public protocol TwoMlsPqSessionProtocol: AnyObject, Sendable {
      * One envelope per session: re-installing the SAME bytes is an idempotent
      * no-op; DIFFERENT bytes are `EstablishmentEnvelopeConflict` (loud — the
      * envelope's signatures bind this session's welcome, so a second distinct
-     * envelope can only be a host bug). `SessionNotReady` when the session owes
-     * no envelope (not born-dedicated, or the host already let the staple move
-     * on — neither occurs in the intended receive→mint→install sequence).
+     * envelope can only be a host bug). An EMPTY envelope is
+     * `EstablishmentEnvelopeRequired` (the wrapper guards it with a clearer
+     * message). `SessionNotReady` when the session owes no envelope (not
+     * born-dedicated, or the host already let the staple move on — neither
+     * occurs in the intended receive→mint→install sequence).
      *
      * CAPTURE ORDERING: capture/persist the session AFTER this call (the same
      * rule as `set_initial_app_payload`) — the envelope rides the archive, and
@@ -1918,10 +1920,12 @@ public protocol TwoMlsPqSessionProtocol: AnyObject, Sendable {
      * package travels in A.3, pinned by `bootstrap_kp_commitment`) for the BARE
      * envelope shape (no self-sufficient `set_initial_app_payload`):
      * pre-establishment envelopes then carry `[welcome][return_kp]`, so any single
-     * frame is a complete establishment vector for the invitation holder. Unused when
-     * a host payload is attached (the payload carries the key package itself). Same
-     * guards, capture ordering, and envelope regeneration as
-     * `set_initial_app_payload`.
+     * frame is a complete establishment vector for the invitation holder — "complete"
+     * meaning the classical establishment itself: the bare shape deliberately carries no
+     * bootstrap-KP commitment (see [`crate::key_packages::InitialFrame`]), which the host supplies
+     * out-of-band as the separate `bootstrap_kp_commitment` argument to `receive`/`accept`.
+     * Unused when a host payload is attached (the payload carries the key package itself).
+     * Same guards, capture ordering, and envelope regeneration as `set_initial_app_payload`.
      */
     func setInitialReturnKeyPackage(keyPackage: Data) throws 
     
@@ -2567,9 +2571,11 @@ open func initialWelcome() -> Data?  {
      * One envelope per session: re-installing the SAME bytes is an idempotent
      * no-op; DIFFERENT bytes are `EstablishmentEnvelopeConflict` (loud — the
      * envelope's signatures bind this session's welcome, so a second distinct
-     * envelope can only be a host bug). `SessionNotReady` when the session owes
-     * no envelope (not born-dedicated, or the host already let the staple move
-     * on — neither occurs in the intended receive→mint→install sequence).
+     * envelope can only be a host bug). An EMPTY envelope is
+     * `EstablishmentEnvelopeRequired` (the wrapper guards it with a clearer
+     * message). `SessionNotReady` when the session owes no envelope (not
+     * born-dedicated, or the host already let the staple move on — neither
+     * occurs in the intended receive→mint→install sequence).
      *
      * CAPTURE ORDERING: capture/persist the session AFTER this call (the same
      * rule as `set_initial_app_payload`) — the envelope rides the archive, and
@@ -2680,10 +2686,12 @@ open func setInitialAppPayload(payload: Data)throws   {try rustCallWithError(Ffi
      * package travels in A.3, pinned by `bootstrap_kp_commitment`) for the BARE
      * envelope shape (no self-sufficient `set_initial_app_payload`):
      * pre-establishment envelopes then carry `[welcome][return_kp]`, so any single
-     * frame is a complete establishment vector for the invitation holder. Unused when
-     * a host payload is attached (the payload carries the key package itself). Same
-     * guards, capture ordering, and envelope regeneration as
-     * `set_initial_app_payload`.
+     * frame is a complete establishment vector for the invitation holder — "complete"
+     * meaning the classical establishment itself: the bare shape deliberately carries no
+     * bootstrap-KP commitment (see [`crate::key_packages::InitialFrame`]), which the host supplies
+     * out-of-band as the separate `bootstrap_kp_commitment` argument to `receive`/`accept`.
+     * Unused when a host payload is attached (the payload carries the key package itself).
+     * Same guards, capture ordering, and envelope regeneration as `set_initial_app_payload`.
      */
 open func setInitialReturnKeyPackage(keyPackage: Data)throws   {try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
     uniffi_two_mls_pq_fn_method_twomlspqsession_set_initial_return_key_package(
@@ -3947,6 +3955,16 @@ public func FfiConverterTypeHpkeSealed_lower(_ value: HpkeSealed) -> RustBuffer 
  * re-stapled on every initiator frame until establishment; hand it to the spawned
  * session's `process_incoming` AFTER the join (fail-open: it is an optional early
  * delivery — the sender re-sends until its first commit).
+ *
+ * The BARE shape (`welcome` + `return_key_package`, no `app_payload`) is deliberately NOT
+ * establishment-self-sufficient — it carries no bootstrap-KP-commitment section. That is by
+ * design, not an omission: the commitment is only meaningful read from the host's SIGNED
+ * establishment payload, so the acceptor always receives it as a required SEPARATE argument
+ * to `receive`/`accept` (`bootstrap_kp_commitment`), delivered by the host out-of-band. A
+ * commitment section here would put security-load-bearing bytes on the envelope's
+ * UNAUTHENTICATED channel (see `seal_initial_envelope`), and would need a fifth
+ * `InitialFrame` field — an FFI shape change. So the bare shape stays a routing/transport
+ * hint; the app path is unaffected, since it uses the self-sufficient `app_payload`.
  */
 public struct InitialFrame: Equatable, Hashable {
     public var appPayload: Data?
@@ -6214,7 +6232,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_two_mls_pq_checksum_method_mlsciphersuite_value() != 46029) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqinvitation_bootstrap_kp_group_id() != 1447) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqinvitation_bootstrap_kp_group_id() != 24489) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqinvitation_client_id() != 2420) {
@@ -6238,7 +6256,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_two_mls_pq_checksum_method_twomlspqinvitation_processed_welcome_group_id() != 55990) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqinvitation_receive() != 55740) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqinvitation_receive() != 61974) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqinvitation_state_seq() != 33948) {
@@ -6262,7 +6280,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_app_binding() != 59144) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_bootstrap_kp_commitment() != 61225) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_bootstrap_kp_commitment() != 55432) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_epochs() != 27665) {
@@ -6274,7 +6292,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_initial_welcome() != 13904) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_install_establishment_envelope() != 40753) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_install_establishment_envelope() != 28716) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_install_sink() != 61277) {
@@ -6283,7 +6301,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_is_established() != 41629) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_is_fully_established() != 13237) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_is_fully_established() != 4878) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_my_principal_state() != 54784) {
@@ -6298,7 +6316,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_set_initial_app_payload() != 22701) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_set_initial_return_key_package() != 40915) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_set_initial_return_key_package() != 43095) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_set_pad_target() != 13394) {
@@ -6328,13 +6346,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_process_incoming_approved() != 44354) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_proposal_context() != 63573) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_proposal_context() != 13199) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_queue_proposal() != 6049) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_queued_remote_successor() != 13627) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_queued_remote_successor() != 29270) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_send_rendezvous() != 31926) {
@@ -6343,22 +6361,22 @@ private let initializationResult: InitializationResult = {
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_should_listen_on() != 34726) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_my_pq_turn() != 43166) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_my_pq_turn() != 12380) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_bootstrap_begin() != 36603) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_bootstrap_begin() != 6266) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_bootstrap_bind() != 63281) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_bootstrap_bind() != 29288) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_bootstrap_envelope() != 52814) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_bootstrap_envelope() != 39456) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_bootstrap_respond() != 25723) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_bootstrap_respond() != 45787) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_pending_outbound() != 19268) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_pending_outbound() != 1918) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_ratchet_bind() != 28798) {
@@ -6397,7 +6415,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_two_mls_pq_checksum_constructor_twomlspqprincipal_new() != 59164) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_constructor_twomlspqsession_accept() != 28683) {
+    if (uniffi_two_mls_pq_checksum_constructor_twomlspqsession_accept() != 20471) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_constructor_twomlspqsession_initiate() != 37020) {
