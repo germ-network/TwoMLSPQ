@@ -160,5 +160,5 @@ rebindable view, and the sequences ride the session archive.
 
 A refusal surfaces as `CredentialRejected` and is **retryable** where it arises from
 a staple: the staple re-rides every frame, so approve-and-reprocess recovers the
-round. `new_sender` / `new_recipient` are event hints; `their_principal_state()` /
+round. `new_sender` / `new_recipient` are event hints; 	zxvbbvsv=`their_principal_state()` /
 `my_principal_state()` are the truth.
