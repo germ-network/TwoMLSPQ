@@ -1,7 +1,0 @@
----
-"@germ-network/two-mls-pq": patch
----
-
-Authenticate the A.4 PQ-ratchet legs. The EK (`0x17`) and CT (`0x19`) side-band frames now carry an MLS application message in the initiator's send-PQ group — `[tag][MLSMessage]` with authenticated content `[tag][payload]` — instead of the raw key bytes, so each leg is authenticated by a leaf signature AND proof of the group's current epoch. Following MLS's signature convention rather than a Double-Ratchet-style ratcheted MAC, this closes a post-compromise gap: a stolen leaf signing key alone can no longer forge a leg the peer acts on (the forger also needs current epoch secrets, which a healed round has rotated away), and a forged or stale EK no longer wedges the responder into a half-open state. The seal over the injected secret `S` is unchanged and still provides the explicit receipt.
-
-Wire-breaking for the side-band, so `BINDING_CONTRACT_VERSION` bumps 26→27 and peers must re-pair; no FFI signature or error-variant change. Staging an A.4 now pushes a `Checkpoint` (the EK advances the send-PQ application ratchet). Verified end to end, plus an `apq` test suite pinning the four mls-rs behaviors the design rests on (application messages round-trip in the ML-KEM group, replay/stale-epoch frames fail, own messages are rejected, and a restored group signs with its snapshot signer) and session-level tests for the no-wedge and stale-epoch-replay properties.
