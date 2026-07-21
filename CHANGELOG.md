@@ -1,5 +1,22 @@
 # @germ-network/two-mls-pq
 
+## 0.12.0
+
+### Minor Changes
+
+- [#104](https://github.com/germ-network/TwoMLSPQ/pull/104) [`d2e1e08`](https://github.com/germ-network/TwoMLSPQ/commit/d2e1e08f1cc7a81b376724d014fca357d724be15) Thanks [@germ-mark](https://github.com/germ-mark)! - Expose two adopter affordances on the Swift surface; both additive, no wire or contract change.
+
+  - `PQSession.localSessionId` (FFI `send_group_id() -> MlsGroupId?`) — this side's OWN send-group classical id, the mirror of `receiveGroupId`. A stable, per-endpoint session identifier present from creation. Unlike `activeSessionId()` (the shared hash of the two client ids) it is LOCAL — each endpoint's send group differs — so an adopter can key local session state by it without sharing an at-rest identifier with its peer. It is the identity value on its own, separate from `shouldListenOn()`'s routing/rendezvous tuple.
+  - `PQClient.reply(appBinding:)` / `PQInvitation.receive(expectedAppBinding:)` — the high-level wrapper now threads the AppBinding (contract 15) through to `initiate(appBinding:)` / `receive(expectedAppBinding:)` instead of hardcoding `nil`. Both default to `nil` (source-compatible). A session may now be created bound to a relationship digest and the peer's welcome verified against it (`AppBindingMismatch` on a mismatch, checked before invitation state is claimed).
+
+### Patch Changes
+
+- [#103](https://github.com/germ-network/TwoMLSPQ/pull/103) [`9627532`](https://github.com/germ-network/TwoMLSPQ/commit/962753257ce362a06e4b4b6c4c3e63cc18c202dd) Thanks [@germ-mark](https://github.com/germ-mark)! - Authenticate the A.4 PQ-ratchet legs. The EK (`0x17`) and CT (`0x19`) side-band frames now carry an MLS application message in the initiator's send-PQ group — `[tag][MLSMessage]` with authenticated content `[tag][payload]` — instead of the raw key bytes, so each leg is authenticated by a leaf signature AND proof of the group's current epoch. Following MLS's signature convention rather than a Double-Ratchet-style ratcheted MAC, this closes a post-compromise gap: a stolen leaf signing key alone can no longer forge a leg the peer acts on (the forger also needs current epoch secrets, which a healed round has rotated away), and a forged or stale EK no longer wedges the responder into a half-open state. The seal over the injected secret `S` is unchanged and still provides the explicit receipt.
+
+  Wire-breaking for the side-band, so `BINDING_CONTRACT_VERSION` bumps 26→27 and peers must re-pair; no FFI signature or error-variant change. Staging an A.4 now pushes a `Checkpoint` (the EK advances the send-PQ application ratchet). Verified end to end, plus an `apq` test suite pinning the four mls-rs behaviors the design rests on (application messages round-trip in the ML-KEM group, replay/stale-epoch frames fail, own messages are rejected, and a restored group signs with its snapshot signer) and session-level tests for the no-wedge and stale-epoch-replay properties.
+
+- [#97](https://github.com/germ-network/TwoMLSPQ/pull/97) [`d33eeec`](https://github.com/germ-network/TwoMLSPQ/commit/d33eeec33bc7b7a7a793536e5ae4b16bc87a64ad) Thanks [@germ-mark](https://github.com/germ-mark)! - Renumber the protocol-flow sections into lifecycle order — a pure §A.3↔§A.4 swap so the bootstrap ("Finish PQ setup") precedes the KEM ratchet, matching the wire-format side-band tag order — and sweep every in-repo reference (book, Rust/Swift doc comments, test names, vendored binding) to match. Land the four surviving PR [#78](https://github.com/germ-network/TwoMLSPQ/issues/78) cleanup findings: the bootstrap twin-field invariant and the 32-byte KP-commitment length are now validated on archive restore (existing `ArchiveInvalid`), the commitment gets an internal `[u8; 32]` newtype, and the per-push clone of the ~8 KB bootstrap KP secret is eliminated by holding it behind an `Arc`. No FFI-visible shape change (`BINDING_CONTRACT_VERSION` stays 26); `SESSION_ARCHIVE_VERSION` bumps 1→2 and now advances monotonically, so persisted v1 sessions hard-cut and regenerate.
+
 ## 0.11.0
 
 ### Minor Changes
