@@ -369,7 +369,17 @@ pub fn version() -> String {
 // `EstablishmentEnvelopeRequired`, `EstablishmentCreatorMismatch`,
 // `EstablishmentEnvelopeConflict`. `receive(new_client_id:)` equal to the invitation identity
 // now degenerates to the nil topology (credential-differ rule).
-const BINDING_CONTRACT_VERSION: u64 = 26;
+//
+// v27 (2026-07-21): the A.4 ratchet legs are authenticated. The EK (0x17) and CT (0x19) side-band
+// frames now carry an MLS **application message** in the initiator's send-PQ group
+// (`[tag][MLSMessage]`, content `[tag][payload]`) instead of the raw key bytes, so each leg is
+// authenticated by a leaf signature AND current-epoch proof — a stolen signing key alone can no
+// longer forge a leg the peer acts on, and a forged/stale EK no longer wedges the responder (see
+// `pq_ops::process_a4_leg`, book §A.4). WIRE-BREAKING for the side-band: peers must re-pair. No FFI
+// signature or error-variant change (the `pq_ratchet_respond`/`pq_ratchet_bind` surface is
+// unchanged); staging an A.4 now pushes a `Checkpoint` (the EK advances the send-PQ application
+// ratchet). The seal over the injected secret `S` is unchanged.
+const BINDING_CONTRACT_VERSION: u64 = 27;
 
 /// See `BINDING_CONTRACT_VERSION`. Exported so the Swift layer can verify the
 /// binding it was generated with matches the binary it loaded.

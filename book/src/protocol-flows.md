@@ -561,9 +561,9 @@ sequenceDiagram
     Note over Alice,Bob: Alice is initiator → operates on her send group (ASG).<br/>Lightweight KEM EK/CT exchange injects fresh PQ entropy S without a PQ updatePath.
 
     Alice-)Alice: Generate fresh PQ EK, DK
-    Alice-)Bob: PQ EK (fresh encapsulation key), as a dedicated side-band frame
+    Alice-)Bob: PQ EK (fresh encapsulation key) — an MLS application message in [ASG-PQ], as a dedicated side-band frame.<br/>Bob authenticates it (Alice's leaf signature AND current-epoch proof) by DECRYPTING it before responding
     Bob-)Bob: Pick a fresh random S, encapsulate to EK, and SEAL S under a key bound to the KEM shared<br/>secret + a repeatable export of [ASG-PQ] at its current epoch → [enc][sealed S]
-    Bob-)Alice: [enc][sealed S], as a dedicated side-band frame
+    Bob-)Alice: [enc][sealed S] — likewise an MLS application message in [ASG-PQ], as a dedicated side-band frame<br/>(Bob's leaf signature and epoch proof authenticate the CT the same way)
     Alice-)Alice: Open S — the AEAD tag is the explicit receipt: a stale or misdirected ciphertext fails HERE,<br/>with EK/DK and her PQ leaf intact (ML-KEM decapsulation alone returns garbage, not an error)
 
     Alice-)Alice: [ASG-PQ] PSK=S + Commit' (no updatePath — PARTIAL, so it stays small) → pq_epoch++<br/>(psk_id carries the 0x52 injected-secret domain byte)
@@ -577,6 +577,27 @@ sequenceDiagram
     Bob-)Bob: From the staple: apply pq_message to [ASG-PQ], then t_message to [ASG-cl], discard S
     Note over Alice,Bob: Turn flips — Bob initiates the next PQ ratchet on his send group (BSG)
 ```
+
+**Authenticating the legs (MLS signatures, not a ratcheted MAC).** Each leg — the EK and the
+CT — travels as an **MLS application message** in the initiator's send-PQ group, not as raw
+key bytes. Decrypting a leg is therefore what authenticates it, with MLS's two factors: the
+sender's **leaf signature** and proof of the group's **current epoch** (the receive ratchet
+will not decrypt without the epoch secrets). Two properties follow that a bare frame lacked:
+
+- **Post-compromise security of the authentication.** A stolen leaf **signing key alone** can
+  no longer forge a leg the peer acts on — the forger also needs the current epoch secrets,
+  which a round the attacker missed has already rotated away. Pre-healing (the attacker still
+  holds current state) is unavoidable and equivalent to forking any ratchet; the point is that
+  the forgery power does **not** outlive one healed round. 
+- **No forged-EK wedge.** A leg that fails authentication is rejected with **no state change**:
+  the header seal drops a network tamper before MLS is even invoked, and a forged or stale EK
+  never drives the responder into a half-open `Responding` state (the failure mode a bare,
+  signature-less EK created). The `pq_inflight` guard, checked before the mutating decrypt, is
+  what keeps a re-sent leg idempotent — a replayed application frame does not re-decrypt.
+
+Framing the legs this way costs the initiator one extra **`Checkpoint`** when it stages a
+round (the EK advances the send-PQ application ratchet, state the `Core` push omits), and the
+seal over `S` is unchanged — it still provides the explicit receipt below.
 
 **Why the PQ half cannot wait, and the classical half must.** `apq_psk` is exported from the PQ
 group's POST-commit epoch, so the classical commit cannot even be built until the PQ one has

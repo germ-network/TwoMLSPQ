@@ -124,11 +124,16 @@ pub(crate) const PQ_BOOTSTRAP_KP_TAG: u8 = 0x13;
 /// rides here; the initiator's stapled bind is what reaches a classical group.
 pub(crate) const PQ_BOOTSTRAP_WELCOME_TAG: u8 = 0x15;
 
-// PQ ratchet (book: Protocol Flows §A.4), cryptokit only: the initiator's ML-KEM
-// encapsulation key, and the responder's ciphertext — the KEM encapsulation plus the
-// AEAD-sealed injected secret (`[u32 enc_len][enc][sealed]`, opened by
-// `apq::pq_ratchet::open_injected_secret`), not a bare KEM ciphertext. The round closes
-// with the initiator's stapled bind, not a frame.
+// PQ ratchet (book: Protocol Flows §A.4): the initiator's ML-KEM encapsulation key, and the
+// responder's ciphertext — the KEM encapsulation plus the AEAD-sealed injected secret
+// (`[u32 enc_len][enc][sealed]`, opened by `apq::pq_ratchet::open_injected_secret`), not a
+// bare KEM ciphertext. Each leg travels as `[tag][MLSMessage]` where the MLSMessage is an
+// application message in the initiator's send-PQ group carrying `[tag][payload]` as its
+// authenticated content: MLS then gives each leg a leaf signature AND current-epoch proof, so
+// a stolen signing key alone cannot forge one (the PCS the bare frame lacked — see
+// `pq_ops::process_a4_leg`). The outer tag routes at `open_incoming`; the inner (signed) tag
+// guides parsing after the group decrypts it. The round closes with the initiator's stapled
+// bind, not a frame.
 pub(crate) const PQ_EK_TAG: u8 = 0x17;
 pub(crate) const PQ_CT_TAG: u8 = 0x19;
 
