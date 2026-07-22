@@ -22,8 +22,16 @@ to indicate the queued state.
 
 The app can treat these references as opaque bytes-typed identifiers. They are in
 practice **raw 32-byte values**: SHA-256 over the stated object.
-That is this library's own wire convention; the app layer wraps them in whatever
-typed-digest encoding it uses — no app-layer type tags appear on this surface.
+That is this library's own wire convention; no app-layer type tags appear on this
+surface.
+
+The Swift wrapper applies the tag: everything it vends is `[kind][digest]` (33 bytes),
+derived and compared by `PQDigest` (`Sources/TwoMLSPQ/PQDigest.swift`). The kind tag
+belongs to the Swift package rather than to a shared identity type precisely because
+the hash is a suite facet — `TwoMlsSuite::CURRENT.digest` — so it must version with
+this crate. Since the crate carries no tags, the two sides restate the algorithm
+independently; `DigestContractTests.digestDerivationMatchesTheCrate` is what holds
+them together, and a suite whose digest is not SHA-256 must fail there.
 
 ## `TwoMlsPqPrincipal`
 

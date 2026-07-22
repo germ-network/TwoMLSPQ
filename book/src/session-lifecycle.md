@@ -113,9 +113,11 @@ Sending is two-phase so CommProtocol can bind a per-round proposal hash:
   round stages one, rotation rounds included — and `proposal_hash` its 32-byte
   SHA-256; the receiver independently derives the same value as
   `QueuedRemoteProposal.digest`. A host that must sign over the proposal (the anchor
-  agent handoff binds the rotation Upd's digest) applies its own digest to
-  `proposal_message`: bytes and hash come from the same critical section, so no later
-  prepare can interpose a different Upd.
+  agent handoff binds the rotation Upd's digest) digests `proposal_message` itself:
+  bytes and hash come from the same critical section, so no later prepare can
+  interpose a different Upd. Through the Swift package, derive that digest with
+  `PQDigest.over(_:)` — not a hand-rolled hash — so it stays equal to `proposalHash`
+  when the suite's digest changes.
   - `proposing: None` → routine round. Our own send group commits in two cases, both
     gated on the peer having applied our previous commit: when a queued, app-approved
     remote proposal is pending (it folds the proposal — `did_commit: true`, and the

@@ -6,7 +6,7 @@
 //
 //  Conforms the TwoMLSPQ UniFFI types to the abstract protocol surface.
 //
-//  The abstraction speaks `Data`/`TypedDigest` while TwoMLSPQ wraps identity
+//  The abstraction speaks `Data` while TwoMLSPQ wraps identity
 //  bytes in single-field structs (`ClientId`, …), and several abstract members
 //  collide with the generated methods only on return type — so the conformances
 //  are thin adapter types at TwoMLSPQ's top level rather than
@@ -42,7 +42,6 @@
 //     reply restores send-ready — CAPTURE AFTER `createTwoMLSGroup` (the attach).
 //
 
-import CommProtocol
 import Foundation
 import TwoMLSPQBinding
 
@@ -203,12 +202,12 @@ enum TwoMLSPQBindingContract {
 
 // MARK: - Scalar conversions
 
-/// Lift a raw FFI digest into a `CommProtocol.TypedDigest`. The FFI's documented
-/// convention is SHA-256-32 over the stated object (see the note above
-/// `PrepareEncryptResult` in TwoMLSPQ's lib.rs); the type tag is applied HERE — the
-/// Rust crate carries no app-layer digest-type values.
-private func liftDigest(_ raw: Data) throws -> TypedDigest {
-	try TypedDigest(prefix: .sha256, checkedData: raw)
+/// Lift a raw FFI digest into this package's tagged form. The FFI's documented
+/// convention is a bare 32-byte digest over the stated object (see the note above
+/// `PrepareEncryptResult` in TwoMLSPQ's lib.rs); the kind tag is applied HERE — the
+/// Rust crate carries no app-layer digest-type values. See PQDigest.swift.
+private func liftDigest(_ raw: Data) throws(SessionError) -> Data {
+	try PQDigest.lift(ffi: raw)
 }
 
 // MARK: - Persistence adapter
@@ -294,7 +293,10 @@ public struct PQPrepareEncryptResult {
 	// `proposalHash` is the WELCOME digest (the AAD binding each such message to
 	// its establishment vector); the peer stages nothing from those frames.
 	public let proposalMessage: Data
-	public let proposalHash: TypedDigest
+	/// Tagged digest bytes (`PQDigest`) — equal to `PQDigest.over(proposalMessage)` and to the
+	/// receiver's `PQQueuedRemoteProposal.digest`. Carry them verbatim into whatever signs over
+	/// the rotation; derive any parallel digest with `PQDigest.over(_:)`, never by hand.
+	public let proposalHash: Data
 	// NB: protocol spells this `commitedRemoteClientId` (single "t");
 	// the FFI struct spells it `committedRemoteClientId`.
 	public let commitedRemoteClientId: ClientID?
@@ -321,10 +323,13 @@ public struct PQSenderMessage: Sendable {
 }
 
 public struct PQQueuedRemoteProposal: Sendable {
-	public let digest: TypedDigest
+	/// Tagged digest bytes (`PQDigest`); hand back to `queueProposal(digest:)` unmodified.
+	public let digest: Data
 	public let sender: ClientID
 	public let proposing: ClientID
-	public let context: TypedDigest
+	/// Tagged digest bytes (`PQDigest`) — the ordering context, equal to the sender's
+	/// `proposalContext`.
+	public let context: Data
 
 	init(_ base: TwoMLSPQBinding.QueuedRemoteProposal) throws {
 		digest = try liftDigest(base.digest)
@@ -416,14 +421,14 @@ public struct PQPendingEstablishment {
 		admittedCreator: ClientID
 	) throws(SessionError) -> PQDecryptResult? {
 		try mapPQErrors(.processIncoming) {
-			// The digests match the crate's `sha256` exactly — `TypedDigest(.sha256,
-			// over:)` is raw SHA-256, the same primitive `crate::sha256` emits (the
-			// contract-version canary catches a suite change). Computed here from the
-			// surfaced bytes, so the pair is always the one the host verified.
+			// The digests match the crate's `sha256` exactly — `PQDigest.raw(over:)` is
+			// the same primitive `crate::sha256` emits, pinned by the derivation canary.
+			// Computed here from the surfaced bytes, so the pair is always the one the
+			// host verified. Untagged: the FFI carries bare digests.
 			let raw = try base.processIncomingApproved(
 				ciphertext: ciphertext,
-				approvedEnvelopeDigest: TypedDigest(prefix: .sha256, over: envelope).digest,
-				approvedWelcomeDigest: TypedDigest(prefix: .sha256, over: welcome).digest,
+				approvedEnvelopeDigest: PQDigest.raw(over: envelope),
+				approvedWelcomeDigest: PQDigest.raw(over: welcome),
 				expectedCreator: admittedCreator
 			)
 			// Re-presenting the same captured bytes with digests over those same
@@ -556,7 +561,8 @@ public struct PQSession {
 
 	// MARK: State
 
-	public var proposalContext: TypedDigest? {
+	/// Tagged digest bytes (`PQDigest`).
+	public var proposalContext: Data? {
 		// Non-throwing per the protocol; FFI digests are always well-formed
 		// 32-byte values, so a conversion failure is treated as "no context".
 		guard let digest = base.proposalContext() else { return nil }
@@ -623,11 +629,16 @@ public struct PQSession {
 		}
 	}
 
+	/// Approve a staged remote proposal by its digest.
+	///
+	/// `digest` must be the bytes this package emitted (`PQQueuedRemoteProposal.digest`, or
+	/// `PQDigest.over(_:)` over the proposal message) — the crate byte-compares it against its
+	/// own staged proposal, so a recomputed-by-hand value is rejected there.
 	public func queueProposal(
-		digest: TypedDigest
+		digest: Data
 	) throws(SessionError) {
 		try mapPQErrors(.pqOperation) {
-			try base.queueProposal(digest: digest.digest)
+			try base.queueProposal(digest: PQDigest.strip(digest))
 		}
 	}
 
@@ -670,8 +681,8 @@ public struct PQSession {
 			else {
 				return nil
 			}
-			let token = TypedDigest(prefix: .sha256, over: stablePrefix)
-			if let acked = try base.forwarded(spawnToken: token.wireFormat) {
+			let token = PQDigest.over(stablePrefix)
+			if let acked = try base.forwarded(spawnToken: token) {
 				return PQSenderMessage(acked)
 			}
 			guard let staple = frame.stapledMessage,
@@ -1029,8 +1040,7 @@ public struct PQInvitation {
 					detail: "§A.1 bootstrap-KP envelope resolves to no pinned session")
 			}
 			return .forward(
-				groupId: try DataIdentifier(
-					prefix: .bits256, checkedData: group.bytes),
+				groupId: try PQIdentifier.tagged256(group.bytes),
 				// The envelope PLAINTEXT: `forwarded(headerDecrypted:)` re-parses it
 				// to the verbatim `[0x13][KP′]` frame and answers A.3.
 				mlsMessageData: decrypted)
@@ -1057,13 +1067,10 @@ public struct PQInvitation {
 				code: .malformedFrame,
 				detail: "§A.1 envelope with no establishment vector")
 		}
-		let digest = TypedDigest(prefix: .sha256, over: stablePrefix)
-		if let spawned = base.forwardGroupId(spawnToken: digest.wireFormat) {
+		let digest = PQDigest.over(stablePrefix)
+		if let spawned = base.forwardGroupId(spawnToken: digest) {
 			return .forward(
-				groupId: try DataIdentifier(
-					prefix: .bits256,
-					checkedData: spawned.bytes
-				),
+				groupId: try PQIdentifier.tagged256(spawned.bytes),
 				// The envelope PLAINTEXT: `forwarded(headerDecrypted:)` re-parses
 				// it to ack the replay and deliver the stapled app message.
 				mlsMessageData: decrypted
@@ -1167,7 +1174,7 @@ public struct PQInvitation {
 				welcome: sendGroupWelcome,
 				theirClassicalKeyPackage: remoteKeyPackage,
 				bootstrapKpCommitment: bootstrapKpCommitment,
-				spawnToken: welcomeToken.wireFormat,
+				spawnToken: welcomeToken.digest,
 				newClientId: newClientId,
 				expectedRemote: remoteClientId,
 				expectedAppBinding: expectedAppBinding

@@ -15,17 +15,28 @@ ML-KEM-768 (FIPS 203).
 
 ```
 App
-		TwoMLSPQ(Swift Package) Swift API
-    		└─ TwoMLSPQ (rust crate)  sessions · two send groups (APQ groups)
-        		└─ mls-rs            MLS group state · key schedules
-              		└─ crypto       X25519/ChaCha (classical) · ML-KEM-768 (PQ)
-        └─ CommProtocol (Swift)        TypedDigest
+    ├─ CommProtocol (Swift)          identities · anchors · handoff signatures
+    └─ TwoMLSPQ (Swift package)      Swift API · tagged digest bytes
+            └─ TwoMLSPQ (rust crate) sessions · two send groups (APQ groups)
+                └─ mls-rs            MLS group state · key schedules
+                    └─ crypto        X25519/ChaCha (classical) · ML-KEM-768 (PQ)
 
 ```
 
-The Swift package does pull in CommProtocol for a TypedDigest to express hash digests in its
-API without making them opaque bytes. It does not otherwise depend on CommProtocol's identities
-and exposes an MLS client interface of basic credentials.
+The Swift package has **no external Swift dependencies**. CommProtocol is a sibling under the
+app, not a layer beneath: the two meet in app code, which carries values between them.
+
+Digests cross the Swift API as self-describing tagged `Data` — `[kind][digest]` — that this
+package derives (`PQDigest.over(_:)`) and compares. The kind tag matters: the digest algorithm
+is a facet of the crate's cipher suite, so the tag namespace versions with the crate, and a new
+suite ships from this repo without waiting on a release of anything else. Callers owe these
+bytes nothing but carriage — hand them back verbatim. Anything that must byte-match a digest
+this library emitted (an establishment welcome digest, a value signed alongside `proposalHash`)
+must be derived with `PQDigest.over(_:)` rather than hashed by hand, or it silently diverges
+the first time the suite's digest changes.
+
+It does not otherwise depend on CommProtocol's identities and exposes an MLS client interface
+of basic credentials.
 
 The app hands TwoMLSPQ the opaque **`ClientId`** of one of its **agents** — identity bytes.
 TwoMLSPQ builds a **`TwoMlsPqPrincipal`** for that ClientId, minting a fresh MLS leaf signing key

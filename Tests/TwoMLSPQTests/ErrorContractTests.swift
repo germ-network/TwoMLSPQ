@@ -11,7 +11,6 @@
 //  are pinned per-surface below.
 //
 
-import CommProtocol
 import Foundation
 import Testing
 

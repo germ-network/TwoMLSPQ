@@ -7,14 +7,13 @@
 //  `TwoMLSPQ` module) so this package carries no dependency on the abstract shim protocols.
 //  The `AbstractTwoMLS` package's protocols reference these via `import TwoMLSPQ`.
 //
-//  Note: `TwoMLSPQ` keeps its `CommProtocol` dependency. `TypedDigest` here is NOT an opaque
-//  token — the proposal digest's 33-byte `.wireFormat` is signed into the cross-party agent
-//  handoff (CommProtocol's `createNewAgentHandoff`) and re-derived + verified by the peer, so it
-//  is shared, load-bearing crypto vocabulary. `CommProtocol` is a type dependency, not the shim
-//  protocol this split quarantines.
+//  Note: digests and routing ids cross this surface as opaque, self-describing `Data` (see
+//  PQDigest.swift). They are still load-bearing crypto vocabulary — the proposal digest's
+//  33-byte tagged form is signed into the cross-party agent handoff — but the bytes were always
+//  the contract, not the Swift type, so this package vends bytes and owns their kind tags.
+//  That is what lets a suite change ship from here alone.
 //
 
-import CommProtocol
 import Foundation
 
 // MARK: - Opaque id aliases
@@ -71,7 +70,9 @@ public enum HeaderDecryptResult {
 	/// a fresh stapled message. `mlsMessageData` is the backend-opaque decrypted payload — hand
 	/// it verbatim to the spawned session's `forwarded(headerDecrypted:)`, which acknowledges the
 	/// replay and returns any newly-delivered stapled message.
-	case forward(groupId: DataIdentifier, mlsMessageData: Data)
+	/// `groupId` is a tagged 256-bit identifier (`PQIdentifier`) — adopters persist these bytes
+	/// as spawned-session lookup keys, so pass them around verbatim.
+	case forward(groupId: GroupID, mlsMessageData: Data)
 	case appWelcome(
 		//opaque token for this welcome; pass it back verbatim to `receive`
 		welcomeToken: WelcomeToken,
@@ -91,13 +92,13 @@ public enum HeaderDecryptResult {
 /// silently break replay-forward routing (the token keys the invitation's forward table).
 /// No public initializer: only a backend mints one.
 public struct WelcomeToken: Sendable, Equatable, Hashable {
-	/// The underlying digest — readable (e.g. as a storage key), not forgeable into a token
-	/// from outside the package.
-	public let digest: TypedDigest
+	/// The underlying digest, tagged (`PQDigest`) — readable (e.g. as a storage key), not
+	/// forgeable into a token from outside the package. These are also the bytes handed to the
+	/// FFI as the opaque spawn token.
+	public let digest: Data
 
 	/// `package` so the backend adapter and in-package tests mint tokens; the app can't.
-	package init(_ digest: TypedDigest) { self.digest = digest }
-
-	/// Wire bytes handed to the FFI as the opaque spawn token.
-	var wireFormat: Data { digest.wireFormat }
+	/// Derive the digest with `PQDigest.over(_:)` — a hand-rolled hash produces a token the
+	/// crate's forward table will not match.
+	package init(_ digest: Data) { self.digest = digest }
 }

@@ -49,7 +49,7 @@ struct PQInvitationReceiveTests {
 			remoteKeyPackage: initiatorKp,
 			bootstrapKpCommitment: try #require(initiatorSession.bootstrapKpCommitment()),
 			remoteClientId: initiator.clientId().bytes,
-			welcomeToken: WelcomeToken(TypedDigest(prefix: .sha256, over: welcome)),
+			welcomeToken: WelcomeToken(PQDigest.over(welcome)),
 			stapledMessage: nil,
 			newClientId: dedicatedId
 		)
@@ -94,7 +94,7 @@ struct PQInvitationReceiveTests {
 		let welcome = try #require(initiatorSession.initialWelcome())
 		let initiatorKp = try initiator.generateKeyPackage(suite: .x25519Chacha())
 		let commitment = try #require(initiatorSession.bootstrapKpCommitment())
-		let token = WelcomeToken(TypedDigest(prefix: .sha256, over: welcome))
+		let token = WelcomeToken(PQDigest.over(welcome))
 
 		_ = try invitation.receive(
 			sendGroupWelcome: welcome,
@@ -147,7 +147,7 @@ struct PQInvitationReceiveTests {
 				remoteKeyPackage: initiatorKp,
 				bootstrapKpCommitment: commitment,
 				remoteClientId: .mock(),  // not the initiator's identity
-				welcomeToken: WelcomeToken(TypedDigest(prefix: .sha256, over: welcome)),
+				welcomeToken: WelcomeToken(PQDigest.over(welcome)),
 				stapledMessage: nil,
 				newClientId: .mock()
 			)
@@ -179,7 +179,7 @@ struct PQInvitationReceiveTests {
 		)
 		let welcome = try #require(initiatorSession.initialWelcome())
 		let initiatorKp = try initiator.generateKeyPackage(suite: .x25519Chacha())
-		let token = WelcomeToken(TypedDigest(prefix: .sha256, over: welcome))
+		let token = WelcomeToken(PQDigest.over(welcome))
 
 		do {
 			_ = try invitation.receive(
@@ -244,7 +244,7 @@ struct PQInvitationReceiveTests {
 		let welcome = try #require(initiatorSession.initialWelcome())
 		let initiatorKp = try initiator.generateKeyPackage(suite: .x25519Chacha())
 		let commitment = try #require(initiatorSession.bootstrapKpCommitment())
-		let token = WelcomeToken(TypedDigest(prefix: .sha256, over: welcome))
+		let token = WelcomeToken(PQDigest.over(welcome))
 
 		do {
 			_ = try invitation.receive(

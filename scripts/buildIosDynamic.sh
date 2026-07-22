@@ -202,9 +202,30 @@ xcodebuild -create-xcframework \
     -framework "$FW_DIR/macos/${MODULE}.framework" \
     -output "$STAGE_DIR/$FRAMEWORK.xcframework"
 
-# -y preserves the macOS versioned framework's symlinks (Versions/Current, etc.) instead
-# of dereferencing them into duplicated content.
-(cd "$STAGE_DIR" && zip -ry "$FRAMEWORK.xcframework.zip" "$FRAMEWORK.xcframework")
+# DETERMINISTIC ARCHIVE (trial — see release-artifacts.yml's "Reuse the published
+# binary" step). Identical inputs must produce a byte-identical zip, so the checksum
+# becomes the binary's true identity: a release that changed only Swift recomputes the
+# checksum it already pins, and the workflow can then reuse the published asset instead
+# of republishing ~2.4 MB of unchanged binary under a new url. Three sources of noise:
+#
+#   * mtimes      — the zip central directory stores them, and a rebuild's files are
+#                   always freshly stamped. Normalized to a fixed epoch (1980-01-01, the
+#                   earliest the zip format can represent).
+#   * entry order — directory walk order is not guaranteed stable, so enumerate with
+#                   `find | sort` and feed the list via `-@` rather than recursing.
+#   * extra attrs — `-X` drops uid/gid and Finder metadata.
+#
+# This makes the ARCHIVE step deterministic. Whether the whole build is depends on the
+# compiler output too (the dylibs embed absolute source paths for panic locations, which
+# are stable within a CI runner but differ from a dev machine). That is fine: the reuse
+# decision compares checksums, so residual nondeterminism costs a redundant publish, never
+# a wrong one. -y still preserves the macOS versioned framework's symlinks (Versions/
+# Current, etc.) instead of dereferencing them into duplicated content.
+(
+    cd "$STAGE_DIR"
+    find "$FRAMEWORK.xcframework" -exec touch -h -t 198001010000 {} +
+    find "$FRAMEWORK.xcframework" | sort | zip -qXy "$FRAMEWORK.xcframework.zip" -@
+)
 
 rm -rf "$BUILD_DIR/$FRAMEWORK.xcframework" "$BUILD_DIR/$FRAMEWORK.xcframework.zip"
 mv "$STAGE_DIR/$FRAMEWORK.xcframework" "$BUILD_DIR/$FRAMEWORK.xcframework"
