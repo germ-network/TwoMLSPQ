@@ -3,6 +3,18 @@ bench = false
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [package]
+# NOT independently versioned. `publish` inherits the workspace's `false`, so this crate
+# never reaches crates.io and `version` below is inert — it has stayed 0.1.0 while the
+# shipping product moved well past it. The release version lives in the repo's
+# package.json / git tag (changesets), and names the SWIFT PACKAGE, which is the only
+# consumable artifact: one tag pins one (Swift API, Rust binary) pair, via the xcframework
+# url + checksum written into Package.swift at release time.
+#
+# The Rust half's own compatibility axis is `BINDING_CONTRACT_VERSION` (see lib.rs), not
+# this field — it versions the Rust<->Swift ABI and is enforced at runtime by the canary in
+# PQSession.swift. Deliberately NOT a second changesets package: the two ship as one
+# artifact and cannot be mixed, so a second version stream could only ever disagree with
+# the contract check.
 authors.workspace = true
 autobenches = false
 edition.workspace = true
