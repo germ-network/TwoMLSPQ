@@ -13,9 +13,27 @@ name: Release artifacts
 # assets are uploaded, so no consumer can resolve a usable-but-wrong tag.
 #
 # Idempotent: a re-dispatch on an ALREADY-pinned tag is a genuine no-op — build, pin, and
-# upload are all skipped. Rebuilding is deliberately not done there, because the zip embeds
-# mtimes (not byte-reproducible), so a rebuild would produce a different checksum than the one
-# already pinned in Package.swift and uploaded — replacing the asset would break the pin.
+# upload are all skipped.
+#
+# TRIAL (2026-07): ASSET REUSE FOR SWIFT-ONLY RELEASES. Most releases here change only the
+# Swift wrapper, yet each one used to rebuild and republish the whole ~2.4 MB xcframework.
+# Worse, the zip was not byte-reproducible (it embedded mtimes), so the republished binary
+# got a NEW checksum despite being functionally identical — which meant nothing in the
+# published artifacts could distinguish "the Rust binary changed" from "we rebuilt the same
+# source on a different day", and consumers re-downloaded it either way.
+#
+# So buildIosDynamic.sh now produces a deterministic archive, and the "Reuse the published
+# binary" step below skips pin+upload when this build's checksum equals the one Package.swift
+# already pins. The checksum becomes the binary's identity, moving only when the binary moves.
+#
+# Why this is safe: equal checksums mean the archives are byte-identical, so reuse is
+# definitionally correct, and any mismatch — including residual build nondeterminism we have
+# not chased down — falls through to the normal publish path. There is no outcome where a
+# stale binary ships. Worst case the trial simply never fires and we publish as before.
+#
+# What it changes for consumers: a tag's Package.swift may pin an EARLIER tag's asset. That is
+# intended, and it is the signal that the binary did not change. The consequence to respect:
+# release assets are now load-bearing for LATER tags, so do not delete them.
 #
 # Invoked automatically from release.yml when changesets publishes; dispatchable by hand to
 # build and pin a tag that is not yet pinned.
@@ -107,11 +125,59 @@ jobs:
           echo "value=$sum" >> "$GITHUB_OUTPUT"
           printf '%s\n' "$sum" | tee "$GITHUB_WORKSPACE/TwoMLSPQ.xcframework.zip.checksum"
 
-      # Pin the fallback binaryTarget (url + checksum) and the vendored binding to THIS build,
-      # then move the tag to the pin commit. Only reached when the tag is not yet pinned, so
-      # the rewrite is always a real change.
-      - name: Pin Package.swift + binding and move the tag
+      # Did this build actually produce a different binary? The comparand is Package.swift's
+      # own pin, which by the RELEASE CONVENTION always names an ALREADY-RELEASED tag — it
+      # lags through as many Swift-only releases as you like, always naming the last tag that
+      # genuinely changed the binary. So when the checksums match there is nothing to do: the
+      # pin in the tagged tree is already correct and already points at a live asset.
+      #
+      # The asset is re-verified before reuse. Skipping on a checksum match alone would ship a
+      # 404 if the pinned release had been pruned, and reuse is exactly what makes older
+      # assets load-bearing for newer tags.
+      - name: Reuse the published binary when this build is byte-identical
+        id: reuse
         if: steps.pinned.outputs.already != 'true'
+        env:
+          SUM: ${{ steps.checksum.outputs.value }}
+        run: |
+          set -euo pipefail
+          python3 - > "$RUNNER_TEMP/pin.txt" <<'PY'
+          import re, pathlib
+          s = pathlib.Path("Package.swift").read_text()
+          u = re.search(r'url:\s*"([^"]*TwoMLSPQ\.xcframework\.zip)"', s)
+          c = re.search(r'checksum:\s*"([0-9a-f]{64})"', s)
+          print(u.group(1) if u else "")
+          print(c.group(1) if c else "")
+          PY
+          pinned_url=$(sed -n 1p "$RUNNER_TEMP/pin.txt")
+          pinned_sum=$(sed -n 2p "$RUNNER_TEMP/pin.txt")
+
+          if [ -z "$pinned_sum" ] || [ "$pinned_sum" != "$SUM" ]; then
+            echo "binary changed (pinned=${pinned_sum:-none} built=${SUM}) — publishing"
+            echo "reuse=false" >> "$GITHUB_OUTPUT"
+          elif ! curl -fsIL -o /dev/null "$pinned_url"; then
+            echo "::warning::checksum matches the pin but ${pinned_url} is unreachable — \
+          publishing a fresh asset instead of reusing a missing one"
+            echo "reuse=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "reuse=true" >> "$GITHUB_OUTPUT"
+            {
+              echo "### XCFramework unchanged"
+              echo
+              echo "This build is byte-identical to the pinned binary, so no new asset was"
+              echo "published. \`Package.swift\` keeps pointing at the last release that"
+              echo "actually changed it."
+              echo
+              echo "- checksum: \`${SUM}\`"
+              echo "- asset: ${pinned_url}"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # Pin the fallback binaryTarget (url + checksum) and the vendored binding to THIS build,
+      # then move the tag to the pin commit. Skipped when the tag is already pinned, and when
+      # the build reproduced the pinned binary (nothing to rewrite — the pin is correct).
+      - name: Pin Package.swift + binding and move the tag
+        if: steps.pinned.outputs.already != 'true' && steps.reuse.outputs.reuse != 'true'
         env:
           TAG: ${{ inputs.tag }}
           SUM: ${{ steps.checksum.outputs.value }}
@@ -145,8 +211,11 @@ jobs:
           git tag -f "${TAG}"
           git push origin --force "refs/tags/${TAG}"
 
+      # Nothing is uploaded on a reuse: the tagged Package.swift's pin is the single source of
+      # truth for where the binary lives, and an asset here would imply this release published
+      # one. The step summary above records the decision.
       - name: Upload artifacts to release
-        if: steps.pinned.outputs.already != 'true'
+        if: steps.pinned.outputs.already != 'true' && steps.reuse.outputs.reuse != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
