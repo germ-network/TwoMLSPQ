@@ -1,5 +1,70 @@
 # @germ-network/two-mls-pq
 
+## 0.13.0
+
+### Minor Changes
+
+- [#108](https://github.com/germ-network/TwoMLSPQ/pull/108) [`ac54e0f`](https://github.com/germ-network/TwoMLSPQ/commit/ac54e0f86f078405ee8ae8324c7f5a0a67bf1722) Thanks [@germ-mark](https://github.com/germ-mark)! - Own the digest vocabulary: drop CommProtocol from the Swift product.
+
+  Digests and routing ids now cross the Swift API as self-describing tagged `Data`
+  that this package derives (`PQDigest.over(_:)`) and compares, instead of as
+  `CommProtocol.TypedDigest`/`DataIdentifier`. The bytes were always the real
+  contract — the 33-byte tagged form is what the cross-party agent handoff signs
+  over — while the shared Swift _type_ bought only call-site convenience, at the
+  price of putting the digest kind namespace in another package's hands. Since the
+  hash is a facet of the crate's cipher suite (`TwoMlsSuite::CURRENT.digest`), a
+  future suite could not ship without a CommProtocol release first. It can now.
+
+  Every byte is unchanged: the digest tag stays `0x01` and routing ids stay `0x02`,
+  the values CommProtocol assigned, so spawn tokens (keys of the crate's archived
+  forward table) and adopter-persisted routing keys keep matching across the
+  upgrade. No FFI change — binding contract stays 27, no re-pairing.
+
+  Source-breaking for adopters: `proposalHash`, `QueuedRemoteProposal.digest`/
+  `.context`, `proposalContext`, `queueProposal(digest:)`, `WelcomeToken.digest`,
+  and `HeaderDecryptResult.forward`'s group id are now `Data`. Where a caller
+  previously built a `TypedDigest` to hand back, pass the bytes through; where it
+  derived one to match a value this library emitted, use `PQDigest.over(_:)`. The
+  retype moved a type-system guarantee to a runtime check, so malformed digests
+  now throw `SessionError(.internalError)` at the boundary rather than failing to
+  compile.
+
+  The Swift package now has no external Swift dependencies (CommProtocol remains a
+  test-only dependency, which mints client ids the way the app does).
+
+### Patch Changes
+
+- [#108](https://github.com/germ-network/TwoMLSPQ/pull/108) [`f4ffd47`](https://github.com/germ-network/TwoMLSPQ/commit/f4ffd4756235f12382ecf5b0c6d56dd84d402a33) Thanks [@germ-mark](https://github.com/germ-mark)! - Release tooling (trial): stop republishing the xcframework when it has not changed.
+
+  Most releases here change only the Swift wrapper, yet every one rebuilt and
+  republished the whole ~2.4 MB xcframework. Because the zip embedded mtimes it was
+  not byte-reproducible, so that republished binary also got a NEW checksum despite
+  being functionally identical — meaning nothing in the published artifacts could
+  distinguish "the Rust binary changed" from "we rebuilt the same source on a
+  different day", and consumers re-downloaded it either way.
+
+  `buildIosDynamic.sh` now builds a deterministic archive (fixed mtimes, sorted
+  entry order, no extra attributes), and the release job skips the pin and upload
+  when the freshly computed checksum equals the one `Package.swift` already pins.
+  The checksum becomes the binary's identity, moving only when the binary moves.
+
+  **What adopters may notice:** a tag's `Package.swift` can pin an EARLIER tag's
+  asset url. That is intended — it is the signal that the binary did not change
+  between those releases, and the checksum still verifies the exact bytes SwiftPM
+  downloads. Nothing about resolution or verification changes.
+
+  Safe by construction: equal checksums mean the archives are byte-identical, so
+  reuse is definitionally correct, and any mismatch — including build
+  nondeterminism we have not chased down (the dylibs embed absolute source paths
+  for panic locations, stable within a CI runner but not across machines) — falls
+  through to the normal publish path. There is no outcome where a stale binary
+  ships; the worst case is that the trial never fires and releases publish exactly
+  as before. Reuse additionally re-verifies that the pinned asset is still
+  reachable, and publishes fresh if it is not.
+
+  **Operational consequence:** published release assets are now load-bearing for
+  later tags. Do not delete them.
+
 ## 0.12.1
 
 ### Patch Changes
