@@ -15,7 +15,12 @@ name: Release artifacts
 # Idempotent: a re-dispatch on an ALREADY-pinned tag is a genuine no-op — build, pin, and
 # upload are all skipped.
 #
-# TRIAL (2026-07): ASSET REUSE FOR SWIFT-ONLY RELEASES. Most releases here change only the
+# TRIAL (2026-07, tracked in GER-1919): ASSET REUSE FOR SWIFT-ONLY RELEASES. NOTE it cannot
+# fire until the SECOND release after it lands — the checksum it compares against must itself
+# have been produced by the deterministic zip. Its failure mode is silent non-firing, so if you
+# are here because you never saw it work, start at that issue.
+#
+# Most releases here change only the
 # Swift wrapper, yet each one used to rebuild and republish the whole ~2.4 MB xcframework.
 # Worse, the zip was not byte-reproducible (it embedded mtimes), so the republished binary
 # got a NEW checksum despite being functionally identical — which meant nothing in the
