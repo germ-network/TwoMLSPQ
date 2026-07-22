@@ -63,8 +63,11 @@ impl IntoAnyError for RuleError {
     }
 }
 
-/// The TwoMLS operation whitelist, applied identically to the classical and PQ halves
-/// (`OurConfig`/`PqConfig` share it).
+/// The TwoMLS operation whitelist, shared by the classical and PQ halves
+/// (`OurConfig`/`PqConfig`). The proposal shape rules apply identically to both; anything
+/// suite-dependent (which attestation epoch field applies, the FULL-commit forced path)
+/// branches on the group's own cipher suite — never on which config it came in through,
+/// which is the same either way.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TwoMlsRules;
 
@@ -183,11 +186,11 @@ impl MlsRules for TwoMlsRules {
     fn commit_options(
         &self,
         _roster: &Roster,
-        _context: &GroupContext,
+        context: &GroupContext,
         proposals: &ProposalBundle,
     ) -> Result<CommitOptions, RuleError> {
-        // TwoMLS policy: a FULL commit — one carrying the APP_DATA_UPDATE attestation, i.e. an
-        // owed-bind discharge — MUST include an updatePath.
+        // TwoMLS policy: on the CLASSICAL half, a FULL commit — one carrying the APP_DATA_UPDATE
+        // attestation, i.e. an owed-bind discharge — MUST include an updatePath.
         //
         // RFC 9420 leaves the path at the committer's DISCRETION for a commit whose proposals do
         // not require one, and mls-rs honours that: it omits the path unless a proposal forces it
@@ -200,14 +203,23 @@ impl MlsRules for TwoMlsRules {
         // (`InvalidSignature`). Routine folds already carry a path (their folded Update forces one),
         // so in practice this only pins the path onto the discharge — the one FULL commit that
         // otherwise wouldn't. It also delivers the "fresh own leaf" PCS source the discharge is
-        // meant to. Deliberately CLASSICAL-only (this is the classical group's rules); the PQ group
-        // sets its own path policy and is untouched — an ML-KEM updatePath is expensive and no PQ
-        // bug requires it.
+        // meant to.
+        //
+        // The PQ half is EXEMPT, by suite — these rules are shared by both halves
+        // (`OurConfig`/`PqConfig`), so the scoping must be explicit, not assumed. A FULL commit's
+        // PQ half is the pathless PSK-injection bind (the shape `filter_proposals` documents and
+        // the book's contract-24 design requires): its PQ freshness is the injected secret S, its
+        // credential handoffs ride A.5's updatePath commit (whose folded Update forces the path
+        // regardless of this option), and an ML-KEM updatePath here would bolt ~3.7 KB onto every
+        // bind for entropy the PSK already carries. Suite recognition is total for any group these
+        // rules admit an attestation into (`filter_proposals` rejects the rest); an unrecognized
+        // suite conservatively keeps the classical protection.
         let is_full_commit = proposals
             .custom_proposals()
             .iter()
             .any(|c| c.proposal.proposal_type() == APP_DATA_UPDATE);
-        Ok(CommitOptions::default().with_path_required(is_full_commit))
+        let is_pq_half = crate::client::suite_is_pq(context.cipher_suite).unwrap_or(false);
+        Ok(CommitOptions::default().with_path_required(is_full_commit && !is_pq_half))
     }
 
     fn encryption_options(

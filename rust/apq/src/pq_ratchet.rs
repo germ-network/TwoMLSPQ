@@ -492,6 +492,59 @@ mod tests {
         assert_eq!(data, b"after-pq-ratchet");
     }
 
+    /// Contract 24 wire shape, pinned: the bind's PQ half is a PATHLESS PSK-injection commit.
+    /// `TwoMlsRules::commit_options` forces an updatePath onto attestation-carrying commits on
+    /// the CLASSICAL half only — but both halves share those rules (`OurConfig`/`PqConfig`), so
+    /// a regression that un-scopes the suite predicate lands an ML-KEM updatePath here. That
+    /// cannot hide: an ML-KEM-768 updatePath carries the committer's fresh leaf encapsulation
+    /// key (1184 B) and an encrypted path secret whose `kem_output` alone is 1088 B, so a bind
+    /// commit smaller than one `kem_output` provably has no path. (Pathless shape ≈ 300 B; the
+    /// v0.10–v0.12 regression measured ≈ 4 KB.) The peer must also still APPLY the pathless
+    /// shape — pinning both build and receive.
+    #[test]
+    fn test_bind_pq_commit_is_pathless() {
+        let alice = client();
+        let bob = client();
+        let (mut asg, welcome) = create_combiner_send_group(
+            &bob.generate_classical_key_package().unwrap(),
+            &bob.generate_pq_key_package().unwrap(),
+            &alice,
+            None,
+        )
+        .unwrap();
+        let mut bob_recv = join_combiner_group(&welcome, &bob).unwrap();
+
+        let eph = generate_ephemeral(&kem()).unwrap();
+        let (s_bob, ct) = encapsulate(&kem(), &eph.encapsulation_key()).unwrap();
+        let s_alice = decapsulate(&kem(), &eph, &ct).unwrap();
+        assert_eq!(s_alice, s_bob);
+
+        let attestation = ApqInfoUpdate {
+            t_epoch: asg.classical.current_epoch() + 1,
+            pq_epoch: asg.pq.as_ref().unwrap().current_epoch() + 1,
+        };
+        let a_stores = [alice.pq().secret_store(), alice.classical().secret_store()];
+        let pq_commit =
+            inject_and_commit(asg.pq.as_mut().unwrap(), &s_alice, &a_stores, attestation).unwrap();
+
+        const ML_KEM_768_CIPHERTEXT: usize = 1088;
+        assert!(
+            pq_commit.len() < ML_KEM_768_CIPHERTEXT,
+            "bind PQ commit is {} B — an ML-KEM updatePath rode a commit that must be pathless",
+            pq_commit.len()
+        );
+
+        // The pathless shape is valid on receive: the peer applies it and derives the epoch.
+        let (_, bob_attestation) = apply_injected_commit(
+            bob_recv.pq.as_mut().unwrap(),
+            &s_bob,
+            &pq_commit,
+            &[bob.pq().secret_store(), bob.classical().secret_store()],
+        )
+        .unwrap();
+        assert_eq!(bob_attestation, attestation);
+    }
+
     #[test]
     fn test_injected_secret_is_deleted_after_bind() {
         let alice = client();
