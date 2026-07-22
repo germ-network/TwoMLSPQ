@@ -51,9 +51,12 @@ let package = Package(
 		)
 	],
 	dependencies: [
-		// Not the shim protocol — a type dependency. `TypedDigest`/`DataIdentifier` are
-		// load-bearing shared crypto vocabulary (the proposal digest's `.wireFormat` is
-		// signed into the cross-party agent handoff), so the concrete types name them.
+		// TEST-ONLY. The public product has no external Swift dependencies: digests and
+		// routing ids cross its surface as self-describing `Data` this package owns (see
+		// PQDigest.swift), so a suite change ships from here without a CommProtocol
+		// release. The test target still mints client ids with `AgentPrivateKey` the way
+		// the app does — `ClientID` IS `AgentPublicKey.wireFormat`, carried opaquely but
+		// persisted in MLS group state, so testing against the real encoding is the point.
 		.package(
 			url: "https://github.com/germ-network/autonomous-comm-protocol.git",
 			from: "1.2.0"
@@ -61,14 +64,11 @@ let package = Package(
 	],
 	targets: [
 		// The public product: the hand-written concrete PQ types + value/currency types,
-		// top-level in this module. Depends on the internal binding target below (so the raw
-		// UniFFI interface types stay out of this surface) + CommProtocol for `TypedDigest`.
+		// top-level in this module. Depends ONLY on the internal binding target below (so the
+		// raw UniFFI interface types stay out of this surface) — no external Swift packages.
 		.target(
 			name: "TwoMLSPQ",
-			dependencies: [
-				"TwoMLSPQBinding",
-				.product(name: "CommProtocol", package: "autonomous-comm-protocol"),
-			]
+			dependencies: ["TwoMLSPQBinding"]
 		),
 		// The generated UniFFI binding (`two_mls_pq.swift`, owning its own `RustBuffer` from
 		// `two_mls_pqFFI`). An INTERNAL target — not vended — so its `@unchecked Sendable`

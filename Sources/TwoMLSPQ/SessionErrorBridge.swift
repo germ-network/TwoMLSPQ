@@ -7,7 +7,6 @@
 //  every PQ wrapper method routes its throws through `mapPQErrors`.
 //
 
-import CommProtocol
 import Foundation
 import TwoMLSPQBinding
 
@@ -52,9 +51,10 @@ extension SessionError {
 	/// Translate one backend error at a known surface. Exhaustive over every
 	/// `TwoMlsPqError` case — a binding bump that adds a case fails compilation
 	/// HERE (no `default`), which is part of the re-sync ritual (see the contract
-	/// ladder in PQSession.swift). LinearEncodingError (from the
-	/// digest lifts) and everything else — including the fileprivate
-	/// UniffiInternalError / rustPanic — fall through to `.internalError`.
+	/// ladder in PQSession.swift). Everything else — including the fileprivate
+	/// UniffiInternalError / rustPanic — falls through to `.internalError`.
+	/// (The digest lift/strip helpers in PQDigest.swift throw `SessionError`
+	/// directly, so they bypass this translation.)
 	init(pqError error: any Error, at surface: PQErrorSurface) {
 		switch error {
 		case let pq as TwoMlsPqError:
@@ -160,11 +160,6 @@ extension SessionError {
 					+ "session; one session binds exactly one envelope."
 			}
 			self.init(code: code, underlying: pq, detail: detail)
-
-		case let encoding as LinearEncodingError:
-			self.init(
-				code: .internalError, underlying: encoding,
-				detail: "FFI digest/id convention violation (\(encoding))")
 
 		default:
 			self.init(

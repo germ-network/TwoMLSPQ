@@ -71,7 +71,7 @@ struct LifecycleTests {
 			remoteKeyPackage: myKeyPackage,
 			bootstrapKpCommitment: bootstrapKpCommitment,
 			remoteClientId: try local.clientId,
-			welcomeToken: WelcomeToken(TypedDigest(prefix: .sha256, over: welcome)),
+			welcomeToken: WelcomeToken(PQDigest.over(welcome)),
 			stapledMessage: nil,
 			newClientId: dedicatedId
 		)
