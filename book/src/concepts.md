@@ -145,3 +145,9 @@ structured results (`DecryptResult`, `PrepareEncryptResult`, …). Everything ab
 DIDs, anchor signatures, key discovery from a PDS, sequencing/ordering of proposals,
 transport — belongs to CommProtocol. Keeping that line sharp is why the API is
 deliberately small and stateless about identity.
+
+Opaque is not the same as free, though: a `ClientId` this library never reads is still
+persisted in ratchet trees and byte-compared, which makes its encoding an identifier
+format with an append-only obligation on whoever produces it. See
+[Carried Encodings](./carried-encodings.md) for what the boundary costs in each
+direction.

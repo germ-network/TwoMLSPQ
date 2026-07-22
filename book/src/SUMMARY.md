@@ -2,6 +2,7 @@
 
 - [Introduction](./introduction.md)
 - [Concepts](./concepts.md)
+- [Carried Encodings](./carried-encodings.md)
 - [The Rules of a TwoMLS Group](./group-rules.md)
 - [Cipher Suites & Feature Flags](./cipher-suites.md)
 - [Session Lifecycle](./session-lifecycle.md)
