@@ -1966,8 +1966,10 @@ fn test_stale_ciphertext_crossing_rounds_is_rejected() {
     let ek3 = open_ratchet(&bob, &alice);
 
     // The transport re-delivers round N's ciphertext. It answers a spent ephemeral and a prior
-    // epoch, so the open fails explicitly — the round-N+2 ephemeral is untouched.
-    assert_err!(bob.pq_ratchet_bind(ct1), TwoMlsPqError::Mls);
+    // epoch, so the open fails explicitly — the round-N+2 ephemeral is untouched. `StaleFrame`:
+    // terminal, discard it. It must not be `Mls`, whose `fatal` disposition would have a host
+    // tear the session down over a re-delivery the transport produces by design.
+    assert_err!(bob.pq_ratchet_bind(ct1), TwoMlsPqError::StaleFrame);
 
     // Proof the ephemeral survived: the CORRECT round-N+2 ciphertext still binds, and the round
     // completes cleanly.
@@ -2236,8 +2238,11 @@ fn test_stale_epoch_ek_replayed_after_heal_is_rejected() {
     discharge_bind(&bob, &alice, b"heal");
 
     // Replaying the now-stale EK is rejected — its epoch no longer exists in Alice's mirror —
-    // and leaves her responder state clean.
-    assert_err!(alice.pq_ratchet_respond(ek0), TwoMlsPqError::Mls);
+    // and leaves her responder state clean. `StaleFrame`, not `Mls`: the frame is spent, our
+    // state is fine, and `Mls` carries the `fatal` disposition that tells a host otherwise.
+    // A cross-round re-delivery like this one clears the `pq_inflight` guard (the round it
+    // belongs to is long closed), so this IS the door such a frame arrives at.
+    assert_err!(alice.pq_ratchet_respond(ek0), TwoMlsPqError::StaleFrame);
     assert!(alice.pq_take_pending_outbound().is_none());
 
     // A fresh round (Alice now initiates) still completes.
@@ -7018,6 +7023,11 @@ fn test_dropped_bind_heals_on_restaple() {
 /// `SessionNotReady`, which a host is entitled to read as "wrong door". Mid-hold (bound
 /// but not yet discharged) a repeat is `SessionNotReady` — retriable, and moot once the
 /// discharge passes the turn.
+///
+/// This is also what keeps a duplicate away from `process_a4_leg`, whose decrypt consumes a
+/// generation and cannot survive one. Every case below is answered by a guard, so the
+/// `StaleFrame` mapping there is a backstop, not a live path — but it is the reason a hole in
+/// one of these guards would cost a frame rather than the session.
 #[test]
 fn test_duplicate_side_band_frames_are_discardable_not_routing_errors() {
     let (alice, bob) = establish_full();

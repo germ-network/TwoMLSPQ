@@ -1243,18 +1243,38 @@ fn map_credential_err(e: mls_rs::error::MlsError) -> TwoMlsPqError {
     }
 }
 
-/// Map an mls-rs failure to decrypt an APPLICATION message, separating a spent generation
-/// (`StaleFrame` — a replay, terminal) from everything else (`DecryptionFailed` — transient,
-/// redelivery heals it). Both mls-rs variants below mean the secret tree already handed out
-/// this generation's key: `KeyMissing` for a generation behind the ratchet (or one whose
-/// out-of-order history entry was consumed), `InvalidLeafConsumption` for a spent leaf secret.
+/// Map an mls-rs failure to decrypt an APPLICATION message, separating a frame whose keys this
+/// group no longer holds (`StaleFrame` — terminal, discard it) from everything else
+/// (`DecryptionFailed` — transient, redelivery heals it). Three mls-rs variants say the keys
+/// are gone, and none of them can come back:
+///   * `KeyMissing` — a generation behind the ratchet, or one whose out-of-order history entry
+///     was already consumed;
+///   * `InvalidLeafConsumption` — a spent leaf secret;
+///   * `EpochNotFound` — an epoch older than the group's current one. On the received-message
+///     path this only ever means the past (a current-epoch message takes the branch above it,
+///     and `prior_epoch` retention is not enabled), which is what a side-band leg re-delivered
+///     from a completed round looks like.
 ///
-/// For the app-message arms only. A staple or commit that fails to process is a different
-/// question — ordering, credentials — and has its own mapping.
+/// `InvalidEpoch` deliberately stays transient: it also covers a frame that arrived AHEAD of
+/// the commit it needs, and that one really does heal on redelivery.
+///
+/// Every site that decrypts a peer application message routes here — the two `process_incoming`
+/// arms and the A.4 legs (`process_a4_leg`), which contract 27 reframed as application messages.
+/// A staple or commit that fails to process is a different question — ordering, credentials —
+/// and has its own mapping.
+///
+/// Note what is NOT here: `Mls`, and with it the `fatal` disposition. `fatal` asserts that OUR
+/// state may be inconsistent, and asks a host to discard the session — which in a host that
+/// reads it literally means tearing the session down and re-establishing. A peer frame we
+/// cannot open never justifies that, and a generation-consuming call site is the last place to
+/// default to it: the double delivery that produces replays is designed-in traffic for any host
+/// running a push relay alongside a socket, and it must cost a discard, never a session.
 fn map_app_message_err(e: mls_rs::error::MlsError) -> TwoMlsPqError {
     use mls_rs::error::MlsError;
     match e {
-        MlsError::KeyMissing(_) | MlsError::InvalidLeafConsumption => TwoMlsPqError::StaleFrame,
+        MlsError::KeyMissing(_) | MlsError::InvalidLeafConsumption | MlsError::EpochNotFound => {
+            TwoMlsPqError::StaleFrame
+        }
         _ => TwoMlsPqError::DecryptionFailed,
     }
 }

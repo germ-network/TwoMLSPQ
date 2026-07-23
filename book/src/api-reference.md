@@ -288,11 +288,13 @@ Service's refusal (an unauthorized credential succession) — retryable where it
 from a staple: authorize (`queue_proposal` on a fresh delivery) and reprocess.
 `EpochDesync` means a stapled commit is more than one epoch ahead of the receive group
 (the bridging commit no longer rides any frame) — re-establish the session, distinct from the
-transient `DecryptionFailed`. `StaleFrame` is a replayed application message — a frame whose
-message key the receive group already spent — and is likewise distinct from
-`DecryptionFailed`: it is terminal, so a host must discard it rather than retry. Expect it as
+transient `DecryptionFailed`. `StaleFrame` is an application message the group can no longer
+open — a replay whose generation was spent, or a frame from an epoch it has moved past, which
+is what a side-band leg re-delivered from a closed round looks like. Likewise distinct from
+`DecryptionFailed`: it is terminal, so a host discards it rather than retrying. Expect it as
 steady-state traffic wherever a host runs two delivery channels over one queue (a push relay
-alongside a socket), where the second copy of every frame is a replay. `UnexpectedWelcome` means a welcome differing from the one a
+alongside a socket), where the second copy of every frame is a replay.
+`UnexpectedWelcome` means a welcome differing from the one a
 live session was joined from arrived (re-deliveries of the *same* welcome are silently
 idempotent). `CipherSuiteMismatch` is raised when a peer key
 package or welcome carries a cipher-suite pair that isn't the session's fixed suite

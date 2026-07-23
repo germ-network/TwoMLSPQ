@@ -188,7 +188,10 @@ import TwoMLSPQBinding
 //     transient meaning. A host running two delivery channels over one queue — a push relay
 //     alongside a socket — is handed the second copy of every frame, and under the old
 //     collapse that copy read as retriable, so the host spooled and re-attempted ciphertext
-//     that could never open. New crate error `StaleFrame`, appended. No wire or API change.
+//     that could never open. New crate error `StaleFrame`, appended. The A.4 side-band legs
+//     also stop reporting `.internalError`/`.fatal` for a failed decrypt — a host that reads
+//     `.fatal` as "tear the session down" must never be told that by a peer frame it could
+//     not open. No wire or API change.
 private let expectedBindingContract: UInt64 = 28
 
 enum TwoMLSPQBindingContract {

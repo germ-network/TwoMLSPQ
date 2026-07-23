@@ -49,7 +49,12 @@ pub(in crate::session) enum PqInflight {
 ///   1. Call this only from INSIDE the persist closure and only after the guard phase has
 ///      confirmed the leg is expected — a re-sent leg must be caught by the `pq_inflight`
 ///      guard BEFORE it reaches here, because a replayed application frame does not
-///      re-decrypt (mls-rs replay protection), it errors.
+///      re-decrypt (mls-rs replay protection), it errors. Should one ever slip the guard it
+///      reports `StaleFrame` (`map_app_message_err`), not `Mls`: the guard is still the
+///      contract, but a hole in it must cost the frame, not the session — `Mls` carries the
+///      `fatal` disposition, which tells a host its state is inconsistent and earns a
+///      teardown. Double delivery is designed-in traffic for a host running a push relay
+///      alongside a socket, so that default was the wrong way round here.
 ///   2. On the wire the leg is header-sealed; a network tamper breaks the OUTER seal and is
 ///      dropped at `open_incoming` before mls-rs is invoked. That matters because a frame
 ///      with valid sender-data but corrupt content would consume its generation here — so the
@@ -67,7 +72,7 @@ fn process_a4_leg(
     let my_index = group.current_member_index();
     let desc = match group
         .process_incoming_message(msg)
-        .map_err(|_| TwoMlsPqError::Mls)?
+        .map_err(map_app_message_err)?
     {
         ReceivedMessage::ApplicationMessage(desc) => desc,
         _ => return Err(TwoMlsPqError::Mls),
