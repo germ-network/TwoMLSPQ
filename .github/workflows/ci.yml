@@ -90,6 +90,41 @@ jobs:
       - name: Clippy (apq, no providers)
         run: cargo clippy -p apq --all-targets -- -D warnings
 
+  # A changeset naming a package that isn't in the workspace only breaks `changeset
+  # version`, which runs in the Release workflow — on main, after the merge. Resolve the
+  # release plan here so a bad package name fails the PR instead. Exits 0 when there are
+  # no changesets, so this does not require one per PR.
+  changesets:
+    name: Changesets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # `changeset status` walks back to where HEAD diverged from the base branch, so
+          # the default shallow single-branch clone is not enough.
+          fetch-depth: 0
+
+      # ...and on a pull_request the checkout is detached with only refs/remotes/origin/*,
+      # so a bare `main` does not resolve and the merge-base lookup dies. Give it a local
+      # ref. On a push to main the checkout already made one, hence the guard.
+      - name: Point `main` at the fetched base branch
+        run: git show-ref --verify --quiet refs/heads/main || git branch main origin/main
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v5
+        with:
+          run_install: true
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: ".node-version"
+          check-latest: true
+          cache: pnpm
+
+      - name: Resolve the release plan
+        run: pnpm changeset status
+
   book:
     name: Book
     runs-on: ubuntu-latest

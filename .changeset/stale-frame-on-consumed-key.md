@@ -1,5 +1,5 @@
 ---
-"TwoMLSPQ": minor
+"@germ-network/two-mls-pq": minor
 ---
 
 Report a replayed application message as `StaleFrame`, not `DecryptionFailed`
