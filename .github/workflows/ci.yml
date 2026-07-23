@@ -99,6 +99,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # `changeset status` walks back to where HEAD diverged from the base branch, so
+          # the default shallow single-branch clone is not enough.
+          fetch-depth: 0
+
+      # ...and on a pull_request the checkout is detached with only refs/remotes/origin/*,
+      # so a bare `main` does not resolve and the merge-base lookup dies. Give it a local
+      # ref. On a push to main the checkout already made one, hence the guard.
+      - name: Point `main` at the fetched base branch
+        run: git show-ref --verify --quiet refs/heads/main || git branch main origin/main
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v5
