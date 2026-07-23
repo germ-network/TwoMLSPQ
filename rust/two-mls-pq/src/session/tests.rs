@@ -3930,10 +3930,27 @@ fn test_sealed_frames_carry_no_plaintext_framing() {
             .any(|w| w == &plaintext[..plaintext.len().min(16)]),
         "sealed blob leaks a prefix of the plaintext frame"
     );
-    // First byte is a random nonce, never a tag or the MLS 0x00 version byte (with
-    // overwhelming probability; a fixed seed would make this exact, but the point is
-    // that nothing structural is guaranteed to be there).
-    assert_ne!(sealed.first(), Some(&super::MESSAGE_FRAME_TAG));
+    // Offset 0 is a random nonce, so on any ONE frame it equals a given tag once in 256
+    // draws — this assertion was a single sample and flaked exactly there (CI drew 0x03).
+    // The property worth pinning is that nothing STRUCTURAL sits at offset 0: a seal that
+    // failed to hide the framing would leave the tag there on EVERY frame, not one in 256.
+    // So sample several and require one to differ, which fails spuriously at 256^-8.
+    let mut leading = vec![sealed.first().copied()];
+    for _ in 0..7 {
+        assert_ok!(bob_session.prepare_to_encrypt(None));
+        leading.push(
+            assert_ok!(bob_session.encrypt(b"secret".to_vec()))
+                .cipher_text
+                .first()
+                .copied(),
+        );
+    }
+    assert!(
+        leading
+            .iter()
+            .any(|byte| *byte != Some(super::MESSAGE_FRAME_TAG)),
+        "every sealed frame began with the plaintext tag — the seal is not hiding the framing"
+    );
 }
 
 /// A frame sealed under an epoch still in the receive window opens after the receiver
