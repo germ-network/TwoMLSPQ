@@ -1244,19 +1244,21 @@ fn map_credential_err(e: mls_rs::error::MlsError) -> TwoMlsPqError {
 }
 
 /// Map an mls-rs failure to decrypt an APPLICATION message, separating a frame whose keys this
-/// group no longer holds (`StaleFrame` — terminal, discard it) from everything else
-/// (`DecryptionFailed` — transient, redelivery heals it). Three mls-rs variants say the keys
-/// are gone, and none of them can come back:
-///   * `KeyMissing` — a generation behind the ratchet, or one whose out-of-order history entry
-///     was already consumed;
-///   * `InvalidLeafConsumption` — a spent leaf secret;
-///   * `EpochNotFound` — an epoch older than the group's current one. On the received-message
-///     path this only ever means the past (a current-epoch message takes the branch above it,
-///     and `prior_epoch` retention is not enabled), which is what a side-band leg re-delivered
-///     from a completed round looks like.
+/// group has spent (`StaleFrame` — terminal, discard it) from everything else
+/// (`DecryptionFailed` — transient, redelivery heals it).
 ///
-/// `InvalidEpoch` deliberately stays transient: it also covers a frame that arrived AHEAD of
-/// the commit it needs, and that one really does heal on redelivery.
+/// Only two variants qualify, and the bar is that they cannot become openable later:
+/// `KeyMissing` (a generation behind the ratchet, or one whose out-of-order history entry was
+/// already consumed) and `InvalidLeafConsumption` (a spent leaf secret). A ratchet only moves
+/// forward, so neither key is coming back.
+///
+/// `EpochNotFound` looks like it belongs and does NOT. Application messages get no epoch bound
+/// check (`min_epoch_available()` is `None` for a `Group`), so ANY epoch but the current one
+/// falls through to the epoch-repository lookup — which misses both for an epoch we have moved
+/// past AND for one we have not reached yet. That second case is a frame which overtook the
+/// commit it needs, the canonical retriable one, and calling it terminal would discard exactly
+/// what the retry spool exists to hold. Ambiguity resolves toward transient here: re-attempting
+/// a frame that can never open wastes a pass, discarding one that could open loses a message.
 ///
 /// Every site that decrypts a peer application message routes here — the two `process_incoming`
 /// arms and the A.4 legs (`process_a4_leg`), which contract 27 reframed as application messages.
@@ -1272,9 +1274,7 @@ fn map_credential_err(e: mls_rs::error::MlsError) -> TwoMlsPqError {
 fn map_app_message_err(e: mls_rs::error::MlsError) -> TwoMlsPqError {
     use mls_rs::error::MlsError;
     match e {
-        MlsError::KeyMissing(_) | MlsError::InvalidLeafConsumption | MlsError::EpochNotFound => {
-            TwoMlsPqError::StaleFrame
-        }
+        MlsError::KeyMissing(_) | MlsError::InvalidLeafConsumption => TwoMlsPqError::StaleFrame,
         _ => TwoMlsPqError::DecryptionFailed,
     }
 }

@@ -5501,21 +5501,21 @@ public enum TwoMlsPqError: Swift.Error, Equatable, Hashable, Foundation.Localize
      */
     case EstablishmentEnvelopeConflict
     /**
-     * An application message this group can no longer open, because the keys for it are
-     * gone: a replayed frame whose generation was spent, or a frame from an epoch the group
-     * has moved past (a side-band leg re-delivered from a closed round). Terminal — no
-     * redelivery brings those keys back — so the app should discard it.
+     * An application message whose message key this group has already spent — a replay, the
+     * message-path analogue of `DuplicateWelcome`. Terminal: a ratchet only moves forward, so
+     * no redelivery brings that key back. The app should discard it.
      *
      * Expected traffic, not a fault, wherever a host runs two delivery channels over one
      * queue (a push relay alongside a socket): the same frame arrives twice, and the second
-     * copy is a no-op. The message-path analogue of `DuplicateWelcome`.
+     * copy is a no-op.
      *
      * Distinct from `DecryptionFailed`, which stays the TRANSIENT bucket — a frame that
      * overtook the bind or commit it needs, and which redelivery heals. Collapsing the two
-     * makes a spent frame read as retriable, so a host spools and re-attempts ciphertext
-     * that can never open. Raised only where mls-rs proves the keys gone (`KeyMissing`,
-     * `InvalidLeafConsumption`, `EpochNotFound` — see `map_app_message_err`); anything else
-     * it refuses on stays `DecryptionFailed`.
+     * makes a spent frame read as retriable, so a host spools and re-attempts ciphertext that
+     * can never open. Raised only where mls-rs proves the key spent (`KeyMissing`,
+     * `InvalidLeafConsumption`); everything else it refuses on stays `DecryptionFailed`,
+     * including the epoch misses that cannot be told apart from a frame arriving early — see
+     * `map_app_message_err`.
      */
     case StaleFrame
 

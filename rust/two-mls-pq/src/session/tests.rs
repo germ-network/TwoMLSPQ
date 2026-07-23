@@ -2237,11 +2237,12 @@ fn test_stale_epoch_ek_replayed_after_heal_is_rejected() {
     assert_ok!(bob.pq_ratchet_bind(ct));
     discharge_bind(&bob, &alice, b"heal");
 
-    // Replaying the now-stale EK is rejected — its epoch no longer exists in Alice's mirror —
-    // and leaves her responder state clean. `StaleFrame`, not `Mls`: the frame is spent, our
-    // state is fine, and `Mls` carries the `fatal` disposition that tells a host otherwise.
-    // A cross-round re-delivery like this one clears the `pq_inflight` guard (the round it
-    // belongs to is long closed), so this IS the door such a frame arrives at.
+    // Replaying the now-stale EK is rejected — its generation is spent in Alice's mirror — and
+    // leaves her responder state clean. `StaleFrame`, not `Mls`: the frame is spent, our state
+    // is fine, and `Mls` carries the `fatal` disposition that tells a host otherwise. A
+    // cross-round re-delivery like this one clears the `pq_inflight` guard (the round it
+    // belongs to is long closed), so this IS the door such a frame arrives at — and for a host
+    // running a push relay alongside a socket, it is designed-in traffic, not an anomaly.
     assert_err!(alice.pq_ratchet_respond(ek0), TwoMlsPqError::StaleFrame);
     assert!(alice.pq_take_pending_outbound().is_none());
 
@@ -7024,10 +7025,10 @@ fn test_dropped_bind_heals_on_restaple() {
 /// but not yet discharged) a repeat is `SessionNotReady` — retriable, and moot once the
 /// discharge passes the turn.
 ///
-/// This is also what keeps a duplicate away from `process_a4_leg`, whose decrypt consumes a
-/// generation and cannot survive one. Every case below is answered by a guard, so the
-/// `StaleFrame` mapping there is a backstop, not a live path — but it is the reason a hole in
-/// one of these guards would cost a frame rather than the session.
+/// Note the scope: these guards answer duplicates WITHIN a round. A leg re-delivered from a
+/// round that has since closed clears them and reaches `process_a4_leg`'s decrypt — see
+/// `test_stale_epoch_ek_replayed_after_heal_is_rejected`, which pins that such a frame is
+/// refused without `Mls`, whose `fatal` disposition would earn a session teardown.
 #[test]
 fn test_duplicate_side_band_frames_are_discardable_not_routing_errors() {
     let (alice, bob) = establish_full();

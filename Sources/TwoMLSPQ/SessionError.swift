@@ -46,15 +46,14 @@ public struct SessionError: Error, Sendable {
 		/// Transient decrypt failure — a frame overtook its A.4 bind, or is malformed or
 		/// tampered. Redelivery heals it. NOT a replay: see `staleFrame`.
 		case decryptionFailed
-		/// An application message this session can no longer open, because its keys are gone:
-		/// a replay whose generation was spent, or a frame from an epoch the group has moved
-		/// past (a side-band leg re-delivered from a closed round). Terminal — nothing brings
-		/// those keys back. Discard it.
+		/// An application message whose message key this session already spent. Terminal — a
+		/// ratchet only moves forward, so nothing brings that key back. Discard it.
 		///
 		/// Steady-state wherever a host runs two delivery channels over one queue (a push
-		/// relay alongside a socket), so expected traffic, not a fault. Note it is NOT only a
-		/// duplicate: a frame that arrived too late to open reports the same code, because the
-		/// receiver cannot tell the two apart and the handling is identical.
+		/// relay alongside a socket), so expected traffic, not a fault. Note it is not
+		/// necessarily a duplicate *we* saw: a frame that arrived too late to open reports the
+		/// same code, because the receiver cannot tell the two apart and the handling is
+		/// identical either way.
 		///
 		/// The separation from `decryptionFailed` is what makes it actionable: collapsed into
 		/// the transient bucket it reads as retriable, and a host spools and re-attempts

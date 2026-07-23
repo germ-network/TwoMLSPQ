@@ -12,12 +12,13 @@ spooled and re-attempted ciphertext that can never open, and every genuine
 transient failure was buried in the noise.
 
 Every application-message decrypt now separates the two through one mapping:
-mls-rs `KeyMissing`, `InvalidLeafConsumption` and `EpochNotFound` — the errors
-that prove the keys for this frame are gone — become the new `StaleFrame`,
-which bridges to `SessionError.staleFrame` and its `.discardFrame` disposition.
-Everything else stays `DecryptionFailed` and keeps its transient meaning,
-including `InvalidEpoch`, which also covers a frame that arrived ahead of the
-commit it needs.
+mls-rs `KeyMissing` / `InvalidLeafConsumption` — the errors that prove the
+message key is spent, and a ratchet only moves forward — become the new
+`StaleFrame`, which bridges to `SessionError.staleFrame` and its
+`.discardFrame` disposition. Everything else stays `DecryptionFailed` and keeps
+its transient meaning, epoch misses included: an application message carries no
+epoch bound check, so a miss cannot be told apart from a frame that arrived
+ahead of the commit it needs, and only the transient reading is safe there.
 
 That covers the A.4 side-band legs too, which contract 27 reframed as
 application messages. Those previously reported `Mls` for any failed decrypt —
