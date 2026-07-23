@@ -24,9 +24,14 @@ That covers the A.4 side-band legs too, which contract 27 reframed as
 application messages. Those previously reported `Mls` for any failed decrypt —
 and `Mls` carries the `fatal` disposition, which tells a host its own state may
 be inconsistent. A host that acts on that literally tears the session down, so
-a peer frame it merely could not open must never produce it. The `pq_inflight`
-guards still keep replays away from that decrypt; this makes a hole in one cost
-a frame instead of a session.
+a peer frame it merely could not open must never produce it.
+
+That door is reachable, not theoretical: the `pq_inflight` guards answer
+duplicates WITHIN a round, but a leg re-delivered from a round that has since
+closed clears them and reaches the decrypt. Two existing tests already drove
+exactly that and pinned `Mls`; they now pin `StaleFrame`. For a host running a
+push relay alongside a socket, such a re-delivery is designed-in traffic, so
+the old mapping put a session teardown one dropped ack away.
 
 Binding contract 27 → 28: `StaleFrame` is appended to `TwoMlsPqError`, so
 prior variants keep their ordinals. No wire change and no FFI signature change.

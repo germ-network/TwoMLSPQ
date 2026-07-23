@@ -43,8 +43,17 @@ public struct SessionError: Error, Sendable {
 	}
 
 	public enum Code: Sendable, Equatable, Hashable {
-		/// Transient decrypt failure — a frame overtook its A.4 bind, or is malformed or
-		/// tampered. Redelivery heals it. NOT a replay: see `staleFrame`.
+		/// A frame this session could not open and cannot prove spent. Retriable, because the
+		/// common causes heal: it overtook the A.4 bind or the commit it needs — including one
+		/// whose epoch we have not reached, which an application message's absent epoch bound
+		/// check cannot tell apart from an epoch already passed.
+		///
+		/// A malformed or tampered frame lands here too, and no redelivery heals that one. The
+		/// bucket is deliberately "not known to be spent" rather than "known to be transient":
+		/// re-attempting a frame that can never open wastes a pass, while discarding one that
+		/// still could loses a message. Bounded by the host's own attempt cap.
+		///
+		/// NOT a spent key — that is `staleFrame`, and it is terminal.
 		case decryptionFailed
 		/// An application message whose message key this session already spent. Terminal — a
 		/// ratchet only moves forward, so nothing brings that key back. Discard it.
