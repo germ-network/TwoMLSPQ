@@ -60,30 +60,57 @@ pub(in crate::session) enum PqInflight {
 ///      dropped at `open_incoming` before mls-rs is invoked. That matters because a frame
 ///      with valid sender-data but corrupt content would consume its generation here — so the
 ///      header seal, not this function, is what keeps a network attacker from stranding a
-///      generation.
+///      generation. The seal is symmetric, though, so it does not constrain the PEER: the
+///      content-type gate below is what stops a leg carrying anything but an application
+///      message, which mls-rs would otherwise apply before this function could refuse it.
 ///
 /// The peer-sender check is belt-and-braces over mls-rs's own `CantProcessMessageFromSelf`:
 /// in a two-party group a successfully processed application message is necessarily the
 /// peer's, but the leg kind is only meaningful from the peer, so we assert it.
+///
+/// NOTHING here reports `Mls`. Every rejection below is a judgement about a frame the PEER
+/// supplied, and `Mls` carries the `fatal` disposition — "our own state may be inconsistent,
+/// discard the session". A host that reads that literally tears the session down, so no frame
+/// arriving at this door may be able to ask for one.
 fn process_a4_leg(
     group: &mut crate::key_package_store::PqMlsGroup,
     inner_tag: u8,
     msg: MlsMessage,
 ) -> Result<Vec<u8>> {
+    // Content-type gate, BEFORE the decrypt, because `process_incoming_message` validates
+    // and APPLIES atomically: a Commit behind this tag would advance `group`'s epoch and
+    // only then be refused by the match below, handing a peer an unasked-for epoch move at
+    // a door that carries application messages only. The content type rides the
+    // PrivateMessage's plaintext framing, so reading it needs no keys and touches no state.
+    let carries_application = matches!(
+        msg.description(),
+        mls_rs::MlsMessageDescription::PrivateProtocolMessage {
+            content_type: mls_rs::group::ContentType::Application,
+            ..
+        }
+    );
+    if !carries_application {
+        return Err(TwoMlsPqError::DecryptionFailed);
+    }
+
     let my_index = group.current_member_index();
     let desc = match group
         .process_incoming_message(msg)
         .map_err(map_app_message_err)?
     {
         ReceivedMessage::ApplicationMessage(desc) => desc,
-        _ => return Err(TwoMlsPqError::Mls),
+        //unreachable past the gate above; kept as defense in depth
+        _ => return Err(TwoMlsPqError::DecryptionFailed),
     };
     if desc.sender_index == my_index {
-        return Err(TwoMlsPqError::Mls);
+        return Err(TwoMlsPqError::DecryptionFailed);
     }
-    let (&tag, payload) = desc.data().split_first().ok_or(TwoMlsPqError::Mls)?;
+    let (&tag, payload) = desc
+        .data()
+        .split_first()
+        .ok_or(TwoMlsPqError::DecryptionFailed)?;
     if tag != inner_tag {
-        return Err(TwoMlsPqError::Mls);
+        return Err(TwoMlsPqError::DecryptionFailed);
     }
     Ok(payload.to_vec())
 }

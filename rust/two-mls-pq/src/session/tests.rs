@@ -7035,6 +7035,57 @@ fn test_dropped_bind_heals_on_restaple() {
     assert!(alice.my_pq_turn(), "the re-stapled bind closed the round");
 }
 
+/// A leg's routing tag is chosen by the SENDER, so anything can arrive behind it. What must
+/// never happen is answering such a frame with `Mls`: that code carries the `fatal`
+/// disposition — "our own state may be inconsistent, discard the session" — which hands a peer
+/// a session teardown for the cost of one misrouted leg. This pins the refusal as a
+/// frame-level one, with nothing staged and no epoch moved.
+///
+/// Scope, honestly: the Commit injected here belongs to the CLASSICAL group, so mls-rs would
+/// refuse it on group id alone. That makes this a test of the refusal's SHAPE, not of
+/// `process_a4_leg`'s content-type gate — the gate stops a commit mls-rs would otherwise
+/// APPLY (it validates and applies atomically), and reaching that state needs an unapplied
+/// commit for the recv-PQ group at exactly its current epoch, while the `pq_inflight` guard
+/// simultaneously has to be open. Those two conditions fight each other through the public
+/// API, so the gate stands as defense in depth, unpinned.
+#[test]
+fn test_non_application_leg_is_refused_with_the_group_untouched() {
+    let (alice, bob) = establish_full();
+
+    // Bob opens a round, so Alice sits as a responder with an empty in-flight slot: the
+    // guard phase passes and the frame reaches the decrypt this test is about.
+    let _ek = open_ratchet(&bob, &alice);
+    let before = alice.epochs();
+
+    // A real Commit — lifted from a message frame's staple — wearing the EK tag.
+    assert_ok!(alice.prepare_to_encrypt(None));
+    let from_alice = assert_ok!(alice.encrypt(b"per-round".to_vec()));
+    let res = assert_some!(assert_ok!(bob.process_incoming(from_alice.cipher_text)));
+    assert_ok!(bob.queue_proposal(assert_some!(res.proposal).digest));
+    assert!(assert_ok!(bob.prepare_to_encrypt(None)).did_commit);
+    let committed = assert_ok!(bob.encrypt(b"committed".to_vec())).cipher_text;
+    let commit_mls = frame_staple(&alice, &committed);
+    assert_eq!(commit_mls.first(), Some(&0x00), "staple is an MLSMessage");
+
+    let mut forged = vec![super::PQ_EK_TAG];
+    forged.extend_from_slice(&commit_mls);
+
+    assert_err!(
+        alice.pq_ratchet_respond(forged),
+        TwoMlsPqError::DecryptionFailed
+    );
+    let after = alice.epochs();
+    assert_eq!(
+        (after.pq_epoch, after.classical_epoch),
+        (before.pq_epoch, before.classical_epoch),
+        "a refused leg must not have moved either epoch"
+    );
+    assert!(
+        alice.pq_take_pending_outbound().is_none(),
+        "and must not have staged a response"
+    );
+}
+
 /// Re-sends make duplicates steady-state traffic, not an edge case: a retained frame
 /// rides every send until its answer lands. A receiver whose state proves the step is
 /// DONE must read the repeat as a discardable duplicate — distinctly from
