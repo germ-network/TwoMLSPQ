@@ -1966,8 +1966,10 @@ fn test_stale_ciphertext_crossing_rounds_is_rejected() {
     let ek3 = open_ratchet(&bob, &alice);
 
     // The transport re-delivers round N's ciphertext. It answers a spent ephemeral and a prior
-    // epoch, so the open fails explicitly — the round-N+2 ephemeral is untouched.
-    assert_err!(bob.pq_ratchet_bind(ct1), TwoMlsPqError::Mls);
+    // epoch, so the open fails explicitly — the round-N+2 ephemeral is untouched. `StaleFrame`:
+    // terminal, discard it. It must not be `Mls`, whose `fatal` disposition would have a host
+    // tear the session down over a re-delivery the transport produces by design.
+    assert_err!(bob.pq_ratchet_bind(ct1), TwoMlsPqError::StaleFrame);
 
     // Proof the ephemeral survived: the CORRECT round-N+2 ciphertext still binds, and the round
     // completes cleanly.
@@ -2235,9 +2237,13 @@ fn test_stale_epoch_ek_replayed_after_heal_is_rejected() {
     assert_ok!(bob.pq_ratchet_bind(ct));
     discharge_bind(&bob, &alice, b"heal");
 
-    // Replaying the now-stale EK is rejected — its epoch no longer exists in Alice's mirror —
-    // and leaves her responder state clean.
-    assert_err!(alice.pq_ratchet_respond(ek0), TwoMlsPqError::Mls);
+    // Replaying the now-stale EK is rejected — its generation is spent in Alice's mirror — and
+    // leaves her responder state clean. `StaleFrame`, not `Mls`: the frame is spent, our state
+    // is fine, and `Mls` carries the `fatal` disposition that tells a host otherwise. A
+    // cross-round re-delivery like this one clears the `pq_inflight` guard (the round it
+    // belongs to is long closed), so this IS the door such a frame arrives at — and for a host
+    // running a push relay alongside a socket, it is designed-in traffic, not an anomaly.
+    assert_err!(alice.pq_ratchet_respond(ek0), TwoMlsPqError::StaleFrame);
     assert!(alice.pq_take_pending_outbound().is_none());
 
     // A fresh round (Alice now initiates) still completes.
@@ -2496,6 +2502,28 @@ fn test_process_incoming_app_message_returns_decrypt_result() {
     );
 }
 
+/// A host running a push relay alongside its socket is handed the same frame twice. The
+/// second copy has to be nameable as a replay: reported as `DecryptionFailed` it reads as
+/// transient, so the host spools and re-attempts ciphertext that can never open.
+#[test]
+fn test_replayed_app_message_is_stale_not_a_decrypt_failure() {
+    let (alice_session, bob_session) = establish_sessions();
+
+    assert_ok!(alice_session.prepare_to_encrypt(None));
+    let enc = assert_ok!(alice_session.encrypt(b"secret".to_vec()));
+
+    assert_some!(assert_ok!(
+        bob_session.process_incoming(enc.cipher_text.clone())
+    ));
+
+    assert_err!(
+        bob_session.process_incoming(enc.cipher_text),
+        TwoMlsPqError::StaleFrame
+    );
+}
+
+/// The split only earns its keep if the transient bucket survives it: a frame
+/// unprocessable for any other reason still reports as retriable.
 #[test]
 fn test_process_incoming_garbage_bytes_returns_error() {
     let (_, bob_session) = establish_sessions();
@@ -3902,10 +3930,27 @@ fn test_sealed_frames_carry_no_plaintext_framing() {
             .any(|w| w == &plaintext[..plaintext.len().min(16)]),
         "sealed blob leaks a prefix of the plaintext frame"
     );
-    // First byte is a random nonce, never a tag or the MLS 0x00 version byte (with
-    // overwhelming probability; a fixed seed would make this exact, but the point is
-    // that nothing structural is guaranteed to be there).
-    assert_ne!(sealed.first(), Some(&super::MESSAGE_FRAME_TAG));
+    // Offset 0 is a random nonce, so on any ONE frame it equals a given tag once in 256
+    // draws — this assertion was a single sample and flaked exactly there (CI drew 0x03).
+    // The property worth pinning is that nothing STRUCTURAL sits at offset 0: a seal that
+    // failed to hide the framing would leave the tag there on EVERY frame, not one in 256.
+    // So sample several and require one to differ, which fails spuriously at 256^-8.
+    let mut leading = vec![sealed.first().copied()];
+    for _ in 0..7 {
+        assert_ok!(bob_session.prepare_to_encrypt(None));
+        leading.push(
+            assert_ok!(bob_session.encrypt(b"secret".to_vec()))
+                .cipher_text
+                .first()
+                .copied(),
+        );
+    }
+    assert!(
+        leading
+            .iter()
+            .any(|byte| *byte != Some(super::MESSAGE_FRAME_TAG)),
+        "every sealed frame began with the plaintext tag — the seal is not hiding the framing"
+    );
 }
 
 /// A frame sealed under an epoch still in the receive window opens after the receiver
@@ -6996,6 +7041,11 @@ fn test_dropped_bind_heals_on_restaple() {
 /// `SessionNotReady`, which a host is entitled to read as "wrong door". Mid-hold (bound
 /// but not yet discharged) a repeat is `SessionNotReady` — retriable, and moot once the
 /// discharge passes the turn.
+///
+/// Note the scope: these guards answer duplicates WITHIN a round. A leg re-delivered from a
+/// round that has since closed clears them and reaches `process_a4_leg`'s decrypt — see
+/// `test_stale_epoch_ek_replayed_after_heal_is_rejected`, which pins that such a frame is
+/// refused without `Mls`, whose `fatal` disposition would earn a session teardown.
 #[test]
 fn test_duplicate_side_band_frames_are_discardable_not_routing_errors() {
     let (alice, bob) = establish_full();

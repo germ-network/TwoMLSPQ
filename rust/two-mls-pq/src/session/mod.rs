@@ -1243,6 +1243,42 @@ fn map_credential_err(e: mls_rs::error::MlsError) -> TwoMlsPqError {
     }
 }
 
+/// Map an mls-rs failure to decrypt an APPLICATION message, separating a frame whose keys this
+/// group has spent (`StaleFrame` — terminal, discard it) from everything else
+/// (`DecryptionFailed` — transient, redelivery heals it).
+///
+/// Only two variants qualify, and the bar is that they cannot become openable later:
+/// `KeyMissing` (a generation behind the ratchet, or one whose out-of-order history entry was
+/// already consumed) and `InvalidLeafConsumption` (a spent leaf secret). A ratchet only moves
+/// forward, so neither key is coming back.
+///
+/// `EpochNotFound` looks like it belongs and does NOT. Application messages get no epoch bound
+/// check (`min_epoch_available()` is `None` for a `Group`), so ANY epoch but the current one
+/// falls through to the epoch-repository lookup — which misses both for an epoch we have moved
+/// past AND for one we have not reached yet. That second case is a frame which overtook the
+/// commit it needs, the canonical retriable one, and calling it terminal would discard exactly
+/// what the retry spool exists to hold. Ambiguity resolves toward transient here: re-attempting
+/// a frame that can never open wastes a pass, discarding one that could open loses a message.
+///
+/// Every site that decrypts a peer application message routes here — the two `process_incoming`
+/// arms and the A.4 legs (`process_a4_leg`), which contract 27 reframed as application messages.
+/// A staple or commit that fails to process is a different question — ordering, credentials —
+/// and has its own mapping.
+///
+/// Note what is NOT here: `Mls`, and with it the `fatal` disposition. `fatal` asserts that OUR
+/// state may be inconsistent, and asks a host to discard the session — which in a host that
+/// reads it literally means tearing the session down and re-establishing. A peer frame we
+/// cannot open never justifies that, and a generation-consuming call site is the last place to
+/// default to it: the double delivery that produces replays is designed-in traffic for any host
+/// running a push relay alongside a socket, and it must cost a discard, never a session.
+fn map_app_message_err(e: mls_rs::error::MlsError) -> TwoMlsPqError {
+    use mls_rs::error::MlsError;
+    match e {
+        MlsError::KeyMissing(_) | MlsError::InvalidLeafConsumption => TwoMlsPqError::StaleFrame,
+        _ => TwoMlsPqError::DecryptionFailed,
+    }
+}
+
 /// Validate the cipher suite(s) in an APQ welcome's already-decoded halves against the session's
 /// expected pair. An empty PQ half (the acceptor's A.3-deferred return welcome) validates the
 /// classical half only.

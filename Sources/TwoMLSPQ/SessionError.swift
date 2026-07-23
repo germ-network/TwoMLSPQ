@@ -43,11 +43,31 @@ public struct SessionError: Error, Sendable {
 	}
 
 	public enum Code: Sendable, Equatable, Hashable {
-		/// Transient decrypt failure (a frame overtook its A.4 bind, or a replay/tamper) —
-		/// redelivery heals it.
+		/// A frame this session could not open and cannot prove spent. Retriable, because the
+		/// common causes heal: it overtook the A.4 bind or the commit it needs — including one
+		/// whose epoch we have not reached, which an application message's absent epoch bound
+		/// check cannot tell apart from an epoch already passed.
+		///
+		/// A malformed or tampered frame lands here too, and no redelivery heals that one. The
+		/// bucket is deliberately "not known to be spent" rather than "known to be transient":
+		/// re-attempting a frame that can never open wastes a pass, while discarding one that
+		/// still could loses a message. Bounded by the host's own attempt cap.
+		///
+		/// NOT a spent key — that is `staleFrame`, and it is terminal.
 		case decryptionFailed
-		/// A duplicate or already-consumed frame from a string-only backend (reserved for the
-		/// deprecated classical shim's consumed-key substrings; no PQ path emits it).
+		/// An application message whose message key this session already spent. Terminal — a
+		/// ratchet only moves forward, so nothing brings that key back. Discard it.
+		///
+		/// Steady-state wherever a host runs two delivery channels over one queue (a push
+		/// relay alongside a socket), so expected traffic, not a fault. Note it is not
+		/// necessarily a duplicate *we* saw: a frame that arrived too late to open reports the
+		/// same code, because the receiver cannot tell the two apart and the handling is
+		/// identical either way.
+		///
+		/// The separation from `decryptionFailed` is what makes it actionable: collapsed into
+		/// the transient bucket it reads as retriable, and a host spools and re-attempts
+		/// ciphertext that can never open. (Also carries the deprecated classical shim's
+		/// consumed-key substring matches, which is where the code started.)
 		case staleFrame
 		/// A different welcome for an already-joined receive group — a benign per-remote replay
 		/// guard. Nothing to do.

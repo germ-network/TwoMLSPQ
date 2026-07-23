@@ -268,7 +268,7 @@ All failures map to the flat `TwoMlsPqError` enum (`Mls`, `InvalidKeyPackage`,
 `EpochDesync`, `UnexpectedWelcome`, `InvalidClientId`, `RemoteIdentityMismatch`,
 `CredentialRejected`, `ApqInfoMismatch`, `AppBindingMismatch`,
 `SinkAlreadyInstalled`, `DuplicateSideBand`, `BootstrapKpMismatch`,
-`BindDischargeFailed`, `BindApplyFailed`).
+`BindDischargeFailed`, `BindApplyFailed`, `StaleFrame`).
 mls-rs error types never cross the FFI boundary. The two PQ-bind failures carry
 recovery semantics a caller must branch on: `BindDischargeFailed` is fatal — the classical
 commit discharging an owed bind failed, so the host re-establishes the session — while
@@ -288,7 +288,14 @@ Service's refusal (an unauthorized credential succession) — retryable where it
 from a staple: authorize (`queue_proposal` on a fresh delivery) and reprocess.
 `EpochDesync` means a stapled commit is more than one epoch ahead of the receive group
 (the bridging commit no longer rides any frame) — re-establish the session, distinct from the
-transient `DecryptionFailed`. `UnexpectedWelcome` means a welcome differing from the one a
+transient `DecryptionFailed`. `StaleFrame` is an application message whose message key the
+group already spent — a replay — and is likewise distinct from `DecryptionFailed`: it is
+terminal, so a host discards it rather than retrying. Expect it as steady-state traffic
+wherever a host runs two delivery channels over one queue (a push relay alongside a socket),
+where the second copy of every frame is a replay. Epoch misses stay `DecryptionFailed`: an
+application message carries no epoch bound check, so a miss cannot be told apart from a frame
+that arrived ahead of the commit it needs.
+`UnexpectedWelcome` means a welcome differing from the one a
 live session was joined from arrived (re-deliveries of the *same* welcome are silently
 idempotent). `CipherSuiteMismatch` is raised when a peer key
 package or welcome carries a cipher-suite pair that isn't the session's fixed suite

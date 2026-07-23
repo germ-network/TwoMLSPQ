@@ -5500,6 +5500,24 @@ public enum TwoMlsPqError: Swift.Error, Equatable, Hashable, Foundation.Localize
 
      */
     case EstablishmentEnvelopeConflict
+    /**
+     * An application message whose message key this group has already spent — a replay, the
+     * message-path analogue of `DuplicateWelcome`. Terminal: a ratchet only moves forward, so
+     * no redelivery brings that key back. The app should discard it.
+     *
+     * Expected traffic, not a fault, wherever a host runs two delivery channels over one
+     * queue (a push relay alongside a socket): the same frame arrives twice, and the second
+     * copy is a no-op.
+     *
+     * Distinct from `DecryptionFailed`, which stays the TRANSIENT bucket — a frame that
+     * overtook the bind or commit it needs, and which redelivery heals. Collapsing the two
+     * makes a spent frame read as retriable, so a host spools and re-attempts ciphertext that
+     * can never open. Raised only where mls-rs proves the key spent (`KeyMissing`,
+     * `InvalidLeafConsumption`); everything else it refuses on stays `DecryptionFailed`,
+     * including the epoch misses that cannot be told apart from a frame arriving early — see
+     * `map_app_message_err`.
+     */
+    case StaleFrame
 
     
 
@@ -5558,6 +5576,7 @@ public struct FfiConverterTypeTwoMlsPqError: FfiConverterRustBuffer {
         case 27: return .EstablishmentEnvelopeRequired
         case 28: return .EstablishmentCreatorMismatch
         case 29: return .EstablishmentEnvelopeConflict
+        case 30: return .StaleFrame
 
          default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -5684,6 +5703,10 @@ public struct FfiConverterTypeTwoMlsPqError: FfiConverterRustBuffer {
         
         case .EstablishmentEnvelopeConflict:
             writeInt(&buf, Int32(29))
+        
+        
+        case .StaleFrame:
+            writeInt(&buf, Int32(30))
         
         }
     }

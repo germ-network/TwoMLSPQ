@@ -379,7 +379,19 @@ pub fn version() -> String {
 // signature or error-variant change (the `pq_ratchet_respond`/`pq_ratchet_bind` surface is
 // unchanged); staging an A.4 now pushes a `Checkpoint` (the EK advances the send-PQ application
 // ratchet). The seal over the injected secret `S` is unchanged.
-const BINDING_CONTRACT_VERSION: u64 = 27;
+//
+// v28 (2026-07-23): a replayed application message reports `StaleFrame` (appended) instead of
+// `DecryptionFailed`, which keeps its transient meaning. Every application-message decrypt
+// routes through `map_app_message_err` — the two `process_incoming` arms and the A.4 legs —
+// and only a generation mls-rs proves spent (`KeyMissing`, `InvalidLeafConsumption`) maps to
+// it. A host running two delivery channels over one queue (push relay + socket) sees the
+// second copy of every frame, and under the old collapse it read as retriable, so the host
+// spooled and re-attempted ciphertext that could never open. The A.4 legs additionally stop
+// wearing `Mls`/`fatal` for a failed decrypt: the `pq_inflight` guards only catch duplicates
+// WITHIN a round, so a leg re-delivered from a closed round reaches that decrypt, and a frame
+// a host could not open must never be answered with `fatal` — which asks it to discard the
+// session. No wire or FFI signature change.
+const BINDING_CONTRACT_VERSION: u64 = 28;
 
 /// See `BINDING_CONTRACT_VERSION`. Exported so the Swift layer can verify the
 /// binding it was generated with matches the binary it loaded.
@@ -890,13 +902,30 @@ pub enum TwoMlsPqError {
     /// envelope can only be a host bug), so the conflict is loud rather than a
     /// silent replace. Re-installing the SAME bytes is an idempotent no-op.
     ///
+    #[error("a different establishment envelope is already installed")]
+    EstablishmentEnvelopeConflict,
+    /// An application message whose message key this group has already spent — a replay, the
+    /// message-path analogue of `DuplicateWelcome`. Terminal: a ratchet only moves forward, so
+    /// no redelivery brings that key back. The app should discard it.
+    ///
+    /// Expected traffic, not a fault, wherever a host runs two delivery channels over one
+    /// queue (a push relay alongside a socket): the same frame arrives twice, and the second
+    /// copy is a no-op.
+    ///
+    /// Distinct from `DecryptionFailed`, which stays the TRANSIENT bucket — a frame that
+    /// overtook the bind or commit it needs, and which redelivery heals. Collapsing the two
+    /// makes a spent frame read as retriable, so a host spools and re-attempts ciphertext that
+    /// can never open. Raised only where mls-rs proves the key spent (`KeyMissing`,
+    /// `InvalidLeafConsumption`); everything else it refuses on stays `DecryptionFailed`,
+    /// including the epoch misses that cannot be told apart from a frame arriving early — see
+    /// `map_app_message_err`.
     //
     // Deliberately the LAST variant: uniffi numbers error cases by position, so appending
     // keeps every prior variant's ordinal stable. Keep appending future variants here (the
     // contract bump already forces binding/binary pairing, but there is no reason to
     // renumber the survivors).
-    #[error("a different establishment envelope is already installed")]
-    EstablishmentEnvelopeConflict,
+    #[error("frame's message key was already consumed")]
+    StaleFrame,
 }
 
 /// The protocol digest over `bytes` — the single hashing primitive behind every

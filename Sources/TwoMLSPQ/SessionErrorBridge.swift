@@ -81,6 +81,8 @@ extension SessionError {
 				code = .proposalRejected
 			case .DecryptionFailed:
 				code = .decryptionFailed
+			case .StaleFrame:
+				code = .staleFrame
 			case .ArchiveInvalid:
 				code = .archiveInvalid
 			case .DuplicateWelcome:

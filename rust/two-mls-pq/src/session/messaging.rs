@@ -1349,7 +1349,7 @@ impl TwoMlsPqSession {
                 match recv
                     .classical
                     .process_incoming_message(app_msg)
-                    .map_err(|_| TwoMlsPqError::DecryptionFailed)?
+                    .map_err(map_app_message_err)?
                 {
                     ReceivedMessage::ApplicationMessage(desc) => {
                         let sender = ClientId {
@@ -1458,8 +1458,8 @@ impl TwoMlsPqSession {
         // — so it only decrypts after the join the same envelope's welcome produced;
         // hand it here AFTER `receive`. It carries no staple of its own and no
         // proposal (the sender had no recv group to propose into), so the result is
-        // application-message-only. Replays are consumed-generation rejects
-        // (`DecryptionFailed` — the host's fail-open staple handling drops them).
+        // application-message-only. Replays are consumed-generation rejects, reported as
+        // `StaleFrame` so the host discards them instead of re-attempting them.
         if ciphertext.first() == Some(&PRE_ESTABLISHMENT_APP_TAG) {
             let app_msg = MlsMessage::from_bytes(&ciphertext[1..])
                 .map_err(|_| TwoMlsPqError::DecryptionFailed)?;
@@ -1472,7 +1472,7 @@ impl TwoMlsPqSession {
                 match recv
                     .classical
                     .process_incoming_message(app_msg)
-                    .map_err(|_| TwoMlsPqError::DecryptionFailed)?
+                    .map_err(map_app_message_err)?
                 {
                     ReceivedMessage::ApplicationMessage(desc) => {
                         let sender = ClientId {
