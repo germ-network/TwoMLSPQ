@@ -2496,6 +2496,28 @@ fn test_process_incoming_app_message_returns_decrypt_result() {
     );
 }
 
+/// A host running a push relay alongside its socket is handed the same frame twice. The
+/// second copy has to be nameable as a replay: reported as `DecryptionFailed` it reads as
+/// transient, so the host spools and re-attempts ciphertext that can never open.
+#[test]
+fn test_replayed_app_message_is_stale_not_a_decrypt_failure() {
+    let (alice_session, bob_session) = establish_sessions();
+
+    assert_ok!(alice_session.prepare_to_encrypt(None));
+    let enc = assert_ok!(alice_session.encrypt(b"secret".to_vec()));
+
+    assert_some!(assert_ok!(
+        bob_session.process_incoming(enc.cipher_text.clone())
+    ));
+
+    assert_err!(
+        bob_session.process_incoming(enc.cipher_text),
+        TwoMlsPqError::StaleFrame
+    );
+}
+
+/// The split only earns its keep if the transient bucket survives it: a frame
+/// unprocessable for any other reason still reports as retriable.
 #[test]
 fn test_process_incoming_garbage_bytes_returns_error() {
     let (_, bob_session) = establish_sessions();

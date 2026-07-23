@@ -100,10 +100,11 @@ struct ErrorContractTests {
 			(.BootstrapKpMismatch, .bootstrapKpMismatch),
 			(.EstablishmentCreatorMismatch, .establishmentCreatorMismatch),
 			(.EstablishmentEnvelopeConflict, .establishmentEnvelopeConflict),
+			(.StaleFrame, .staleFrame),
 		]
 		// + the two per-surface cases (SessionNotReady,
-		// EstablishmentEnvelopeRequired) = all 29 crate cases
-		#expect(expected.count == 27)
+		// EstablishmentEnvelopeRequired) = all 30 crate cases
+		#expect(expected.count == 28)
 		for (crate, code) in expected {
 			let mapped = SessionError(pqError: crate, at: .client)
 			#expect(mapped.code == code, "\(crate) -> \(mapped.code)")

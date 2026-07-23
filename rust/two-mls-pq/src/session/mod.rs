@@ -1243,6 +1243,22 @@ fn map_credential_err(e: mls_rs::error::MlsError) -> TwoMlsPqError {
     }
 }
 
+/// Map an mls-rs failure to decrypt an APPLICATION message, separating a spent generation
+/// (`StaleFrame` — a replay, terminal) from everything else (`DecryptionFailed` — transient,
+/// redelivery heals it). Both mls-rs variants below mean the secret tree already handed out
+/// this generation's key: `KeyMissing` for a generation behind the ratchet (or one whose
+/// out-of-order history entry was consumed), `InvalidLeafConsumption` for a spent leaf secret.
+///
+/// For the app-message arms only. A staple or commit that fails to process is a different
+/// question — ordering, credentials — and has its own mapping.
+fn map_app_message_err(e: mls_rs::error::MlsError) -> TwoMlsPqError {
+    use mls_rs::error::MlsError;
+    match e {
+        MlsError::KeyMissing(_) | MlsError::InvalidLeafConsumption => TwoMlsPqError::StaleFrame,
+        _ => TwoMlsPqError::DecryptionFailed,
+    }
+}
+
 /// Validate the cipher suite(s) in an APQ welcome's already-decoded halves against the session's
 /// expected pair. An empty PQ half (the acceptor's A.3-deferred return welcome) validates the
 /// classical half only.

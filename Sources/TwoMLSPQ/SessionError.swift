@@ -43,11 +43,17 @@ public struct SessionError: Error, Sendable {
 	}
 
 	public enum Code: Sendable, Equatable, Hashable {
-		/// Transient decrypt failure (a frame overtook its A.4 bind, or a replay/tamper) —
-		/// redelivery heals it.
+		/// Transient decrypt failure — a frame overtook its A.4 bind, or is malformed or
+		/// tampered. Redelivery heals it. NOT a replay: see `staleFrame`.
 		case decryptionFailed
-		/// A duplicate or already-consumed frame from a string-only backend (reserved for the
-		/// deprecated classical shim's consumed-key substrings; no PQ path emits it).
+		/// An application message whose message key the receive group already spent — a replay,
+		/// terminal. Steady-state wherever a host runs two delivery channels over one queue (a
+		/// push relay alongside a socket), so it is expected traffic, not a fault. Discard it.
+		///
+		/// The separation from `decryptionFailed` is what makes a replay actionable: collapsed
+		/// into the transient bucket it reads as retriable, and a host spools and re-attempts
+		/// ciphertext that can never open. (Also carries the deprecated classical shim's
+		/// consumed-key substring matches, which is where the code started.)
 		case staleFrame
 		/// A different welcome for an already-joined receive group — a benign per-remote replay
 		/// guard. Nothing to do.

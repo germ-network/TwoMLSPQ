@@ -183,7 +183,13 @@ import TwoMLSPQBinding
 //     the side-band (re-pairing required); no Swift API or error change. The `pqRatchet*`
 //     signatures are unchanged — only their FFI checksums moved (docstring metadata), so the
 //     vendored binding was re-synced.
-private let expectedBindingContract: UInt64 = 27
+// v28 (contract 28): a replayed application message reports `.staleFrame` (disposition
+//     `.discardFrame`) instead of `.decryptionFailed` (`.retryLater`), which keeps its
+//     transient meaning. A host running two delivery channels over one queue — a push relay
+//     alongside a socket — is handed the second copy of every frame, and under the old
+//     collapse that copy read as retriable, so the host spooled and re-attempted ciphertext
+//     that could never open. New crate error `StaleFrame`, appended. No wire or API change.
+private let expectedBindingContract: UInt64 = 28
 
 enum TwoMLSPQBindingContract {
 	static let verified: Void = {
