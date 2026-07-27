@@ -2344,6 +2344,21 @@ public protocol TwoMlsPqSessionProtocol: AnyObject, Sendable {
     func pqRekeyRespond(updMsg: Data) throws  -> ClientId?
     
     /**
+     * Whether the PQ side-band is permanently wedged: one of our own binds failed PAST its
+     * point of no return, so every side-band door now answers
+     * [`TwoMlsPqError::BindTriggerFailed`] and the peer waits for a staple that can never be
+     * built. CLASSICAL MESSAGING IS UNAFFECTED — send and receive both keep working, and an
+     * already-reserved bind still discharges.
+     *
+     * Distinct from [`Self::pq_receive_broken`] in direction AND remedy: that one breaks
+     * RECEIVING and heals on restore; this one breaks the SIDE-BAND, survives restore
+     * (`SessionInner::pq_wedged` rides the archive), and needs a new session. Queryable
+     * because A.3's wedge is otherwise invisible — `is_fully_established()` reports true on
+     * a session whose bootstrap never closed.
+     */
+    func pqSideBandWedged()  -> Bool
+    
+    /**
      * Consume the current round's side-band frame.
      *
      * Prefer [`Self::pq_pending_outbound`]: taking leaves the round's only carrier of its
@@ -3313,6 +3328,27 @@ open func pqRekeyRespond(updMsg: Data)throws  -> ClientId?  {
     uniffi_two_mls_pq_fn_method_twomlspqsession_pq_rekey_respond(
             self.uniffiCloneHandle(),
         FfiConverterData.lower(updMsg),$0
+    )
+})
+}
+    
+    /**
+     * Whether the PQ side-band is permanently wedged: one of our own binds failed PAST its
+     * point of no return, so every side-band door now answers
+     * [`TwoMlsPqError::BindTriggerFailed`] and the peer waits for a staple that can never be
+     * built. CLASSICAL MESSAGING IS UNAFFECTED — send and receive both keep working, and an
+     * already-reserved bind still discharges.
+     *
+     * Distinct from [`Self::pq_receive_broken`] in direction AND remedy: that one breaks
+     * RECEIVING and heals on restore; this one breaks the SIDE-BAND, survives restore
+     * (`SessionInner::pq_wedged` rides the archive), and needs a new session. Queryable
+     * because A.3's wedge is otherwise invisible — `is_fully_established()` reports true on
+     * a session whose bootstrap never closed.
+     */
+open func pqSideBandWedged() -> Bool  {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_two_mls_pq_fn_method_twomlspqsession_pq_side_band_wedged(
+            self.uniffiCloneHandle(),$0
     )
 })
 }
@@ -5554,6 +5590,30 @@ public enum TwoMlsPqError: Swift.Error, Equatable, Hashable, Foundation.Localize
      * `map_app_message_err`.
      */
     case StaleFrame
+    /**
+     * FATAL: a PQ bind TRIGGER failed past its point of no return. The third member of the
+     * family the other two name: [`Self::BindDischargeFailed`] is our classical half
+     * failing, [`Self::BindApplyFailed`] is the peer's staple failing on us, and this is
+     * our own trigger failing — A.3's join, A.4's decapsulation or A.5's applied Commit'
+     * has already landed, so the round's input cannot be rebuilt from anything the peer
+     * can re-send.
+     *
+     * LATCHED and ARCHIVED, unlike its two siblings, and the difference is not a
+     * preference. `BindApplyFailed` may be in-memory because inbound processing persists
+     * on SUCCESS only, so a restore predates the failed take. These triggers run inside
+     * `mutate_and_persist`, which pushes even on `Err` because their partial mutations are
+     * real — so the tear reaches the blob and a restore reproduces it. A verdict that did
+     * not ride beside it would restore a session that reports healthy and deadlocks.
+     *
+     * While set, every PQ side-band door answers this instead of the retriable
+     * `SessionNotReady` — or, at the A.3 door, the `DuplicateSideBand` that would report a
+     * round which never closed as already done. CLASSICAL MESSAGING IS UNAFFECTED: send and
+     * receive both keep working and an already-reserved bind still discharges. Not
+     * reachable from any honest flow (a peer-forced trigger failure is refused in the guard
+     * phase before anything is consumed); route to re-establishment. Queryable via
+     * `pq_side_band_wedged`.
+     */
+    case BindTriggerFailed
 
     
 
@@ -5613,6 +5673,7 @@ public struct FfiConverterTypeTwoMlsPqError: FfiConverterRustBuffer {
         case 28: return .EstablishmentCreatorMismatch
         case 29: return .EstablishmentEnvelopeConflict
         case 30: return .StaleFrame
+        case 31: return .BindTriggerFailed
 
          default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -5743,6 +5804,10 @@ public struct FfiConverterTypeTwoMlsPqError: FfiConverterRustBuffer {
         
         case .StaleFrame:
             writeInt(&buf, Int32(30))
+        
+        
+        case .BindTriggerFailed:
+            writeInt(&buf, Int32(31))
         
         }
     }
@@ -6492,6 +6557,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_rekey_respond() != 19548) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_side_band_wedged() != 20963) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_take_pending_outbound() != 2145) {

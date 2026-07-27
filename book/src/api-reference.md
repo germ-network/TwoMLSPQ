@@ -268,13 +268,20 @@ All failures map to the flat `TwoMlsPqError` enum (`Mls`, `InvalidKeyPackage`,
 `EpochDesync`, `UnexpectedWelcome`, `InvalidClientId`, `RemoteIdentityMismatch`,
 `CredentialRejected`, `ApqInfoMismatch`, `AppBindingMismatch`,
 `SinkAlreadyInstalled`, `DuplicateSideBand`, `BootstrapKpMismatch`,
-`BindDischargeFailed`, `BindApplyFailed`, `StaleFrame`).
-mls-rs error types never cross the FFI boundary. The two PQ-bind failures carry
-recovery semantics a caller must branch on: `BindDischargeFailed` is fatal — the classical
-commit discharging an owed bind failed, so the host re-establishes the session — while
-`BindApplyFailed` (paired with the queryable `pq_receive_broken()`) marks receive-side PQ
-state as broken but leaves sending intact, and a restore from the last persisted state
-heals it. `DuplicateSideBand` is a benign no-op (a re-delivered side-band frame);
+`BindDischargeFailed`, `BindApplyFailed`, `StaleFrame`, `BindTriggerFailed`).
+mls-rs error types never cross the FFI boundary. The three PQ-bind failures carry
+recovery semantics a caller must branch on, and they name the three places one bind can
+break. `BindDischargeFailed` is fatal — our classical commit discharging an owed bind
+failed, so the host re-establishes the session. `BindApplyFailed` (paired with the queryable
+`pq_receive_broken()`) is the peer's staple failing on us: it marks receive-side PQ state as
+broken but leaves sending intact, and a restore from the last persisted state heals it.
+`BindTriggerFailed` (paired with the queryable `pq_side_band_wedged()`) is our own trigger
+failing past its point of no return — A.3's join, A.4's decapsulation or A.5's applied
+Commit' had already landed — so the round cannot be rebuilt and re-establishment is the
+exit. It is the one of the three whose latch is ARCHIVED, and deliberately: the bind
+triggers run inside a persist that captures partial mutations even on failure, so the tear
+reaches the blob and a restore would otherwise reproduce it while reporting healthy.
+Classical messaging keeps working under all three. `DuplicateSideBand` is a benign no-op (a re-delivered side-band frame);
 `BootstrapKpMismatch` rejects an A.3 bootstrap key package whose hash does not match the
 commitment `receive` was given. `InvalidClientId` rejects an empty
 principal id supplied to `receive(new_client_id:)` or `prepare_to_encrypt(Some(id))` — empty is
