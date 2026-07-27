@@ -435,7 +435,20 @@ pub fn version() -> String {
 // responder's S is now derived BEFORE the round is consumed, so a failed re-export is a
 // no-op the peer's next re-staple retries. Archive layout stays v3 (unpublished), gaining one
 // tail field.
-const BINDING_CONTRACT_VERSION: u64 = 30;
+//
+// v31: `derive_session_id` is REMOVED from the FFI surface. A session pins its id at its
+// FOUNDING pair for life, while the ids a caller holds move on (a rotation replaces them; a
+// born-dedicated acceptor never operated under its founding id), so re-deriving produced a
+// digest the session did not agree with. Deprecating it would only have invited a
+// substitution that is not value-preserving — the replacement depends on which question was
+// being asked: `TwoMlsPqSession::active_session_id` for THIS SESSION's id, or a digest the
+// caller computes itself for a pre-session pair key (it is SHA-256 over two sorted public
+// ClientIds — nothing secret, and never the session id once either party rotates). The
+// derivation survives crate-internally as `pair_session_id`, called only by the
+// constructors. Removing an exported function drops its FFI symbol, so the vendored binding
+// must be re-paired with the binary; nothing else in the surface, the wire, or the error
+// variants moves.
+const BINDING_CONTRACT_VERSION: u64 = 31;
 
 /// See `BINDING_CONTRACT_VERSION`. Exported so the Swift layer can verify the
 /// binding it was generated with matches the binary it loaded.
@@ -1006,11 +1019,17 @@ pub(crate) fn sha256(bytes: &[u8]) -> Vec<u8> {
     crate::suite::TwoMlsSuite::CURRENT.digest(bytes)
 }
 
-/// Derive the session identifier for a pair of clients.
-/// Both sides compute the same value from the same inputs regardless of who
-/// initiated, allowing CommProtocol to deduplicate concurrent session initiations.
-#[uniffi::export]
-pub fn derive_session_id(my_id: ClientId, their_id: ClientId) -> Result<SessionId> {
+/// The symmetric pair digest behind a session's id: both sides compute the same value
+/// from the same two client ids regardless of who initiated.
+///
+/// Crate-internal, and staying that way. The constructors call it with the **founding**
+/// pair — the invitation identity the initiator addressed — which is the only pair for
+/// which the result means anything: the session pins that value for life, while the ids
+/// themselves move on (a principal rotation replaces them, and a born-dedicated acceptor
+/// never operated under its founding id at all). A caller re-deriving from the ids it
+/// holds later would get a digest the session does not agree with, which is why this is
+/// not exported; `TwoMlsPqSession::active_session_id` reads the stored value instead.
+pub(crate) fn pair_session_id(my_id: ClientId, their_id: ClientId) -> SessionId {
     let (first, second) = if my_id.bytes <= their_id.bytes {
         (my_id.bytes, their_id.bytes)
     } else {
@@ -1020,9 +1039,9 @@ pub fn derive_session_id(my_id: ClientId, their_id: ClientId) -> Result<SessionI
     let mut input = first;
     input.extend_from_slice(&second);
 
-    Ok(SessionId {
+    SessionId {
         bytes: sha256(&input),
-    })
+    }
 }
 
 impl From<mls_rs::error::MlsError> for TwoMlsPqError {
@@ -1060,25 +1079,23 @@ mod tests {
     }
 
     #[test]
-    fn test_derive_session_id_is_symmetric() -> Result<()> {
+    fn test_pair_session_id_is_symmetric() {
         let alice = client_id(b"alice");
         let bob = client_id(b"bob");
         assert_eq!(
-            derive_session_id(alice.clone(), bob.clone())?.bytes,
-            derive_session_id(bob, alice)?.bytes
+            pair_session_id(alice.clone(), bob.clone()).bytes,
+            pair_session_id(bob, alice).bytes
         );
-        Ok(())
     }
 
     #[test]
-    fn test_derive_session_id_differs_for_different_pairs() -> Result<()> {
+    fn test_pair_session_id_differs_for_different_pairs() {
         let alice = client_id(b"alice");
         let bob = client_id(b"bob");
         let carol = client_id(b"carol");
         assert_ne!(
-            derive_session_id(alice.clone(), bob)?.bytes,
-            derive_session_id(alice, carol)?.bytes
+            pair_session_id(alice.clone(), bob).bytes,
+            pair_session_id(alice, carol).bytes
         );
-        Ok(())
     }
 }

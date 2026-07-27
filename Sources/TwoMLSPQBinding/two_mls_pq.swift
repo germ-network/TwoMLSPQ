@@ -6198,19 +6198,6 @@ public func bindingContractVersion() -> UInt64  {
     )
 })
 }
-/**
- * Derive the session identifier for a pair of clients.
- * Both sides compute the same value from the same inputs regardless of who
- * initiated, allowing CommProtocol to deduplicate concurrent session initiations.
- */
-public func deriveSessionId(myId: ClientId, theirId: ClientId)throws  -> SessionId  {
-    return try  FfiConverterTypeSessionId_lift(try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
-    uniffi_two_mls_pq_fn_func_derive_session_id(
-        FfiConverterTypeClientId_lower(myId),
-        FfiConverterTypeClientId_lower(theirId),$0
-    )
-})
-}
 public func version() -> String  {
     return try!  FfiConverterString.lift(try! rustCall() {
     uniffi_two_mls_pq_fn_func_version($0
@@ -6350,9 +6337,6 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.contractVersionMismatch
     }
     if (uniffi_two_mls_pq_checksum_func_binding_contract_version() != 52582) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_two_mls_pq_checksum_func_derive_session_id() != 62066) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_func_version() != 33499) {
