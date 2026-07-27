@@ -164,8 +164,18 @@ fn leg_carrier(group: &CombinerGroup, msg: &MlsMessage) -> Option<LegCarrier> {
 /// Require that a processed proposal is an Update from the peer's leaf — the only
 /// proposal kind members of this protocol ever exchange. An MLS Update always covers
 /// its sender's own leaf, so a member sender other than ourselves pins it to the one
-/// other member (the rules filter re-checks the same at commit time; this rejects at
-/// ingest, before the proposal enters any cache).
+/// other member, and the rules filter re-checks the same at commit time.
+///
+/// This rejects at ingest but NOT before the cache: mls-rs files a by-ref proposal into
+/// `state.proposals` inside `process_incoming_message`, which is what produced the
+/// description examined here — so by the time this can refuse, the proposal is already
+/// cached and will be folded into the next commit on that group. On a PQ half that is
+/// not merely untidy: `apq::rules` rejects any Update co-riding the `AppDataUpdate`
+/// attestation, so one cached Update makes every later BIND commit fail — past the
+/// point where the round's one-shot input is spent. Callers that refuse a message on a
+/// half they will later commit a bind in must therefore also drop what the refusal
+/// admitted (see `pq_ratchet_bind`'s `LegCarrier::Pq` arm), and the bind entry points
+/// re-check the cache before consuming anything (`send_pq_commit_blocked`).
 pub(in crate::session) fn require_peer_update(
     desc: &ProposalMessageDescription,
     my_index: u32,
@@ -177,6 +187,34 @@ pub(in crate::session) fn require_peer_update(
     } else {
         Err(TwoMlsPqError::ProposalRejected)
     }
+}
+
+/// Whether our send-PQ half carries a by-ref proposal that would doom the next BIND
+/// commit on it. A bind's PQ half is a pathless PSK-injection commit bearing the -02
+/// `AppDataUpdate` attestation, and `apq::rules` rejects ANY Update co-riding that
+/// attestation — so one cached proposal turns `commit_pq_and_owe_bind` into a guaranteed
+/// `BadAppDataUpdate`, and it fails PAST the point where the round's one-shot input (A.4's
+/// ephemeral, A.3's join, A.5's applied Commit') is already spent. Everything after that
+/// point is persisted by `mutate_and_persist`, which pushes on `Err` because its partial
+/// mutations are real — so the tear reaches the blob and no restore undoes it.
+///
+/// The peer can arrange this without forging anything. mls-rs files a by-ref proposal into
+/// `state.proposals` inside `process_incoming_message` — before any rules filter runs, and
+/// before the receiving door inspects the message KIND — so a proposal routed through a
+/// door that answers a benign, retriable error still lands in the cache and stays there
+/// (see `require_peer_update`). Checking here, in the guard phase, makes that cost the peer
+/// a retriable refusal instead of a permanent wedge.
+///
+/// An A.5 round legitimately parks the peer's `Upd'` in this half — that commit carries no
+/// attestation, so the rule above does not reach it — but `pq_inflight` gates one round at
+/// a time and no bind entry point is reachable with an A.5 round open, so anything seen
+/// here is residue.
+fn send_pq_commit_blocked(inner: &SessionInner) -> bool {
+    inner
+        .send_group
+        .as_ref()
+        .and_then(|g| g.pq.as_ref())
+        .is_some_and(|pq| pq.commit_required())
 }
 
 /// Retire any bootstrap pin (a frozen establishment credential held admissible past
@@ -710,6 +748,14 @@ impl TwoMlsPqSession {
             if inner.owed_bind.is_some() {
                 return Err(TwoMlsPqError::SessionNotReady);
             }
+            // Residue in our send-PQ's proposal cache would make the bind commit below fail
+            // with the ephemeral ALREADY SPENT and the tear persisted — so refuse now, while
+            // refusing is still free (see `send_pq_commit_blocked`). Retriable, and
+            // self-clearing: the door that admitted the residue drops it on the way out, so
+            // the peer's next honest CT binds.
+            if send_pq_commit_blocked(&inner) {
+                return Err(TwoMlsPqError::SessionNotReady);
+            }
             // Only an initiator holding the A.4 ephemeral can bind the ciphertext.
             match &inner.pq_inflight {
                 Some(PqInflight::Initiating(_)) => {}
@@ -742,7 +788,20 @@ impl TwoMlsPqSession {
                         .as_mut()
                         .and_then(|g| g.pq.as_mut())
                         .ok_or(TwoMlsPqError::SessionNotReady)?;
-                    process_a4_leg(send_pq, PQ_CT_TAG, ct_leg)?
+                    // This door feeds our SEND-PQ — the half every bind commits — and mls-rs
+                    // has already cached anything cacheable by the time `process_a4_leg` gets
+                    // to reject the message KIND. A by-ref proposal left parked here would be
+                    // folded into the bind commit below and refused by `apq::rules`, past the
+                    // point of no return. So drop what the refusal admitted: the `Initiating`
+                    // guard above proves no A.5 round is open, and A.5's `Upd'` is the only
+                    // by-ref proposal this half ever legitimately carries.
+                    match process_a4_leg(send_pq, PQ_CT_TAG, ct_leg) {
+                        Ok(payload) => payload,
+                        Err(e) => {
+                            send_pq.clear_proposal_cache();
+                            return Err(e);
+                        }
+                    }
                 }
             };
             // OPEN the sealed secret. The PSK binds the group the secret is injected into
@@ -897,23 +956,42 @@ impl TwoMlsPqSession {
                     .and_then(|g| g.pq.as_mut())
                     .ok_or(TwoMlsPqError::SessionNotReady)?;
                 let my_index = send_pq.current_member_index();
-                match send_pq
+                // Every refusal from here to the end of the ingest runs with the peer's
+                // proposal ALREADY CACHED — mls-rs files a by-ref proposal inside
+                // `process_incoming_message`, before this code sees its description — and
+                // this closure sits in `mutate_and_persist`, which persists on `Err`. A
+                // proposal left parked in our send-PQ is folded into the next BIND commit on
+                // that half and refused by `apq::rules`, past the point where that round's
+                // one-shot input is spent (see `send_pq_commit_blocked`). So each refusal
+                // drops what it refused. Nothing is lost by that: the peer re-sends its
+                // `Upd'` — which is exactly what makes the credential-lag refusal below
+                // retriable — and the retry re-ingests it.
+                let ingested = match send_pq
                     .process_incoming_message(proposal_msg)
                     .map_err(|_| TwoMlsPqError::Mls)?
                 {
+                    // Only the peer's own-leaf Update is a legitimate A.5 opener.
                     ReceivedMessage::Proposal(desc) => {
-                        // Only the peer's own-leaf Update is a legitimate A.5 opener.
-                        require_peer_update(&desc, my_index)?;
-                        rotated = (!desc.authenticated_data.is_empty()).then(|| ClientId {
-                            bytes: desc.authenticated_data.clone(),
-                        });
+                        require_peer_update(&desc, my_index).map(|()| {
+                            (!desc.authenticated_data.is_empty()).then(|| ClientId {
+                                bytes: desc.authenticated_data.clone(),
+                            })
+                        })
                     }
-                    _ => return Err(TwoMlsPqError::Mls),
-                }
+                    _ => Err(TwoMlsPqError::Mls),
+                };
+                rotated = match ingested {
+                    Ok(announced) => announced,
+                    Err(e) => {
+                        send_pq.clear_proposal_cache();
+                        return Err(e);
+                    }
+                };
                 // The classical ratchet leads the credential sequence; a PQ handoff may
                 // only catch a leaf up to an ALREADY-canonical identity.
                 if let Some(announced) = &rotated {
                     if !canonical_theirs.iter().any(|h| h == &announced.bytes) {
+                        send_pq.clear_proposal_cache();
                         return Err(TwoMlsPqError::CredentialRejected);
                     }
                 }
@@ -1004,6 +1082,12 @@ impl TwoMlsPqSession {
             // Rule 2, as the other two binds (see `pq_ratchet_bind`): at most one owed bind.
             // Retriable — our next classical commit discharges the outstanding one.
             if inner.owed_bind.is_some() {
+                return Err(TwoMlsPqError::SessionNotReady);
+            }
+            // Residue in our send-PQ's proposal cache would fail the bind commit below with
+            // the peer's Commit' ALREADY APPLIED — unrepeatable, and persisted. Refuse while
+            // it is still free (see `send_pq_commit_blocked`).
+            if send_pq_commit_blocked(&inner) {
                 return Err(TwoMlsPqError::SessionNotReady);
             }
             // Only the initiator of THIS rekey may close it.
@@ -1675,6 +1759,14 @@ impl TwoMlsPqSession {
             // reserved attestation, which the peer rejects pre-apply with our PQ leaf already
             // spent. Retriable — our next classical commit discharges the owed bind.
             if inner.owed_bind.is_some() {
+                return Err(TwoMlsPqError::SessionNotReady);
+            }
+            // Residue in our send-PQ's proposal cache would fail the bind commit below with
+            // the Welcome' ALREADY JOINED into `recv.pq` and the pre-committed key package
+            // spent — and a retry would then answer `DuplicateSideBand`, reporting a round
+            // that never closed as done. Refuse while it is still free (see
+            // `send_pq_commit_blocked`).
+            if send_pq_commit_blocked(&inner) {
                 return Err(TwoMlsPqError::SessionNotReady);
             }
             pq_welcome

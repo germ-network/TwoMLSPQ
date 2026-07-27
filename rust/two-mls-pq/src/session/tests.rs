@@ -2132,6 +2132,127 @@ fn test_pq_ratchet_bind_guarded_while_commit_staged() {
     discharge_bind(&bob, &alice, b"app");
 }
 
+/// A cached by-ref proposal in our send-PQ is fatal to every BIND commit on that half: a
+/// bind's PQ commit carries the -02 `AppDataUpdate` attestation, and `apq::rules` rejects
+/// any Update co-riding it. mls-rs files a by-ref proposal into the cache inside
+/// `process_incoming_message` — BEFORE `process_a4_leg` gets to reject the message KIND —
+/// so the legacy `0x19` door lets the sole counterparty park one with a plain, well-formed
+/// MLS message and no forgery at all. Left there it would be folded into the next bind and
+/// fail it past the point where the A.4 ephemeral is already spent, with
+/// `mutate_and_persist` writing the tear to the blob. So the refusal must drop what it
+/// admitted.
+#[test]
+fn test_a_peer_proposal_smuggled_into_the_send_pq_leaves_no_cached_residue() {
+    let (alice, bob) = establish_full();
+    let ek = open_ratchet(&bob, &alice);
+    assert_ok!(alice.pq_ratchet_respond(ek));
+    let ct = assert_some!(alice.pq_take_pending_outbound());
+
+    // Alice's recv-PQ mirror IS Bob's send-PQ, so an ordinary Update proposed there is a
+    // valid message in the very half Bob's bind commits. A deviating peer needs nothing else.
+    let poison = {
+        let mut inner = alice.lock();
+        let mirror = inner
+            .recv_group
+            .as_mut()
+            .and_then(|g| g.pq.as_mut())
+            .expect("recv-PQ mirror");
+        assert_ok!(mirror.propose_update(Vec::new()))
+    };
+    let mut frame = vec![super::PQ_CT_TAG];
+    frame.extend_from_slice(&assert_ok!(poison.to_bytes()));
+    assert_err!(bob.pq_ratchet_bind(frame), TwoMlsPqError::Mls);
+
+    // The refusal left nothing behind for the bind below to fold.
+    {
+        let inner = bob.lock();
+        let send_pq = inner
+            .send_group
+            .as_ref()
+            .and_then(|g| g.pq.as_ref())
+            .expect("send-PQ");
+        assert!(
+            send_pq.get_cached_proposals().is_empty(),
+            "a refused ingest must not leave a proposal the next bind would fold"
+        );
+    }
+
+    // The round is untouched: the honest CT still binds and the round closes.
+    assert_ok!(bob.pq_ratchet_bind(ct));
+    discharge_bind(&bob, &alice, b"after-smuggle");
+}
+
+/// The guard half of the same hazard. Residue in the send-PQ must be refused BEFORE the
+/// bind spends the A.4 ephemeral, because everything past that point is unrecoverable AND
+/// persisted: `mutate_and_persist` pushes on `Err`, `rewrap_side_band` can no longer
+/// re-mint the parked EK once no round is in flight, and every later attempt would answer
+/// the retriable-looking `SessionNotReady` forever while `is_fully_established()` still
+/// reported true. The residue is planted directly here, standing in for the two doors that
+/// admit it (the `0x19` leg above, and an A.5 `Upd'` refused as `CredentialRejected`).
+#[test]
+fn test_bind_refuses_a_poisoned_send_pq_before_the_ephemeral_is_spent() {
+    let (alice, bob) = establish_full();
+    let ek = open_ratchet(&bob, &alice);
+    assert_ok!(alice.pq_ratchet_respond(ek));
+    let ct = assert_some!(alice.pq_take_pending_outbound());
+
+    let poison = {
+        let mut inner = alice.lock();
+        let mirror = inner
+            .recv_group
+            .as_mut()
+            .and_then(|g| g.pq.as_mut())
+            .expect("recv-PQ mirror");
+        assert_ok!(mirror.propose_update(Vec::new()))
+    };
+    {
+        let mut inner = bob.lock();
+        let send_pq = inner
+            .send_group
+            .as_mut()
+            .and_then(|g| g.pq.as_mut())
+            .expect("send-PQ");
+        assert_ok!(send_pq.process_incoming_message(poison));
+    }
+
+    // Refused as a pure no-op: retriable, and it never reaches the persist choke point.
+    let sink = Arc::new(RecordingSink::default());
+    assert_ok!(bob.install_sink(sink.clone()));
+    let before = sink.kinds().len();
+    assert_err!(
+        bob.pq_ratchet_bind(ct.clone()),
+        TwoMlsPqError::SessionNotReady
+    );
+    assert_eq!(
+        sink.kinds().len(),
+        before,
+        "a guard-phase refusal must not push a Checkpoint per replay"
+    );
+
+    // The round SURVIVED: the ephemeral is intact and our EK is still parked for re-send.
+    {
+        let inner = bob.lock();
+        assert!(matches!(
+            inner.pq_inflight,
+            Some(super::PqInflight::Initiating(_))
+        ));
+        assert!(inner.pending_side_band.is_some());
+    }
+
+    // Clearing the residue — what the ingest doors now do on refusal — lets the same CT bind.
+    {
+        let mut inner = bob.lock();
+        inner
+            .send_group
+            .as_mut()
+            .and_then(|g| g.pq.as_mut())
+            .expect("send-PQ")
+            .clear_proposal_cache();
+    }
+    assert_ok!(bob.pq_ratchet_bind(ct));
+    discharge_bind(&bob, &alice, b"healed");
+}
+
 /// A.3's bind calls the same `commit_pq_and_owe_bind` as A.4's, so it carries the identical
 /// hazard: a prepared-but-unsent classical commit is sitting in `current_staple` waiting for
 /// its `encrypt`, and the bind's commit would fire out from under it. A displaced commit
