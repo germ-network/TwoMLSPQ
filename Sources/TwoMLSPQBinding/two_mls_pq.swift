@@ -2241,15 +2241,23 @@ public protocol TwoMlsPqSessionProtocol: AnyObject, Sendable {
      * the peer.)
      *
      * Epochs: `Fresh` seals at the epoch CURRENT to each call, so a frame retained across a
-     * ratchet keeps opening for the peer. `Stable` cannot, by construction — the bytes hold
-     * still, so the cached seal keeps the epoch it was first sealed at and the peer opens it
-     * from its retained header-key window. That is roomy for the PQ family (`seal_side_band`
-     * seals under recv-PQ, which advances only when the PEER commits — and applying a peer
-     * commit clears this side's retained frame anyway). It is tighter for the one frame that
-     * takes `seal_side_band`'s classical fallback, the pre-A.3 `BOOTSTRAP_KP`, whose key
-     * tracks the CLASSICAL epoch that ordinary messaging advances: a `Stable` pass over that
-     * frame wants to finish inside the peer's classical header window. `Fresh` has no such
-     * constraint.
+     * ratchet keeps opening for the peer. `Stable` holds the bytes still only while they can
+     * still land: the cache is stamped with its sealing epoch and EXPIRES when that clock
+     * moves (`hand_out`), re-sealing fresh rather than converging on a blob the peer's
+     * window has evicted. A chunking pass therefore restarts — the bytes had to change —
+     * whenever the frame or its seal goes stale under it:
+     *
+     * - a re-mint (`rewrap_side_band`) replaced the frame outright — any send that follows
+     * one of OUR commits, plus (once) the first prepare/send after restoring a v2 round,
+     * which converts its old-form EK whether or not the epoch moved;
+     * - the SEALING clock moved — for the classically-sealed frames (the A.4 legs and the
+     * pre-A.3 `BOOTSTRAP_KP`) that is the recv-classical epoch, which the PEER's commits
+     * advance. This is a different classical clock from the re-mint's (our send epoch), so
+     * neither event implies the other; the stamp is what covers the gap. Roomy for the
+     * A.3/A.5 frames: their recv-PQ seal clock advances only on a peer PQ commit, and
+     * applying one clears this side's retained frame anyway.
+     *
+     * `Fresh` has none of these constraints.
      */
     func pqPendingOutbound(sealing: SideBandSealing)  -> Data?
     
@@ -2268,9 +2276,19 @@ public protocol TwoMlsPqSessionProtocol: AnyObject, Sendable {
      * itself, so the initiator's open is an explicit receipt (see
      * `apq::pq_ratchet::seal_injected_secret`).
      *
-     * The EK arrives as an MLS application message in our recv-PQ mirror; decrypting it (in
-     * the closure) is what authenticates it — a leaf signature AND proof of the current epoch,
-     * so a stolen signing key alone cannot forge an EK we will answer (see `process_a4_leg`).
+     * The EK arrives as an MLS application message in our recv-CLASSICAL mirror; decrypting
+     * it (in the closure) is what authenticates it — a leaf signature AND proof of the
+     * current epoch, so a stolen signing key alone cannot forge an EK we will answer (see
+     * `process_a4_leg`). The CT goes back out in our own SEND-classical group, not the
+     * mirror the EK arrived in: the mirror carries our uncommitted routine `Upd` on any
+     * round we have sent since last applying a peer commit, and
+     * `encrypt_application_message` refuses (`CommitRequired`) while one is cached — a
+     * failure that would land AFTER the EK decrypt consumed its generation and strand the
+     * round for good. Our send group is proposal-free in steady state.
+     *
+     * A PQ-carried EK is a peer whose build predates the classical carriers: dropped here as
+     * a no-op (nothing consumed, no state advanced) rather than answered, so the two forms
+     * never interleave within a round. That peer's own upgrade re-opens the round natively.
      */
     func pqRatchetRespond(ekMsg: Data) throws 
     
@@ -3159,15 +3177,23 @@ open func pqBootstrapRespond(kpMsg: Data)throws   {try rustCallWithError(FfiConv
      * the peer.)
      *
      * Epochs: `Fresh` seals at the epoch CURRENT to each call, so a frame retained across a
-     * ratchet keeps opening for the peer. `Stable` cannot, by construction — the bytes hold
-     * still, so the cached seal keeps the epoch it was first sealed at and the peer opens it
-     * from its retained header-key window. That is roomy for the PQ family (`seal_side_band`
-     * seals under recv-PQ, which advances only when the PEER commits — and applying a peer
-     * commit clears this side's retained frame anyway). It is tighter for the one frame that
-     * takes `seal_side_band`'s classical fallback, the pre-A.3 `BOOTSTRAP_KP`, whose key
-     * tracks the CLASSICAL epoch that ordinary messaging advances: a `Stable` pass over that
-     * frame wants to finish inside the peer's classical header window. `Fresh` has no such
-     * constraint.
+     * ratchet keeps opening for the peer. `Stable` holds the bytes still only while they can
+     * still land: the cache is stamped with its sealing epoch and EXPIRES when that clock
+     * moves (`hand_out`), re-sealing fresh rather than converging on a blob the peer's
+     * window has evicted. A chunking pass therefore restarts — the bytes had to change —
+     * whenever the frame or its seal goes stale under it:
+     *
+     * - a re-mint (`rewrap_side_band`) replaced the frame outright — any send that follows
+     * one of OUR commits, plus (once) the first prepare/send after restoring a v2 round,
+     * which converts its old-form EK whether or not the epoch moved;
+     * - the SEALING clock moved — for the classically-sealed frames (the A.4 legs and the
+     * pre-A.3 `BOOTSTRAP_KP`) that is the recv-classical epoch, which the PEER's commits
+     * advance. This is a different classical clock from the re-mint's (our send epoch), so
+     * neither event implies the other; the stamp is what covers the gap. Roomy for the
+     * A.3/A.5 frames: their recv-PQ seal clock advances only on a peer PQ commit, and
+     * applying one clears this side's retained frame anyway.
+     *
+     * `Fresh` has none of these constraints.
      */
 open func pqPendingOutbound(sealing: SideBandSealing) -> Data?  {
     return try!  FfiConverterOptionData.lift(try! rustCall() {
@@ -3199,9 +3225,19 @@ open func pqRatchetBind(ctMsg: Data)throws   {try rustCallWithError(FfiConverter
      * itself, so the initiator's open is an explicit receipt (see
      * `apq::pq_ratchet::seal_injected_secret`).
      *
-     * The EK arrives as an MLS application message in our recv-PQ mirror; decrypting it (in
-     * the closure) is what authenticates it — a leaf signature AND proof of the current epoch,
-     * so a stolen signing key alone cannot forge an EK we will answer (see `process_a4_leg`).
+     * The EK arrives as an MLS application message in our recv-CLASSICAL mirror; decrypting
+     * it (in the closure) is what authenticates it — a leaf signature AND proof of the
+     * current epoch, so a stolen signing key alone cannot forge an EK we will answer (see
+     * `process_a4_leg`). The CT goes back out in our own SEND-classical group, not the
+     * mirror the EK arrived in: the mirror carries our uncommitted routine `Upd` on any
+     * round we have sent since last applying a peer commit, and
+     * `encrypt_application_message` refuses (`CommitRequired`) while one is cached — a
+     * failure that would land AFTER the EK decrypt consumed its generation and strand the
+     * round for good. Our send group is proposal-free in steady state.
+     *
+     * A PQ-carried EK is a peer whose build predates the classical carriers: dropped here as
+     * a no-op (nothing consumed, no state advanced) rather than answered, so the two forms
+     * never interleave within a round. That peer's own upgrade re-opens the round natively.
      */
 open func pqRatchetRespond(ekMsg: Data)throws   {try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
     uniffi_two_mls_pq_fn_method_twomlspqsession_pq_ratchet_respond(
@@ -6440,13 +6476,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_bootstrap_respond() != 45787) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_pending_outbound() != 1918) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_pending_outbound() != 43323) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_ratchet_bind() != 59912) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_ratchet_respond() != 52781) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_ratchet_respond() != 10590) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_receive_broken() != 41138) {
