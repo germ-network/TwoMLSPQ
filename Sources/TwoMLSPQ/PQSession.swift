@@ -193,7 +193,44 @@ import TwoMLSPQBinding
 //     from a closed round clears the in-flight guards and reaches that decrypt, and a host
 //     that reads `.fatal` as "tear the session down" must never be told that by a peer frame
 //     it could not open. No wire or API change.
-private let expectedBindingContract: UInt64 = 28
+// v29 (contract 29): the A.4 side-band legs move from the PQ groups to each sender's own
+//     CLASSICAL send group, sealed under the classical header family — fresher
+//     authentication (the classical leaf and epoch secrets heal every round, where a PQ leaf
+//     waits for A.5) at no loss of strength, since both halves sign Ed25519. Wire-breaking
+//     for the A.4 legs, but sessions established on 0.14 SURVIVE: their archives restore
+//     (archive layout v3 still accepts v2), and a round already in flight completes — a
+//     migrated responder's PQ-carried ciphertext is still accepted by the bind, and a
+//     migrated initiator's encapsulation key is converted to the new form on its next send.
+//     A peer that has not yet upgraded simply cannot answer a new-form leg, so the PQ
+//     side-band (and with it A.5 credential catch-up) pauses for that pair until it does —
+//     never a teardown. Hosts will newly see `.staleFrame` (`.discardFrame`) on side-band
+//     legs in two shapes, both meaning "this copy can never open, drop it, the round is
+//     fine": an old-form leg from a pre-upgrade peer (answerable only by that peer
+//     upgrading), and a superseded copy of a leg that has since been re-minted (legs are
+//     re-sent as fresh wraps rather than fixed bytes now). Classical messaging is unaffected
+//     throughout. No API change.
+// v30 (contract 30): a PQ bind can no longer be wedged by proposal residue, nor fail
+//     silently past its point of no return. A cached by-ref proposal in our send-PQ dooms
+//     every bind commit on that half, and MLS caches one at ingest — before the A.4 leg door
+//     inspects the message kind — so a deviating peer could park one through a door that
+//     answers a benign, retriable error and then let the next bind tear itself apart with the
+//     round's one-shot input already spent, the tear persisted, and no restore healing it.
+//     The three bind entry points now refuse that in the guard phase (retriable, nothing
+//     consumed) and the admitting doors drop what they refuse. Where no guard can help —
+//     past the point of no return — the trigger latches the new `.bindTriggerFailed`
+//     (`.reestablish`), queryable via `isSideBandWedged`; classical messaging keeps working
+//     throughout, and an already-reserved bind still discharges. Hosts must handle the new
+//     case (the error map is exhaustive, so it will not compile until they do). Archive
+//     layout stays v3, gaining one field.
+// v31 (contract 31): `deriveSessionId` is REMOVED from the crate's FFI surface — a session
+//     pins its id at its FOUNDING pair for life, so re-deriving from current client ids
+//     disagreed with it after a principal rotation (and always, for a born-dedicated
+//     acceptor). `activeSessionId()` is the session's id; a pre-session pair key is a digest
+//     the caller computes itself. Nothing to do here: the raw binding is an internal target,
+//     so this function was never reachable from this product. The bump covers the dropped FFI
+//     symbol, which requires the vendored binding to be re-paired with the binary. No wire,
+//     API, or error-variant change.
+private let expectedBindingContract: UInt64 = 31
 
 enum TwoMLSPQBindingContract {
 	static let verified: Void = {
@@ -932,6 +969,20 @@ public struct PQSession {
 	/// it as fatal, send-mostly can defer.
 	public var isReceiveBroken: Bool {
 		base.pqReceiveBroken()
+	}
+
+	/// Whether the PQ side-band is permanently wedged: one of our own binds
+	/// failed past its point of no return, so every side-band call now refuses
+	/// with `.bindTriggerFailed` and the peer waits for a staple that can never
+	/// be built. CLASSICAL MESSAGING IS UNAFFECTED.
+	///
+	/// Differs from `isReceiveBroken` in direction and remedy: that one breaks
+	/// RECEIVING and heals on restore; this one breaks the SIDE-BAND, survives
+	/// restore (the verdict is archived beside the torn state), and needs a new
+	/// session. Worth polling because A.3's wedge is otherwise invisible —
+	/// `isFullyEstablished` reports true on a bootstrap that never closed.
+	public var isSideBandWedged: Bool {
+		base.pqSideBandWedged()
 	}
 }
 

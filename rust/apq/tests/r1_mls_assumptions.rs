@@ -329,6 +329,111 @@ fn assumption_d_restored_group_signs_with_snapshot_signer_not_loader_key() {
     );
 }
 
+/// (a, on the CLASSICAL carrier) — the legs moved to the classical groups, so the two
+/// behaviors the session's guard ordering rests on must be pinned in the suite they now
+/// actually run in, not only in the ML-KEM one: a replayed frame does NOT re-decrypt (so
+/// `pq_inflight` must gate re-sends before the decrypt), and a frame from an unrelated group
+/// is rejected without consuming a generation (so a misrouted or foreign leg cannot strand a
+/// round). Same assertions as (a) and (a, corollary 1) above, different cipher suite.
+#[test]
+fn assumption_a_holds_on_the_classical_carrier() {
+    let (mut alice_send, mut bob_recv) = live_pair();
+    let (mut other_send, _other_recv) = live_pair();
+
+    let frame = alice_send
+        .classical
+        .encrypt_application_message(b"\x17ek", vec![])
+        .unwrap()
+        .to_bytes()
+        .unwrap();
+
+    // A frame from an unrelated classical group: rejected, and no generation consumed —
+    // proven by the honest frame still decrypting afterwards.
+    let foreign = other_send
+        .classical
+        .encrypt_application_message(b"\x17ek", vec![])
+        .unwrap()
+        .to_bytes()
+        .unwrap();
+    assert!(
+        bob_recv
+            .classical
+            .process_incoming_message(MlsMessage::from_bytes(&foreign).unwrap())
+            .is_err(),
+        "a foreign-group leg must not authenticate here"
+    );
+
+    assert_eq!(
+        app_data(
+            bob_recv
+                .classical
+                .process_incoming_message(MlsMessage::from_bytes(&frame).unwrap())
+                .unwrap()
+        ),
+        b"\x17ek",
+        "the foreign frame must not have consumed this generation"
+    );
+
+    assert!(
+        bob_recv
+            .classical
+            .process_incoming_message(MlsMessage::from_bytes(&frame).unwrap())
+            .is_err(),
+        "a replayed application frame must not re-decrypt (guards must gate re-sends)"
+    );
+}
+
+/// A re-wrapped leg is a NEW application message that the peer opens across a commit — the
+/// mls-rs half of `rewrap_side_band`'s claim. Pins exactly one thing: re-encrypting the same
+/// payload after an epoch advance yields fresh ciphertext the receiver decrypts (the
+/// generations do not collide across epochs).
+///
+/// Deliberately NOT pinned: that the pre-commit wrap stops opening once the receiver moves
+/// past its epoch. mls-rs applies no epoch bound check to application messages — an old
+/// epoch's keys die by *storage eviction* (`max_epoch_retention` at `write_to_storage`), and
+/// this harness never flushes, so the old wrap keeps opening here however many commits pass.
+/// The eviction bound that makes re-wrapping load-bearing in production is pinned where the
+/// eviction actually runs: `EPOCH_RETENTION` in `apq::storage` and its
+/// `test_retention_matches_mls_rs_in_memory_provider`.
+#[test]
+fn a4_leg_rewrapped_after_a_commit_still_opens() {
+    let (mut alice_send, mut bob_recv) = live_pair();
+
+    // Wrap 1, held back rather than delivered.
+    let stale = alice_send
+        .classical
+        .encrypt_application_message(b"\x17ek", vec![])
+        .unwrap()
+        .to_bytes()
+        .unwrap();
+
+    // Alice commits (empty commit) and Bob applies: both move to the next epoch.
+    let commit = alice_send.classical.commit(Vec::new()).unwrap();
+    alice_send.classical.apply_pending_commit().unwrap();
+    bob_recv
+        .classical
+        .process_incoming_message(commit.commit_message)
+        .unwrap();
+
+    // Wrap 2, minted at the new epoch, opens.
+    let rewrapped = alice_send
+        .classical
+        .encrypt_application_message(b"\x17ek", vec![])
+        .unwrap()
+        .to_bytes()
+        .unwrap();
+    assert_ne!(stale, rewrapped, "a re-wrap is new ciphertext");
+    assert_eq!(
+        app_data(
+            bob_recv
+                .classical
+                .process_incoming_message(MlsMessage::from_bytes(&rewrapped).unwrap())
+                .unwrap()
+        ),
+        b"\x17ek"
+    );
+}
+
 /// Sanity: the ML-KEM-768 EK on the wire is the size the framing budget assumes, so the
 /// doc's "~64 bytes of signature over an ~1184-byte payload" cost note stays honest.
 #[test]

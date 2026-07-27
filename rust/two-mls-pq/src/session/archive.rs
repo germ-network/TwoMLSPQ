@@ -1,22 +1,23 @@
 //! Session archive (de)serialization: the versioned single-blob layout, the
 //! `archive_wire` TLS structs, the state<->wire conversions, and the
 //! `archive` / `from_archive` endpoints. The layout version is a whole-blob
-//! compatibility gate (no migrations pre-release) -- see the note on
-//! `SESSION_ARCHIVE_VERSION`.
+//! compatibility gate, and since v3 it admits exactly one older layout -- see
+//! the note on `SESSION_ARCHIVE_VERSION`.
 
 use super::*;
 
-// The session archive layout version. The byte covers the WHOLE layout. There is still no
-// cross-version archive compatibility — an archive from another build simply fails to decode
-// (`ArchiveInvalid`) and is regenerated; no migration. The header also carries the concrete
-// `ApqCipherSuite` pair (4 bytes, classical then pq, big-endian) in place of the old PQ-mode
-// byte: the suite is a stored session property, and a restored archive whose pair differs
-// from this build's pinned suite fails loudly.
+// The session archive layout version. The byte covers the WHOLE layout, and it is the ONLY
+// thing that decides which layouts a build will read: `decode_wire` accepts the current
+// version and — since v3 — the one named by `SESSION_ARCHIVE_VERSION_V2`, rejecting every
+// other as `ArchiveInvalid`. Anything not on that list simply fails to decode and is
+// regenerated. The header also carries the concrete `ApqCipherSuite` pair (4 bytes, classical
+// then pq, big-endian) in place of the old PQ-mode byte: the suite is a stored session
+// property, and a restored archive whose pair differs from this build's pinned suite fails
+// loudly.
 //
 // MONOTONIC FROM HERE ON. Every change to the archive's layout OR its acceptance semantics
 // (a new field, a reshaped field, or a tightened restore-time validation) bumps this byte by
-// one. The byte never resets and never reuses a value — even though nothing needs to *read*
-// an old value (the hard cut means old blobs just fail), a monotonic version is the honest
+// one. The byte never resets and never reuses a value: a monotonic version is the honest
 // record of "this layout is not that layout", and a distinct byte keeps two builds' blobs
 // from ever being mistaken for each other. This ends the earlier pre-release convention of
 // leaving the byte untouched (and the 2026-07-13 floor reset to 1); those and the original
@@ -24,9 +25,29 @@ use super::*;
 // too (the staple first-byte check in `session_from_wire`, whose fields their bytes could
 // otherwise alias into).
 //
-// v2 (this change): restore-time validation tightened — the bootstrap twin-field invariant
-// and the 32-byte commitment length are now enforced on decode (see `session_from_wire`).
-const SESSION_ARCHIVE_VERSION: u8 = 2;
+// ACCEPTING AN OLD VERSION IS THE EXCEPTION, NOT THE NEW RULE. It costs a decode path that
+// must stay correct for a layout nobody writes any more, so it is worth paying only to carry
+// real sessions across a release — as v3 does for 0.14 — and the acceptance should be dropped
+// again once those sessions are gone. Keeping the layouts one `else` apart, rather than
+// forking the whole struct, is what makes that removal a deletion instead of a merge.
+//
+// v2: restore-time validation tightened — the bootstrap twin-field invariant and the 32-byte
+// commitment length are now enforced on decode (see `session_from_wire`).
+//
+// v3 (this change): the A.4 legs moved to the classical groups, so a `Responding` round now
+// retains its `wire_ct` for re-wrapping (see `PqInflight::Responding`). THIS IS THE FIRST
+// VERSION WITH A MIGRATION, and the hard-cut rule above is relaxed exactly this far: v2 is
+// still ACCEPTED on decode, because 0.14 shipped to real sessions whose connections must
+// survive the upgrade. The mechanism is append-only — the new state rides an `ArchiveTail`
+// encoded AFTER the (byte-unchanged) `SessionArchive`, so a v2 blob decodes as the same
+// prefix and its absent tail restores as `None`, which is exactly right: a v2 round's legs
+// rode the PQ groups, whose `pq_epoch` cannot move mid-round, so they never re-wrap. Writing
+// is always v3. A v3 blob on a 0.14 build still fails there, which is the hard cut's
+// remaining, intended direction.
+const SESSION_ARCHIVE_VERSION: u8 = 3;
+/// The one older layout still accepted on decode (see the version note): identical to v3
+/// minus the trailing [`archive_wire::ArchiveTail`].
+const SESSION_ARCHIVE_VERSION_V2: u8 = 2;
 
 // In its own module because the derive-generated impls reference the std `Result`, which
 // the crate-local `Result` alias would shadow (same pattern as `invitation::wire`).
@@ -220,12 +241,58 @@ pub(crate) mod archive_wire {
         pub(in crate::session) bytes: Zeroizing<Vec<u8>>,
     }
 
+    /// The responder's retained A.4 `[enc][sealed S]` payload — the re-wrap source for a
+    /// classical-carried round (see `PqInflight::Responding`). A one-field struct so
+    /// `Option<CtBlob>` composes with the byte_vec framing. Public commit-style bytes, not
+    /// key material: `S` itself travels in `SecretBlob`.
+    #[derive(MlsSize, MlsEncode, MlsDecode)]
+    pub(in crate::session) struct CtBlob {
+        #[mls_codec(with = "mls_rs_codec::byte_vec")]
+        pub(in crate::session) bytes: Vec<u8>,
+    }
+
+    /// State appended AFTER [`SessionArchive`] in a v3 blob. Append-only by construction:
+    /// a v2 blob simply ends where this begins, decoding as the same prefix with an
+    /// all-`None` tail (see the `SESSION_ARCHIVE_VERSION` note). Future additive state
+    /// belongs here too, one field per addition, never reordered.
+    #[derive(MlsSize, MlsEncode, MlsDecode)]
+    pub(in crate::session) struct ArchiveTail {
+        /// Set only for a `Responding` round whose CT rode the classical carrier. `None`
+        /// both for a v2-restored round (its PQ-form CT cannot be rebuilt — it is
+        /// MLS-encrypted to the peer — and never needs to be) and for every non-A.4 state.
+        pub(in crate::session) responder_wire_ct: Option<CtBlob>,
+        /// The wedge latch (`SessionInner::pq_wedged`), tag-dispatched like
+        /// `WirePqInflight.kind`: `0` A.3 bootstrap, `1` A.4 ratchet, `2` A.5 re-key.
+        /// Unknown tags are rejected as `ArchiveInvalid`, as that `kind` is.
+        ///
+        /// ARCHIVED — and this is the whole difference from `bind_apply_broken`, which is
+        /// not — because the state it marks was written to a blob by the very push that
+        /// carried the `Err`: `mutate_and_persist` pushes on `Err` by design, its partial
+        /// mutations being real. A latch that healed on restore would hand the honest label
+        /// back to the retriable lie the restored state still embodies.
+        pub(in crate::session) pq_wedged: Option<u8>,
+    }
+
+    impl ArchiveTail {
+        /// The tail a v2 blob restores as, and the one a session with nothing to append
+        /// writes. A v2 blob carries no verdict, and `None` is the only answer that keeps a
+        /// restored 0.14 session usable — the tear it could not record is the pre-existing
+        /// behaviour this field exists to stop.
+        pub(in crate::session) fn empty() -> Self {
+            Self {
+                responder_wire_ct: None,
+                pq_wedged: None,
+            }
+        }
+    }
+
     /// The archivable `PqInflight` round state, tag-dispatched by `kind` so all six
     /// variants share one optional-payload struct — the flat-struct style the rest of
     /// this module uses in place of codec enums. The A.3/A.5 markers carry no secrets
     /// (their round state lives in the group snapshots); the A.4 variants carry the
     /// round's KEM material (see [`super::TwoMlsPqSession::archive`] for why persisting
-    /// it is sound).
+    /// it is sound). The `Responding` round's `wire_ct` rides the [`ArchiveTail`] rather
+    /// than a fourth field here, so this struct's bytes stay v2-identical.
     ///
     /// - `0` `Initiating`     — `ephemeral` set; `secret` absent.
     /// - `1` `Responding`     — `secret` set; `ephemeral` absent.
@@ -439,7 +506,9 @@ fn retained_from_wire(frame: Option<Vec<u8>>) -> Option<RetainedFrame> {
 }
 
 /// `PqInflight` → its wire form. The A.4 variants carry the round's KEM material; the
-/// A.3/A.5 markers carry only a discriminant.
+/// A.3/A.5 markers carry only a discriminant. A `Responding` round's `wire_ct` does NOT
+/// belong to this struct (it rides the [`archive_wire::ArchiveTail`], keeping these bytes
+/// v2-identical) — `tail_from` extracts it.
 fn wire_pq_inflight(inflight: &PqInflight) -> archive_wire::WirePqInflight {
     use archive_wire::{PqEphemeralBlob, SecretBlob, WirePqInflight};
     match inflight {
@@ -451,10 +520,12 @@ fn wire_pq_inflight(inflight: &PqInflight) -> archive_wire::WirePqInflight {
             }),
             secret: None,
         },
-        PqInflight::Responding(s) => WirePqInflight {
+        PqInflight::Responding { secret, .. } => WirePqInflight {
             kind: 1,
             ephemeral: None,
-            secret: Some(SecretBlob { bytes: s.clone() }),
+            secret: Some(SecretBlob {
+                bytes: secret.clone(),
+            }),
         },
         PqInflight::RekeyInitiated => WirePqInflight {
             kind: 2,
@@ -479,10 +550,42 @@ fn wire_pq_inflight(inflight: &PqInflight) -> archive_wire::WirePqInflight {
     }
 }
 
+/// The v3 tail for `inner`: a `Responding` round's retained `wire_ct`, plus the wedge latch.
+///
+/// A whole-state view rather than an inflight one, because the wedge is not round state and
+/// must ride BOTH blob kinds: it is set inside a `Checkpoint` closure, but a later ordinary
+/// `Core` push can win the `state_seq` race in `reconcile_persisted`, and a winner without
+/// the verdict would restore a session that reports healthy and deadlocks.
+fn tail_from(inner: &SessionInner) -> archive_wire::ArchiveTail {
+    use archive_wire::{ArchiveTail, CtBlob};
+    let responder_wire_ct = match inner.pq_inflight.as_ref() {
+        Some(PqInflight::Responding {
+            wire_ct: Some(ct), ..
+        }) => Some(CtBlob { bytes: ct.clone() }),
+        _ => None,
+    };
+    ArchiveTail {
+        responder_wire_ct,
+        pq_wedged: inner.pq_wedged.map(|w| w as u8),
+    }
+}
+
 /// Wire form → `PqInflight`, rejecting an unknown `kind` or a payload that does not match
 /// the discriminant (a forged or corrupt archive) as `ArchiveInvalid`.
-fn pq_inflight_from_wire(wire: archive_wire::WirePqInflight) -> Result<PqInflight> {
+///
+/// `wire_ct` comes from the blob's [`archive_wire::ArchiveTail`] and is `None` for a v2
+/// archive — correct by construction there: that round's CT rode the PQ group, which cannot
+/// change epoch mid-round, so it never re-wraps (and its payload is unrecoverable anyway,
+/// being MLS-encrypted to the peer). It is only meaningful for `kind: 1`; a tail pairing it
+/// with any other state is a corrupt archive.
+fn pq_inflight_from_wire(
+    wire: archive_wire::WirePqInflight,
+    wire_ct: Option<Vec<u8>>,
+) -> Result<PqInflight> {
     use archive_wire::WirePqInflight;
+    if wire_ct.is_some() && wire.kind != 1 {
+        return Err(TwoMlsPqError::ArchiveInvalid);
+    }
     match wire {
         WirePqInflight {
             kind: 0,
@@ -495,7 +598,10 @@ fn pq_inflight_from_wire(wire: archive_wire::WirePqInflight) -> Result<PqInfligh
             kind: 1,
             ephemeral: None,
             secret: Some(s),
-        } => Ok(PqInflight::Responding(s.bytes)),
+        } => Ok(PqInflight::Responding {
+            secret: s.bytes,
+            wire_ct,
+        }),
         WirePqInflight {
             kind: 2,
             ephemeral: None,
@@ -533,14 +639,20 @@ impl TwoMlsPqSession {
     /// `checkpoint` must be present.
     #[uniffi::constructor]
     pub fn restore(core: Option<Archive>, checkpoint: Option<Archive>) -> Result<Arc<Self>> {
-        session_from_wire(reconcile_persisted(core, checkpoint)?)
+        let (wire, tail) = reconcile_persisted(core, checkpoint)?;
+        session_from_wire(wire, tail)
     }
 }
 
 /// Validate a decoded wire and rebuild the live session; shared by `from_archive` and
 /// `restore`. The restored session starts with no sink — attach one with
 /// `install_sink` (which pushes a fresh baseline checkpoint).
-fn session_from_wire(wire: archive_wire::SessionArchive) -> Result<Arc<TwoMlsPqSession>> {
+///
+/// `tail` is the blob's v3 append-only section, empty for a restored v2 archive.
+fn session_from_wire(
+    wire: archive_wire::SessionArchive,
+    tail: archive_wire::ArchiveTail,
+) -> Result<Arc<TwoMlsPqSession>> {
     // Structural invariants the live session maintains; reject blobs that violate
     // them rather than resurrecting an impossible state.
     if wire.send_psk_ledger.len() > SEND_PSK_WINDOW {
@@ -645,7 +757,26 @@ fn session_from_wire(wire: archive_wire::SessionArchive) -> Result<Arc<TwoMlsPqS
     for candidate in &staged_candidates {
         candidate.combiner().auth_view().rebind(&auth_core_restored);
     }
-    let pq_inflight = wire.pq_inflight.map(pq_inflight_from_wire).transpose()?;
+    let responder_wire_ct = tail.responder_wire_ct.map(|blob| blob.bytes);
+    // A tail without the round it belongs to is a corrupt archive (the pairing itself is
+    // validated inside `pq_inflight_from_wire`).
+    if responder_wire_ct.is_some() && wire.pq_inflight.is_none() {
+        return Err(TwoMlsPqError::ArchiveInvalid);
+    }
+    let pq_inflight = wire
+        .pq_inflight
+        .map(|w| pq_inflight_from_wire(w, responder_wire_ct))
+        .transpose()?;
+    // The wedge verdict rides beside the torn state it describes, so a restore reproduces
+    // both — see `SessionInner::pq_wedged` for why this one is archived where
+    // `bind_apply_broken` is not. An unknown tag is a forged or corrupt archive.
+    let pq_wedged = match tail.pq_wedged {
+        None => None,
+        Some(0) => Some(PqWedge::Bootstrap),
+        Some(1) => Some(PqWedge::Ratchet),
+        Some(2) => Some(PqWedge::Rekey),
+        Some(_) => return Err(TwoMlsPqError::ArchiveInvalid),
+    };
 
     let group_state = |entry: archive_wire::GroupEntry| apq::CombinerGroupState {
         classical: entry.classical.bytes,
@@ -659,6 +790,35 @@ fn session_from_wire(wire: archive_wire::SessionArchive) -> Result<Arc<TwoMlsPqS
         )?),
         None => None,
     };
+
+    // Round/frame/tail agreement: a parked CT minted in OUR send-classical group always has
+    // its `wire_ct` retained (`pq_ratchet_respond` sets both in one closure), and a v2 restore
+    // — the one legitimate `wire_ct: None` — always parks a PQ-form frame. So a classical
+    // `0x19` paired with an empty tail is unreachable through any honest path; what produces
+    // it is a v3 blob relabelled v2 with its tail stripped (the archive is
+    // attacker-influenceable at rest — see the decode fuzz target). Accepting it would
+    // resurrect a round whose CT can never re-mint: the frame pins to its epoch, the peer's
+    // window moves past it, and nothing but the bind that can no longer happen clears
+    // `Responding` — a delayed, permanent side-band wedge. Fail closed at restore instead.
+    if matches!(
+        pq_inflight,
+        Some(PqInflight::Responding { wire_ct: None, .. })
+    ) {
+        let classical_ct = wire
+            .pending_side_band
+            .as_deref()
+            .and_then(|f| f.split_first())
+            .filter(|(&tag, _)| tag == crate::session::frames::PQ_CT_TAG)
+            .and_then(|(_, mls)| MlsMessage::from_bytes(mls).ok())
+            .and_then(|msg| {
+                msg.group_id()
+                    .map(|id| id == send_group.classical.group_id())
+            })
+            .unwrap_or(false);
+        if classical_ct {
+            return Err(TwoMlsPqError::ArchiveInvalid);
+        }
+    }
 
     // The imports above re-homed every group's captured storage and PSK handles onto
     // `client`, so the plumbing collapses to `client`'s handles exactly as
@@ -709,6 +869,12 @@ fn session_from_wire(wire: archive_wire::SessionArchive) -> Result<Arc<TwoMlsPqS
             // in-memory apply failure, and restoring predates the failed take — so a restore
             // IS the recovery (see `SessionInner::bind_apply_broken`).
             bind_apply_broken: false,
+            // Restored from the tail, in deliberate contrast to `bind_apply_broken` above:
+            // that latch heals here because inbound processing persists on success only, so
+            // the blob predates the failed take. A wedged TRIGGER has no such luck — its
+            // closure persisted the tear on the way out — so the verdict must come back with
+            // it. That contrast is the design, not an inconsistency.
+            pq_wedged,
             // The seal cache is live-only, so a restore restarts any chunking pass with a
             // fresh base — the frames themselves ride the archive, so re-sending resumes.
             pending_side_band: retained_from_wire(wire.pending_side_band),
@@ -778,7 +944,8 @@ impl TwoMlsPqSession {
     /// Restore from a single serialised archive (the legacy whole-blob path). Self-contained:
     /// the archive rebuilds the session's exact client internally.
     pub fn from_archive(archive: Archive) -> Result<Arc<Self>> {
-        session_from_wire(decode_wire(&archive)?)
+        let (wire, tail) = decode_wire(&archive)?;
+        session_from_wire(wire, tail)
     }
 
     /// Serialise the session as one blob. NOT exported — this is the pull model push
@@ -1007,15 +1174,19 @@ fn combiner_kp_from_wire(wire: archive_wire::WireCombinerKp) -> CombinerKeyPacka
     }
 }
 
-/// Encode an archive wire struct to bytes: header `[version][suite pair]` + MLS body. Exact-
-/// size `Zeroizing` prealloc so a growing Vec can't strand unwiped secret copies (the returned
-/// Vec is itself unwiped — the `ArchiveSink` sealing obligation covers it).
+/// Encode an archive wire struct to bytes: header `[version][suite pair]` + MLS body +
+/// [`archive_wire::ArchiveTail`]. Always writes the current version. Exact-size `Zeroizing`
+/// prealloc so a growing Vec can't strand unwiped secret copies (the returned Vec is itself
+/// unwiped — the `ArchiveSink` sealing obligation covers it).
 fn encode_archive(
     suite: &apq::ApqCipherSuite,
     wire: &archive_wire::SessionArchive,
+    tail: &archive_wire::ArchiveTail,
 ) -> Result<Vec<u8>> {
     use mls_rs::mls_rs_codec::{MlsEncode, MlsSize};
-    let mut out = Zeroizing::new(Vec::with_capacity(5 + wire.mls_encoded_len()));
+    let mut out = Zeroizing::new(Vec::with_capacity(
+        5 + wire.mls_encoded_len() + tail.mls_encoded_len(),
+    ));
     out.push(SESSION_ARCHIVE_VERSION);
     // Header suite bytes: the declared suite's wire id (`TwoMlsSuite::to_wire`, the one
     // encoding authority `decode_wire` validates against). The session's stored pair is
@@ -1029,42 +1200,59 @@ fn encode_archive(
     out.extend_from_slice(&crate::suite::TwoMlsSuite::CURRENT.to_wire());
     wire.mls_encode(&mut out)
         .map_err(|_| TwoMlsPqError::ArchiveInvalid)?;
+    tail.mls_encode(&mut out)
+        .map_err(|_| TwoMlsPqError::ArchiveInvalid)?;
     Ok(out.to_vec())
 }
 
 /// Encode the full session (checkpoint): identity + classical + meta + the ML-KEM trees.
 pub(super) fn encode_checkpoint(inner: &mut SessionInner) -> Result<Vec<u8>> {
+    let tail = tail_from(inner);
     let wire = build_archive_wire(inner, true)?;
-    encode_archive(&inner.suite, &wire)
+    encode_archive(&inner.suite, &wire, &tail)
 }
 
 /// Encode the `core` blob: everything except the two ML-KEM ratchet trees.
 pub(super) fn encode_core(inner: &mut SessionInner) -> Result<Vec<u8>> {
+    let tail = tail_from(inner);
     let wire = build_archive_wire(inner, false)?;
-    encode_archive(&inner.suite, &wire)
+    encode_archive(&inner.suite, &wire, &tail)
 }
 
-/// Decode + header-validate a single archive blob into its wire struct.
-fn decode_wire(archive: &Archive) -> Result<archive_wire::SessionArchive> {
+/// Decode + header-validate a single archive blob into its wire struct and v3 tail.
+///
+/// Two layouts are accepted (see the `SESSION_ARCHIVE_VERSION` note): v3, whose body is
+/// followed by an [`archive_wire::ArchiveTail`], and v2, which ends at the body and restores
+/// with an empty tail. Both still require the body to be followed by EXACTLY its version's
+/// remaining bytes, so a truncated or over-long blob fails as before.
+fn decode_wire(
+    archive: &Archive,
+) -> Result<(archive_wire::SessionArchive, archive_wire::ArchiveTail)> {
     use mls_rs::mls_rs_codec::MlsDecode;
     // Header: [version][classical u16 BE][pq u16 BE]. The archived suite pair must be this
     // build's declared suite — fail loudly across builds rather than misinterpret the group
     // snapshots (a recognized `TwoMlsSuite` variant is a coherent APQ pair by construction).
-    let mut rest = match archive.bytes.as_slice() {
-        [SESSION_ARCHIVE_VERSION, s0, s1, s2, s3, rest @ ..]
+    let (version, mut rest) = match archive.bytes.as_slice() {
+        [version @ (SESSION_ARCHIVE_VERSION | SESSION_ARCHIVE_VERSION_V2), s0, s1, s2, s3, rest @ ..]
             if crate::suite::TwoMlsSuite::from_wire([*s0, *s1, *s2, *s3])
                 == Some(crate::suite::TwoMlsSuite::CURRENT) =>
         {
-            rest
+            (*version, rest)
         }
         _ => return Err(TwoMlsPqError::ArchiveInvalid),
     };
     let wire = archive_wire::SessionArchive::mls_decode(&mut rest)
         .map_err(|_| TwoMlsPqError::ArchiveInvalid)?;
+    let tail = if version == SESSION_ARCHIVE_VERSION {
+        archive_wire::ArchiveTail::mls_decode(&mut rest)
+            .map_err(|_| TwoMlsPqError::ArchiveInvalid)?
+    } else {
+        archive_wire::ArchiveTail::empty()
+    };
     if !rest.is_empty() {
         return Err(TwoMlsPqError::ArchiveInvalid);
     }
-    Ok(wire)
+    Ok((wire, tail))
 }
 
 /// Reconcile the two pushed blobs into one wire struct (see `restore`). PQ trees come
@@ -1072,21 +1260,21 @@ fn decode_wire(archive: &Archive) -> Result<archive_wire::SessionArchive> {
 fn reconcile_persisted(
     core: Option<Archive>,
     checkpoint: Option<Archive>,
-) -> Result<archive_wire::SessionArchive> {
+) -> Result<(archive_wire::SessionArchive, archive_wire::ArchiveTail)> {
     let checkpoint = checkpoint.ok_or(TwoMlsPqError::ArchiveInvalid)?;
-    let ck = decode_wire(&checkpoint)?;
-    let core = match core {
+    let (ck, ck_tail) = decode_wire(&checkpoint)?;
+    let (core, core_tail) = match core {
         Some(core) => decode_wire(&core)?,
         // No core: the session only ever checkpointed (or the core was lost) — the checkpoint
         // alone is a complete, consistent state.
-        None => return Ok(ck),
+        None => return Ok((ck, ck_tail)),
     };
     // The checkpoint is at least as new: it already carries everything through its seq. The `>=`
     // (not `>`) is load-bearing: `install_sink` re-pushes a baseline checkpoint at the restored
     // seq WITHOUT bumping, so a checkpoint and a pre-restore core can share a seq — the tie must
     // break toward the checkpoint, which re-encodes the full reconciled state.
     if ck.state_seq >= core.state_seq {
-        return Ok(ck);
+        return Ok((ck, ck_tail));
     }
     // The core is newer. It shares the checkpoint's PQ halves (no PQ op happened since, or
     // there would be a newer checkpoint); validate that and splice them in. A mismatch means a
@@ -1111,5 +1299,8 @@ fn reconcile_persisted(
         // group if a future change ever breaks that monotonicity.
         (None, Some(_)) => return Err(TwoMlsPqError::ArchiveInvalid),
     };
-    Ok(merged)
+    // The tail follows its own blob: `pq_inflight` came from the core (the winner), so its
+    // retained CT must too — pairing the core's round with the checkpoint's tail could
+    // resurrect a CT from a round the core has already moved past.
+    Ok((merged, core_tail))
 }

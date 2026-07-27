@@ -2241,15 +2241,23 @@ public protocol TwoMlsPqSessionProtocol: AnyObject, Sendable {
      * the peer.)
      *
      * Epochs: `Fresh` seals at the epoch CURRENT to each call, so a frame retained across a
-     * ratchet keeps opening for the peer. `Stable` cannot, by construction — the bytes hold
-     * still, so the cached seal keeps the epoch it was first sealed at and the peer opens it
-     * from its retained header-key window. That is roomy for the PQ family (`seal_side_band`
-     * seals under recv-PQ, which advances only when the PEER commits — and applying a peer
-     * commit clears this side's retained frame anyway). It is tighter for the one frame that
-     * takes `seal_side_band`'s classical fallback, the pre-A.3 `BOOTSTRAP_KP`, whose key
-     * tracks the CLASSICAL epoch that ordinary messaging advances: a `Stable` pass over that
-     * frame wants to finish inside the peer's classical header window. `Fresh` has no such
-     * constraint.
+     * ratchet keeps opening for the peer. `Stable` holds the bytes still only while they can
+     * still land: the cache is stamped with its sealing epoch and EXPIRES when that clock
+     * moves (`hand_out`), re-sealing fresh rather than converging on a blob the peer's
+     * window has evicted. A chunking pass therefore restarts — the bytes had to change —
+     * whenever the frame or its seal goes stale under it:
+     *
+     * - a re-mint (`rewrap_side_band`) replaced the frame outright — any send that follows
+     * one of OUR commits, plus (once) the first prepare/send after restoring a v2 round,
+     * which converts its old-form EK whether or not the epoch moved;
+     * - the SEALING clock moved — for the classically-sealed frames (the A.4 legs and the
+     * pre-A.3 `BOOTSTRAP_KP`) that is the recv-classical epoch, which the PEER's commits
+     * advance. This is a different classical clock from the re-mint's (our send epoch), so
+     * neither event implies the other; the stamp is what covers the gap. Roomy for the
+     * A.3/A.5 frames: their recv-PQ seal clock advances only on a peer PQ commit, and
+     * applying one clears this side's retained frame anyway.
+     *
+     * `Fresh` has none of these constraints.
      */
     func pqPendingOutbound(sealing: SideBandSealing)  -> Data?
     
@@ -2268,9 +2276,19 @@ public protocol TwoMlsPqSessionProtocol: AnyObject, Sendable {
      * itself, so the initiator's open is an explicit receipt (see
      * `apq::pq_ratchet::seal_injected_secret`).
      *
-     * The EK arrives as an MLS application message in our recv-PQ mirror; decrypting it (in
-     * the closure) is what authenticates it — a leaf signature AND proof of the current epoch,
-     * so a stolen signing key alone cannot forge an EK we will answer (see `process_a4_leg`).
+     * The EK arrives as an MLS application message in our recv-CLASSICAL mirror; decrypting
+     * it (in the closure) is what authenticates it — a leaf signature AND proof of the
+     * current epoch, so a stolen signing key alone cannot forge an EK we will answer (see
+     * `process_a4_leg`). The CT goes back out in our own SEND-classical group, not the
+     * mirror the EK arrived in: the mirror carries our uncommitted routine `Upd` on any
+     * round we have sent since last applying a peer commit, and
+     * `encrypt_application_message` refuses (`CommitRequired`) while one is cached — a
+     * failure that would land AFTER the EK decrypt consumed its generation and strand the
+     * round for good. Our send group is proposal-free in steady state.
+     *
+     * A PQ-carried EK is a peer whose build predates the classical carriers: dropped here as
+     * a no-op (nothing consumed, no state advanced) rather than answered, so the two forms
+     * never interleave within a round. That peer's own upgrade re-opens the round natively.
      */
     func pqRatchetRespond(ekMsg: Data) throws 
     
@@ -2324,6 +2342,21 @@ public protocol TwoMlsPqSessionProtocol: AnyObject, Sendable {
      * and does not touch the session's principal state.
      */
     func pqRekeyRespond(updMsg: Data) throws  -> ClientId?
+    
+    /**
+     * Whether the PQ side-band is permanently wedged: one of our own binds failed PAST its
+     * point of no return, so every side-band door now answers
+     * [`TwoMlsPqError::BindTriggerFailed`] and the peer waits for a staple that can never be
+     * built. CLASSICAL MESSAGING IS UNAFFECTED — send and receive both keep working, and an
+     * already-reserved bind still discharges.
+     *
+     * Distinct from [`Self::pq_receive_broken`] in direction AND remedy: that one breaks
+     * RECEIVING and heals on restore; this one breaks the SIDE-BAND, survives restore
+     * (`SessionInner::pq_wedged` rides the archive), and needs a new session. Queryable
+     * because A.3's wedge is otherwise invisible — `is_fully_established()` reports true on
+     * a session whose bootstrap never closed.
+     */
+    func pqSideBandWedged()  -> Bool
     
     /**
      * Consume the current round's side-band frame.
@@ -3159,15 +3192,23 @@ open func pqBootstrapRespond(kpMsg: Data)throws   {try rustCallWithError(FfiConv
      * the peer.)
      *
      * Epochs: `Fresh` seals at the epoch CURRENT to each call, so a frame retained across a
-     * ratchet keeps opening for the peer. `Stable` cannot, by construction — the bytes hold
-     * still, so the cached seal keeps the epoch it was first sealed at and the peer opens it
-     * from its retained header-key window. That is roomy for the PQ family (`seal_side_band`
-     * seals under recv-PQ, which advances only when the PEER commits — and applying a peer
-     * commit clears this side's retained frame anyway). It is tighter for the one frame that
-     * takes `seal_side_band`'s classical fallback, the pre-A.3 `BOOTSTRAP_KP`, whose key
-     * tracks the CLASSICAL epoch that ordinary messaging advances: a `Stable` pass over that
-     * frame wants to finish inside the peer's classical header window. `Fresh` has no such
-     * constraint.
+     * ratchet keeps opening for the peer. `Stable` holds the bytes still only while they can
+     * still land: the cache is stamped with its sealing epoch and EXPIRES when that clock
+     * moves (`hand_out`), re-sealing fresh rather than converging on a blob the peer's
+     * window has evicted. A chunking pass therefore restarts — the bytes had to change —
+     * whenever the frame or its seal goes stale under it:
+     *
+     * - a re-mint (`rewrap_side_band`) replaced the frame outright — any send that follows
+     * one of OUR commits, plus (once) the first prepare/send after restoring a v2 round,
+     * which converts its old-form EK whether or not the epoch moved;
+     * - the SEALING clock moved — for the classically-sealed frames (the A.4 legs and the
+     * pre-A.3 `BOOTSTRAP_KP`) that is the recv-classical epoch, which the PEER's commits
+     * advance. This is a different classical clock from the re-mint's (our send epoch), so
+     * neither event implies the other; the stamp is what covers the gap. Roomy for the
+     * A.3/A.5 frames: their recv-PQ seal clock advances only on a peer PQ commit, and
+     * applying one clears this side's retained frame anyway.
+     *
+     * `Fresh` has none of these constraints.
      */
 open func pqPendingOutbound(sealing: SideBandSealing) -> Data?  {
     return try!  FfiConverterOptionData.lift(try! rustCall() {
@@ -3199,9 +3240,19 @@ open func pqRatchetBind(ctMsg: Data)throws   {try rustCallWithError(FfiConverter
      * itself, so the initiator's open is an explicit receipt (see
      * `apq::pq_ratchet::seal_injected_secret`).
      *
-     * The EK arrives as an MLS application message in our recv-PQ mirror; decrypting it (in
-     * the closure) is what authenticates it — a leaf signature AND proof of the current epoch,
-     * so a stolen signing key alone cannot forge an EK we will answer (see `process_a4_leg`).
+     * The EK arrives as an MLS application message in our recv-CLASSICAL mirror; decrypting
+     * it (in the closure) is what authenticates it — a leaf signature AND proof of the
+     * current epoch, so a stolen signing key alone cannot forge an EK we will answer (see
+     * `process_a4_leg`). The CT goes back out in our own SEND-classical group, not the
+     * mirror the EK arrived in: the mirror carries our uncommitted routine `Upd` on any
+     * round we have sent since last applying a peer commit, and
+     * `encrypt_application_message` refuses (`CommitRequired`) while one is cached — a
+     * failure that would land AFTER the EK decrypt consumed its generation and strand the
+     * round for good. Our send group is proposal-free in steady state.
+     *
+     * A PQ-carried EK is a peer whose build predates the classical carriers: dropped here as
+     * a no-op (nothing consumed, no state advanced) rather than answered, so the two forms
+     * never interleave within a round. That peer's own upgrade re-opens the round natively.
      */
 open func pqRatchetRespond(ekMsg: Data)throws   {try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
     uniffi_two_mls_pq_fn_method_twomlspqsession_pq_ratchet_respond(
@@ -3277,6 +3328,27 @@ open func pqRekeyRespond(updMsg: Data)throws  -> ClientId?  {
     uniffi_two_mls_pq_fn_method_twomlspqsession_pq_rekey_respond(
             self.uniffiCloneHandle(),
         FfiConverterData.lower(updMsg),$0
+    )
+})
+}
+    
+    /**
+     * Whether the PQ side-band is permanently wedged: one of our own binds failed PAST its
+     * point of no return, so every side-band door now answers
+     * [`TwoMlsPqError::BindTriggerFailed`] and the peer waits for a staple that can never be
+     * built. CLASSICAL MESSAGING IS UNAFFECTED — send and receive both keep working, and an
+     * already-reserved bind still discharges.
+     *
+     * Distinct from [`Self::pq_receive_broken`] in direction AND remedy: that one breaks
+     * RECEIVING and heals on restore; this one breaks the SIDE-BAND, survives restore
+     * (`SessionInner::pq_wedged` rides the archive), and needs a new session. Queryable
+     * because A.3's wedge is otherwise invisible — `is_fully_established()` reports true on
+     * a session whose bootstrap never closed.
+     */
+open func pqSideBandWedged() -> Bool  {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_two_mls_pq_fn_method_twomlspqsession_pq_side_band_wedged(
+            self.uniffiCloneHandle(),$0
     )
 })
 }
@@ -5518,6 +5590,30 @@ public enum TwoMlsPqError: Swift.Error, Equatable, Hashable, Foundation.Localize
      * `map_app_message_err`.
      */
     case StaleFrame
+    /**
+     * FATAL: a PQ bind TRIGGER failed past its point of no return. The third member of the
+     * family the other two name: [`Self::BindDischargeFailed`] is our classical half
+     * failing, [`Self::BindApplyFailed`] is the peer's staple failing on us, and this is
+     * our own trigger failing — A.3's join, A.4's decapsulation or A.5's applied Commit'
+     * has already landed, so the round's input cannot be rebuilt from anything the peer
+     * can re-send.
+     *
+     * LATCHED and ARCHIVED, unlike its two siblings, and the difference is not a
+     * preference. `BindApplyFailed` may be in-memory because inbound processing persists
+     * on SUCCESS only, so a restore predates the failed take. These triggers run inside
+     * `mutate_and_persist`, which pushes even on `Err` because their partial mutations are
+     * real — so the tear reaches the blob and a restore reproduces it. A verdict that did
+     * not ride beside it would restore a session that reports healthy and deadlocks.
+     *
+     * While set, every PQ side-band door answers this instead of the retriable
+     * `SessionNotReady` — or, at the A.3 door, the `DuplicateSideBand` that would report a
+     * round which never closed as already done. CLASSICAL MESSAGING IS UNAFFECTED: send and
+     * receive both keep working and an already-reserved bind still discharges. Not
+     * reachable from any honest flow (a peer-forced trigger failure is refused in the guard
+     * phase before anything is consumed); route to re-establishment. Queryable via
+     * `pq_side_band_wedged`.
+     */
+    case BindTriggerFailed
 
     
 
@@ -5577,6 +5673,7 @@ public struct FfiConverterTypeTwoMlsPqError: FfiConverterRustBuffer {
         case 28: return .EstablishmentCreatorMismatch
         case 29: return .EstablishmentEnvelopeConflict
         case 30: return .StaleFrame
+        case 31: return .BindTriggerFailed
 
          default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -5707,6 +5804,10 @@ public struct FfiConverterTypeTwoMlsPqError: FfiConverterRustBuffer {
         
         case .StaleFrame:
             writeInt(&buf, Int32(30))
+        
+        
+        case .BindTriggerFailed:
+            writeInt(&buf, Int32(31))
         
         }
     }
@@ -6097,19 +6198,6 @@ public func bindingContractVersion() -> UInt64  {
     )
 })
 }
-/**
- * Derive the session identifier for a pair of clients.
- * Both sides compute the same value from the same inputs regardless of who
- * initiated, allowing CommProtocol to deduplicate concurrent session initiations.
- */
-public func deriveSessionId(myId: ClientId, theirId: ClientId)throws  -> SessionId  {
-    return try  FfiConverterTypeSessionId_lift(try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
-    uniffi_two_mls_pq_fn_func_derive_session_id(
-        FfiConverterTypeClientId_lower(myId),
-        FfiConverterTypeClientId_lower(theirId),$0
-    )
-})
-}
 public func version() -> String  {
     return try!  FfiConverterString.lift(try! rustCall() {
     uniffi_two_mls_pq_fn_func_version($0
@@ -6249,9 +6337,6 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.contractVersionMismatch
     }
     if (uniffi_two_mls_pq_checksum_func_binding_contract_version() != 52582) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_two_mls_pq_checksum_func_derive_session_id() != 62066) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_func_version() != 33499) {
@@ -6440,13 +6525,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_bootstrap_respond() != 45787) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_pending_outbound() != 1918) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_pending_outbound() != 43323) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_ratchet_bind() != 59912) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_ratchet_respond() != 52781) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_ratchet_respond() != 10590) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_receive_broken() != 41138) {
@@ -6456,6 +6541,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_rekey_respond() != 19548) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_side_band_wedged() != 20963) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_pq_take_pending_outbound() != 2145) {

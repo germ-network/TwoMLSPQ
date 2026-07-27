@@ -136,7 +136,21 @@ The receiving side of a published key package — no live client required.
   opaque blob for layers that carry it as a single value.
 - `MlsCipherSuite::is_combiner_pq()` / `is_combiner_classical()` — routing signals (true for
   the PQ `0xFDEA` and classical `0x0003` halves respectively).
-- `derive_session_id(a, b) -> SessionId` — symmetric session identifier for a pair.
+
+`derive_session_id(a, b)` was **removed** in contract 31. A session pins its id at its
+**founding** pair — the invitation identity the initiator addressed — and never moves it
+again, while the client ids themselves do: a principal rotation replaces them, and a
+born-dedicated acceptor never operated under its founding id at all. Re-deriving from the
+ids a caller holds later therefore produced a digest the session did not agree with. There
+is no single replacement, because the call answered two different questions:
+
+- *"What is this session's id?"* — [`active_session_id()`](#twomlspqsession), the stored
+  founding value: identical on both sides, available from construction, preserved across
+  archive restore.
+- *"What is a stable key for this pair, before a session exists?"* — compute your own
+  digest. It was only `SHA-256(min(a,b) ‖ max(a,b))` over two public `ClientId`s, with
+  nothing secret and nothing protocol-specific in it — but do not call the result a session
+  id, since it stops matching the session's the moment either party rotates.
 
 ## `TwoMlsPqSession`
 
@@ -161,7 +175,9 @@ rest by higher `state_seq`) and fails closed (`ArchiveInvalid`) on a PQ-epoch ma
 mismatch.
 
 State: `is_established`, `is_fully_established`, `has_receive_group`,
-`active_session_id`, `receive_group_id`, `my_principal_state`, `their_principal_state`,
+`active_session_id` (the founding-pair id this session was constructed with — since
+contract 31 the only way to obtain it, the free `derive_session_id` having been removed),
+`receive_group_id`, `my_principal_state`, `their_principal_state`,
 `pending_outbound` (the standalone copy of the own welcome — not consumed by
 `encrypt`; the welcome also rides every pre-commit frame as the staple), `epochs`,
 `app_binding() -> Result<Option<Vec<u8>>>` (Swift `try appBinding() -> Data?`; the
@@ -268,13 +284,20 @@ All failures map to the flat `TwoMlsPqError` enum (`Mls`, `InvalidKeyPackage`,
 `EpochDesync`, `UnexpectedWelcome`, `InvalidClientId`, `RemoteIdentityMismatch`,
 `CredentialRejected`, `ApqInfoMismatch`, `AppBindingMismatch`,
 `SinkAlreadyInstalled`, `DuplicateSideBand`, `BootstrapKpMismatch`,
-`BindDischargeFailed`, `BindApplyFailed`, `StaleFrame`).
-mls-rs error types never cross the FFI boundary. The two PQ-bind failures carry
-recovery semantics a caller must branch on: `BindDischargeFailed` is fatal — the classical
-commit discharging an owed bind failed, so the host re-establishes the session — while
-`BindApplyFailed` (paired with the queryable `pq_receive_broken()`) marks receive-side PQ
-state as broken but leaves sending intact, and a restore from the last persisted state
-heals it. `DuplicateSideBand` is a benign no-op (a re-delivered side-band frame);
+`BindDischargeFailed`, `BindApplyFailed`, `StaleFrame`, `BindTriggerFailed`).
+mls-rs error types never cross the FFI boundary. The three PQ-bind failures carry
+recovery semantics a caller must branch on, and they name the three places one bind can
+break. `BindDischargeFailed` is fatal — our classical commit discharging an owed bind
+failed, so the host re-establishes the session. `BindApplyFailed` (paired with the queryable
+`pq_receive_broken()`) is the peer's staple failing on us: it marks receive-side PQ state as
+broken but leaves sending intact, and a restore from the last persisted state heals it.
+`BindTriggerFailed` (paired with the queryable `pq_side_band_wedged()`) is our own trigger
+failing past its point of no return — A.3's join, A.4's decapsulation or A.5's applied
+Commit' had already landed — so the round cannot be rebuilt and re-establishment is the
+exit. It is the one of the three whose latch is ARCHIVED, and deliberately: the bind
+triggers run inside a persist that captures partial mutations even on failure, so the tear
+reaches the blob and a restore would otherwise reproduce it while reporting healthy.
+Classical messaging keeps working under all three. `DuplicateSideBand` is a benign no-op (a re-delivered side-band frame);
 `BootstrapKpMismatch` rejects an A.3 bootstrap key package whose hash does not match the
 commitment `receive` was given. `InvalidClientId` rejects an empty
 principal id supplied to `receive(new_client_id:)` or `prepare_to_encrypt(Some(id))` — empty is

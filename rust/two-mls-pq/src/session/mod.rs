@@ -58,12 +58,17 @@ use crate::providers;
 /// The frame itself rides the archive, so re-sending resumes across a restore either way.
 ///
 /// Epoch note: a cached seal keeps the epoch it was sealed at, where a `Fresh` re-seal
-/// would not. Near-moot for the PQ family (`seal_side_band` seals under recv-PQ, which
-/// advances only when the PEER commits, and applying a peer commit clears the retained
-/// frame anyway; the peer's `recv_pq_header_keys` window covers the rest). The exception is
-/// the one frame taking the classical fallback, the pre-A.3 `BOOTSTRAP_KP`: its key tracks
-/// the CLASSICAL epoch that ordinary messaging advances, so a long `Stable` pass over it
-/// could age past the peer's classical window. `Fresh` never meets this.
+/// would not — so the cache is STAMPED with that epoch and `hand_out` drops it once the
+/// sealing group has moved on, re-sealing fresh rather than re-sending bytes the peer's
+/// window has already evicted. The stamp matters most for the classically-sealed frames
+/// (the A.4 legs and the pre-A.3 `BOOTSTRAP_KP`), whose key tracks the recv-CLASSICAL
+/// epoch: that clock belongs to the PEER's commits, which neither replace this frame nor
+/// trigger a re-mint (`rewrap_side_band` watches our SEND epoch — a different classical
+/// clock), so without the stamp a `Stable` pass spanning a few peer commits would go
+/// permanently unopenable. Near-moot for the PQ family (recv-PQ advances only when the
+/// peer commits, and applying a peer PQ commit clears the retained frame anyway), but the
+/// stamp guards it identically. `Fresh` never meets any of this. A dropped cache mid-pass
+/// means the chunking host restarts from a fresh peek — the bytes had to change.
 /// A PQ commit that has landed, waiting for the classical commit that binds its entropy into
 /// the classical half.
 ///
@@ -122,22 +127,25 @@ enum StapleAction {
 /// so the answer is what replaces or clears the slot — no retirement stamp exists.
 struct RetainedFrame {
     frame: Vec<u8>,
-    seal: Option<Vec<u8>>,
+    /// The `Stable` cache: the sealed bytes plus the sealing group's epoch at seal time
+    /// (`side_band_seal_epoch`) — the stamp `hand_out` checks so a cached seal is never
+    /// re-sent after the peer's window has moved past its key.
+    seal: Option<(u64, Vec<u8>)>,
 }
 
 impl RetainedFrame {
-    /// Retain `frame`, seeding the `Stable` cache with `sealed` — the bytes a `*_begin` is
-    /// about to return to the caller.
+    /// Retain `frame`, seeding the `Stable` cache with `sealed` (stamped `at` the sealing
+    /// epoch) — the bytes a `*_begin` is about to return to the caller.
     ///
     /// The seed is what makes `begin`'s return and a subsequent `Stable` hand-out AGREE.
     /// Without it the first peek re-seals (a fresh nonce), so a chunking host that sent
     /// `begin`'s return and then peeked for the rest of the pass would cut pieces from two
     /// different seals — which reassemble into nothing, silently. `Fresh` hosts are
     /// unaffected: they re-seal per send by definition.
-    fn seeded(frame: Vec<u8>, sealed: &[u8]) -> Self {
+    fn seeded(frame: Vec<u8>, at: u64, sealed: &[u8]) -> Self {
         Self {
             frame,
-            seal: Some(sealed.to_vec()),
+            seal: Some((at, sealed.to_vec())),
         }
     }
 
@@ -275,7 +283,31 @@ struct SessionInner {
     /// heals on restore: reloading the last persisted state predates the failed take. Read
     /// by `pq_receive_broken`; a host decides how fatal that is (see
     /// [`TwoMlsPqError::BindApplyFailed`]).
+    ///
+    /// Its in-memory-ness is a CONSEQUENCE, not a free choice: it holds only because
+    /// `process_incoming_with` persists on success only. A change to that rule silently
+    /// turns the heal-on-restore property into a lie — contrast `pq_wedged`, which rides the
+    /// archive precisely because its closures do not have that property.
     bind_apply_broken: bool,
+    /// Which PQ round failed PAST ITS POINT OF NO RETURN (`past_no_return`), if one has.
+    /// Refuses every PQ side-band door with [`TwoMlsPqError::BindTriggerFailed`] thereafter,
+    /// so a wedged session says so instead of answering the retriable `SessionNotReady` — or,
+    /// at the A.3 door, the `DuplicateSideBand` that reports a round which never closed as
+    /// already done. Read by `pq_side_band_wedged`.
+    ///
+    /// ARCHIVED, and that is the whole difference from `bind_apply_broken` above. These
+    /// triggers run inside `mutate_and_persist`, which pushes even on `Err` because their
+    /// partial mutations are real — a spent application generation, a consumed exporter leaf
+    /// and its watermark, an applied ML-KEM commit and the `owed_bind` reservation it made.
+    /// The tear is therefore IN the blob, and a verdict that did not ride beside it would
+    /// restore a session that reports healthy and deadlocks. Skipping the push instead would
+    /// not help: it does not undo the mutation, it only delays capture, and the very next
+    /// successful push encodes the torn state anyway.
+    ///
+    /// Which round it was does not change the recovery (re-establish) but is the only
+    /// forensic record of which one-shot went, since the state left behind reads as healthy
+    /// from every other angle.
+    pq_wedged: Option<PqWedge>,
     /// Cross-party TwoMLS-PSKs of OUR send group's recent epochs, owned by the session
     /// (destined for the session archive; the mls-rs secret stores are ephemeral plumbing,
     /// filled just-in-time by `inject_send_psks`). The peer binds the PSK of our send
@@ -663,6 +695,50 @@ impl SessionInner {
         Ok(())
     }
 
+    /// Run the tail of a bind that is PAST ITS POINT OF NO RETURN: the round's one-shot
+    /// input is spent, the mutations already made are real and PERSISTED (see
+    /// `mutate_and_persist`, which pushes even on `Err`), and no retry can rebuild the round.
+    /// Any error from `f` is latched into `pq_wedged` and renamed to the fatal
+    /// [`TwoMlsPqError::BindTriggerFailed`].
+    ///
+    /// **Why a helper and not an ordering rule.** "Consume last" is not achievable in these
+    /// three binds: `commit_pq_and_owe_bind` IS the consumption and it is fallible, and
+    /// `record_pq_header_key` needs the very epoch that commit produces. So what a bind can
+    /// promise is not "nothing fallible follows the consume" but "nothing past the consume
+    /// escapes wearing a retriable name" — a property of which closure a line sits in, not of
+    /// where it sits relative to a `take`. A fallible line added to a tail is inside the
+    /// mapping by construction, exactly as `discharge_and_commit` made the send-side window
+    /// structural.
+    ///
+    /// Deliberately scoped to the TAIL, not the whole closure: every bind's prologue — the
+    /// decrypt, the sealed-secret open, the credential-lag refusal — is retriable on purpose,
+    /// and wrapping it would wedge sessions that merely saw a stale or misdirected frame.
+    fn past_no_return<T>(
+        &mut self,
+        round: PqWedge,
+        f: impl FnOnce(&mut SessionInner) -> Result<T>,
+    ) -> Result<T> {
+        match f(self) {
+            Ok(v) => Ok(v),
+            Err(_) => {
+                self.pq_wedged = Some(round);
+                Err(TwoMlsPqError::BindTriggerFailed)
+            }
+        }
+    }
+
+    /// Guard every PQ side-band door with the wedge latch. A round that failed past its point
+    /// of no return left PERSISTED torn state, so there is nothing for a retry to fix and the
+    /// honest answer is the fatal name rather than whatever the state SHAPE would otherwise
+    /// produce — `SessionNotReady` at the A.4/A.5 doors, and at A.3's the `DuplicateSideBand`
+    /// that reports the step as already taken. One helper so the doors cannot drift.
+    fn check_not_wedged(&self) -> Result<()> {
+        match self.pq_wedged {
+            None => Ok(()),
+            Some(_) => Err(TwoMlsPqError::BindTriggerFailed),
+        }
+    }
+
     /// The classical half of the bind, run from the classical committing round that carries
     /// it: export the reserved `apq_psk`, hand back the attestation and PSK for the caller to
     /// fold into the commit it is already building, and yield the PQ commit the frame carries.
@@ -707,17 +783,16 @@ impl SessionInner {
             t_epoch: owed.t_epoch,
             pq_epoch: owed.pq_epoch,
         };
-        // The turn passes HERE, not at the trigger. The round's terminal send is the commit
-        // this discharge rides, and until that exists we may still open the NEXT round — which
-        // is the point of waiting: its `begin` frame parks in `pending_side_band` and rides the
-        // same `EncryptResult` as this bind, so the next round costs no extra trip (both land
-        // before the peer takes a turn).
+        // The turn passes HERE, not at the trigger: it tracks what the peer can observe, and
+        // the round's terminal send is the commit this discharge rides. The window between —
+        // where the spec would allow the NEXT round's non-committing EK to open and share this
+        // `EncryptResult` — is one the session-driven ratchet deliberately does not use:
+        // `maybe_stage_next_round` refuses while a bind is owed, and this discharge both
+        // clears the debt and passes the turn before that gate runs. Rounds therefore
+        // strictly alternate in practice; the receive paths still must not assume it (a
+        // future driver may claim the window — rule 2 only forbids a second COMMIT).
         //
-        // The two rounds are then in flight together but on DIFFERENT paths — this one's bind
-        // in the STAPLE, the next one's EK in the side-band slot — so they never contend, and
-        // each is persisted by its own path's rules.
-        //
-        // Rule 2 is therefore not covered by the turn and is checked explicitly at each bind
+        // Rule 2 is likewise not covered by the turn and is checked explicitly at each bind
         // entry point (`owed_bind.is_some()`).
         self.pq_turn_mine = false;
         Ok(Some((owed.pq_commit, apq_psk, attestation)))
@@ -848,6 +923,13 @@ impl SessionInner {
 
     /// Seal the retained side-band frame for hand-out, filling its `Stable` cache on a
     /// miss. `None` when the slot is empty (the quiescent case — nothing to re-send).
+    ///
+    /// A `Stable` hit is honoured only while the sealing group still sits at the epoch the
+    /// cache was stamped with. Once it moves — the peer committed, for the classically-sealed
+    /// frames — the cached bytes are sealed under a key leaving the peer's window, and
+    /// serving them "stably" would converge on a blob the peer can never open. Re-seal fresh
+    /// instead: the chunking pass restarts, which a host must already tolerate (a restore
+    /// does the same), and the alternative is not a completed pass but a dead one.
     fn hand_out(&mut self, sealing: SideBandSealing) -> Option<Vec<u8>> {
         // Lift the frame out before sealing: `seal_side_band` borrows the whole inner, so
         // it cannot run while a slot borrow is live.
@@ -855,13 +937,16 @@ impl SessionInner {
             let retained = self.pending_side_band.as_ref()?;
             (retained.frame.clone(), retained.seal.clone())
         };
-        if let (SideBandSealing::Stable, Some(sealed)) = (sealing, cached) {
-            return Some(sealed);
+        let epoch_now = self.side_band_seal_epoch(&frame);
+        if let (SideBandSealing::Stable, Some((at, sealed))) = (sealing, cached) {
+            if epoch_now == Some(at) {
+                return Some(sealed);
+            }
         }
         let sealed = self.seal_side_band(&frame).ok()?;
         if matches!(sealing, SideBandSealing::Stable) {
-            if let Some(retained) = self.pending_side_band.as_mut() {
-                retained.seal = Some(sealed.clone());
+            if let (Some(at), Some(retained)) = (epoch_now, self.pending_side_band.as_mut()) {
+                retained.seal = Some((at, sealed.clone()));
             }
         }
         Some(sealed)
@@ -1178,6 +1263,7 @@ fn build_session(
             // Not written to any blob — a restore lands before any failed take (see the
             // field), so it always starts clear.
             bind_apply_broken: false,
+            pq_wedged: None,
             last_cross_injected_pq: None,
             last_send_pq_exported: None,
             listen_rendezvous: BTreeMap::new(),
@@ -1438,7 +1524,7 @@ impl TwoMlsPqSession {
         validate_combiner_kp(client.combiner().cipher_suite(), &their_key_package)?;
         let their_parsed = parse_mls_key_package(their_key_package.classical.clone())?;
         let their_id = their_parsed.client_id;
-        let session_id = crate::derive_session_id(client.client_id(), their_id.clone())?;
+        let session_id = crate::pair_session_id(client.client_id(), their_id.clone());
 
         let (send_group, apq_welcome) = create_combiner_send_group(
             &their_key_package.classical,
@@ -1616,7 +1702,7 @@ impl TwoMlsPqSession {
         // The session id derives from the FOUNDING pair — the invitation identity the
         // peer initiated toward — never the dedicated principal, so both sides compute
         // the same value (the initiator derives it from the key package it addressed).
-        let session_id = crate::derive_session_id(client.client_id(), their_id.clone())?;
+        let session_id = crate::pair_session_id(client.client_id(), their_id.clone());
 
         // Decode the incoming welcome once; validate its cipher suite(s) before joining, so a
         // mismatch fails early and clearly rather than deep inside mls-rs — then join the

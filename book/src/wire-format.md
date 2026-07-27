@@ -17,8 +17,8 @@ HPKE plaintext (see "The §A.1 envelope" below).
 | `ESTABLISHMENT_HANDOFF_TAG` | `0x0B` | Born-dedicated establishment staple: `[0x0B][u32-LE len][signed handoff blob][u32-LE len][APQWelcome_A]` — wraps the *unmodified* welcome next to the acceptor's opaque host-signed delegation. A message-path staple form (rides the `0x03` staple slot and standalone delivery), but banded here because it exists only during establishment |
 | `PQ_BOOTSTRAP_KP_TAG` | `0x13` | Bootstrap: PQ key package for the deferred send-group half |
 | `PQ_BOOTSTRAP_WELCOME_TAG` | `0x15` | Bootstrap: the new PQ group's Welcome (PQ-groups-only; no classical commit) |
-| `PQ_EK_TAG` | `0x17` | PQ ratchet: the ML-KEM encapsulation key, carried as an **MLS application message** in the initiator's send-PQ group — `[0x17][MLSMessage]`, the message's authenticated content being `[0x17][ek]`. MLS then authenticates the leg by leaf signature **and** current-epoch proof (see below) |
-| `PQ_CT_TAG` | `0x19` | PQ ratchet: the ML-KEM ciphertext **plus** the AEAD-sealed injected secret (`[u32-LE enc_len][enc][sealed]`, not a bare KEM ciphertext — the seal makes ML-KEM implicit rejection an explicit failure), likewise carried as an MLS application message: `[0x19][MLSMessage]`, content `[0x19][enc ∥ sealed]` |
+| `PQ_EK_TAG` | `0x17` | PQ ratchet: the ML-KEM encapsulation key, carried as an **MLS application message** in the sender's **send-classical** group — `[0x17][MLSMessage]`, the message's authenticated content being `[0x17][ek]`. MLS then authenticates the leg by leaf signature **and** current-epoch proof (see below) |
+| `PQ_CT_TAG` | `0x19` | PQ ratchet: the ML-KEM ciphertext **plus** the AEAD-sealed injected secret (`[u32-LE enc_len][enc][sealed]`, not a bare KEM ciphertext — the seal makes ML-KEM implicit rejection an explicit failure), likewise an MLS application message in **its own** sender's send-classical group: `[0x19][MLSMessage]`, content `[0x19][enc ∥ sealed]` |
 | `PQ_REKEY_UPD_TAG` | `0x1B` | PQ re-key: initiator's `Upd'` proposal |
 | `PQ_REKEY_COMMIT_TAG` | `0x1D` | PQ re-key: the responder's `Commit'` |
 
@@ -27,15 +27,71 @@ There is no bind tag: a round's closing bind is the **message-frame staple** (th
 its round's next leg.
 
 **Why the A.4 legs are MLS messages, not bare bytes.** Wrapping the EK and CT as MLS
-application messages in the initiator's send-PQ group (rather than shipping the raw key
-bytes) is what gives each leg the same two-factor authentication MLS gives every member
-message: a **leaf signature** and proof of the **current epoch's** secrets (the receive
-ratchet won't decrypt without them). Following the MLS convention of signature, this closes a post-compromise gap the bare frame had:
-a stolen signing key **alone** can no longer forge a leg the peer will act on, because the
+application messages (rather than shipping the raw key bytes) is what gives each leg the same
+two-factor authentication MLS gives every member message: a **leaf signature** and proof of
+the **current epoch's** secrets (the receive ratchet won't decrypt without them). Following
+the MLS convention of signature, this closes a post-compromise gap the bare frame had: a
+stolen signing key **alone** can no longer forge a leg the peer will act on, because the
 attacker also lacks the current epoch secrets once a round they missed has healed the group.
 The seal over the injected secret is unchanged and still does its own job (the explicit
 receipt); the MLS framing is purely the authentication layer. See
 [Protocol Flows §A.4](./protocol-flows.md) and `pq_ops::process_a4_leg`.
+
+**Why the CLASSICAL group carries them.** Both factors are *fresher* there. The classical
+leaf signature and epoch secrets heal on every round and pick up a principal rotation the
+moment it is canonicalized, while a send-PQ leaf lags until an A.5 catch-up — so the same
+two-factor argument simply binds to more recent key material. Nothing is traded away in
+strength: MLS cipher suites are monolithic and **both halves sign Ed25519** (the PQ suite is
+confidentiality-only — see [Cipher Suites](./cipher-suites.md)), so the signature factor is
+classical either way, and the classical epoch secrets are *hybrid* (ML-KEM-seeded via the APQ
+PSK). Under an ML-KEM break the classical carrier keeps both factors where the PQ carrier
+kept only the signature. The round's binding to the PQ group is untouched: `ct_seal_psk` is
+still a PQ-group exporter, keyed into the seal over `S`.
+
+Each leg rides **its own sender's send-classical group** — the EK the initiator's, the CT the
+responder's — not one shared group as the PQ form used. The responder must not mint its CT in
+the mirror the EK arrived in: that mirror routinely holds its own uncommitted `Upd`, and
+mls-rs refuses to encrypt while a by-ref proposal is cached (`CommitRequired`) — a failure
+that would land *after* the EK decrypt consumed its generation and strand the round.
+
+**The cost, and what pays it.** A classical-carried leg is encrypted at the epoch it was
+minted at, and ordinary traffic advances that epoch — past the peer's retention window within
+a few commits. So a leg is **re-minted** at the current epoch whenever the carrying group has
+moved (`pq_ops::rewrap_side_band`, driven from the send path), instead of being pinned for
+re-send the way the PQ form could be (`pq_epoch` cannot move mid-round). What survives a stall
+is therefore the *round*, not a leg's bytes: a blob captured before a burst of commits stops
+opening, exactly as a message frame from that moment does. A leg that arrives *ahead* of the
+commit for its epoch is the ordinary retriable case, healed by the staple's re-send.
+
+**The epoch floor that re-minting requires.** One logical leg now exists as several valid
+wraps, and MLS keeps the keys of generations it *skipped* so they can still arrive out of
+order — so a superseded wrap redelivered late (a push relay handing over a second copy, not an
+attack) would still decrypt, where a replay of the wrap actually consumed would not. Answering
+one after its round closed would park a responder against an ephemeral the initiator has
+already discarded, and since only a bind clears that state and only a clear state opens a
+round, both sides would stop ratcheting for good. Both receive paths therefore reject, before
+decrypting, a classical-carried leg whose epoch is **strictly below** the receiver's current
+classical epoch. The bound is exact rather than heuristic: reaching epoch E proves the sender
+committed E, and that commit's own send re-minted the live leg to E, so anything below E is
+superseded or replayed by construction. Legs *ahead* of the receiver stay retriable, as
+before, and the legacy PQ-carried CT below is exempt — it has no re-minting and the epoch it
+sits at cannot move mid-round.
+
+**Receiving the older form.** A `0x19` minted in the PQ group still binds: a peer that opened
+its round before this change can only re-send the CT bytes it parked (the payload is
+MLS-encrypted to us, so it cannot rebuild them), and refusing it would strand an otherwise
+completable round. `pq_ratchet_bind` therefore routes on the leg's `group_id`. The respond
+path is single-form — a PQ-carried `0x17` is dropped, non-fatally and without consuming
+anything — so the two forms never interleave within a round.
+
+**An old-form EK is migrated, not answered.** The asymmetry above would strand the other
+half of the compatibility problem — a round restored from an older archive holds a PQ-form EK
+no upgraded peer will answer — so the first send after such a restore *converts* it, re-minting
+the classical form from the ephemeral the round still holds. That trades a window against a
+not-yet-upgraded peer for one against an upgraded peer, which is the right way round: the
+first is permanent once both sides upgrade, the second heals the moment the peer does. Only
+the EK is convertible; a retained CT is encrypted to its peer and stays in the form it was
+minted in, which is why the bind keeps the dual-form arm.
 
 **Length prefix & padding (inside the seal).** These tagged frames are the AEAD *plaintext*; the
 symmetric header seal wraps each as `[u32-LE frame_len][frame][optional zero padding]` (see

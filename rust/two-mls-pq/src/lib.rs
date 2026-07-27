@@ -391,7 +391,64 @@ pub fn version() -> String {
 // WITHIN a round, so a leg re-delivered from a closed round reaches that decrypt, and a frame
 // a host could not open must never be answered with `fatal` — which asks it to discard the
 // session. No wire or FFI signature change.
-const BINDING_CONTRACT_VERSION: u64 = 28;
+//
+// v29 (2026-07-27): the A.4 legs move from the send-PQ group to each sender's own
+// send-CLASSICAL group (EK in the initiator's, CT in the responder's — not the mirror the EK
+// arrived in, whose cached `Upd` would block the encrypt after the EK's generation was spent),
+// sealed under the classical header family. Both factors are fresher there (the classical leaf
+// and epoch secrets heal every round, where a send-PQ leaf waits for A.5) at no loss of
+// strength — both halves sign Ed25519 — and the round stays bound to the PQ group through
+// `ct_seal_psk`. A classical-carried leg is pinned to the epoch it was minted at, which
+// ordinary traffic advances, so an unanswered leg is RE-MINTED at the current epoch on each
+// send (`rewrap_side_band`); without that a stalled round would wedge permanently. That makes
+// one logical leg several valid wraps, and mls-rs keeps the keys of SKIPPED generations, so a
+// superseded wrap redelivered late still decrypts where a replay of the consumed one does not
+// — both receive paths therefore reject, pre-decrypt, any leg strictly below the receiver's
+// classical epoch (`StaleFrame`), which is exact: reaching epoch E proves the sender committed
+// E and that commit re-minted the live leg to E. Opening and ANSWERING a round are now
+// classical-only mutations (the PQ half is read once, through the repeatable `ct_seal_psk`
+// exporter), so neither pushes a `Checkpoint` any more — only the bind, which commits the PQ
+// half, still does.
+// WIRE-BREAKING for the A.4 side-band, with a deliberate compatibility tail: `pq_ratchet_bind`
+// still accepts a PQ-carried CT (all a migrated pre-v29 responder can re-send — the payload is
+// MLS-encrypted to the peer and cannot be rebuilt), while `pq_ratchet_respond` accepts only
+// the classical form and DROPS a PQ-carried EK non-fatally, so the two forms never interleave
+// in a round. An old-form EK is instead MIGRATED: the first send after restoring such a round
+// re-mints it classical from the ephemeral it still holds, trading a window against a 0.14
+// peer (transient — it heals when that peer upgrades) for one against an upgraded peer
+// (permanent, since both ends upgrading is the end state). Archive layout bumps to v3, which
+// for the first time still ACCEPTS v2 (see `SESSION_ARCHIVE_VERSION`): 0.14 shipped to real
+// sessions, and the migration is what keeps them alive. No FFI signature or error-variant
+// change.
+// v30 (2026-07-27): a PQ bind can no longer be wedged by proposal residue, and can no longer
+// fail silently past its point of no return. A cached by-ref proposal in our send-PQ dooms
+// every bind commit on that half (`apq::rules` refuses an Update co-riding the AppDataUpdate
+// attestation), and mls-rs caches one inside `process_incoming_message` — before the A.4 leg
+// door inspects the message kind — so the peer could park one through a door that answers a
+// benign, retriable error, then let the next bind tear itself apart with the round's one-shot
+// input already spent and `mutate_and_persist` writing the tear to the blob. The three bind
+// entry points now refuse that in the GUARD phase (retriable, nothing consumed) and the two
+// admitting doors drop what they refuse. Past the point of no return, where no guard can
+// help, the three triggers latch `BindTriggerFailed` (appended) — ARCHIVED, unlike
+// `BindApplyFailed`, because these closures persist their partial mutations by design —
+// queryable via `pq_side_band_wedged()`, with classical messaging unaffected. The A.3/A.5
+// responder's S is now derived BEFORE the round is consumed, so a failed re-export is a
+// no-op the peer's next re-staple retries. Archive layout stays v3 (unpublished), gaining one
+// tail field.
+//
+// v31: `derive_session_id` is REMOVED from the FFI surface. A session pins its id at its
+// FOUNDING pair for life, while the ids a caller holds move on (a rotation replaces them; a
+// born-dedicated acceptor never operated under its founding id), so re-deriving produced a
+// digest the session did not agree with. Deprecating it would only have invited a
+// substitution that is not value-preserving — the replacement depends on which question was
+// being asked: `TwoMlsPqSession::active_session_id` for THIS SESSION's id, or a digest the
+// caller computes itself for a pre-session pair key (it is SHA-256 over two sorted public
+// ClientIds — nothing secret, and never the session id once either party rotates). The
+// derivation survives crate-internally as `pair_session_id`, called only by the
+// constructors. Removing an exported function drops its FFI symbol, so the vendored binding
+// must be re-paired with the binary; nothing else in the surface, the wire, or the error
+// variants moves.
+const BINDING_CONTRACT_VERSION: u64 = 31;
 
 /// See `BINDING_CONTRACT_VERSION`. Exported so the Swift layer can verify the
 /// binding it was generated with matches the binary it loaded.
@@ -919,13 +976,36 @@ pub enum TwoMlsPqError {
     /// `InvalidLeafConsumption`); everything else it refuses on stays `DecryptionFailed`,
     /// including the epoch misses that cannot be told apart from a frame arriving early — see
     /// `map_app_message_err`.
+    #[error("frame's message key was already consumed")]
+    StaleFrame,
+    /// FATAL: a PQ bind TRIGGER failed past its point of no return. The third member of the
+    /// family the other two name: [`Self::BindDischargeFailed`] is our classical half
+    /// failing, [`Self::BindApplyFailed`] is the peer's staple failing on us, and this is
+    /// our own trigger failing — A.3's join, A.4's decapsulation or A.5's applied Commit'
+    /// has already landed, so the round's input cannot be rebuilt from anything the peer
+    /// can re-send.
+    ///
+    /// LATCHED and ARCHIVED, unlike its two siblings, and the difference is not a
+    /// preference. `BindApplyFailed` may be in-memory because inbound processing persists
+    /// on SUCCESS only, so a restore predates the failed take. These triggers run inside
+    /// `mutate_and_persist`, which pushes even on `Err` because their partial mutations are
+    /// real — so the tear reaches the blob and a restore reproduces it. A verdict that did
+    /// not ride beside it would restore a session that reports healthy and deadlocks.
+    ///
+    /// While set, every PQ side-band door answers this instead of the retriable
+    /// `SessionNotReady` — or, at the A.3 door, the `DuplicateSideBand` that would report a
+    /// round which never closed as already done. CLASSICAL MESSAGING IS UNAFFECTED: send and
+    /// receive both keep working and an already-reserved bind still discharges. Not
+    /// reachable from any honest flow (a peer-forced trigger failure is refused in the guard
+    /// phase before anything is consumed); route to re-establishment. Queryable via
+    /// `pq_side_band_wedged`.
     //
     // Deliberately the LAST variant: uniffi numbers error cases by position, so appending
     // keeps every prior variant's ordinal stable. Keep appending future variants here (the
     // contract bump already forces binding/binary pairing, but there is no reason to
     // renumber the survivors).
-    #[error("frame's message key was already consumed")]
-    StaleFrame,
+    #[error("PQ bind trigger failed past its point of no return; re-establish")]
+    BindTriggerFailed,
 }
 
 /// The protocol digest over `bytes` — the single hashing primitive behind every
@@ -939,11 +1019,17 @@ pub(crate) fn sha256(bytes: &[u8]) -> Vec<u8> {
     crate::suite::TwoMlsSuite::CURRENT.digest(bytes)
 }
 
-/// Derive the session identifier for a pair of clients.
-/// Both sides compute the same value from the same inputs regardless of who
-/// initiated, allowing CommProtocol to deduplicate concurrent session initiations.
-#[uniffi::export]
-pub fn derive_session_id(my_id: ClientId, their_id: ClientId) -> Result<SessionId> {
+/// The symmetric pair digest behind a session's id: both sides compute the same value
+/// from the same two client ids regardless of who initiated.
+///
+/// Crate-internal, and staying that way. The constructors call it with the **founding**
+/// pair — the invitation identity the initiator addressed — which is the only pair for
+/// which the result means anything: the session pins that value for life, while the ids
+/// themselves move on (a principal rotation replaces them, and a born-dedicated acceptor
+/// never operated under its founding id at all). A caller re-deriving from the ids it
+/// holds later would get a digest the session does not agree with, which is why this is
+/// not exported; `TwoMlsPqSession::active_session_id` reads the stored value instead.
+pub(crate) fn pair_session_id(my_id: ClientId, their_id: ClientId) -> SessionId {
     let (first, second) = if my_id.bytes <= their_id.bytes {
         (my_id.bytes, their_id.bytes)
     } else {
@@ -953,9 +1039,9 @@ pub fn derive_session_id(my_id: ClientId, their_id: ClientId) -> Result<SessionI
     let mut input = first;
     input.extend_from_slice(&second);
 
-    Ok(SessionId {
+    SessionId {
         bytes: sha256(&input),
-    })
+    }
 }
 
 impl From<mls_rs::error::MlsError> for TwoMlsPqError {
@@ -993,25 +1079,23 @@ mod tests {
     }
 
     #[test]
-    fn test_derive_session_id_is_symmetric() -> Result<()> {
+    fn test_pair_session_id_is_symmetric() {
         let alice = client_id(b"alice");
         let bob = client_id(b"bob");
         assert_eq!(
-            derive_session_id(alice.clone(), bob.clone())?.bytes,
-            derive_session_id(bob, alice)?.bytes
+            pair_session_id(alice.clone(), bob.clone()).bytes,
+            pair_session_id(bob, alice).bytes
         );
-        Ok(())
     }
 
     #[test]
-    fn test_derive_session_id_differs_for_different_pairs() -> Result<()> {
+    fn test_pair_session_id_differs_for_different_pairs() {
         let alice = client_id(b"alice");
         let bob = client_id(b"bob");
         let carol = client_id(b"carol");
         assert_ne!(
-            derive_session_id(alice.clone(), bob)?.bytes,
-            derive_session_id(alice, carol)?.bytes
+            pair_session_id(alice.clone(), bob).bytes,
+            pair_session_id(alice, carol).bytes
         );
-        Ok(())
     }
 }

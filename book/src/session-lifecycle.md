@@ -72,7 +72,9 @@ frame rides that send's re-staple peek (`pq_pending_outbound`), so the host's ro
   exported APQ-PSK into the classical half in the same round. Opened automatically by the
   turn-holder's next send (no host call): it auto-stages the initiator's ML-KEM encapsulation
   key (`0x17`); the responder answers with its ciphertext plus the AEAD-sealed injected secret
-  (`0x19`), and the closing bind rides the next message frame's staple.
+  (`0x19`), and the closing bind rides the next message frame's staple. Both legs are MLS
+  application messages in their own sender's **classical** send group — the entropy they carry
+  is PQ, the transport that authenticates them is not (see [Wire Format](./wire-format.md)).
 - **PQ re-key** (`0x1B`/`0x1D`, then a stapled bind) — updatePath commits run on the two
   send groups' PQ halves **alone**, so the classical ratchet is never blocked behind a large
   ML-KEM updatePath. It is not a host call either: the session opens it in place of an A.4 when

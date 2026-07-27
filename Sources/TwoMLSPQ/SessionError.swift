@@ -102,6 +102,20 @@ public struct SessionError: Error, Sendable {
 		/// forever. Not reachable from any honest flow (it takes an internal MLS failure
 		/// mid-commit). The session's PQ binding is permanently broken — route to re-establishment.
 		case bindDischargeFailed
+		/// One of our own bind TRIGGERS failed past its point of no return: A.3's join, A.4's
+		/// decapsulation or A.5's applied Commit' had already landed, so the round cannot be
+		/// rebuilt from anything the peer can re-send, and the half-applied state was PERSISTED.
+		/// Every further PQ side-band call refuses with this code. Not reachable from any honest
+		/// flow (a peer-forced trigger failure is refused before anything is consumed).
+		///
+		/// CLASSICAL MESSAGING IS UNAFFECTED — send and receive both keep working, and an
+		/// already-reserved bind still discharges — so this is not a reason to drop frames. But
+		/// unlike `bindApplyFailed` there is NO recoverable spool and no heal: restoring does not
+		/// clear it, because the verdict was archived beside the torn state it describes.
+		/// Re-establishment is the only exit. Poll `isSideBandWedged` to detect it without
+		/// waiting to trip over the error — worth doing because A.3's wedge otherwise looks
+		/// healthy (`isFullyEstablished` still reports true).
+		case bindTriggerFailed
 		/// The AS rejected a credential succession — authorize the fresh proposal (`queueProposal`)
 		/// and reprocess.
 		case credentialRejected
@@ -182,9 +196,11 @@ public struct SessionError: Error, Sendable {
 				// A.3 KP′ not matching the signed commitment: drop the bad frame, the session is
 				// intact and the genuine re-stapled KP′ still works.
 				return .discardFrame
-			case .epochDesync, .bindDischargeFailed:
+			case .epochDesync, .bindDischargeFailed, .bindTriggerFailed:
 				// The crate words this "re-establish the session" too; the recovery is
-				// out-of-session (tear down and re-exchange).
+				// out-of-session (tear down and re-exchange). `bindTriggerFailed` belongs here
+				// and NOT with `bindApplyFailed`'s `.retryLater`: there is no poisoned window of
+				// recoverable frames to spool, and no restore that heals it.
 				return .reestablish
 			case .bindApplyFailed:
 				// Custody: the poisoned window's frames are recoverable after the restore — never

@@ -558,12 +558,12 @@ sequenceDiagram
     participant Alice
     participant Bob
 
-    Note over Alice,Bob: Alice is initiator → operates on her send group (ASG).<br/>Lightweight KEM EK/CT exchange injects fresh PQ entropy S without a PQ updatePath.
+    Note over Alice,Bob: Alice is initiator → operates on her send group (ASG).<br/>Lightweight KEM EK/CT exchange injects fresh PQ entropy S without a PQ updatePath.<br/>The legs travel as app messages in each sender's own CLASSICAL send group — fresher<br/>authentication — while S stays bound to [ASG-PQ] through the seal below.
 
     Alice-)Alice: Generate fresh PQ EK, DK
-    Alice-)Bob: PQ EK (fresh encapsulation key) — an MLS application message in [ASG-PQ], as a dedicated side-band frame.<br/>Bob authenticates it (Alice's leaf signature AND current-epoch proof) by DECRYPTING it before responding
+    Alice-)Bob: PQ EK (fresh encapsulation key) — an MLS application message in [ASG-cl], as a dedicated side-band frame.<br/>Bob authenticates it (Alice's leaf signature AND current-epoch proof) by DECRYPTING it before responding
     Bob-)Bob: Pick a fresh random S, encapsulate to EK, and SEAL S under a key bound to the KEM shared<br/>secret + a repeatable export of [ASG-PQ] at its current epoch → [enc][sealed S]
-    Bob-)Alice: [enc][sealed S] — likewise an MLS application message in [ASG-PQ], as a dedicated side-band frame<br/>(Bob's leaf signature and epoch proof authenticate the CT the same way)
+    Bob-)Alice: [enc][sealed S] — an MLS application message in Bob's OWN send group [BSG-cl], as a dedicated<br/>side-band frame (his leaf signature and epoch proof authenticate the CT the same way).<br/>Not Alice's group — his mirror of it holds his uncommitted Upd, which would block the encrypt
     Alice-)Alice: Open S — the AEAD tag is the explicit receipt: a stale or misdirected ciphertext fails HERE,<br/>with EK/DK and her PQ leaf intact (ML-KEM decapsulation alone returns garbage, not an error)
 
     Alice-)Alice: [ASG-PQ] PSK=S + Commit' (no updatePath — PARTIAL, so it stays small) → pq_epoch++<br/>(psk_id carries the 0x52 injected-secret domain byte)
@@ -579,8 +579,8 @@ sequenceDiagram
 ```
 
 **Authenticating the legs (MLS signatures, not a ratcheted MAC).** Each leg — the EK and the
-CT — travels as an **MLS application message** in the initiator's send-PQ group, not as raw
-key bytes. Decrypting a leg is therefore what authenticates it, with MLS's two factors: the
+CT — travels as an **MLS application message** in its own sender's send-classical group, not
+as raw key bytes. Decrypting a leg is therefore what authenticates it, with MLS's two factors: the
 sender's **leaf signature** and proof of the group's **current epoch** (the receive ratchet
 will not decrypt without the epoch secrets). Two properties follow that a bare frame lacked:
 
@@ -595,9 +595,29 @@ will not decrypt without the epoch secrets). Two properties follow that a bare f
   signature-less EK created). The `pq_inflight` guard, checked before the mutating decrypt, is
   what keeps a re-sent leg idempotent — a replayed application frame does not re-decrypt.
 
-Framing the legs this way costs the initiator one extra **`Checkpoint`** when it stages a
-round (the EK advances the send-PQ application ratchet, state the `Core` push omits), and the
-seal over `S` is unchanged — it still provides the explicit receipt below.
+**Why the classical group carries them.** Both factors heal *faster* there: the classical
+leaf and epoch secrets rotate every round and adopt a principal rotation as soon as it is
+canonicalized, while a send-PQ leaf lags until an A.5 catch-up. Nothing is given up in
+strength — both halves sign Ed25519 (the PQ suite is confidentiality-only), so the signature
+factor is classical either way, and the classical epoch secrets are ML-KEM-seeded through the
+APQ PSK. The round's tie to [ASG-PQ] is unaffected: the seal over `S` is keyed by a repeatable
+export of that group, so a CT answering a different group or epoch still fails its open. Each
+leg rides its own sender's group because the responder cannot mint into the mirror the EK
+arrived in — that mirror holds its uncommitted `Upd`, and mls-rs refuses to encrypt while a
+by-ref proposal is cached, which would strand the round with the EK already spent.
+
+The cost is that a leg's ciphertext is pinned to the classical epoch it was minted at, an
+epoch ordinary traffic advances — so an unanswered leg is **re-minted** at the current epoch
+on each send (`rewrap_side_band`). What survives a stall is the round, not the bytes. That
+re-minting is also why both receive paths reject a leg whose epoch is *below* the receiver's:
+one leg now exists as several valid wraps, and answering a superseded one after its round had
+closed would park a responder against an ephemeral the initiator has already discarded.
+
+In exchange, opening and answering a round are purely classical mutations — the PQ half is
+read once, through the repeatable exporter that keys the seal — so neither costs the
+**`Checkpoint`** the send-PQ form needed (`Core` already carries them); only the bind, which
+commits the PQ half, still checkpoints. The seal over `S` is unchanged — it still provides
+the explicit receipt below.
 
 **Why the PQ half cannot wait, and the classical half must.** `apq_psk` is exported from the PQ
 group's POST-commit epoch, so the classical commit cannot even be built until the PQ one has
