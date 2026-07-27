@@ -2134,13 +2134,16 @@ fn test_pq_ratchet_bind_guarded_while_commit_staged() {
 
 /// A cached by-ref proposal in our send-PQ is fatal to every BIND commit on that half: a
 /// bind's PQ commit carries the -02 `AppDataUpdate` attestation, and `apq::rules` rejects
-/// any Update co-riding it. mls-rs files a by-ref proposal into the cache inside
-/// `process_incoming_message` — BEFORE `process_a4_leg` gets to reject the message KIND —
-/// so the legacy `0x19` door lets the sole counterparty park one with a plain, well-formed
-/// MLS message and no forgery at all. Left there it would be folded into the next bind and
-/// fail it past the point where the A.4 ephemeral is already spent, with
-/// `mutate_and_persist` writing the tear to the blob. So the refusal must drop what it
-/// admitted.
+/// any Update co-riding it. The legacy `0x19` door would let the sole counterparty park one
+/// with a plain, well-formed MLS message and no forgery at all; left there it would be
+/// folded into the next bind and fail it past the point where the A.4 ephemeral is already
+/// spent, with `mutate_and_persist` writing the tear to the blob.
+///
+/// Two lines of defense now stand in that order, and this pins both effects at once:
+/// `process_a4_leg`'s content-type gate refuses a non-application message BEFORE
+/// `process_incoming_message` can cache anything (a peer-supplied frame, so
+/// `DecryptionFailed`, never `Mls`), and the legacy arm's cache-drop backstops every
+/// refusal that does reach the ingest. Either way the bind below must find nothing to fold.
 #[test]
 fn test_a_peer_proposal_smuggled_into_the_send_pq_leaves_no_cached_residue() {
     let (alice, bob) = establish_full();
@@ -2161,7 +2164,7 @@ fn test_a_peer_proposal_smuggled_into_the_send_pq_leaves_no_cached_residue() {
     };
     let mut frame = vec![super::PQ_CT_TAG];
     frame.extend_from_slice(&assert_ok!(poison.to_bytes()));
-    assert_err!(bob.pq_ratchet_bind(frame), TwoMlsPqError::Mls);
+    assert_err!(bob.pq_ratchet_bind(frame), TwoMlsPqError::DecryptionFailed);
 
     // The refusal left nothing behind for the bind below to fold.
     {
@@ -7870,6 +7873,74 @@ fn test_dropped_bind_heals_on_restaple() {
         b"healing"
     );
     assert!(alice.my_pq_turn(), "the re-stapled bind closed the round");
+}
+
+/// A leg's routing tag is chosen by the SENDER, so anything can arrive behind it. What must
+/// never happen is answering such a frame with `Mls`: that code carries the `fatal`
+/// disposition — "our own state may be inconsistent, discard the session" — which hands a peer
+/// a session teardown for the cost of one misrouted leg. This pins the refusal as a
+/// frame-level one, with nothing staged and no epoch moved.
+///
+/// Scope, honestly — revised for the classical carriers, which moved the goalposts without
+/// quite putting this commit through them. The injected Commit is now for the RIGHT group
+/// (the peer's send-classical is exactly the group the EK door decrypts in) and it passes
+/// every guard-phase check — carrier match on group id, epoch floor. But THIS commit still
+/// dies inside mls-rs without applying: its by-value PSK only resolves behind the staple
+/// arm's `inject_send_psks`, which this door never runs. So the test pins the refusal's
+/// SHAPE — frame-level, neither epoch of either half moved (the recv-classical epoch is read
+/// directly, since `epochs()` reports the send group), nothing staged, and never `Mls` — and
+/// `process_a4_leg`'s content-type gate stands as defense in depth for the commits that
+/// WOULD apply, e.g. one carrying no PSK at all (a routine round with no new peer entropy
+/// to bind). Verified by mutation that the gate alone is not what this test exercises.
+#[test]
+fn test_non_application_leg_is_refused_with_the_group_untouched() {
+    let (alice, bob) = establish_full();
+
+    // Bob opens a round, so Alice sits as a responder with an empty in-flight slot: the
+    // guard phase passes and the frame reaches the decrypt this test is about.
+    let _ek = open_ratchet(&bob, &alice);
+    let before = alice.epochs();
+    let recv_epoch = |s: &Arc<TwoMlsPqSession>| {
+        let inner = s.lock();
+        assert_some!(inner
+            .recv_group
+            .as_ref()
+            .map(|g| g.classical.current_epoch()))
+    };
+    let recv_before = recv_epoch(&alice);
+
+    // A real Commit — lifted from a message frame's staple — wearing the EK tag.
+    assert_ok!(alice.prepare_to_encrypt(None));
+    let from_alice = assert_ok!(alice.encrypt(b"per-round".to_vec()));
+    let res = assert_some!(assert_ok!(bob.process_incoming(from_alice.cipher_text)));
+    assert_ok!(bob.queue_proposal(assert_some!(res.proposal).digest));
+    assert!(assert_ok!(bob.prepare_to_encrypt(None)).did_commit);
+    let committed = assert_ok!(bob.encrypt(b"committed".to_vec())).cipher_text;
+    let commit_mls = frame_staple(&alice, &committed);
+    assert_eq!(commit_mls.first(), Some(&0x00), "staple is an MLSMessage");
+
+    let mut forged = vec![super::PQ_EK_TAG];
+    forged.extend_from_slice(&commit_mls);
+
+    assert_err!(
+        alice.pq_ratchet_respond(forged),
+        TwoMlsPqError::DecryptionFailed
+    );
+    let after = alice.epochs();
+    assert_eq!(
+        (after.pq_epoch, after.classical_epoch),
+        (before.pq_epoch, before.classical_epoch),
+        "a refused leg must not have moved either send-group epoch"
+    );
+    assert_eq!(
+        recv_epoch(&alice),
+        recv_before,
+        "nor the recv-classical epoch — the group this door actually decrypts in"
+    );
+    assert!(
+        alice.pq_take_pending_outbound().is_none(),
+        "and must not have staged a response"
+    );
 }
 
 /// Re-sends make duplicates steady-state traffic, not an edge case: a retained frame
