@@ -297,6 +297,10 @@ fn test_archive_mid_a3_window_completes_after_restore() {
 /// delegation are byte-transparent — decoding an archive body and re-encoding it reproduces
 /// the exact bytes, for both an initiator (secret present) and an acceptor (commitment
 /// present). Varint decode enforces minimal encoding, so this pins the wire layout unchanged.
+///
+/// Since v3 the body is followed by an `ArchiveTail`, so the round trip covers both parts —
+/// and the split point it asserts is what makes the v2 migration work: a v2 blob is byte-wise
+/// this same body with nothing after it.
 #[test]
 fn test_archive_reencode_is_byte_identical() {
     use mls_rs::mls_rs_codec::{MlsDecode, MlsEncode};
@@ -307,8 +311,11 @@ fn test_archive_reencode_is_byte_identical() {
         let body = &archive.bytes[5..];
         let mut rest = body;
         let wire = assert_ok!(super::archive_wire::SessionArchive::mls_decode(&mut rest));
+        let tail = assert_ok!(super::archive_wire::ArchiveTail::mls_decode(&mut rest));
+        assert!(rest.is_empty(), "body + tail must consume the whole blob");
         let mut reencoded = Vec::new();
         assert_ok!(wire.mls_encode(&mut reencoded));
+        assert_ok!(tail.mls_encode(&mut reencoded));
         assert_eq!(reencoded.as_slice(), body);
     }
 }
@@ -321,7 +328,7 @@ fn test_archive_reencode_is_byte_identical() {
 fn test_session_archive_version_is_pinned() {
     let (alice, _bob) = establish_sessions();
     let archive = assert_ok!(alice.archive());
-    assert_eq!(archive.bytes[0], 2);
+    assert_eq!(archive.bytes[0], 3);
 }
 
 /// The pre-committed bootstrap KP carries the FROZEN establishment credential. Enough
@@ -708,14 +715,19 @@ fn test_never_approving_app_still_discharges_its_bind() {
 fn test_unlicensed_discharge_waits_for_evidence() {
     let (alice, bob) = establish_full();
 
-    // Bob commits, and Alice's answering frame is deliberately never delivered — so Bob has
-    // no evidence she applied it.
+    // Bob commits. Alice APPLIES the commit but never answers, so Bob holds no evidence:
+    // the license is her offer in a frame HE receives, and no such frame exists. (She must
+    // apply it — Bob's A.4 EK below is an application message at his post-commit epoch, so a
+    // peer still behind that commit could not decrypt it. That is the ordinary
+    // frame-overtakes-its-commit case, retriable and healed by the staple's re-send; it is
+    // not what this test is about.)
     assert_ok!(alice.prepare_to_encrypt(None));
     let upd = assert_ok!(alice.encrypt(b"upd".to_vec()));
     let got = assert_some!(assert_ok!(bob.process_incoming(upd.cipher_text)));
     assert_ok!(bob.queue_proposal(assert_some!(got.proposal).digest));
     assert!(assert_ok!(bob.prepare_to_encrypt(None)).did_commit);
-    drop(assert_ok!(bob.encrypt(b"committed".to_vec()))); // never delivered
+    let committed = assert_ok!(bob.encrypt(b"committed".to_vec()));
+    assert_some!(assert_ok!(alice.process_incoming(committed.cipher_text)));
 
     // Bob binds, then tries to discharge with nothing licensing him.
     let ek = assert_some!(bob.pq_pending_outbound(SideBandSealing::Fresh));
@@ -1816,11 +1828,14 @@ fn test_failed_bind_apply_breaks_receive_not_send_and_heals_on_restore() {
     {
         let mut inner = alice.lock();
         assert!(
-            matches!(inner.pq_inflight, Some(super::PqInflight::Responding(_))),
+            matches!(
+                inner.pq_inflight,
+                Some(super::PqInflight::Responding { .. })
+            ),
             "Alice should hold S as the A.4 responder"
         );
-        if let Some(super::PqInflight::Responding(s)) = inner.pq_inflight.as_mut() {
-            s[0] ^= 0xFF;
+        if let Some(super::PqInflight::Responding { secret, .. }) = inner.pq_inflight.as_mut() {
+            secret[0] ^= 0xFF;
         }
     }
 
@@ -2057,6 +2072,41 @@ fn test_pq_ratchet_turn_flips_to_responder() {
     ratchet_round(&alice, &bob, b"a1");
     assert!(bob.my_pq_turn());
     assert!(!alice.my_pq_turn());
+}
+
+/// The RESPOND path carries the same staple hazard as the binds, now that its CT is an
+/// application message in the responder's own send-classical group: a prepared-but-unsent
+/// commit is holding the staple slot, and minting the CT under it would put the leg at an
+/// epoch the peer can only reach by applying the commit that has not shipped. Guarded before
+/// the EK decrypt, so the refusal consumes nothing and the retry is a true no-op — which is
+/// what stops an unlucky ordering from stranding the round with the EK's generation spent.
+#[test]
+fn test_pq_ratchet_respond_guarded_while_commit_staged() {
+    let (alice, bob) = establish_full();
+    let ek = open_ratchet(&bob, &alice);
+
+    // Alice prepares a round of her own before answering the EK.
+    assert_ok!(alice.prepare_to_encrypt(None));
+    assert_err!(
+        alice.pq_ratchet_respond(ek.clone()),
+        TwoMlsPqError::SessionNotReady
+    );
+    {
+        let inner = alice.lock();
+        assert!(
+            inner.pq_inflight.is_none(),
+            "the refusal must not have opened the round"
+        );
+    }
+
+    // Retriable, and nothing was consumed: once her round's encrypt has gone out, the very
+    // same EK is answered and the round completes.
+    let enc = assert_ok!(alice.encrypt(b"round".to_vec()));
+    assert_some!(assert_ok!(bob.process_incoming(enc.cipher_text)));
+    assert_ok!(alice.pq_ratchet_respond(ek));
+    let ct = assert_some!(alice.pq_take_pending_outbound());
+    assert_ok!(bob.pq_ratchet_bind(ct));
+    discharge_bind(&bob, &alice, b"after-guarded-respond");
 }
 
 #[test]
@@ -3255,6 +3305,478 @@ fn test_archive_mid_a4_as_responder_completes_after_restore() {
     message_round(&restored_alice, &bob_session, b"classical-after-jump");
 }
 
+/// Restore a v2 (0.14) archive holding a mid-A.4 `Initiating` round and finish it against an
+/// UPGRADED peer. The parked EK comes back in the old PQ form, which no upgraded peer will
+/// answer (`pq_ratchet_respond` is single-form), so the migration has to convert it: the first
+/// send after the restore re-mints it into the classical form from the ephemeral the round
+/// still holds. Without that conversion the initiator re-sends a form the peer drops forever
+/// while the peer waits for one she never sends — a permanent side-band wedge in the state
+/// every upgraded pair ends up in.
+#[test]
+fn test_v2_archive_with_an_initiating_round_migrates_and_completes() {
+    use mls_rs::mls_rs_codec::{MlsDecode, MlsEncode};
+
+    let (alice, bob) = establish_full();
+    // Alice takes the turn and opens a round.
+    ratchet_round(&bob, &alice, b"flip");
+    assert_ok!(alice.prepare_to_encrypt(None));
+    let opener = assert_ok!(alice.encrypt(b"open".to_vec()));
+    assert_some!(assert_ok!(bob.process_incoming(opener.cipher_text)));
+
+    // Rewrite her parked EK into the PQ form a 0.14 build would have minted — same payload
+    // from the same ephemeral, carried in her send-PQ group instead of her send-classical.
+    {
+        let mut inner = alice.lock();
+        let ek = assert_some!(match &inner.pq_inflight {
+            Some(super::PqInflight::Initiating(eph)) => Some(eph.encapsulation_key()),
+            _ => None,
+        });
+        let send_pq = assert_some!(inner.send_group.as_mut().and_then(|g| g.pq.as_mut()));
+        let mls = assert_ok!(send_pq
+            .encrypt_application_message(&[&[super::PQ_EK_TAG][..], &ek].concat(), Vec::new()));
+        let mut frame = vec![super::PQ_EK_TAG];
+        frame.extend_from_slice(&assert_ok!(mls.to_bytes()));
+        inner.pending_side_band = Some(super::RetainedFrame::unsealed(frame));
+    }
+
+    // Archive that state as a v2 blob (body, no tail, older version byte) and restore it.
+    let v3 = assert_ok!(alice.archive()).bytes;
+    let v2 = {
+        let mut rest = &v3[5..];
+        let body = assert_ok!(super::archive_wire::SessionArchive::mls_decode(&mut rest));
+        let mut out = v3[..5].to_vec();
+        out[0] = 2;
+        assert_ok!(body.mls_encode(&mut out));
+        out
+    };
+    let restored = assert_ok!(TwoMlsPqSession::from_archive(crate::Archive { bytes: v2 }));
+
+    // The restored EK is still old-form, so the upgraded peer discards it — the wedge.
+    let old_form = assert_some!(restored.pq_pending_outbound(SideBandSealing::Fresh));
+    assert_err!(bob.pq_ratchet_respond(old_form), TwoMlsPqError::StaleFrame);
+
+    // One ordinary send migrates it. The peer answers the converted leg and the round closes,
+    // which is what keeps a 0.14 session alive across the upgrade.
+    assert_ok!(restored.prepare_to_encrypt(None));
+    let msg = assert_ok!(restored.encrypt(b"post-restore".to_vec()));
+    assert_some!(assert_ok!(bob.process_incoming(msg.cipher_text)));
+
+    let migrated = assert_some!(restored.pq_pending_outbound(SideBandSealing::Fresh));
+    assert_ok!(bob.pq_ratchet_respond(migrated));
+    let ct = assert_some!(bob.pq_take_pending_outbound());
+    assert_ok!(restored.pq_ratchet_bind(ct));
+    discharge_bind(&restored, &bob, b"after-v2-initiating-migration");
+    message_round(&restored, &bob, b"classical-after-migration");
+}
+
+/// Restore a v2 (0.14) archive holding a mid-A.4 `Responding` round and finish the round.
+/// This is the migration the 0.14 compatibility floor requires, and the reason the v3 tail is
+/// append-only: a v2 blob is byte-wise a v3 blob minus that tail, which is how it can be
+/// synthesized here — strip the tail, stamp the older version byte — and how the real thing
+/// decodes. The restored round comes back with `wire_ct: None` (a v2 round's CT rode the PQ
+/// group, which cannot change epoch mid-round, so it never re-wraps) and still applies the
+/// initiator's stapled bind, which is what keeps the session alive across the upgrade.
+///
+/// Fidelity matters here: a genuine 0.14 archive parks a PQ-form CT, so the fixture rewrites
+/// the parked frame into that form before downgrading. Downgrading a native archive as-is —
+/// classical frame, tail stripped — is byte-wise indistinguishable from tampering and is
+/// exactly what the restore-time cross-check rejects (see the downgrade test above).
+#[test]
+fn test_v2_archive_with_a_responding_round_restores_and_completes() {
+    use mls_rs::mls_rs_codec::{MlsDecode, MlsEncode};
+
+    let (alice, bob) = establish_full();
+    // Bob opens (he holds the turn after the bootstrap); Alice responds and holds S.
+    let ek = open_ratchet(&bob, &alice);
+    assert_ok!(alice.pq_ratchet_respond(ek));
+
+    // Rewrite her parked CT into the PQ form a 0.14 build minted — the same retained payload,
+    // carried as an application message in her recv-PQ mirror of Bob's send-PQ group.
+    {
+        let mut inner = alice.lock();
+        let payload = assert_some!(match &inner.pq_inflight {
+            Some(super::PqInflight::Responding {
+                wire_ct: Some(ct), ..
+            }) => Some(ct.clone()),
+            _ => None,
+        });
+        let recv_pq = assert_some!(inner.recv_group.as_mut().and_then(|g| g.pq.as_mut()));
+        let mls = assert_ok!(recv_pq.encrypt_application_message(
+            &[&[super::PQ_CT_TAG][..], &payload].concat(),
+            Vec::new()
+        ));
+        let mut frame = vec![super::PQ_CT_TAG];
+        frame.extend_from_slice(&assert_ok!(mls.to_bytes()));
+        inner.pending_side_band = Some(super::RetainedFrame::unsealed(frame));
+    }
+    let ct = assert_some!(alice.pq_pending_outbound(SideBandSealing::Fresh));
+
+    // Alice's current archive, rewritten into the v2 layout: same header suite bytes, same
+    // body, no tail, version 2.
+    let v3 = assert_ok!(alice.archive()).bytes;
+    let v2 = {
+        let mut rest = &v3[5..];
+        let body = assert_ok!(super::archive_wire::SessionArchive::mls_decode(&mut rest));
+        let mut out = v3[..5].to_vec();
+        out[0] = 2;
+        assert_ok!(body.mls_encode(&mut out));
+        out
+    };
+    let restored = assert_ok!(TwoMlsPqSession::from_archive(crate::Archive { bytes: v2 }));
+    {
+        let inner = restored.lock();
+        assert!(
+            matches!(
+                inner.pq_inflight,
+                Some(super::PqInflight::Responding { wire_ct: None, .. })
+            ),
+            "a v2 round restores holding S with no re-wrap source"
+        );
+    }
+
+    // The round closes against the restored session: Bob binds the CT Alice had already
+    // emitted, and the restored Alice applies his stapled bind.
+    assert_ok!(bob.pq_ratchet_bind(ct));
+    discharge_bind(&bob, &restored, b"after-v2-migration");
+    message_round(&restored, &bob, b"classical-after-v2-migration");
+}
+
+/// A `Stable` cache must not outlive its sealing epoch — the two-clock hazard.
+///
+/// An A.4 leg's outer seal hangs off the RECV-classical epoch, which the PEER's commits
+/// advance; the re-mint (`rewrap_side_band`) watches our SEND epoch, a different classical
+/// clock. So a peer that keeps committing while we never do moves the seal clock without ever
+/// replacing the frame, and an unstamped `Stable` cache would keep serving a blob sealed
+/// under a key drifting out of the peer's window — a `Stable` host re-sending dead bytes
+/// indefinitely. The stamp makes the cache expire with its epoch instead: the next peek
+/// re-seals fresh, and the peer opens it.
+#[test]
+fn test_stable_seal_expires_when_the_peer_moves_the_seal_clock() {
+    let (alice, bob) = establish_full();
+    // Flip the turn to Alice, then she opens a round; her EK parks, and a Stable peek fills
+    // the cache.
+    ratchet_round(&bob, &alice, b"flip");
+    let _ = open_ratchet(&alice, &bob);
+    let stable1 = assert_some!(alice.pq_pending_outbound(SideBandSealing::Stable));
+    assert_eq!(
+        stable1,
+        assert_some!(alice.pq_pending_outbound(SideBandSealing::Stable)),
+        "a Stable peek holds still while the seal clock does"
+    );
+
+    // BOB commits (folding Alice's routine Upd) — the seal clock moves, Alice's own send
+    // epoch does not, so the frame is not re-minted and only the stamp can save the cache.
+    assert_ok!(alice.prepare_to_encrypt(None));
+    let a = assert_ok!(alice.encrypt(b"upd".to_vec()));
+    let ra = assert_some!(assert_ok!(bob.process_incoming(a.cipher_text)));
+    assert_ok!(bob.queue_proposal(assert_some!(ra.proposal).digest));
+    assert!(assert_ok!(bob.prepare_to_encrypt(None)).did_commit);
+    let bc = assert_ok!(bob.encrypt(b"commit".to_vec()));
+    assert_some!(assert_ok!(alice.process_incoming(bc.cipher_text)));
+
+    // The cache expired with its epoch: the next Stable peek is a fresh seal, and — the part
+    // that matters — Bob can open it, where the stale bytes would eventually outlive his
+    // window entirely.
+    let stable2 = assert_some!(alice.pq_pending_outbound(SideBandSealing::Stable));
+    assert_ne!(
+        stable1, stable2,
+        "the Stable cache must be dropped when the sealing epoch moves"
+    );
+    assert_eq!(
+        assert_some!(assert_ok!(bob.open_incoming(stable2.clone()))).kind,
+        super::OpenedFrameKind::PqSideBand {
+            kind: super::PqFrameKind::RatchetEphemeralKey
+        }
+    );
+    // And the round is still whole: the re-sealed leg answers and the round closes.
+    assert_ok!(bob.pq_ratchet_respond(stable2));
+    let ct = assert_some!(bob.pq_take_pending_outbound());
+    assert_ok!(alice.pq_ratchet_bind(ct));
+    discharge_bind(&alice, &bob, b"after-stable-expiry");
+}
+
+/// A v3 blob relabelled v2 with its tail stripped must fail restore, not silently migrate.
+///
+/// The archive is attacker-influenceable at rest (the decode fuzz target's stated threat
+/// model), and this exact tamper is otherwise the one that decodes into a DIFFERENT valid
+/// state rather than an error: a native `Responding { wire_ct: Some }` comes back as the
+/// migrated `{ wire_ct: None }`, whose parked classical CT can then never re-mint — a
+/// delayed, permanent side-band wedge once the peer's window moves past its epoch. The
+/// restore-time cross-check makes it fail closed instead: a classical-carried `0x19` paired
+/// with an empty tail is unreachable through any honest path (`pq_ratchet_respond` sets frame
+/// and `wire_ct` in one closure; a v2 restore always parks a PQ-form frame).
+#[test]
+fn test_downgraded_v3_archive_with_responding_round_fails_closed() {
+    use mls_rs::mls_rs_codec::{MlsDecode, MlsEncode};
+
+    let (alice, bob) = establish_full();
+    let ek = open_ratchet(&bob, &alice);
+    assert_ok!(alice.pq_ratchet_respond(ek));
+
+    // The tamper: same body, version byte lowered, tail dropped.
+    let v3 = assert_ok!(alice.archive()).bytes;
+    let downgraded = {
+        let mut rest = &v3[5..];
+        let body = assert_ok!(super::archive_wire::SessionArchive::mls_decode(&mut rest));
+        let mut out = v3[..5].to_vec();
+        out[0] = 2;
+        assert_ok!(body.mls_encode(&mut out));
+        out
+    };
+    assert_err!(
+        TwoMlsPqSession::from_archive(crate::Archive { bytes: downgraded }),
+        TwoMlsPqError::ArchiveInvalid
+    );
+}
+
+/// The bind path stays DUAL-FORM: a CT minted in the PQ group — all a migrated 0.14
+/// responder can re-send, since its payload is MLS-encrypted to us and cannot be rebuilt —
+/// still binds. This is the one legacy tail the change keeps, and it is what stops such a
+/// round from stranding. (The round's own binding is unchanged either way: `ct_seal_psk` is a
+/// PQ-group exporter in both forms.)
+#[test]
+fn test_legacy_pq_carried_ct_still_binds() {
+    let (alice, bob) = establish_full();
+    // Alice takes the turn, then opens a round and holds the ephemeral.
+    ratchet_round(&bob, &alice, b"flip");
+    let ek_payload = {
+        assert_ok!(alice.prepare_to_encrypt(None));
+        let opener = assert_ok!(alice.encrypt(b"open".to_vec()));
+        assert_ok!(bob.process_incoming(opener.cipher_text));
+        let inner = alice.lock();
+        assert_some!(match &inner.pq_inflight {
+            Some(super::PqInflight::Initiating(eph)) => Some(eph.encapsulation_key()),
+            _ => None,
+        })
+    };
+
+    // Bob answers the way a pre-change build did: seal S under the SAME PQ-group-derived
+    // psk, then carry it as an application message in his recv-PQ mirror (= Alice's send-PQ).
+    let (secret, wire_ct) = {
+        let inner = bob.lock();
+        let recv_pq = assert_some!(inner.recv_group.as_ref().and_then(|g| g.pq.as_ref()));
+        let psk = assert_ok!(super::ct_seal_psk(recv_pq));
+        assert_ok!(apq::pq_ratchet::seal_injected_secret(
+            &assert_ok!(crate::providers::pq_kem()),
+            &assert_ok!(crate::providers::header_aead_suite()),
+            &ek_payload,
+            &psk,
+        ))
+    };
+    {
+        let mut inner = bob.lock();
+        let recv_pq = assert_some!(inner.recv_group.as_mut().and_then(|g| g.pq.as_mut()));
+        let mls = assert_ok!(recv_pq.encrypt_application_message(
+            &[&[super::PQ_CT_TAG][..], &wire_ct].concat(),
+            Vec::new()
+        ));
+        // Bob's state after answering, exactly as a v2 archive restores it: the round holds S
+        // with no re-wrap source, and the old-form frame is parked for re-send.
+        inner.pq_inflight = Some(super::PqInflight::Responding {
+            secret,
+            wire_ct: None,
+        });
+        let mut frame = vec![super::PQ_CT_TAG];
+        frame.extend_from_slice(&assert_ok!(mls.to_bytes()));
+        inner.pending_side_band = Some(super::RetainedFrame::unsealed(frame));
+    }
+
+    // Emit it the way a real send does, through the seal — which routes a PQ-carried leg to
+    // the PQ family, as the build that minted it did. Alice opens it from the matching window,
+    // classifies it, binds it through the PQ arm, and the round closes normally.
+    let legacy_ct = assert_some!(bob.pq_pending_outbound(SideBandSealing::Fresh));
+    assert_eq!(
+        assert_some!(assert_ok!(alice.open_incoming(legacy_ct.clone()))).kind,
+        super::OpenedFrameKind::PqSideBand {
+            kind: super::PqFrameKind::RatchetCiphertext
+        }
+    );
+    assert_ok!(alice.pq_ratchet_bind(legacy_ct));
+    discharge_bind(&alice, &bob, b"legacy-ct-round");
+    message_round(&alice, &bob, b"classical-after-legacy-round");
+}
+
+/// OPENING an A.4 pushes only a `Core`, and that `Core` is sufficient — the initiator-side
+/// mirror of the test below, and the sharper of the two: the round's decapsulation key exists
+/// nowhere but `pq_inflight`, so if the cheaper blob failed to carry it the round could never
+/// be bound and no retry would rebuild it. Staging is classical now (the EK is an application
+/// message in the send-classical group), which is why `maybe_stage_next_round` no longer asks
+/// its caller for the follow-up `Checkpoint`.
+#[test]
+fn test_a4_open_pushes_core_only_and_restores_from_it() {
+    let (alice, bob) = establish_full();
+    // Give Alice the turn so her next send opens the round.
+    ratchet_round(&bob, &alice, b"flip");
+
+    // Baseline checkpoint BEFORE the round exists, so the restore has to rebuild the round —
+    // ephemeral included — from the Core alone.
+    let sink = Arc::new(RecordingSink::default());
+    assert_ok!(alice.install_sink(sink.clone()));
+    let baseline = sink.kinds().len();
+
+    assert_ok!(alice.prepare_to_encrypt(None));
+    let opener = assert_ok!(alice.encrypt(b"open".to_vec()));
+    assert_some!(assert_ok!(bob.process_incoming(opener.cipher_text)));
+
+    let pushed = sink.kinds();
+    assert!(
+        pushed[baseline..]
+            .iter()
+            .all(|k| *k == crate::BlobKind::Core),
+        "opening an A.4 must not push a Checkpoint: {:?}",
+        &pushed[baseline..]
+    );
+
+    // Restore from that Core against the pre-round checkpoint and drive the round to the end.
+    let restored = assert_ok!(TwoMlsPqSession::restore(
+        sink.latest(crate::BlobKind::Core),
+        sink.latest(crate::BlobKind::Checkpoint),
+    ));
+    let ek = assert_some!(restored.pq_pending_outbound(SideBandSealing::Fresh));
+    assert_ok!(bob.pq_ratchet_respond(ek));
+    let ct = assert_some!(bob.pq_take_pending_outbound());
+    assert_ok!(restored.pq_ratchet_bind(ct));
+    discharge_bind(&restored, &bob, b"core-only-open");
+    message_round(&restored, &bob, b"classical-after-core-only-open");
+}
+
+/// Answering an A.4 pushes only a `Core`, and that `Core` is sufficient.
+///
+/// With the legs on the classical carrier the respond path touches no ML-KEM tree: it decrypts
+/// the EK in the recv-classical mirror, mints the CT in the send-classical group, and reads the
+/// PQ half exactly once through `ct_seal_psk` — the repeatable exporter, which consumes no
+/// leaf. So it sheds the full `Checkpoint` (both ratchet trees) it used to serialize. This
+/// pins BOTH halves of that claim, since the saving is only sound if the cheaper blob really
+/// carries the round: no `Checkpoint` is pushed, and restoring from that `Core` against the
+/// pre-round baseline checkpoint yields a session that still closes the round.
+#[test]
+fn test_a4_respond_pushes_core_only_and_restores_from_it() {
+    let (alice, bob) = establish_full();
+
+    // Baseline checkpoint, taken BEFORE the round opens — so the restore below is forced to
+    // reconstruct everything the respond did from the `Core` alone.
+    let sink = Arc::new(RecordingSink::default());
+    assert_ok!(alice.install_sink(sink.clone()));
+    let baseline = sink.kinds().len();
+
+    let ek = open_ratchet(&bob, &alice);
+    assert_ok!(alice.pq_ratchet_respond(ek));
+
+    let pushed = sink.kinds();
+    assert!(
+        pushed[baseline..]
+            .iter()
+            .all(|k| *k == crate::BlobKind::Core),
+        "answering an A.4 must not push a Checkpoint: {:?}",
+        &pushed[baseline..]
+    );
+
+    // Restore from that Core plus the pre-round checkpoint, and finish the round.
+    let restored = assert_ok!(TwoMlsPqSession::restore(
+        sink.latest(crate::BlobKind::Core),
+        sink.latest(crate::BlobKind::Checkpoint),
+    ));
+    let ct = assert_some!(restored.pq_pending_outbound(SideBandSealing::Fresh));
+    assert_ok!(bob.pq_ratchet_bind(ct));
+    discharge_bind(&bob, &restored, b"core-only-respond");
+    message_round(&restored, &bob, b"classical-after-core-only");
+}
+
+/// A SUPERSEDED wrap redelivered after the round closed must not open a phantom round.
+///
+/// This is the hazard re-wrapping introduces and the epoch floor exists to close. One logical
+/// EK becomes several valid wraps at different epochs, and mls-rs caches the keys of
+/// generations it skipped — so unlike a replay of the wrap actually consumed (which dies as
+/// `StaleFrame` on a spent generation), an earlier wrap still DECRYPTS when it turns up late.
+/// A push relay handing over a second copy is designed-in traffic, not an attack.
+///
+/// Without the floor the late wrap sails through the empty-`pq_inflight` gate and parks
+/// `Responding` against an ephemeral the initiator discarded when she bound: she drops the
+/// answering CT (her turn is spent), nothing but a bind clears `Responding`, and round-opening
+/// is gated on it being clear — both sides wedge for the session's lifetime. Exactly the
+/// permanent desync the whole design is meant to make impossible.
+#[test]
+fn test_superseded_ek_wrap_redelivered_after_close_is_discarded() {
+    let (alice, bob) = establish_full();
+    // Alice takes the turn and opens a round; capture that FIRST wrap.
+    ratchet_round(&bob, &alice, b"flip");
+    let early_wrap = open_ratchet(&alice, &bob);
+
+    // Alice commits (folding Bob's offered Upd), which advances her send-classical epoch and
+    // re-mints the parked EK — so `early_wrap` is now superseded but still well-formed.
+    let offer = {
+        assert_ok!(bob.prepare_to_encrypt(None));
+        let b = assert_ok!(bob.encrypt(b"offer".to_vec()));
+        assert_some!(assert_ok!(alice.process_incoming(b.cipher_text)))
+    };
+    assert_ok!(alice.queue_proposal(assert_some!(offer.proposal).digest));
+    assert!(assert_ok!(alice.prepare_to_encrypt(None)).did_commit);
+    let committed = assert_ok!(alice.encrypt(b"commit".to_vec()));
+    assert_some!(assert_ok!(bob.process_incoming(committed.cipher_text)));
+
+    // The round completes on the re-minted wrap, and closing it discards Alice's ephemeral.
+    let live_wrap = assert_some!(alice.pq_pending_outbound(SideBandSealing::Fresh));
+    assert_ne!(
+        early_wrap, live_wrap,
+        "the commit should have re-minted the EK"
+    );
+    assert_ok!(bob.pq_ratchet_respond(live_wrap));
+    let ct = assert_some!(bob.pq_take_pending_outbound());
+    assert_ok!(alice.pq_ratchet_bind(ct));
+    discharge_bind(&alice, &bob, b"closed");
+
+    // Now the stale copy arrives. It must be discarded outright — never answered.
+    assert_err!(
+        bob.pq_ratchet_respond(early_wrap),
+        TwoMlsPqError::StaleFrame
+    );
+    assert!(
+        bob.lock().pq_inflight.is_none(),
+        "a superseded wrap must not open a round against a discarded ephemeral"
+    );
+
+    // Proof the side-band is still alive on both sides: the turn is Bob's, and his round runs
+    // to completion. (Before the floor, this is where both parties deadlocked forever.)
+    assert!(bob.my_pq_turn());
+    ratchet_round(&bob, &alice, b"side-band-still-live");
+}
+
+/// The RESPOND path, by contrast, is single-form: a PQ-carried EK (a peer whose build
+/// predates the classical carriers) is discarded rather than answered, so the two forms never
+/// interleave inside a round. The discard must be non-fatal and must consume nothing — the
+/// session stays fully usable, and the peer's own upgrade re-opens the round natively.
+#[test]
+fn test_legacy_pq_carried_ek_is_dropped_without_answering() {
+    let (alice, bob) = establish_full();
+    ratchet_round(&bob, &alice, b"flip");
+
+    // A well-formed EK in the PQ group, the way a pre-change initiator would send it.
+    let legacy_ek = {
+        let mut inner = alice.lock();
+        let send_pq = assert_some!(inner.send_group.as_mut().and_then(|g| g.pq.as_mut()));
+        let mls = assert_ok!(
+            send_pq.encrypt_application_message(&[super::PQ_EK_TAG, 0xAB, 0xCD], Vec::new())
+        );
+        let mut frame = vec![super::PQ_EK_TAG];
+        frame.extend_from_slice(&assert_ok!(mls.to_bytes()));
+        frame
+    };
+
+    // `StaleFrame` — the discard disposition — because this build can never answer these
+    // bytes at any future point; the round resumes only through the peer's own upgrade.
+    assert_err!(bob.pq_ratchet_respond(legacy_ek), TwoMlsPqError::StaleFrame);
+    {
+        let inner = bob.lock();
+        assert!(
+            inner.pq_inflight.is_none(),
+            "a dropped legacy EK must not open a round"
+        );
+    }
+    // The session is untouched: ordinary messaging and a fresh round both still work.
+    message_round(&bob, &alice, b"still-fine");
+    ratchet_round(&alice, &bob, b"round-after-drop");
+}
+
 #[test]
 fn test_from_archive_rejects_malformed_bytes() {
     let (alice_session, _bob_session) = establish_sessions();
@@ -4051,6 +4573,66 @@ fn test_side_band_padding_equalizes_with_message() {
     discharge_bind(&bob, &alice, b"padded-round");
 }
 
+/// The CT leg re-wraps too, from the `wire_ct` its round retains — a different source than
+/// the EK's (which regenerates from the held ephemeral), and the reason `Responding` carries
+/// that payload at all. A responder that keeps sending while it waits for the bind advances
+/// its own send-classical epoch out from under the parked CT, so without this the initiator
+/// would eventually be unable to open the only frame that can close the round.
+///
+/// Asserted at the leg's own epoch rather than by trying to make a decrypt fail: mls-rs
+/// applies no epoch bound check to application messages, and this harness never flushes the
+/// receiving group, so an old wrap can still open here even though a real peer past its
+/// retention window could not. The mechanism — the parked leg tracking the sender's current
+/// epoch — is the honest thing to pin, and it is what the window argument rests on.
+#[test]
+fn test_ct_leg_rewraps_from_retained_payload() {
+    let (alice, bob) = establish_full();
+    // Bob opens; Alice answers and parks the CT, holding S.
+    let ek = open_ratchet(&bob, &alice);
+    assert_ok!(alice.pq_ratchet_respond(ek));
+
+    let leg_epoch = |session: &Arc<TwoMlsPqSession>| {
+        let inner = session.lock();
+        let retained = assert_some!(inner.pending_side_band.as_ref());
+        let (&tag, mls) = assert_some!(retained.frame.split_first());
+        assert_eq!(tag, super::PQ_CT_TAG);
+        assert_some!(assert_ok!(mls_rs::MlsMessage::from_bytes(mls)).epoch())
+    };
+    let epoch_before = leg_epoch(&alice);
+
+    // Alice keeps talking while she waits, committing each round, so the epoch her parked CT
+    // was minted at falls well behind.
+    for _ in 0..10 {
+        assert_ok!(bob.prepare_to_encrypt(None));
+        let b = assert_ok!(bob.encrypt(b"churn".to_vec()));
+        let rb = assert_some!(assert_ok!(alice.process_incoming(b.cipher_text)));
+        assert_ok!(alice.queue_proposal(assert_some!(rb.proposal).digest));
+        assert!(assert_ok!(alice.prepare_to_encrypt(None)).did_commit);
+        let ac = assert_ok!(alice.encrypt(b"c".to_vec()));
+        assert_some!(assert_ok!(bob.process_incoming(ac.cipher_text)));
+    }
+
+    // The parked CT has followed her forward: it is re-minted at her current epoch, not the
+    // one it was first wrapped at.
+    let epoch_after = leg_epoch(&alice);
+    assert!(
+        epoch_after > epoch_before,
+        "the parked CT must be re-wrapped as the sender's epoch advances \
+         (was {epoch_before}, still {epoch_after})"
+    );
+    assert_eq!(
+        epoch_after,
+        alice.epochs().classical_epoch,
+        "a re-wrapped leg sits at the sender's CURRENT epoch"
+    );
+
+    // And it is still the same round: the re-wrap carries the retained payload, so the bind
+    // opens S and the round closes rather than restarting.
+    let ct = assert_some!(alice.pq_pending_outbound(SideBandSealing::Fresh));
+    assert_ok!(bob.pq_ratchet_bind(ct));
+    discharge_bind(&bob, &alice, b"ct-after-churn");
+}
+
 /// Feature B: the sizing intent is a CAP. A message larger than the target does not drag the
 /// side-band frame past the push-payload budget — it pads only up to the target.
 #[test]
@@ -4130,50 +4712,68 @@ fn test_sealed_side_band_opens_and_classifies() {
     discharge_bind(&bob, &alice, b"a");
 }
 
-/// The point of the PQ family: a side-band frame is keyed by `pq_epoch`, so it
-/// survives classical churn that evicts the message-path window — proving it does not
-/// ride the (async) classical key. Contrast: a message frame from the same pre-churn
-/// moment is evicted and no longer opens.
+/// An A.4 round survives classical churn that evicts the message-path window — the property
+/// that replaces the old PQ-family one for these two frames. The legs ride the classical
+/// groups now, so a leg's bytes are NOT durable across churn (a blob captured pre-churn is
+/// evicted exactly like a message frame from the same moment); what is durable is the ROUND,
+/// because the session re-mints the leg at the current epoch on every send
+/// (`rewrap_side_band`) and re-seals it per peek. The end-to-end assertion — the round
+/// completes after the churn — is the one that matters.
 #[test]
-fn test_side_band_survives_classical_churn() {
+fn test_a4_round_survives_classical_churn_by_rewrapping() {
     let (alice, bob) = establish_full();
     // Flip the turn to Alice so she can open the A.4 by sending (Bob holds it after bootstrap).
     ratchet_round(&bob, &alice, b"flip");
 
-    // Capture two pre-churn frames Bob will try to open later: a message frame
-    // (classical-keyed) and a side-band EK (PQ-keyed). Alice's send auto-stages the EK; the
-    // message frame is held back, not delivered.
+    // Open the round, then capture two pre-churn artifacts Bob will try to open later: a
+    // message frame and the EK as sealed right now. Neither is delivered.
     assert_ok!(alice.prepare_to_encrypt(None));
     let early_message = assert_ok!(alice.encrypt(b"early".to_vec())).cipher_text;
-    let ek = assert_some!(alice.pq_pending_outbound(SideBandSealing::Fresh));
+    let early_ek = assert_some!(alice.pq_pending_outbound(SideBandSealing::Fresh));
 
-    // Churn ONLY the classical ratchet, well past mls-rs epoch retention: Alice
-    // proposes, Bob commits Bob's send group each round, both stay in lockstep. No PQ
-    // activity, so `pq_epoch` — and Bob's PQ window — is untouched.
+    // Churn the classical ratchet well past mls-rs epoch retention, with BOTH parties
+    // committing each round — the leg has two clocks and this moves both: Bob's send epoch
+    // (which keys the outer seal Alice's frames use, and is the window Bob opens from) and
+    // Alice's own send epoch (which the leg's inner application message is encrypted at, and
+    // is what forces the re-wrap).
     for _ in 0..10 {
         assert_ok!(alice.prepare_to_encrypt(None));
         let a = assert_ok!(alice.encrypt(b"churn".to_vec()));
-        let r = assert_some!(assert_ok!(bob.process_incoming(a.cipher_text)));
-        assert_ok!(bob.queue_proposal(assert_some!(r.proposal).digest));
+        let ra = assert_some!(assert_ok!(bob.process_incoming(a.cipher_text)));
+        assert_ok!(bob.queue_proposal(assert_some!(ra.proposal).digest));
         assert!(assert_ok!(bob.prepare_to_encrypt(None)).did_commit);
         let bc = assert_ok!(bob.encrypt(b"c".to_vec()));
-        assert_some!(assert_ok!(alice.process_incoming(bc.cipher_text)));
+        let rb = assert_some!(assert_ok!(alice.process_incoming(bc.cipher_text)));
+        assert_ok!(alice.queue_proposal(assert_some!(rb.proposal).digest));
+        assert!(assert_ok!(alice.prepare_to_encrypt(None)).did_commit);
+        let ac = assert_ok!(alice.encrypt(b"c2".to_vec()));
+        assert_some!(assert_ok!(bob.process_incoming(ac.cipher_text)));
     }
 
-    // The classical window has churned past the early message's epoch — it no longer
-    // opens…
+    // Both pre-churn blobs are now evicted: the leg shares the message path's window, which
+    // is the cost of the classical carrier and is why the leg must be re-minted, not pinned.
     assert!(
         assert_ok!(bob.open_incoming(early_message)).is_none(),
         "message-path window should have evicted the pre-churn epoch"
     );
-    // …but the EK, keyed by the (unchanged) pq_epoch, still opens. If it rode the
-    // classical key it would have been evicted alongside the message frame.
+    assert!(
+        assert_ok!(bob.open_incoming(early_ek)).is_none(),
+        "a leg's pre-churn bytes are evicted with it — the round survives by re-wrapping"
+    );
+
+    // The live round is untouched: today's peek is a leg re-minted at Alice's current epoch,
+    // Bob opens and answers it, and the round closes normally.
+    let ek = assert_some!(alice.pq_pending_outbound(SideBandSealing::Fresh));
     assert_eq!(
-        assert_some!(assert_ok!(bob.open_incoming(ek))).kind,
+        assert_some!(assert_ok!(bob.open_incoming(ek.clone()))).kind,
         super::OpenedFrameKind::PqSideBand {
             kind: super::PqFrameKind::RatchetEphemeralKey
         }
     );
+    assert_ok!(bob.pq_ratchet_respond(ek));
+    let ct = assert_some!(bob.pq_take_pending_outbound());
+    assert_ok!(alice.pq_ratchet_bind(ct));
+    discharge_bind(&alice, &bob, b"after-churn");
 }
 
 /// The pre-A.3 BOOTSTRAP_KP has no recv-PQ group yet, so it falls back to the

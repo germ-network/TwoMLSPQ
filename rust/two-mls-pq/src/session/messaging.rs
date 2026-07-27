@@ -224,26 +224,85 @@ impl SessionInner {
         self.seal_with(&header_key(&recv.classical)?, frame, frame.len())
     }
 
-    /// Seal a PQ side-band frame under the PQ family — `header_key_pq(recv_group.pq)` at
-    /// its current `pq_epoch`, the peer opening it from its own send-PQ window. Falls back
-    /// to the classical `seal` when the recv-PQ group does not exist yet: the only such
-    /// frame is the pre-A.3 `BOOTSTRAP_KP` (its recv-PQ is the group the bootstrap is
-    /// creating), a one-time establishment frame whose cadence is irrelevant, and the
-    /// receiver opens it from its classical window via the dual-window `try_open`.
+    /// Seal a PQ side-band frame. Three cases, by frame kind and group availability:
+    ///
+    /// - **A.4 legs (`0x17`/`0x19`)** — the CLASSICAL family, `header_key(recv_group)`, with
+    ///   side-band padding. Their inner MLS message rides the classical groups, so a
+    ///   `pq_epoch`-keyed outer seal would gate the frame on a clock unrelated to its
+    ///   contents; the classical family keeps seal and payload in one failure domain, and
+    ///   brings these frames' metadata under the hybrid classical key schedule. Note the
+    ///   seal's clock is the RECV-classical epoch (the peer's commits) while the re-mint's is
+    ///   our SEND epoch — two different classical clocks, which is why the `Stable` cache
+    ///   carries its own epoch stamp (`hand_out`) rather than leaning on the re-mint to
+    ///   invalidate it.
+    ///
+    ///   Selected by the leg's actual CARRIER, not by its tag: the one leg that is still
+    ///   PQ-carried — a migrated responder's retained CT, minted in the recv-PQ mirror by a
+    ///   build predating the classical carriers — keeps the PQ family, exactly as that build
+    ///   sealed it. Tag-based selection would work too (both ends trial both windows), but it
+    ///   would make the compatibility tail depend on 0.14's *behaviour* rather than on
+    ///   anything 0.14 promised, and it would falsify the one-line rule this whole scheme
+    ///   rests on: a frame is sealed under the family of the group its contents live in.
+    /// - **Every other side-band frame (A.3/A.5)** — the PQ family, `header_key_pq` at the
+    ///   current `pq_epoch`, the peer opening it from its own send-PQ window. Unchanged: those
+    ///   frames still carry PQ-group handshake material and must not couple their availability
+    ///   to classical traffic.
+    /// - **The pre-A.3 `BOOTSTRAP_KP`** — the classical key with NO padding (via `seal`), the
+    ///   one frame whose recv-PQ group does not exist yet (it is the group the bootstrap
+    ///   creates); the receiver opens it from its classical window via the dual-window
+    ///   `try_open`.
     pub(in crate::session) fn seal_side_band(&self, frame: &[u8]) -> Result<Vec<u8>> {
         let recv = self
             .recv_group
             .as_ref()
             .ok_or(TwoMlsPqError::SessionNotEstablished)?;
+        let pad_to = self.side_band_pad_to(frame.len());
+        if matches!(frame.first(), Some(&PQ_EK_TAG | &PQ_CT_TAG)) && self.a4_leg_is_classical(frame)
+        {
+            return self.seal_with(&header_key(&recv.classical)?, frame, pad_to);
+        }
         match recv.pq.as_ref() {
-            Some(pq) => self.seal_with(
-                &header_key_pq(pq)?,
-                frame,
-                self.side_band_pad_to(frame.len()),
-            ),
+            Some(pq) => self.seal_with(&header_key_pq(pq)?, frame, pad_to),
             // pre-A.3 BOOTSTRAP_KP: classical fallback, never padded.
             None => self.seal(frame),
         }
+    }
+
+    /// The current epoch of the group whose exporter would seal `frame` right now — the same
+    /// family decision `seal_side_band` makes, read as a clock. `hand_out` stamps the `Stable`
+    /// cache with it and refuses a hit once it moves, because for the classically-sealed
+    /// frames this clock belongs to the PEER's commits: nothing else invalidates the cache
+    /// (`rewrap_side_band` watches our SEND epoch, a different classical clock), so an
+    /// unstamped cache could keep serving a seal whose key left the peer's window. `None`
+    /// pre-establishment, where there is nothing to seal under anyway.
+    pub(in crate::session) fn side_band_seal_epoch(&self, frame: &[u8]) -> Option<u64> {
+        let recv = self.recv_group.as_ref()?;
+        if matches!(frame.first(), Some(&PQ_EK_TAG | &PQ_CT_TAG)) && self.a4_leg_is_classical(frame)
+        {
+            return Some(recv.classical.current_epoch());
+        }
+        match recv.pq.as_ref() {
+            Some(pq) => Some(pq.current_epoch()),
+            // The pre-A.3 BOOTSTRAP_KP's classical fallback.
+            None => Some(recv.classical.current_epoch()),
+        }
+    }
+
+    /// Whether a parked A.4 leg's inner message lives in our send-classical group — i.e. we
+    /// minted it ourselves, in the current form. False for the single exception: a CT retained
+    /// across the upgrade from a build that carried the legs in the PQ groups, which sits in
+    /// the recv-PQ mirror it was minted in and cannot be re-minted (its payload is encrypted to
+    /// the peer). Cheap and self-contained — the leg names its own group, so this needs no
+    /// round state and cannot drift from one.
+    fn a4_leg_is_classical(&self, frame: &[u8]) -> bool {
+        let Some(send) = self.send_group.as_ref() else {
+            return false;
+        };
+        frame
+            .get(1..)
+            .and_then(|mls| MlsMessage::from_bytes(mls).ok())
+            .and_then(|msg| msg.group_id().map(|id| id == send.classical.group_id()))
+            .unwrap_or(false)
     }
 
     /// The target frame-body length for a padded side-band seal (Feature B). With a `pad_target`
@@ -313,10 +372,13 @@ impl SessionInner {
             return Ok(None);
         }
         let (nonce, ct) = blob.split_at(nonce_size);
-        // Both families use the same AEAD; only the key set differs. A message frame
-        // authenticates only under a classical-window key and a side-band frame only
-        // under a PQ-window key (the pre-A.3 BOOTSTRAP_KP under classical), so trying
-        // both windows resolves either without ambiguity. Newest epoch first in each.
+        // Both families use the same AEAD; only the key set differs, and a blob
+        // authenticates under exactly one key — so trying both windows resolves every
+        // frame without ambiguity. The family no longer corroborates the KIND: the
+        // classical window opens message frames, the A.4 legs, and the pre-A.3
+        // BOOTSTRAP_KP alike, and only the A.3/A.5 frames are PQ-keyed. Routing is the
+        // inner tag's job (`opened_frame_kind`); which key worked is incidental. Newest
+        // epoch first in each.
         let windows = [&self.recv_header_keys, &self.recv_header_keys_pq];
         for keys in windows {
             for key in keys.values().rev() {
@@ -1173,7 +1235,7 @@ impl TwoMlsPqSession {
                         // epoch and domain as the initiator's export, so both sides get the
                         // same value and it never crosses the wire.
                         let s = match inner.pq_inflight.take() {
-                            Some(PqInflight::Responding(s)) => s,
+                            Some(PqInflight::Responding { secret, .. }) => secret,
                             Some(PqInflight::BootstrapResponded)
                             | Some(PqInflight::RekeyResponded) => Zeroizing::new(
                                 inner.export_cross_from_send_pq()?.psk().as_ref().to_vec(),
@@ -1543,6 +1605,14 @@ impl TwoMlsPqSession {
             // A committing round advanced the send group's classical epoch — capture
             // the new epoch's listen address.
             inner.record_listen_rendezvous()?;
+            // …and re-mint a parked A.4 leg at that new epoch NOW, not only at the paired
+            // `encrypt`: the epoch moved in THIS call, so a host that peeks
+            // `pq_pending_outbound` between prepare and encrypt must already see a leg the
+            // peer can open once the commit lands. (Without this the peeked blob is minted
+            // one epoch back, and the peer — having applied the commit riding the same send —
+            // rejects it at the epoch floor: retriable and healed by the next peek, but a
+            // wasted round trip the atomicity here removes.)
+            inner.rewrap_side_band();
             Ok(result)
         })
     }
@@ -1562,10 +1632,11 @@ impl TwoMlsPqSession {
     /// either path — the frame itself carries the welcome; the standalone copy stays
     /// available for hosts that also deliver it separately (processing is idempotent).
     pub fn encrypt(&self, app_message: Vec<u8>) -> Result<EncryptResult> {
-        // Set inside the Core push when the session auto-stages a PQ round (A.4 or A.5): either
-        // mutates a PQ group the Core blob omits — an A.5's recv-PQ pending update, or an A.4's
-        // send-PQ application-ratchet advance (the EK is now an MLS message) — so it must be
-        // followed by a Checkpoint (below).
+        // Set inside the Core push only when the session auto-stages an A.5, which leaves a
+        // pending update and its new leaf secret in the recv-PQ group — state the Core blob
+        // omits, so it must be followed by a Checkpoint (below). A staged A.4 no longer
+        // qualifies: its EK is an application message in the send-CLASSICAL group, fully
+        // carried by the Core push itself.
         let mut staged_pq_round = false;
         let result = self.mutate_and_persist(crate::BlobKind::Core, |inner| {
             // Contract 26 emission gate — see `prepare_to_encrypt`. Guarded here too
@@ -1630,12 +1701,19 @@ impl TwoMlsPqSession {
                     .compose_initial_envelope(Some(&encode_pre_establishment_app(&app_bytes)))?,
             };
 
+            // A parked A.4 leg is encrypted at the send-classical epoch it was minted at, and
+            // the commits this very flow applies are what move that epoch. Re-mint it here if
+            // it has fallen behind, so an undelivered leg stays openable however long the
+            // round stalls (see `rewrap_side_band` — this is the whole reason the classical
+            // carrier is safe). Ordered before staging, which no-ops while a frame is parked.
+            inner.rewrap_side_band();
             // Session-driven side-band: this send opens the next PQ round when it is our turn
             // and the side-band is idle (A.5 on credential lag, else A.4). Best-effort and
             // send-driven — the staged frame rides this very send's re-staple peek, and it never
-            // fails the message. Either kind now mutates a PQ group the Core push omits (an A.5's
-            // recv-PQ pending update, or an A.4's send-PQ application-ratchet advance now that the
-            // EK is an MLS message), so a staged round needs the follow-up Checkpoint below.
+            // fails the message. An A.5 still mutates a PQ group the Core push omits (its
+            // recv-PQ pending update), so it needs the follow-up Checkpoint below; an A.4 no
+            // longer does — its EK is an application message in the send-CLASSICAL group, which
+            // Core already carries.
             staged_pq_round = inner.maybe_stage_next_round();
 
             Ok(EncryptResult {
@@ -1646,11 +1724,12 @@ impl TwoMlsPqSession {
                 depends_on_seq: inner.current_staple_seq,
             })
         });
-        // A staged PQ round mutated a PQ group the Core push above omits — push a Checkpoint so
-        // the A.5 pending update + new leaf secret, or the A.4 EK's send-PQ application-ratchet
-        // advance and its retained frame, are durable together. This also advances `state_seq`
-        // past the Core, so the app's gate on `state_seq()` before transmitting a
-        // key-material-bearing frame naturally waits for the checkpoint that carries it.
+        // A staged A.5 mutated a PQ group the Core push above omits — push a Checkpoint so its
+        // recv-PQ pending update and new leaf secret are durable together with the retained
+        // frame. (A staged A.4 never reaches here: it is classical-only and rides the Core.)
+        // This also advances `state_seq` past the Core, so the app's gate on `state_seq()`
+        // before transmitting a key-material-bearing frame naturally waits for the checkpoint
+        // that carries it.
         if result.is_ok() && staged_pq_round {
             self.persist_after(crate::BlobKind::Checkpoint);
         }

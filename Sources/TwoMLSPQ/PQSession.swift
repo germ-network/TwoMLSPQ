@@ -193,7 +193,23 @@ import TwoMLSPQBinding
 //     from a closed round clears the in-flight guards and reaches that decrypt, and a host
 //     that reads `.fatal` as "tear the session down" must never be told that by a peer frame
 //     it could not open. No wire or API change.
-private let expectedBindingContract: UInt64 = 28
+// v29 (contract 29): the A.4 side-band legs move from the PQ groups to each sender's own
+//     CLASSICAL send group, sealed under the classical header family — fresher
+//     authentication (the classical leaf and epoch secrets heal every round, where a PQ leaf
+//     waits for A.5) at no loss of strength, since both halves sign Ed25519. Wire-breaking
+//     for the A.4 legs, but sessions established on 0.14 SURVIVE: their archives restore
+//     (archive layout v3 still accepts v2), and a round already in flight completes — a
+//     migrated responder's PQ-carried ciphertext is still accepted by the bind, and a
+//     migrated initiator's encapsulation key is converted to the new form on its next send.
+//     A peer that has not yet upgraded simply cannot answer a new-form leg, so the PQ
+//     side-band (and with it A.5 credential catch-up) pauses for that pair until it does —
+//     never a teardown. Hosts will newly see `.staleFrame` (`.discardFrame`) on side-band
+//     legs in two shapes, both meaning "this copy can never open, drop it, the round is
+//     fine": an old-form leg from a pre-upgrade peer (answerable only by that peer
+//     upgrading), and a superseded copy of a leg that has since been re-minted (legs are
+//     re-sent as fresh wraps rather than fixed bytes now). Classical messaging is unaffected
+//     throughout. No API change.
+private let expectedBindingContract: UInt64 = 29
 
 enum TwoMLSPQBindingContract {
 	static let verified: Void = {
