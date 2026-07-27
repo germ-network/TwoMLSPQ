@@ -1234,17 +1234,51 @@ impl TwoMlsPqSession {
                         // created, A.5 at the epoch its own Commit' produced. Same group,
                         // epoch and domain as the initiator's export, so both sides get the
                         // same value and it never crosses the wire.
-                        let s = match inner.pq_inflight.take() {
-                            Some(PqInflight::Responding { secret, .. }) => secret,
+                        // CONSUME LAST, and here that is actually possible. The A.3/A.5
+                        // re-export below is fallible, and taking the round state first would
+                        // leave a failed export with the slot already empty: the peer
+                        // re-staples this same bind on every frame (its next commit, which
+                        // would supersede it, is what evidence-gating forbids), every retry
+                        // would fall to the not-the-responder arm and answer the retriable
+                        // `SessionNotReady` forever, and nothing would latch it — we never
+                        // reach `apply_bind`, so `bind_apply_broken` stays clear and
+                        // `pq_receive_broken()` would report a healthy session that cannot
+                        // receive. Classifying first and consuming after makes a failed
+                        // derivation a pure no-op the peer's next re-staple retries.
+                        //
+                        // This is the one consume in this family where leaving the state in
+                        // place is both possible and SAFE: nothing else has moved yet. The
+                        // bind's own tail cannot say the same, which is why its failure
+                        // latches instead (see the `apply_bind` call below).
+                        let re_export = match &inner.pq_inflight {
+                            Some(PqInflight::Responding { .. }) => false,
                             Some(PqInflight::BootstrapResponded)
-                            | Some(PqInflight::RekeyResponded) => Zeroizing::new(
-                                inner.export_cross_from_send_pq()?.psk().as_ref().to_vec(),
-                            ),
+                            | Some(PqInflight::RekeyResponded) => true,
                             // A current-epoch bind we are not the responder of — an
-                            // ill-timed or forged staple; restore what we took.
-                            other => {
-                                inner.pq_inflight = other;
-                                return Err(TwoMlsPqError::SessionNotReady);
+                            // ill-timed or forged staple. Nothing taken, nothing consumed.
+                            _ => return Err(TwoMlsPqError::SessionNotReady),
+                        };
+                        let s = if re_export {
+                            // A.3's and A.5's S: exported from our OWN send-PQ at its current
+                            // epoch. No `last_send_pq_exported` watermark guards this one, and
+                            // none is needed — the responder's send-PQ always advances via its
+                            // own commit before this staple arrives, so the leaf is fresh.
+                            let derived = Zeroizing::new(
+                                inner.export_cross_from_send_pq()?.psk().as_ref().to_vec(),
+                            );
+                            inner.pq_inflight = None;
+                            derived
+                        } else {
+                            // A.4's S: held since `encapsulate`. The classification above
+                            // proved the variant under the same borrow and nothing ran in
+                            // between; the restore arm survives only because `take` cannot
+                            // carry that proof.
+                            match inner.pq_inflight.take() {
+                                Some(PqInflight::Responding { secret, .. }) => secret,
+                                other => {
+                                    inner.pq_inflight = other;
+                                    return Err(TwoMlsPqError::SessionNotReady);
+                                }
                             }
                         };
                         // The bind's classical half is the peer's routine commit — when it
