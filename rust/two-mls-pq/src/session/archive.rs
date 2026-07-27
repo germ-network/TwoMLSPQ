@@ -15,12 +15,23 @@ use super::*;
 // property, and a restored archive whose pair differs from this build's pinned suite fails
 // loudly.
 //
-// MONOTONIC FROM HERE ON. Every change to the archive's layout OR its acceptance semantics
-// (a new field, a reshaped field, or a tightened restore-time validation) bumps this byte by
-// one. The byte never resets and never reuses a value: a monotonic version is the honest
-// record of "this layout is not that layout", and a distinct byte keeps two builds' blobs
-// from ever being mistaken for each other. This ends the earlier pre-release convention of
-// leaving the byte untouched (and the 2026-07-13 floor reset to 1); those and the original
+// MONOTONIC ACROSS RELEASES. Every change to the archive's layout OR its acceptance semantics
+// (a new field, a reshaped field, or a tightened restore-time validation) that a RELEASED
+// build could have written bumps this byte by one. The byte never resets and never reuses a
+// value: a monotonic version is the honest record of "this layout is not that layout", and a
+// distinct byte keeps two builds' blobs from ever being mistaken for each other.
+//
+// THE ONE EXCEPTION is an UNRELEASED byte. While no shipped build has written the current
+// layout, that layout is not yet a compatibility surface, so an additive change to it may land
+// IN PLACE rather than bump — two dev builds disagreeing is a dev's problem, healed by
+// regenerating. v3 did exactly this: it took a tail field (the wedge verdict) after #115
+// introduced v3 and before any release wrote it. The hatch CLOSES the instant the byte ships:
+// the first RELEASE to write byte N freezes N, and the next layout change bumps to N+1 like
+// any other. So mutating in place is legal only behind a check that no tag has been cut while
+// this byte was current — at 0.15.0, v3 freezes.
+//
+// This ends the earlier pre-release convention of leaving the byte untouched (and the
+// 2026-07-13 floor reset to 1); those and the original
 // v1–v10 ladder stay in git as history. Ancient pre-v2 layouts remain rejected structurally
 // too (the staple first-byte check in `session_from_wire`, whose fields their bytes could
 // otherwise alias into).
@@ -44,6 +55,10 @@ use super::*;
 // rode the PQ groups, whose `pq_epoch` cannot move mid-round, so they never re-wrap. Writing
 // is always v3. A v3 blob on a 0.14 build still fails there, which is the hard cut's
 // remaining, intended direction.
+//
+// v3 also LATER took a second tail field, `pq_wedged` (the side-band wedge verdict), in place
+// rather than bumping — the unreleased-byte exception above, valid because v3 has not shipped.
+// Once 0.15.0 writes v3 that door closes; the next tail change bumps to v4.
 const SESSION_ARCHIVE_VERSION: u8 = 3;
 /// The one older layout still accepted on decode (see the version note): identical to v3
 /// minus the trailing [`archive_wire::ArchiveTail`].
