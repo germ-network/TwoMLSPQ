@@ -420,7 +420,22 @@ pub fn version() -> String {
 // for the first time still ACCEPTS v2 (see `SESSION_ARCHIVE_VERSION`): 0.14 shipped to real
 // sessions, and the migration is what keeps them alive. No FFI signature or error-variant
 // change.
-const BINDING_CONTRACT_VERSION: u64 = 29;
+// v30 (2026-07-27): a PQ bind can no longer be wedged by proposal residue, and can no longer
+// fail silently past its point of no return. A cached by-ref proposal in our send-PQ dooms
+// every bind commit on that half (`apq::rules` refuses an Update co-riding the AppDataUpdate
+// attestation), and mls-rs caches one inside `process_incoming_message` — before the A.4 leg
+// door inspects the message kind — so the peer could park one through a door that answers a
+// benign, retriable error, then let the next bind tear itself apart with the round's one-shot
+// input already spent and `mutate_and_persist` writing the tear to the blob. The three bind
+// entry points now refuse that in the GUARD phase (retriable, nothing consumed) and the two
+// admitting doors drop what they refuse. Past the point of no return, where no guard can
+// help, the three triggers latch `BindTriggerFailed` (appended) — ARCHIVED, unlike
+// `BindApplyFailed`, because these closures persist their partial mutations by design —
+// queryable via `pq_side_band_wedged()`, with classical messaging unaffected. The A.3/A.5
+// responder's S is now derived BEFORE the round is consumed, so a failed re-export is a
+// no-op the peer's next re-staple retries. Archive layout stays v3 (unpublished), gaining one
+// tail field.
+const BINDING_CONTRACT_VERSION: u64 = 30;
 
 /// See `BINDING_CONTRACT_VERSION`. Exported so the Swift layer can verify the
 /// binding it was generated with matches the binary it loaded.
@@ -948,13 +963,36 @@ pub enum TwoMlsPqError {
     /// `InvalidLeafConsumption`); everything else it refuses on stays `DecryptionFailed`,
     /// including the epoch misses that cannot be told apart from a frame arriving early — see
     /// `map_app_message_err`.
+    #[error("frame's message key was already consumed")]
+    StaleFrame,
+    /// FATAL: a PQ bind TRIGGER failed past its point of no return. The third member of the
+    /// family the other two name: [`Self::BindDischargeFailed`] is our classical half
+    /// failing, [`Self::BindApplyFailed`] is the peer's staple failing on us, and this is
+    /// our own trigger failing — A.3's join, A.4's decapsulation or A.5's applied Commit'
+    /// has already landed, so the round's input cannot be rebuilt from anything the peer
+    /// can re-send.
+    ///
+    /// LATCHED and ARCHIVED, unlike its two siblings, and the difference is not a
+    /// preference. `BindApplyFailed` may be in-memory because inbound processing persists
+    /// on SUCCESS only, so a restore predates the failed take. These triggers run inside
+    /// `mutate_and_persist`, which pushes even on `Err` because their partial mutations are
+    /// real — so the tear reaches the blob and a restore reproduces it. A verdict that did
+    /// not ride beside it would restore a session that reports healthy and deadlocks.
+    ///
+    /// While set, every PQ side-band door answers this instead of the retriable
+    /// `SessionNotReady` — or, at the A.3 door, the `DuplicateSideBand` that would report a
+    /// round which never closed as already done. CLASSICAL MESSAGING IS UNAFFECTED: send and
+    /// receive both keep working and an already-reserved bind still discharges. Not
+    /// reachable from any honest flow (a peer-forced trigger failure is refused in the guard
+    /// phase before anything is consumed); route to re-establishment. Queryable via
+    /// `pq_side_band_wedged`.
     //
     // Deliberately the LAST variant: uniffi numbers error cases by position, so appending
     // keeps every prior variant's ordinal stable. Keep appending future variants here (the
     // contract bump already forces binding/binary pairing, but there is no reason to
     // renumber the survivors).
-    #[error("frame's message key was already consumed")]
-    StaleFrame,
+    #[error("PQ bind trigger failed past its point of no return; re-establish")]
+    BindTriggerFailed,
 }
 
 /// The protocol digest over `bytes` — the single hashing primitive behind every

@@ -210,6 +210,25 @@ impl SessionInner {
         Ok(())
     }
 
+    /// The post-commit form of [`Self::record_pq_header_key`]: run it and DISCARD a failure.
+    ///
+    /// Every caller of this sibling is the tail of a bind whose PQ commit has already landed
+    /// and reserved its classical partner. The round SUCCEEDED, and `mutate_and_persist` has
+    /// captured it either way — so propagating from here would report that success as a
+    /// failure and, worse, latch the round as wedged (`past_no_return`) when nothing is
+    /// actually torn. It sits deliberately OUTSIDE that region for exactly this reason.
+    ///
+    /// Discarding is safe because the derivation is REPEATABLE: `header_key_pq` is the plain
+    /// exporter, deliberately not a `SafeExport` one-shot (contrast `export_psk`), so it
+    /// spends no leaf and re-derives the same key at the same `pq_epoch`. `should_listen_on`
+    /// is where that re-derivation happens — the backstop `record_listen_rendezvous` has
+    /// always had, now shared by both header families — so a dropped capture heals the next
+    /// time the host asks where to listen, rather than leaving the PQ side-band's receive
+    /// window silently short one epoch.
+    pub(in crate::session) fn record_pq_header_key_post_commit(&mut self) {
+        let _ = self.record_pq_header_key();
+    }
+
     /// Seal an outbound frame under the header key of MY recv group (the peer's send
     /// group) at its current classical epoch: `[random nonce][AEAD ct+tag]`, empty AAD.
     /// The peer opens it from its own send-group window (`recv_header_keys`). Requires a
@@ -1234,17 +1253,51 @@ impl TwoMlsPqSession {
                         // created, A.5 at the epoch its own Commit' produced. Same group,
                         // epoch and domain as the initiator's export, so both sides get the
                         // same value and it never crosses the wire.
-                        let s = match inner.pq_inflight.take() {
-                            Some(PqInflight::Responding { secret, .. }) => secret,
+                        // CONSUME LAST, and here that is actually possible. The A.3/A.5
+                        // re-export below is fallible, and taking the round state first would
+                        // leave a failed export with the slot already empty: the peer
+                        // re-staples this same bind on every frame (its next commit, which
+                        // would supersede it, is what evidence-gating forbids), every retry
+                        // would fall to the not-the-responder arm and answer the retriable
+                        // `SessionNotReady` forever, and nothing would latch it — we never
+                        // reach `apply_bind`, so `bind_apply_broken` stays clear and
+                        // `pq_receive_broken()` would report a healthy session that cannot
+                        // receive. Classifying first and consuming after makes a failed
+                        // derivation a pure no-op the peer's next re-staple retries.
+                        //
+                        // This is the one consume in this family where leaving the state in
+                        // place is both possible and SAFE: nothing else has moved yet. The
+                        // bind's own tail cannot say the same, which is why its failure
+                        // latches instead (see the `apply_bind` call below).
+                        let re_export = match &inner.pq_inflight {
+                            Some(PqInflight::Responding { .. }) => false,
                             Some(PqInflight::BootstrapResponded)
-                            | Some(PqInflight::RekeyResponded) => Zeroizing::new(
-                                inner.export_cross_from_send_pq()?.psk().as_ref().to_vec(),
-                            ),
+                            | Some(PqInflight::RekeyResponded) => true,
                             // A current-epoch bind we are not the responder of — an
-                            // ill-timed or forged staple; restore what we took.
-                            other => {
-                                inner.pq_inflight = other;
-                                return Err(TwoMlsPqError::SessionNotReady);
+                            // ill-timed or forged staple. Nothing taken, nothing consumed.
+                            _ => return Err(TwoMlsPqError::SessionNotReady),
+                        };
+                        let s = if re_export {
+                            // A.3's and A.5's S: exported from our OWN send-PQ at its current
+                            // epoch. No `last_send_pq_exported` watermark guards this one, and
+                            // none is needed — the responder's send-PQ always advances via its
+                            // own commit before this staple arrives, so the leaf is fresh.
+                            let derived = Zeroizing::new(
+                                inner.export_cross_from_send_pq()?.psk().as_ref().to_vec(),
+                            );
+                            inner.pq_inflight = None;
+                            derived
+                        } else {
+                            // A.4's S: held since `encapsulate`. The classification above
+                            // proved the variant under the same borrow and nothing ran in
+                            // between; the restore arm survives only because `take` cannot
+                            // carry that proof.
+                            match inner.pq_inflight.take() {
+                                Some(PqInflight::Responding { secret, .. }) => secret,
+                                other => {
+                                    inner.pq_inflight = other;
+                                    return Err(TwoMlsPqError::SessionNotReady);
+                                }
                             }
                         };
                         // The bind's classical half is the peer's routine commit — when it
@@ -1943,6 +1996,14 @@ impl TwoMlsPqSession {
     pub fn should_listen_on(&self) -> Result<ListenChannels> {
         let mut inner = self.lock();
         inner.record_listen_rendezvous()?;
+        // The PQ header window's backstop, exactly as the line above is the classical one.
+        // `record_pq_header_key` is BEST-EFFORT at every post-commit call site (see
+        // `record_pq_header_key_post_commit`), and this is where a dropped capture is
+        // re-derived — the derivation is repeatable, so re-running it costs nothing and
+        // spends nothing. Propagating here is right where discarding was right there:
+        // nothing has been consumed, the send-PQ epoch has not moved, and the caller can
+        // simply ask again.
+        inner.record_pq_header_key()?;
         let send = inner
             .send_group
             .as_ref()

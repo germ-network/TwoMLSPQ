@@ -133,6 +133,8 @@ extension SessionError {
 				code = .bindApplyFailed
 			case .BindDischargeFailed:
 				code = .bindDischargeFailed
+			case .BindTriggerFailed:
+				code = .bindTriggerFailed
 			case .EstablishmentEnvelopeRequired:
 				// Contract 26, dual meaning by surface (like BootstrapKpMismatch):
 				switch surface {

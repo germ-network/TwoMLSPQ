@@ -261,14 +261,27 @@ pub(crate) mod archive_wire {
         /// both for a v2-restored round (its PQ-form CT cannot be rebuilt — it is
         /// MLS-encrypted to the peer — and never needs to be) and for every non-A.4 state.
         pub(in crate::session) responder_wire_ct: Option<CtBlob>,
+        /// The wedge latch (`SessionInner::pq_wedged`), tag-dispatched like
+        /// `WirePqInflight.kind`: `0` A.3 bootstrap, `1` A.4 ratchet, `2` A.5 re-key.
+        /// Unknown tags are rejected as `ArchiveInvalid`, as that `kind` is.
+        ///
+        /// ARCHIVED — and this is the whole difference from `bind_apply_broken`, which is
+        /// not — because the state it marks was written to a blob by the very push that
+        /// carried the `Err`: `mutate_and_persist` pushes on `Err` by design, its partial
+        /// mutations being real. A latch that healed on restore would hand the honest label
+        /// back to the retriable lie the restored state still embodies.
+        pub(in crate::session) pq_wedged: Option<u8>,
     }
 
     impl ArchiveTail {
         /// The tail a v2 blob restores as, and the one a session with nothing to append
-        /// writes.
+        /// writes. A v2 blob carries no verdict, and `None` is the only answer that keeps a
+        /// restored 0.14 session usable — the tear it could not record is the pre-existing
+        /// behaviour this field exists to stop.
         pub(in crate::session) fn empty() -> Self {
             Self {
                 responder_wire_ct: None,
+                pq_wedged: None,
             }
         }
     }
@@ -495,7 +508,7 @@ fn retained_from_wire(frame: Option<Vec<u8>>) -> Option<RetainedFrame> {
 /// `PqInflight` → its wire form. The A.4 variants carry the round's KEM material; the
 /// A.3/A.5 markers carry only a discriminant. A `Responding` round's `wire_ct` does NOT
 /// belong to this struct (it rides the [`archive_wire::ArchiveTail`], keeping these bytes
-/// v2-identical) — `tail_from_inflight` extracts it.
+/// v2-identical) — `tail_from` extracts it.
 fn wire_pq_inflight(inflight: &PqInflight) -> archive_wire::WirePqInflight {
     use archive_wire::{PqEphemeralBlob, SecretBlob, WirePqInflight};
     match inflight {
@@ -537,16 +550,23 @@ fn wire_pq_inflight(inflight: &PqInflight) -> archive_wire::WirePqInflight {
     }
 }
 
-/// The v3 tail for `inflight`: a `Responding` round's retained `wire_ct`, else empty.
-fn tail_from_inflight(inflight: Option<&PqInflight>) -> archive_wire::ArchiveTail {
+/// The v3 tail for `inner`: a `Responding` round's retained `wire_ct`, plus the wedge latch.
+///
+/// A whole-state view rather than an inflight one, because the wedge is not round state and
+/// must ride BOTH blob kinds: it is set inside a `Checkpoint` closure, but a later ordinary
+/// `Core` push can win the `state_seq` race in `reconcile_persisted`, and a winner without
+/// the verdict would restore a session that reports healthy and deadlocks.
+fn tail_from(inner: &SessionInner) -> archive_wire::ArchiveTail {
     use archive_wire::{ArchiveTail, CtBlob};
-    match inflight {
+    let responder_wire_ct = match inner.pq_inflight.as_ref() {
         Some(PqInflight::Responding {
             wire_ct: Some(ct), ..
-        }) => ArchiveTail {
-            responder_wire_ct: Some(CtBlob { bytes: ct.clone() }),
-        },
-        _ => ArchiveTail::empty(),
+        }) => Some(CtBlob { bytes: ct.clone() }),
+        _ => None,
+    };
+    ArchiveTail {
+        responder_wire_ct,
+        pq_wedged: inner.pq_wedged.map(|w| w as u8),
     }
 }
 
@@ -747,6 +767,16 @@ fn session_from_wire(
         .pq_inflight
         .map(|w| pq_inflight_from_wire(w, responder_wire_ct))
         .transpose()?;
+    // The wedge verdict rides beside the torn state it describes, so a restore reproduces
+    // both — see `SessionInner::pq_wedged` for why this one is archived where
+    // `bind_apply_broken` is not. An unknown tag is a forged or corrupt archive.
+    let pq_wedged = match tail.pq_wedged {
+        None => None,
+        Some(0) => Some(PqWedge::Bootstrap),
+        Some(1) => Some(PqWedge::Ratchet),
+        Some(2) => Some(PqWedge::Rekey),
+        Some(_) => return Err(TwoMlsPqError::ArchiveInvalid),
+    };
 
     let group_state = |entry: archive_wire::GroupEntry| apq::CombinerGroupState {
         classical: entry.classical.bytes,
@@ -839,6 +869,12 @@ fn session_from_wire(
             // in-memory apply failure, and restoring predates the failed take — so a restore
             // IS the recovery (see `SessionInner::bind_apply_broken`).
             bind_apply_broken: false,
+            // Restored from the tail, in deliberate contrast to `bind_apply_broken` above:
+            // that latch heals here because inbound processing persists on success only, so
+            // the blob predates the failed take. A wedged TRIGGER has no such luck — its
+            // closure persisted the tear on the way out — so the verdict must come back with
+            // it. That contrast is the design, not an inconsistency.
+            pq_wedged,
             // The seal cache is live-only, so a restore restarts any chunking pass with a
             // fresh base — the frames themselves ride the archive, so re-sending resumes.
             pending_side_band: retained_from_wire(wire.pending_side_band),
@@ -1171,14 +1207,14 @@ fn encode_archive(
 
 /// Encode the full session (checkpoint): identity + classical + meta + the ML-KEM trees.
 pub(super) fn encode_checkpoint(inner: &mut SessionInner) -> Result<Vec<u8>> {
-    let tail = tail_from_inflight(inner.pq_inflight.as_ref());
+    let tail = tail_from(inner);
     let wire = build_archive_wire(inner, true)?;
     encode_archive(&inner.suite, &wire, &tail)
 }
 
 /// Encode the `core` blob: everything except the two ML-KEM ratchet trees.
 pub(super) fn encode_core(inner: &mut SessionInner) -> Result<Vec<u8>> {
-    let tail = tail_from_inflight(inner.pq_inflight.as_ref());
+    let tail = tail_from(inner);
     let wire = build_archive_wire(inner, false)?;
     encode_archive(&inner.suite, &wire, &tail)
 }
