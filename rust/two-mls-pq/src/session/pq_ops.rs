@@ -148,6 +148,22 @@ fn process_a4_leg<Cfg: mls_rs::client_builder::MlsConfig>(
     Ok(payload.to_vec())
 }
 
+/// The content type an MLS protocol message declares in its PLAINTEXT framing — a pure read,
+/// no keys and no state, so it can gate a door before `process_incoming_message` (which
+/// validates and APPLIES atomically) ever sees the message. `None` for a non-protocol message
+/// (Welcome, KeyPackage, GroupInfo), which no door here accepts anyway. Covers both wire
+/// formats: our control messages are `PublicMessage` today (`EncryptionOptions::default`), but
+/// reading the type off either shape keeps the gate correct if that ever changes.
+fn declared_content_type(msg: &MlsMessage) -> Option<mls_rs::group::ContentType> {
+    match msg.description() {
+        mls_rs::MlsMessageDescription::PrivateProtocolMessage { content_type, .. }
+        | mls_rs::MlsMessageDescription::PublicProtocolMessage { content_type, .. } => {
+            Some(content_type)
+        }
+        _ => None,
+    }
+}
+
 /// Encode an A.4 leg's authenticated CONTENT: the domain tag then the payload
 /// (`[0x17][ek]` or `[0x19][wire_ct]`). This is the plaintext handed to
 /// `encrypt_application_message`, so the tag is covered by the MLS signature — binding the
@@ -976,9 +992,32 @@ impl TwoMlsPqSession {
             }
             let proposal_msg =
                 MlsMessage::from_bytes(proposal_bytes).map_err(|_| TwoMlsPqError::Mls)?;
+            // Content-type gate, mirroring `process_a4_leg`'s and for the same reason: the
+            // routing tag is the sender's, and this door feeds `process_incoming_message` on
+            // our SEND-PQ, which APPLIES a commit atomically. So a Commit smuggled behind the
+            // `Upd'` tag — the peer is a member of that group and can author a valid one —
+            // would advance our send-PQ epoch before the kind match in the closure could
+            // refuse it, and (pre-#111 style) answer the fatal `Mls`. Read the type off the
+            // plaintext framing HERE, in the guard phase, and refuse anything but a proposal
+            // as a pure no-op: `DecryptionFailed`, the retriable/discardable disposition,
+            // nothing consumed. A proposal still enters the closure, where mls-rs caches it
+            // and the refusal path drops it.
+            if declared_content_type(&proposal_msg) != Some(mls_rs::group::ContentType::Proposal) {
+                return Err(TwoMlsPqError::DecryptionFailed);
+            }
             // Inflight only (see `pq_ratchet_respond`): the slot may hold our own retained
             // frame from the previous round.
             if inner.pq_inflight.is_some() {
+                return Err(TwoMlsPqError::SessionNotReady);
+            }
+            // No A.5 while a bind is owed. The closure below commits our send-PQ (the Commit'),
+            // moving `pq_epoch` — but an owed bind has RESERVED the current `pq_epoch` in its
+            // attestation, and `discharge_owed_bind` refuses a bind whose reserved epoch no
+            // longer matches, with the PQ leaf already spent and unrebuildable. An honest peer
+            // never reaches this: owing a bind means the turn is still ours, so it is not the
+            // peer's to open a round. A deviating one is refused retriably here, before the
+            // choke point — the bind entry points guard the same reservation the same way.
+            if inner.owed_bind.is_some() {
                 return Err(TwoMlsPqError::SessionNotReady);
             }
             proposal_msg
@@ -1028,9 +1067,13 @@ impl TwoMlsPqSession {
                 // drops what it refused. Nothing is lost by that: the peer re-sends its
                 // `Upd'` — which is exactly what makes the credential-lag refusal below
                 // retriable — and the retry re-ingests it.
+                // The content-type gate in the guard phase already proved this is a proposal,
+                // so `process_incoming_message` returns `Proposal` here — but decrypt/validate
+                // failures are still a peer-frame judgement, so map them to the retriable
+                // `DecryptionFailed`, never the fatal `Mls`.
                 let ingested = match send_pq
                     .process_incoming_message(proposal_msg)
-                    .map_err(|_| TwoMlsPqError::Mls)?
+                    .map_err(map_app_message_err)?
                 {
                     // Only the peer's own-leaf Update is a legitimate A.5 opener.
                     ReceivedMessage::Proposal(desc) => {
@@ -1040,7 +1083,8 @@ impl TwoMlsPqSession {
                             })
                         })
                     }
-                    _ => Err(TwoMlsPqError::Mls),
+                    // Unreachable past the gate; defense in depth, and never fatal.
+                    _ => Err(TwoMlsPqError::DecryptionFailed),
                 };
                 rotated = match ingested {
                     Ok(announced) => announced,
