@@ -1524,7 +1524,7 @@ impl TwoMlsPqSession {
         validate_combiner_kp(client.combiner().cipher_suite(), &their_key_package)?;
         let their_parsed = parse_mls_key_package(their_key_package.classical.clone())?;
         let their_id = their_parsed.client_id;
-        let session_id = crate::derive_session_id(client.client_id(), their_id.clone())?;
+        let session_id = crate::pair_session_id(client.client_id(), their_id.clone());
 
         let (send_group, apq_welcome) = create_combiner_send_group(
             &their_key_package.classical,
@@ -1702,7 +1702,7 @@ impl TwoMlsPqSession {
         // The session id derives from the FOUNDING pair — the invitation identity the
         // peer initiated toward — never the dedicated principal, so both sides compute
         // the same value (the initiator derives it from the key package it addressed).
-        let session_id = crate::derive_session_id(client.client_id(), their_id.clone())?;
+        let session_id = crate::pair_session_id(client.client_id(), their_id.clone());
 
         // Decode the incoming welcome once; validate its cipher suite(s) before joining, so a
         // mismatch fails early and clearly rather than deep inside mls-rs — then join the

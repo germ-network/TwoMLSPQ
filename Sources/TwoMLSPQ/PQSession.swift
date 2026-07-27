@@ -222,7 +222,15 @@ import TwoMLSPQBinding
 //     throughout, and an already-reserved bind still discharges. Hosts must handle the new
 //     case (the error map is exhaustive, so it will not compile until they do). Archive
 //     layout stays v3, gaining one field.
-private let expectedBindingContract: UInt64 = 30
+// v31 (contract 31): `deriveSessionId` is REMOVED from the crate's FFI surface — a session
+//     pins its id at its FOUNDING pair for life, so re-deriving from current client ids
+//     disagreed with it after a principal rotation (and always, for a born-dedicated
+//     acceptor). `activeSessionId()` is the session's id; a pre-session pair key is a digest
+//     the caller computes itself. Nothing to do here: the raw binding is an internal target,
+//     so this function was never reachable from this product. The bump covers the dropped FFI
+//     symbol, which requires the vendored binding to be re-paired with the binary. No wire,
+//     API, or error-variant change.
+private let expectedBindingContract: UInt64 = 31
 
 enum TwoMLSPQBindingContract {
 	static let verified: Void = {
