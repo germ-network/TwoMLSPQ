@@ -87,7 +87,8 @@ The receiving side of a published key package — no live client required.
   initiator sees the dedicated principal from the very first frame, with no
   founding→dedicated rotation, so nothing can displace the welcome staple. The receive-group join still
   uses the invitation identity (the welcome was addressed to its key package), and
-  the session id still derives from the founding pair, so both sides agree on it.
+  the session id — the initiator's random group id — is unaffected by any of this,
+  so both sides still name the same one.
   `expected_remote` is the identity the caller already expects the welcome from
   (Germ validates it from the decrypted initial frame): a key package naming anyone
   else is rejected as `RemoteIdentityMismatch` **before any invitation state is
@@ -137,20 +138,23 @@ The receiving side of a published key package — no live client required.
 - `MlsCipherSuite::is_combiner_pq()` / `is_combiner_classical()` — routing signals (true for
   the PQ `0xFDEA` and classical `0x0003` halves respectively).
 
-`derive_session_id(a, b)` was **removed** in contract 31. A session pins its id at its
-**founding** pair — the invitation identity the initiator addressed — and never moves it
-again, while the client ids themselves do: a principal rotation replaces them, and a
-born-dedicated acceptor never operated under its founding id at all. Re-deriving from the
-ids a caller holds later therefore produced a digest the session did not agree with. There
-is no single replacement, because the call answered two different questions:
+**The session id is the initiator's group id.** `derive_session_id(a, b)` was removed in
+contract 31 and its stored replacement `active_session_id()` in contract 32, because both
+were a hash of the two client ids — `SHA-256(min(a,b) ‖ max(a,b))` — and that is a
+participant-**pair** fingerprint, not a session id: it is computable by anyone holding the
+two public `ClientId`s, and it is identical across every session the pair ever opens.
 
-- *"What is this session's id?"* — [`active_session_id()`](#twomlspqsession), the stored
-  founding value: identical on both sides, available from construction, preserved across
-  archive restore.
-- *"What is a stable key for this pair, before a session exists?"* — compute your own
-  digest. It was only `SHA-256(min(a,b) ‖ max(a,b))` over two public `ClientId`s, with
-  nothing secret and nothing protocol-specific in it — but do not call the result a session
-  id, since it stops matching the session's the moment either party rotates.
+A real session id must be fresh and unpredictable per session. The one already in hand is
+the **initiator's randomly-generated group id**: seeded at group creation, unique per
+session, and shared — the initiator's send group *is* the acceptor's receive group. Read it
+with [`send_group_id()`](#twomlspqsession) on the initiator and
+[`receive_group_id()`](#twomlspqsession) on the acceptor (the classical half, present from
+construction; both sides name the same value). It survives archive restore with the group
+state.
+
+If you genuinely need a stable key for a *pair* before any session exists, compute your own
+`SHA-256(min(a,b) ‖ max(a,b))` over the two `ClientId`s — nothing secret, nothing
+protocol-specific — but do not call it a session id.
 
 ## `TwoMlsPqSession`
 
@@ -175,9 +179,9 @@ rest by higher `state_seq`) and fails closed (`ArchiveInvalid`) on a PQ-epoch ma
 mismatch.
 
 State: `is_established`, `is_fully_established`, `has_receive_group`,
-`active_session_id` (the founding-pair id this session was constructed with — since
-contract 31 the only way to obtain it, the free `derive_session_id` having been removed),
-`receive_group_id`, `my_principal_state`, `their_principal_state`,
+`send_group_id` / `receive_group_id` (the initiator's `send_group_id` is the session id —
+see above; each is a `CombinerGroupId` whose classical half is present from construction),
+`my_principal_state`, `their_principal_state`,
 `pending_outbound` (the standalone copy of the own welcome — not consumed by
 `encrypt`; the welcome also rides every pre-commit frame as the staple), `epochs`,
 `app_binding() -> Result<Option<Vec<u8>>>` (Swift `try appBinding() -> Data?`; the

@@ -2812,6 +2812,11 @@ fn test_accept_with_invalid_welcome_bytes_returns_error() {
     );
 }
 
+/// The canonical session id is the INITIATOR's randomly-generated group id, and both sides
+/// name the same one — the initiator's send group IS the acceptor's receive group. This is the
+/// real session identifier: seeded with fresh randomness at group creation, so it is unique
+/// per session and unpredictable, unlike a bare hash of the two client ids (which every
+/// session this pair ever opens would share — see `test_session_id_is_fresh_per_session`).
 #[test]
 fn test_session_id_is_same_from_both_sides() {
     let alice = make_client();
@@ -2830,11 +2835,13 @@ fn test_session_id_is_same_from_both_sides() {
         None
     ));
 
-    assert_eq!(
-        alice_session.active_session_id().bytes,
-        bob_session.active_session_id().bytes,
-        "session IDs must match"
-    );
+    // Alice initiates, so the session id is her send group's (classical) id; Bob names the
+    // same value as his RECEIVE group. The classical half is present from creation, so this
+    // holds before the A.3 PQ bootstrap.
+    let alice_id = assert_some!(alice_session.send_group_id()).classical.bytes;
+    let bob_id = assert_some!(bob_session.receive_group_id()).classical.bytes;
+    assert!(!alice_id.is_empty(), "a group id is never empty");
+    assert_eq!(alice_id, bob_id, "both sides must name the same session id");
 }
 
 #[test]
@@ -3243,9 +3250,14 @@ fn test_archive_round_trips_session_state() {
     let (alice_session, bob_session) = establish_sessions();
     message_round(&alice_session, &bob_session, b"before");
 
-    let session_id = alice_session.active_session_id();
+    // The session id (the initiator's group id) rides the archived group state, so it is the
+    // same across a restore.
+    let session_id = assert_some!(alice_session.send_group_id()).classical.bytes;
     let restored = round_trip(&alice_session);
-    assert_eq!(restored.active_session_id(), session_id);
+    assert_eq!(
+        assert_some!(restored.send_group_id()).classical.bytes,
+        session_id
+    );
 
     // Both directions keep flowing across the restore.
     message_round(&restored, &bob_session, b"restored->bob");
@@ -4349,25 +4361,43 @@ fn test_process_incoming_proposal_returns_none_until_queued() {
     assert!(prep2.did_commit, "must commit after queue_proposal");
 }
 
+/// The session id is fresh PER SESSION, not per pair — the crux of why the initiator's random
+/// group id is the right identifier and a client-id-pair hash is not. Different peers differ,
+/// of course; but so do two sessions between the SAME pair, which a bare
+/// `SHA-256(clientA ‖ clientB)` — no seed — could never distinguish. Both are asserted here.
 #[test]
-fn test_session_id_differs_for_different_pairs() {
+fn test_session_id_is_fresh_per_session() {
     let alice = make_client();
     let bob = make_client();
     let carol = make_client();
-    let bob_kp = make_combiner_kp(&bob);
-    let carol_kp = make_combiner_kp(&carol);
 
-    let alice_bob = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
-    let alice_carol = assert_ok!(TwoMlsPqSession::initiate(
+    let sid = |s: &Arc<TwoMlsPqSession>| assert_some!(s.send_group_id()).classical.bytes;
+
+    // Different peers → different ids.
+    let alice_bob = assert_ok!(TwoMlsPqSession::initiate(
         Arc::clone(&alice),
-        carol_kp,
+        make_combiner_kp(&bob),
         None
     ));
+    let alice_carol = assert_ok!(TwoMlsPqSession::initiate(
+        Arc::clone(&alice),
+        make_combiner_kp(&carol),
+        None
+    ));
+    assert_ne!(sid(&alice_bob), sid(&alice_carol), "different pairs differ");
 
+    // The SAME pair, a second session → still a different id. This is the property the old
+    // client-id-pair hash lacked: with no per-session seed it would have returned the same
+    // bytes for both, colliding two distinct conversations under one identifier.
+    let alice_bob_again = assert_ok!(TwoMlsPqSession::initiate(
+        Arc::clone(&alice),
+        make_combiner_kp(&bob),
+        None
+    ));
     assert_ne!(
-        alice_bob.active_session_id().bytes,
-        alice_carol.active_session_id().bytes,
-        "different peer pairs must produce different session IDs"
+        sid(&alice_bob),
+        sid(&alice_bob_again),
+        "a fresh session between the same pair must get a fresh id"
     );
 }
 
@@ -5572,12 +5602,13 @@ fn test_receive_under_dedicated_principal() {
     ));
 
     // The acceptor's principal is the dedicated agent from birth — no Pending state,
-    // nothing staged. The session id still derives from the FOUNDING pair (the
-    // invitation identity Alice initiated toward), so both sides agree on it.
+    // nothing staged. Both sides still agree on the session id, and now trivially so: it is
+    // the initiator's random group id (Alice's send group = Bob's receive group), which does
+    // not depend on either party's client id — so a born-dedicated acceptor changes nothing.
     assert_eq!(bob_s.my_principal_state().client_id().bytes, dedicated);
     assert_eq!(
-        alice_s.active_session_id().bytes,
-        bob_s.active_session_id().bytes
+        assert_some!(alice_s.send_group_id()).classical.bytes,
+        assert_some!(bob_s.receive_group_id()).classical.bytes
     );
     // Pre-join, Alice still knows the peer as the invitation identity.
     assert_eq!(

@@ -1791,8 +1791,6 @@ public func FfiConverterTypeTwoMlsPqPrincipal_lower(_ value: TwoMlsPqPrincipal) 
  */
 public protocol TwoMlsPqSessionProtocol: AnyObject, Sendable {
     
-    func activeSessionId()  -> SessionId
-    
     /**
      * The app-state binding this session was created with (`initiate`'s `app_binding`,
      * or the binding the accepted welcome carried), or `None` for an unbound session.
@@ -1899,12 +1897,14 @@ public protocol TwoMlsPqSessionProtocol: AnyObject, Sendable {
     
     /**
      * This session's OWN send-group id — the classical half is present from
-     * creation, the PQ half empty until its deferred bootstrap (A.3). Unlike
-     * [`active_session_id`](Self::active_session_id) (a hash of the two client ids,
-     * shared across the pair) this is a per-endpoint value: each side's send group
-     * differs, so an adopter keying local state by it never shares an at-rest
-     * identifier with its peer. The mirror of [`receive_group_id`](Self::receive_group_id)
-     * (my send group is the peer's receive group).
+     * creation, the PQ half empty until its deferred bootstrap (A.3). A per-endpoint
+     * value: each side's send group differs. The mirror of
+     * [`receive_group_id`](Self::receive_group_id) — my send group is the peer's receive
+     * group — which is what makes the INITIATOR's send-group id a shared identifier both
+     * parties can name (the initiator by this accessor, the acceptor by `receive_group_id`).
+     * That randomly-seeded, per-session group id is the session identifier; there is no
+     * separate derived id (a hash of the two client ids would be a pair fingerprint, not a
+     * session id — the same pair's every session would share it).
      */
     func sendGroupId()  -> CombinerGroupId?
     
@@ -2522,14 +2522,6 @@ public static func restore(core: Archive?, checkpoint: Archive?)throws  -> TwoMl
     
 
     
-open func activeSessionId() -> SessionId  {
-    return try!  FfiConverterTypeSessionId_lift(try! rustCall() {
-    uniffi_two_mls_pq_fn_method_twomlspqsession_active_session_id(
-            self.uniffiCloneHandle(),$0
-    )
-})
-}
-    
     /**
      * The app-state binding this session was created with (`initiate`'s `app_binding`,
      * or the binding the accepted welcome carried), or `None` for an unbound session.
@@ -2708,12 +2700,14 @@ open func receiveGroupId() -> CombinerGroupId?  {
     
     /**
      * This session's OWN send-group id — the classical half is present from
-     * creation, the PQ half empty until its deferred bootstrap (A.3). Unlike
-     * [`active_session_id`](Self::active_session_id) (a hash of the two client ids,
-     * shared across the pair) this is a per-endpoint value: each side's send group
-     * differs, so an adopter keying local state by it never shares an at-rest
-     * identifier with its peer. The mirror of [`receive_group_id`](Self::receive_group_id)
-     * (my send group is the peer's receive group).
+     * creation, the PQ half empty until its deferred bootstrap (A.3). A per-endpoint
+     * value: each side's send group differs. The mirror of
+     * [`receive_group_id`](Self::receive_group_id) — my send group is the peer's receive
+     * group — which is what makes the INITIATOR's send-group id a shared identifier both
+     * parties can name (the initiator by this accessor, the acceptor by `receive_group_id`).
+     * That randomly-seeded, per-session group id is the session identifier; there is no
+     * separate derived id (a hash of the two client ids would be a pair fingerprint, not a
+     * session id — the same pair's every session would share it).
      */
 open func sendGroupId() -> CombinerGroupId?  {
     return try!  FfiConverterOptionTypeCombinerGroupId.lift(try! rustCall() {
@@ -4782,61 +4776,6 @@ public func FfiConverterTypeRendezvousId_lower(_ value: RendezvousId) -> RustBuf
     return FfiConverterTypeRendezvousId.lower(value)
 }
 
-
-/**
- * Session identifier derived from both parties' client IDs at init time.
- * Both sides can derive the same ID independently, preventing identity
- * confusion when both parties initiate simultaneously.
- */
-public struct SessionId: Equatable, Hashable {
-    public var bytes: Data
-
-    // Default memberwise initializers are never public by default, so we
-    // declare one manually.
-    public init(bytes: Data) {
-        self.bytes = bytes
-    }
-
-    
-
-    
-}
-
-#if compiler(>=6)
-extension SessionId: Sendable {}
-#endif
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public struct FfiConverterTypeSessionId: FfiConverterRustBuffer {
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SessionId {
-        return
-            try SessionId(
-                bytes: FfiConverterData.read(from: &buf)
-        )
-    }
-
-    public static func write(_ value: SessionId, into buf: inout [UInt8]) {
-        FfiConverterData.write(value.bytes, into: &buf)
-    }
-}
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeSessionId_lift(_ buf: RustBuffer) throws -> SessionId {
-    return try FfiConverterTypeSessionId.lift(buf)
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeSessionId_lower(_ value: SessionId) -> RustBuffer {
-    return FfiConverterTypeSessionId.lower(value)
-}
-
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
@@ -6420,9 +6359,6 @@ private let initializationResult: InitializationResult = {
     if (uniffi_two_mls_pq_checksum_method_twomlspqprincipal_generate_key_package() != 11085) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_active_session_id() != 37750) {
-        return InitializationResult.apiChecksumMismatch
-    }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_app_binding() != 59144) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -6459,7 +6395,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_receive_group_id() != 24855) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_send_group_id() != 56157) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_send_group_id() != 9016) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_set_initial_app_payload() != 22701) {

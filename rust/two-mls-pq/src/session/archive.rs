@@ -358,6 +358,12 @@ pub(crate) mod archive_wire {
         /// PQ op advanced without emitting a checkpoint (forbidden), so restore fails closed.
         pub(in crate::session) send_pq_epoch: Option<u64>,
         pub(in crate::session) recv_pq_epoch: Option<u64>,
+        /// VESTIGIAL. Once the client-id-pair `SessionId` this session exposed (removed in
+        /// contract 32 — the session id is the initiator's group id, needs no separate
+        /// value). The field stays because a released 0.14 (v2) archive carries these bytes
+        /// in exactly this position, and the v3 migration decodes the same body shape, so
+        /// removing it would misread every 0.14 blob. Written empty from v3 on, ignored on
+        /// decode. Drop it only in a version that no longer accepts v2.
         #[mls_codec(with = "mls_rs_codec::byte_vec")]
         pub(in crate::session) session_id: Vec<u8>,
         /// The session's current client signing identity, rebuilt byte-exact on restore
@@ -873,9 +879,7 @@ fn session_from_wire(
             deferred_candidate: wire.deferred_candidate,
             auth_core: auth_core_restored,
             pq_inflight,
-            session_id: SessionId {
-                bytes: wire.session_id,
-            },
+            // `wire.session_id` is vestigial (see the wire field) — read and dropped.
             state_seq: wire.state_seq,
             my_state,
             their_state,
@@ -1067,7 +1071,8 @@ fn build_archive_wire(
             state_seq: inner.state_seq,
             send_pq_epoch,
             recv_pq_epoch,
-            session_id: inner.session_id.bytes.clone(),
+            // Vestigial (see the wire field): written empty from v3 on.
+            session_id: Vec::new(),
             client,
             my_state: wire_principal_state(&inner.my_state),
             their_state: wire_principal_state(&inner.their_state),

@@ -225,12 +225,19 @@ import TwoMLSPQBinding
 // v31 (contract 31): `deriveSessionId` is REMOVED from the crate's FFI surface — a session
 //     pins its id at its FOUNDING pair for life, so re-deriving from current client ids
 //     disagreed with it after a principal rotation (and always, for a born-dedicated
-//     acceptor). `activeSessionId()` is the session's id; a pre-session pair key is a digest
-//     the caller computes itself. Nothing to do here: the raw binding is an internal target,
-//     so this function was never reachable from this product. The bump covers the dropped FFI
-//     symbol, which requires the vendored binding to be re-paired with the binary. No wire,
-//     API, or error-variant change.
-private let expectedBindingContract: UInt64 = 31
+//     acceptor). Nothing to do here: the raw binding is an internal target, so this function
+//     was never reachable from this product. The bump covers the dropped FFI symbol, which
+//     requires the vendored binding to be re-paired with the binary. No wire, API, or
+//     error-variant change.
+// v32 (contract 32): `activeSessionId()` and its `SessionId` type are REMOVED, finishing v31.
+//     A seedless hash of the two client ids is a participant-pair fingerprint, not a session
+//     id — predictable from the public ids and identical across every session the pair opens.
+//     The session id is the INITIATOR's randomly-generated group id (fresh per session,
+//     already shared: the initiator's send group is the acceptor's receive group), read via
+//     the group-id accessors. Nothing to do here either — the removed function was never
+//     reachable from this product, and the whole app stack already keys on the group id. The
+//     bump covers the dropped FFI symbols. No wire, API, or error-variant change.
+private let expectedBindingContract: UInt64 = 32
 
 enum TwoMLSPQBindingContract {
 	static let verified: Void = {
@@ -752,13 +759,15 @@ public struct PQSession {
 		base.receiveGroupId()?.classical.bytes
 	}
 
-	/// This side's OWN send-group classical id — a stable, per-endpoint session
-	/// identifier present from creation. Distinct from `shouldListenOn()` (which
-	/// bundles the same value into a routing/rendezvous tuple): this is the identity
-	/// value on its own, for an adopter that keys local session state by it. It is
-	/// LOCAL — each endpoint's send group differs (my send group is the peer's
-	/// receive group), so it is never a shared-across-peers at-rest identifier, and
-	/// it is NOT `activeSessionId()` (the shared client-id-pair hash).
+	/// This side's OWN send-group classical id — present from creation. Distinct from
+	/// `shouldListenOn()` (which bundles the same value into a routing/rendezvous tuple):
+	/// this is the identity value on its own, for an adopter that keys local session state
+	/// by it. It is PER-ENDPOINT — each side's send group differs, and my send group is the
+	/// peer's receive group. The INITIATOR's send-group id doubles as the shared session id
+	/// (the acceptor names the same value as its receive group); the acceptor's own
+	/// `localSessionId` is a distinct per-endpoint value. There is no separate derived
+	/// session id — a hash of the two client ids would be a pair fingerprint, not a session
+	/// id.
 	public var localSessionId: GroupID? {
 		base.sendGroupId()?.classical.bytes
 	}
