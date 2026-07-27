@@ -210,6 +210,25 @@ impl SessionInner {
         Ok(())
     }
 
+    /// The post-commit form of [`Self::record_pq_header_key`]: run it and DISCARD a failure.
+    ///
+    /// Every caller of this sibling is the tail of a bind whose PQ commit has already landed
+    /// and reserved its classical partner. The round SUCCEEDED, and `mutate_and_persist` has
+    /// captured it either way — so propagating from here would report that success as a
+    /// failure and, worse, latch the round as wedged (`past_no_return`) when nothing is
+    /// actually torn. It sits deliberately OUTSIDE that region for exactly this reason.
+    ///
+    /// Discarding is safe because the derivation is REPEATABLE: `header_key_pq` is the plain
+    /// exporter, deliberately not a `SafeExport` one-shot (contrast `export_psk`), so it
+    /// spends no leaf and re-derives the same key at the same `pq_epoch`. `should_listen_on`
+    /// is where that re-derivation happens — the backstop `record_listen_rendezvous` has
+    /// always had, now shared by both header families — so a dropped capture heals the next
+    /// time the host asks where to listen, rather than leaving the PQ side-band's receive
+    /// window silently short one epoch.
+    pub(in crate::session) fn record_pq_header_key_post_commit(&mut self) {
+        let _ = self.record_pq_header_key();
+    }
+
     /// Seal an outbound frame under the header key of MY recv group (the peer's send
     /// group) at its current classical epoch: `[random nonce][AEAD ct+tag]`, empty AAD.
     /// The peer opens it from its own send-group window (`recv_header_keys`). Requires a
@@ -1977,6 +1996,14 @@ impl TwoMlsPqSession {
     pub fn should_listen_on(&self) -> Result<ListenChannels> {
         let mut inner = self.lock();
         inner.record_listen_rendezvous()?;
+        // The PQ header window's backstop, exactly as the line above is the classical one.
+        // `record_pq_header_key` is BEST-EFFORT at every post-commit call site (see
+        // `record_pq_header_key_post_commit`), and this is where a dropped capture is
+        // re-derived — the derivation is repeatable, so re-running it costs nothing and
+        // spends nothing. Propagating here is right where discarding was right there:
+        // nothing has been consumed, the send-PQ epoch has not moved, and the caller can
+        // simply ask again.
+        inner.record_pq_header_key()?;
         let send = inner
             .send_group
             .as_ref()

@@ -283,7 +283,31 @@ struct SessionInner {
     /// heals on restore: reloading the last persisted state predates the failed take. Read
     /// by `pq_receive_broken`; a host decides how fatal that is (see
     /// [`TwoMlsPqError::BindApplyFailed`]).
+    ///
+    /// Its in-memory-ness is a CONSEQUENCE, not a free choice: it holds only because
+    /// `process_incoming_with` persists on success only. A change to that rule silently
+    /// turns the heal-on-restore property into a lie — contrast `pq_wedged`, which rides the
+    /// archive precisely because its closures do not have that property.
     bind_apply_broken: bool,
+    /// Which PQ round failed PAST ITS POINT OF NO RETURN (`past_no_return`), if one has.
+    /// Refuses every PQ side-band door with [`TwoMlsPqError::BindTriggerFailed`] thereafter,
+    /// so a wedged session says so instead of answering the retriable `SessionNotReady` — or,
+    /// at the A.3 door, the `DuplicateSideBand` that reports a round which never closed as
+    /// already done. Read by `pq_side_band_wedged`.
+    ///
+    /// ARCHIVED, and that is the whole difference from `bind_apply_broken` above. These
+    /// triggers run inside `mutate_and_persist`, which pushes even on `Err` because their
+    /// partial mutations are real — a spent application generation, a consumed exporter leaf
+    /// and its watermark, an applied ML-KEM commit and the `owed_bind` reservation it made.
+    /// The tear is therefore IN the blob, and a verdict that did not ride beside it would
+    /// restore a session that reports healthy and deadlocks. Skipping the push instead would
+    /// not help: it does not undo the mutation, it only delays capture, and the very next
+    /// successful push encodes the torn state anyway.
+    ///
+    /// Which round it was does not change the recovery (re-establish) but is the only
+    /// forensic record of which one-shot went, since the state left behind reads as healthy
+    /// from every other angle.
+    pq_wedged: Option<PqWedge>,
     /// Cross-party TwoMLS-PSKs of OUR send group's recent epochs, owned by the session
     /// (destined for the session archive; the mls-rs secret stores are ephemeral plumbing,
     /// filled just-in-time by `inject_send_psks`). The peer binds the PSK of our send
@@ -669,6 +693,50 @@ impl SessionInner {
             pq_epoch: attestation.pq_epoch,
         });
         Ok(())
+    }
+
+    /// Run the tail of a bind that is PAST ITS POINT OF NO RETURN: the round's one-shot
+    /// input is spent, the mutations already made are real and PERSISTED (see
+    /// `mutate_and_persist`, which pushes even on `Err`), and no retry can rebuild the round.
+    /// Any error from `f` is latched into `pq_wedged` and renamed to the fatal
+    /// [`TwoMlsPqError::BindTriggerFailed`].
+    ///
+    /// **Why a helper and not an ordering rule.** "Consume last" is not achievable in these
+    /// three binds: `commit_pq_and_owe_bind` IS the consumption and it is fallible, and
+    /// `record_pq_header_key` needs the very epoch that commit produces. So what a bind can
+    /// promise is not "nothing fallible follows the consume" but "nothing past the consume
+    /// escapes wearing a retriable name" — a property of which closure a line sits in, not of
+    /// where it sits relative to a `take`. A fallible line added to a tail is inside the
+    /// mapping by construction, exactly as `discharge_and_commit` made the send-side window
+    /// structural.
+    ///
+    /// Deliberately scoped to the TAIL, not the whole closure: every bind's prologue — the
+    /// decrypt, the sealed-secret open, the credential-lag refusal — is retriable on purpose,
+    /// and wrapping it would wedge sessions that merely saw a stale or misdirected frame.
+    fn past_no_return<T>(
+        &mut self,
+        round: PqWedge,
+        f: impl FnOnce(&mut SessionInner) -> Result<T>,
+    ) -> Result<T> {
+        match f(self) {
+            Ok(v) => Ok(v),
+            Err(_) => {
+                self.pq_wedged = Some(round);
+                Err(TwoMlsPqError::BindTriggerFailed)
+            }
+        }
+    }
+
+    /// Guard every PQ side-band door with the wedge latch. A round that failed past its point
+    /// of no return left PERSISTED torn state, so there is nothing for a retry to fix and the
+    /// honest answer is the fatal name rather than whatever the state SHAPE would otherwise
+    /// produce — `SessionNotReady` at the A.4/A.5 doors, and at A.3's the `DuplicateSideBand`
+    /// that reports the step as already taken. One helper so the doors cannot drift.
+    fn check_not_wedged(&self) -> Result<()> {
+        match self.pq_wedged {
+            None => Ok(()),
+            Some(_) => Err(TwoMlsPqError::BindTriggerFailed),
+        }
     }
 
     /// The classical half of the bind, run from the classical committing round that carries
@@ -1195,6 +1263,7 @@ fn build_session(
             // Not written to any blob — a restore lands before any failed take (see the
             // field), so it always starts clear.
             bind_apply_broken: false,
+            pq_wedged: None,
             last_cross_injected_pq: None,
             last_send_pq_exported: None,
             listen_rendezvous: BTreeMap::new(),

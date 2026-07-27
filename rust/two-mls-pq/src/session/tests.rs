@@ -2253,6 +2253,122 @@ fn test_bind_refuses_a_poisoned_send_pq_before_the_ephemeral_is_spent() {
     discharge_bind(&bob, &alice, b"healed");
 }
 
+/// Past the point of no return NOTHING is recoverable: the A.4 ephemeral is gone, the parked
+/// EK can no longer be re-minted (`rewrap_side_band` returns early with no round in flight),
+/// and `mutate_and_persist` has persisted it all. So a failure there must wear a FATAL name
+/// and must NOT heal on restore — the exact opposite of `bind_apply_broken`, whose in-memory
+/// latch is allowed to heal only because the RECEIVE path persists on success only.
+///
+/// The tamper is a built-but-unapplied commit on the send-PQ. It is genuinely not
+/// peer-reachable (only our own commit creates one, and every site applies immediately), and
+/// it slips past the residue guard on purpose — that guard reads the proposal cache, not the
+/// pending commit — so the bind's own `inject_and_commit` fails with the ephemeral spent.
+#[test]
+fn test_bind_trigger_failure_past_the_consume_is_fatal_and_does_not_heal_on_restore() {
+    let (alice, bob) = establish_full();
+    let ek = open_ratchet(&bob, &alice);
+    assert_ok!(alice.pq_ratchet_respond(ek));
+    let ct = assert_some!(alice.pq_take_pending_outbound());
+
+    let sink = Arc::new(RecordingSink::default());
+    assert_ok!(bob.install_sink(sink.clone()));
+    {
+        let mut inner = bob.lock();
+        let send_pq = inner
+            .send_group
+            .as_mut()
+            .and_then(|g| g.pq.as_mut())
+            .expect("send-PQ");
+        assert_ok!(send_pq.commit_builder().build());
+        assert!(send_pq.has_pending_commit());
+    }
+    let before = sink.kinds().len();
+
+    // Fatal, and named for what actually happened — not the raw `Mls` the failure wore, and
+    // not the retriable `SessionNotReady` every later attempt would otherwise get.
+    assert_err!(
+        bob.pq_ratchet_bind(ct.clone()),
+        TwoMlsPqError::BindTriggerFailed
+    );
+    assert!(bob.pq_side_band_wedged());
+    // The torn mutation WAS captured — the whole reason this latch rides the archive.
+    assert!(
+        sink.kinds().len() > before,
+        "mutate_and_persist pushes even on Err; partial mutations are real"
+    );
+
+    // A retry answers the same fatal name rather than an apparently-retriable one.
+    assert_err!(bob.pq_ratchet_bind(ct), TwoMlsPqError::BindTriggerFailed);
+
+    // Classical messaging is untouched, in BOTH directions: only the PQ side-band is stuck.
+    message_round(&bob, &alice, b"still-sending");
+    message_round(&alice, &bob, b"still-receiving");
+
+    // Restore does NOT heal — the verdict rides the archive beside the tear it describes.
+    let restored = assert_ok!(TwoMlsPqSession::restore(
+        sink.latest(crate::BlobKind::Core),
+        sink.latest(crate::BlobKind::Checkpoint),
+    ));
+    assert!(
+        restored.pq_side_band_wedged(),
+        "a restored session must not report healthy over persisted torn state"
+    );
+}
+
+/// A.3's wedge is the one that lies loudest if left unnamed: the join is already installed in
+/// `recv.pq`, so the entry guard answers `DuplicateSideBand` — "already done, discard" — and
+/// `is_fully_established()` reports true, while the peer sits in `BootstrapResponded` waiting
+/// for a staple that will never be built. The latch is what turns that into an honest answer.
+#[test]
+fn test_bootstrap_wedge_answers_honestly_rather_than_duplicate() {
+    let (alice, bob) = establish_confirmed_sessions();
+    let kp = assert_ok!(alice.pq_bootstrap_begin(None));
+    assert_ok!(bob.pq_bootstrap_respond(kp));
+    let welcome = assert_some!(bob.pq_pending_outbound(SideBandSealing::Fresh));
+
+    {
+        let mut inner = alice.lock();
+        let send_pq = inner
+            .send_group
+            .as_mut()
+            .and_then(|g| g.pq.as_mut())
+            .expect("send-PQ");
+        assert_ok!(send_pq.commit_builder().build());
+    }
+
+    assert_err!(
+        alice.pq_bootstrap_bind(welcome.clone()),
+        TwoMlsPqError::BindTriggerFailed
+    );
+    assert!(alice.pq_side_band_wedged());
+    // The re-sent welcome — which the responder keeps parked — must not be told the round
+    // succeeded. Without the latch this is `DuplicateSideBand`, because the join DID land.
+    assert_err!(
+        alice.pq_bootstrap_bind(welcome),
+        TwoMlsPqError::BindTriggerFailed
+    );
+}
+
+/// The negative control, mirroring `test_ordinary_discharge_is_not_flagged_fatal`: the region
+/// and the residue guard must not over-fire. A clean A.3, a clean A.4 and a clean A.5 all
+/// still complete, and none of them latches.
+#[test]
+fn test_ordinary_bind_triggers_are_not_flagged_wedged() {
+    let (alice, bob) = establish_full();
+    assert!(!alice.pq_side_band_wedged());
+    assert!(!bob.pq_side_band_wedged());
+
+    // A.5 first: `rekey_round` needs its initiator to be the NON-turn-holder, which Alice is
+    // only straight out of A.3. The turn comes back to Bob, who then opens the A.4.
+    let new_alice = make_client().client_id();
+    rekey_round(&alice, &bob, new_alice);
+    ratchet_round(&bob, &alice, b"a4");
+    message_round(&bob, &alice, b"after");
+
+    assert!(!alice.pq_side_band_wedged());
+    assert!(!bob.pq_side_band_wedged());
+}
+
 /// A.3's bind calls the same `commit_pq_and_owe_bind` as A.4's, so it carries the identical
 /// hazard: a prepared-but-unsent classical commit is sitting in `current_staple` waiting for
 /// its `encrypt`, and the bind's commit would fire out from under it. A displaced commit
