@@ -1580,6 +1580,99 @@ fn test_unsolicited_rekey_commit_is_rejected() {
     assert_err!(bob.pq_rekey_apply(bogus), TwoMlsPqError::SessionNotReady);
 }
 
+/// A Commit smuggled behind the A.5 `Upd'` tag must be refused BEFORE it is applied.
+///
+/// The `Upd'` door feeds `process_incoming_message` on our own send-PQ, which validates and
+/// APPLIES a commit atomically. The peer is a member of that group, so it can author a commit
+/// there that WOULD apply — moving our send-PQ epoch — and the pre-gate code refused it only
+/// AFTER, on the message kind, with the fatal `Mls`. The content-type gate reads the kind off
+/// the plaintext framing first and refuses anything but a proposal with the retriable
+/// `DecryptionFailed`, nothing applied.
+///
+/// The forged commit here is a REAL one for our send-PQ at its current epoch — built in the
+/// peer's recv-PQ mirror of it — so absent the gate `process_incoming_message` accepts and
+/// applies it. The epoch assertion is what a mutation of the gate trips.
+#[test]
+fn test_commit_smuggled_behind_the_rekey_upd_tag_is_refused_unapplied() {
+    let (alice, bob) = establish_full();
+
+    let send_pq_epoch = |s: &Arc<TwoMlsPqSession>| {
+        let inner = s.lock();
+        assert_some!(inner.send_group.as_ref().and_then(|g| g.pq.as_ref())).current_epoch()
+    };
+    let before = send_pq_epoch(&bob);
+
+    // Alice's recv-PQ mirror IS Bob's send-PQ, so a commit built there is a valid commit for
+    // Bob's send-PQ at its current epoch — exactly what would apply if it reached the ingest.
+    let commit = {
+        let mut inner = alice.lock();
+        let mirror = assert_some!(inner.recv_group.as_mut().and_then(|g| g.pq.as_mut()));
+        assert_ok!(assert_ok!(mirror.commit_builder().build())
+            .commit_message
+            .to_bytes())
+    };
+    let mut forged = vec![super::PQ_REKEY_UPD_TAG];
+    forged.extend_from_slice(&commit);
+
+    assert_err!(
+        bob.pq_rekey_respond(forged),
+        TwoMlsPqError::DecryptionFailed
+    );
+    assert_eq!(
+        send_pq_epoch(&bob),
+        before,
+        "a commit refused at the Upd' door must not have applied"
+    );
+    {
+        let inner = bob.lock();
+        let send_pq = assert_some!(inner.send_group.as_ref().and_then(|g| g.pq.as_ref()));
+        assert!(
+            send_pq.get_cached_proposals().is_empty() && !send_pq.has_pending_commit(),
+            "and must have left no residue"
+        );
+    }
+
+    // The session is untouched: a real rotation-driven A.5 still runs to completion.
+    ratchet_round(&bob, &alice, b"flip");
+    let new_id = make_client().client_id();
+    rekey_round(&bob, &alice, new_id);
+}
+
+/// The A.5 `Upd'` door refuses a rekey while a bind is owed. The closure commits our send-PQ,
+/// moving `pq_epoch` — but an owed bind reserved the current one in its attestation, and
+/// discharging against a moved epoch fails with the PQ leaf already spent. An honest peer
+/// never sends here (owing a bind means the turn is ours), so a deviating one is refused in
+/// the guard as a retriable no-op, the same way the bind entry points guard the reservation.
+#[test]
+fn test_rekey_upd_refused_while_a_bind_is_owed() {
+    let (alice, bob) = establish_full();
+    // Drive an A.4 to the point where Bob owes his classical bind (bound, not yet discharged).
+    let ek = open_ratchet(&bob, &alice);
+    assert_ok!(alice.pq_ratchet_respond(ek));
+    let ct = assert_some!(alice.pq_take_pending_outbound());
+    assert_ok!(bob.pq_ratchet_bind(ct));
+    assert!(
+        bob.lock().owed_bind.is_some(),
+        "Bob should owe his classical bind here"
+    );
+
+    // A well-formed Upd' proposal for Bob's send-PQ, built in Alice's recv-PQ mirror of it.
+    let upd = {
+        let mut inner = alice.lock();
+        let mirror = assert_some!(inner.recv_group.as_mut().and_then(|g| g.pq.as_mut()));
+        assert_ok!(assert_ok!(mirror.propose_update(Vec::new())).to_bytes())
+    };
+    let mut frame = vec![super::PQ_REKEY_UPD_TAG];
+    frame.extend_from_slice(&upd);
+
+    // Refused retriably in the guard — nothing consumed, the owed bind intact.
+    assert_err!(bob.pq_rekey_respond(frame), TwoMlsPqError::SessionNotReady);
+    assert!(bob.lock().owed_bind.is_some(), "the owed bind must survive");
+
+    // And the owed bind still discharges, closing the round normally.
+    discharge_bind(&bob, &alice, b"after-refused-rekey");
+}
+
 /// The session's own leaf signature public keys in (send-PQ, recv-PQ) — the two
 /// leaves an A.5 credential handoff must move to the new principal: the recv-mirror
 /// leaf via the initiator's Upd' (proposal replaces the proposer), the own-send-PQ
