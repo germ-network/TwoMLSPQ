@@ -448,7 +448,21 @@ pub fn version() -> String {
 // constructors. Removing an exported function drops its FFI symbol, so the vendored binding
 // must be re-paired with the binary; nothing else in the surface, the wire, or the error
 // variants moves.
-const BINDING_CONTRACT_VERSION: u64 = 31;
+//
+// v32: `active_session_id` and its `SessionId` type are REMOVED, finishing what v31 began.
+// v31 kept a stored client-id-pair hash as "the session's id", but a seedless
+// `SHA-256(clientA ‖ clientB)` is a participant-PAIR fingerprint, not a session id: it is
+// computable by anyone holding the two public client ids and is identical across every
+// session the pair ever opens. The real session id is the INITIATOR's randomly-generated
+// group id — fresh per session, unpredictable, and already shared (the initiator's send group
+// is the acceptor's receive group), read via `send_group_id` / `receive_group_id`. The whole
+// consuming stack (AbstractTwoMLS, the app) already keys on the group id and never called the
+// removed accessor, so nothing downstream breaks. The stored+archived field is dropped from
+// the live session; its wire slot stays VESTIGIAL in `SessionArchive` (written empty) so a
+// released 0.14 archive still decodes under the v3 migration. `pair_session_id` and the
+// `SessionId` uniffi record are gone. Drops two FFI symbols — re-pair the vendored binding —
+// no wire (archive layout stays v3) or error-variant change.
+const BINDING_CONTRACT_VERSION: u64 = 32;
 
 /// See `BINDING_CONTRACT_VERSION`. Exported so the Swift layer can verify the
 /// binding it was generated with matches the binary it loaded.
@@ -482,14 +496,6 @@ pub struct MlsGroupId {
 pub struct CombinerGroupId {
     pub classical: MlsGroupId,
     pub pq: MlsGroupId,
-}
-
-/// Session identifier derived from both parties' client IDs at init time.
-/// Both sides can derive the same ID independently, preventing identity
-/// confusion when both parties initiate simultaneously.
-#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
-pub struct SessionId {
-    pub bytes: Vec<u8>,
 }
 
 /// Transport rendezvous channel identifier.
@@ -1019,31 +1025,6 @@ pub(crate) fn sha256(bytes: &[u8]) -> Vec<u8> {
     crate::suite::TwoMlsSuite::CURRENT.digest(bytes)
 }
 
-/// The symmetric pair digest behind a session's id: both sides compute the same value
-/// from the same two client ids regardless of who initiated.
-///
-/// Crate-internal, and staying that way. The constructors call it with the **founding**
-/// pair — the invitation identity the initiator addressed — which is the only pair for
-/// which the result means anything: the session pins that value for life, while the ids
-/// themselves move on (a principal rotation replaces them, and a born-dedicated acceptor
-/// never operated under its founding id at all). A caller re-deriving from the ids it
-/// holds later would get a digest the session does not agree with, which is why this is
-/// not exported; `TwoMlsPqSession::active_session_id` reads the stored value instead.
-pub(crate) fn pair_session_id(my_id: ClientId, their_id: ClientId) -> SessionId {
-    let (first, second) = if my_id.bytes <= their_id.bytes {
-        (my_id.bytes, their_id.bytes)
-    } else {
-        (their_id.bytes, my_id.bytes)
-    };
-
-    let mut input = first;
-    input.extend_from_slice(&second);
-
-    SessionId {
-        bytes: sha256(&input),
-    }
-}
-
 impl From<mls_rs::error::MlsError> for TwoMlsPqError {
     fn from(_: mls_rs::error::MlsError) -> Self {
         TwoMlsPqError::Mls
@@ -1070,32 +1051,8 @@ pub type Result<T> = std::result::Result<T, TwoMlsPqError>;
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    fn client_id(bytes: &[u8]) -> ClientId {
-        ClientId {
-            bytes: bytes.to_vec(),
-        }
-    }
-
-    #[test]
-    fn test_pair_session_id_is_symmetric() {
-        let alice = client_id(b"alice");
-        let bob = client_id(b"bob");
-        assert_eq!(
-            pair_session_id(alice.clone(), bob.clone()).bytes,
-            pair_session_id(bob, alice).bytes
-        );
-    }
-
-    #[test]
-    fn test_pair_session_id_differs_for_different_pairs() {
-        let alice = client_id(b"alice");
-        let bob = client_id(b"bob");
-        let carol = client_id(b"carol");
-        assert_ne!(
-            pair_session_id(alice.clone(), bob).bytes,
-            pair_session_id(alice, carol).bytes
-        );
-    }
+    // The session-id derivation was removed in contract 32 — the session id is the
+    // initiator's random group id (see `TwoMlsPqSession::send_group_id` and the
+    // session-id tests in `session::tests`). Nothing pair-hash-shaped remains to unit-test
+    // here.
 }

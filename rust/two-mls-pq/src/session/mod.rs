@@ -31,7 +31,7 @@ use crate::{
     },
     Archive, ClientId, CombinerGroupId, CommitResult, DecryptResult, EncryptResult,
     EpochRendezvous, ListenChannels, MlsGroupId, MlsSenderMessage, PrepareEncryptResult,
-    PrincipalState, RendezvousId, Result, SessionId, TwoMlsPqError,
+    PrincipalState, RendezvousId, Result, TwoMlsPqError,
 };
 
 use zeroize::Zeroizing;
@@ -234,7 +234,6 @@ struct SessionInner {
     /// `AuthView` — the auth analogue of `track_psk_stores`.
     auth_core: AuthCoreHandle,
     pq_inflight: Option<PqInflight>,
-    session_id: SessionId,
     /// Monotonic per-session mutation counter, bumped once per state-advancing FFI call
     /// (see `mutate_and_persist`). Serialized in the archive so it continues across a
     /// restore; stamps each pushed blob and feeds `depends_on_seq` on outbound frames. `u64`
@@ -1207,7 +1206,6 @@ fn build_session(
     send_group: Option<CombinerGroup>,
     recv_group: Option<CombinerGroup>,
     pending_outbound: Option<Vec<u8>>,
-    session_id: SessionId,
     their_id: ClientId,
     initiated: bool,
     joined_welcome_digest: Option<Vec<u8>>,
@@ -1244,7 +1242,6 @@ fn build_session(
             deferred_candidate: None,
             auth_core,
             pq_inflight: None,
-            session_id,
             state_seq: 0,
             my_state: PrincipalState::Sync { client_id: my_id },
             their_state: PrincipalState::Sync {
@@ -1524,7 +1521,6 @@ impl TwoMlsPqSession {
         validate_combiner_kp(client.combiner().cipher_suite(), &their_key_package)?;
         let their_parsed = parse_mls_key_package(their_key_package.classical.clone())?;
         let their_id = their_parsed.client_id;
-        let session_id = crate::pair_session_id(client.client_id(), their_id.clone());
 
         let (send_group, apq_welcome) = create_combiner_send_group(
             &their_key_package.classical,
@@ -1542,7 +1538,6 @@ impl TwoMlsPqSession {
             // idempotently skips), not the sealed envelope. `pending_outbound` is replaced
             // with the envelope just below.
             Some(apq_welcome),
-            session_id,
             their_id,
             true,
             None,
@@ -1699,10 +1694,6 @@ impl TwoMlsPqSession {
         )?;
         let their_parsed = parse_mls_key_package(their_classical_key_package.clone())?;
         let their_id = their_parsed.client_id;
-        // The session id derives from the FOUNDING pair — the invitation identity the
-        // peer initiated toward — never the dedicated principal, so both sides compute
-        // the same value (the initiator derives it from the key package it addressed).
-        let session_id = crate::pair_session_id(client.client_id(), their_id.clone());
 
         // Decode the incoming welcome once; validate its cipher suite(s) before joining, so a
         // mismatch fails early and clearly rather than deep inside mls-rs — then join the
@@ -1800,7 +1791,6 @@ impl TwoMlsPqSession {
             Some(send_group),
             Some(recv_group),
             Some(apq_welcome),
-            session_id,
             their_id,
             false,
             // Record which welcome the recv group was joined from: welcomes are
@@ -2087,10 +2077,6 @@ impl TwoMlsPqSession {
         self.lock().recv_group.is_some()
     }
 
-    pub fn active_session_id(&self) -> SessionId {
-        self.lock().session_id.clone()
-    }
-
     pub fn my_principal_state(&self) -> PrincipalState {
         self.lock().my_state.clone()
     }
@@ -2133,12 +2119,14 @@ impl TwoMlsPqSession {
     }
 
     /// This session's OWN send-group id — the classical half is present from
-    /// creation, the PQ half empty until its deferred bootstrap (A.3). Unlike
-    /// [`active_session_id`](Self::active_session_id) (a hash of the two client ids,
-    /// shared across the pair) this is a per-endpoint value: each side's send group
-    /// differs, so an adopter keying local state by it never shares an at-rest
-    /// identifier with its peer. The mirror of [`receive_group_id`](Self::receive_group_id)
-    /// (my send group is the peer's receive group).
+    /// creation, the PQ half empty until its deferred bootstrap (A.3). A per-endpoint
+    /// value: each side's send group differs. The mirror of
+    /// [`receive_group_id`](Self::receive_group_id) — my send group is the peer's receive
+    /// group — which is what makes the INITIATOR's send-group id a shared identifier both
+    /// parties can name (the initiator by this accessor, the acceptor by `receive_group_id`).
+    /// That randomly-seeded, per-session group id is the session identifier; there is no
+    /// separate derived id (a hash of the two client ids would be a pair fingerprint, not a
+    /// session id — the same pair's every session would share it).
     pub fn send_group_id(&self) -> Option<CombinerGroupId> {
         let inner = self.lock();
         inner.send_group.as_ref().map(|sg| CombinerGroupId {
