@@ -1,5 +1,230 @@
 # @germ-network/two-mls-pq
 
+## 0.15.0
+
+### Minor Changes
+
+- [#119](https://github.com/germ-network/TwoMLSPQ/pull/119) [`63a7661`](https://github.com/germ-network/TwoMLSPQ/commit/63a7661af1a466c1225476564685e5340006bdcb) Thanks [@germ-mark](https://github.com/germ-mark)! - Gate the A.4 leg doors on content type, and stop them answering with `Mls`
+
+  The EK and CT doors carry application messages only, but the routing tag is
+  chosen by the sender, and MLS validates and applies atomically — so a Commit
+  smuggled behind a leg tag could be _applied_, moving an epoch, before the door's
+  kind check refused it. The doors now read the content type off the plaintext
+  framing and refuse anything but an application message before any keys or state
+  are touched.
+
+  Every rejection at those doors also stops reporting `Mls`, whose disposition is
+  fatal — "our own state may be inconsistent, discard the session". A host reading
+  that literally tears the session down, so a frame the peer chose must never be
+  able to ask for one. Misrouted or malformed legs now report the retriable
+  `DecryptionFailed`; nothing is consumed and nothing is staged either way.
+
+  No wire, FFI, or error-variant change.
+
+- [#115](https://github.com/germ-network/TwoMLSPQ/pull/115) [`eee9c46`](https://github.com/germ-network/TwoMLSPQ/commit/eee9c46a36dc79a9d325b3372e08812783ecd1e7) Thanks [@germ-mark](https://github.com/germ-mark)! - Carry the A.4 ratchet legs in the classical groups
+
+  The EK (`0x17`) and CT (`0x19`) travelled as MLS application messages in the
+  initiator's send-PQ group. Both of MLS's authentication factors are _fresher_ in
+  the classical half: its leaf signature and epoch secrets heal on every round and
+  adopt a principal rotation the moment it is canonicalized, while a send-PQ leaf
+  lags until an A.5 catch-up. Each leg now rides its own sender's **send-classical**
+  group instead, sealed under the classical header family.
+
+  Nothing is traded away in strength. MLS cipher suites are monolithic and both
+  halves sign Ed25519 — the PQ suite is confidentiality-only — so the signature
+  factor was already classical, and the classical epoch secrets are ML-KEM-seeded
+  through the APQ PSK. Under a break of ML-KEM the classical carrier keeps both
+  factors where the PQ carrier kept only the signature. The round's binding to the
+  PQ group is untouched: `ct_seal_psk` is still a PQ-group exporter keyed into the
+  seal over `S`, so a ciphertext answering a different group or epoch still fails
+  its open.
+
+  The responder mints its CT in its **own** send group, not the mirror the EK
+  arrived in. That mirror routinely holds its uncommitted routine `Upd`, and mls-rs
+  refuses to encrypt while a by-ref proposal is cached — a failure that would land
+  after the EK decrypt had already consumed its generation, stranding the round
+  with no way to retry.
+
+  What the classical carrier costs is that a leg's ciphertext is pinned to the
+  epoch it was minted at, and ordinary traffic advances that epoch past the peer's
+  retention window within a few commits. So an unanswered leg is now **re-minted**
+  at the current epoch on every send. Without it a leg that went undelivered across
+  that window would become permanently undecryptable, and since nothing clears the
+  in-flight round but its own completion, the side-band would wedge for the
+  session's lifetime. What survives a stall is therefore the round, not a leg's
+  bytes: a blob captured before a burst of commits stops opening, exactly as a
+  message frame from that moment does.
+
+  Re-minting means one logical leg exists as several valid wraps, and MLS retains
+  the keys of generations it skipped so they can arrive out of order — so a
+  superseded wrap redelivered late still decrypts, where a replay of the wrap
+  actually consumed does not. Answering one after its round had closed would park a
+  responder against an ephemeral the initiator already discarded, deadlocking the
+  side-band permanently. Both receive paths therefore reject, before decrypting,
+  any leg below the receiver's current classical epoch: reaching epoch E proves the
+  sender committed E, and that commit's own send re-minted the live leg to E, so
+  anything below it is superseded or replayed by construction. Legs that arrive
+  _ahead_ of the receiver stay retriable, as they always were.
+
+  Sessions established on 0.14 survive the upgrade. The archive layout goes to v3
+  and, for the first time, still **accepts** v2 — the new state rides a tail
+  appended after the byte-unchanged body, so an older blob decodes as the same
+  prefix. A round restored from v2 comes back intact and completes. An initiator's
+  parked encapsulation key is in the old form, which an upgraded peer will not
+  answer, so the first send after the restore converts it — re-minting the new form
+  from the ephemeral the round still holds. That closes the window against an
+  upgraded peer at the cost of one against a peer still on 0.14, which is the right
+  way round: the first is permanent once both ends upgrade, the second heals the
+  moment the peer does. A responder instead keeps re-sending the PQ-carried
+  ciphertext it parked, which `pq_ratchet_bind` still accepts — its payload is
+  encrypted to the peer and cannot be rebuilt, so refusing it would strand an
+  otherwise completable round.
+
+  Wire-breaking for the A.4 side-band in one direction only: `pq_ratchet_respond`
+  answers the classical form alone and **drops** a PQ-carried EK non-fatally,
+  without consuming anything, so the two forms never interleave inside a round. A
+  peer that has not yet upgraded therefore cannot answer a new-form EK, and the PQ
+  side-band — with it, A.5 credential catch-up — pauses for that pair until it
+  does. The unanswerable old-form leg reports `StaleFrame` (discard — no retry of
+  those bytes can ever succeed on this build), never anything a host should tear a
+  session down over. Classical messaging is unaffected throughout.
+
+  Persistence gets cheaper on the way past. Opening a round and answering one are
+  now classical-only mutations — the PQ half is read exactly once, through a
+  repeatable exporter that consumes no leaf — so neither pushes a `Checkpoint` any
+  more, and the two ML-KEM ratchet trees stop being serialized on every A.4 leg.
+  Only the bind, which really does commit the PQ half, still checkpoints.
+
+  Binding contract 28 → 29. No FFI signature or error-variant change. Hosts may
+  newly see `StaleFrame` (discard) on a side-band leg, since legs are re-sent as
+  fresh wraps rather than fixed bytes and an older copy is no longer retriable.
+
+- [#117](https://github.com/germ-network/TwoMLSPQ/pull/117) [`0bbcb6e`](https://github.com/germ-network/TwoMLSPQ/commit/0bbcb6e0b2a843d716bfa609bea9ff42bd2ae071) Thanks [@germ-mark](https://github.com/germ-mark)! - Close the PQ bind's consume-then-fail window
+
+  A bind's PQ half is a pathless commit carrying the -02 `AppDataUpdate` attestation,
+  and the group rules reject _any_ Update co-riding that attestation. So a single
+  by-ref proposal cached in our send-PQ half makes every later bind commit fail — and
+  it fails **after** the round's one-shot input is already spent: A.4's ephemeral
+  opened, A.3's key package consumed by the join, A.5's `Commit'` applied.
+
+  That was reachable by the counterparty, with no forgery. MLS files a by-ref proposal
+  into the cache inside `process_incoming_message`, which runs _before_ the A.4 leg
+  door inspects the message kind — so a proposal routed through a door that answers a
+  benign, retriable error still lands in the cache and stays there. The next bind then
+  tore itself apart: the ephemeral gone, the parked encapsulation key no longer
+  re-mintable, the side-band unable to open another round, every retry answering the
+  apparently-retriable `SessionNotReady` forever, and `is_fully_established()` still
+  reporting true. Because the bind's persist captures partial mutations by design, the
+  tear reached the archive too, so restoring reproduced it.
+
+  The three bind entry points now check for that residue in their **guard** phase,
+  where refusing is free — nothing consumed, no checkpoint written, and the peer's next
+  honest frame completes the round — and the two doors that admit a proposal drop it on
+  the way out.
+
+  Past the point of no return, where no guard can help, each trigger's tail now runs
+  inside a region that renames any escaping failure to the new fatal
+  `BindTriggerFailed` and latches it. That latch **rides the archive**, unlike
+  `BindApplyFailed`: the apply latch is allowed to heal on restore only because inbound
+  processing persists on success alone, which is exactly what these closures do not do.
+  A verdict that healed here would hand the honest label back to a session that is still
+  torn. It completes the trigger/discharge/apply family and is queryable via
+  `pq_side_band_wedged()` — worth polling, because A.3's wedge otherwise looks healthy.
+  Classical messaging is unaffected throughout, and an already-reserved bind still
+  discharges.
+
+  Two smaller corrections ride along. The A.3/A.5 responder now derives its bind secret
+  _before_ consuming the round, so a failed re-export is a no-op the peer's next
+  re-staple retries instead of a silent, unlatched dead end. And the post-commit
+  header-key capture is now best-effort with a re-derivation backstop in
+  `should_listen_on`, since it is the repeatable exporter — latching a round that
+  actually succeeded would be the fix over-firing.
+
+  Binding contract 29 → 30. Archive layout stays v3, gaining one tail field.
+
+- [#120](https://github.com/germ-network/TwoMLSPQ/pull/120) [`e9081c9`](https://github.com/germ-network/TwoMLSPQ/commit/e9081c9f2f091d1c067046c2c881eee0a427f976) Thanks [@germ-mark](https://github.com/germ-mark)! - Gate the A.5 `Upd'` door on content type, and refuse a rekey while a bind is owed
+
+  The A.5 `Upd'` door carries a proposal, but the routing tag is the sender's, and
+  it feeds `process_incoming_message` on our own send-PQ — which validates and
+  _applies_ a commit atomically. The peer is a member of that group, so it could
+  author a commit there that would apply, moving our send-PQ epoch, before the
+  door's kind check refused it — and the refusal wore the fatal `Mls` disposition
+  that asks a host to tear the session down. This closes the same gap the A.4 leg
+  doors already closed: the door now reads the content type off the plaintext
+  framing first and refuses anything but a proposal with the retriable
+  `DecryptionFailed`, nothing applied.
+
+  The door also now refuses a rekey while a classical bind is owed. Its closure
+  commits our send-PQ, which moves the epoch an owed bind reserved in its
+  attestation — and discharging against a moved epoch fails with the PQ leaf
+  already spent. An honest peer never reaches this (owing a bind means the turn is
+  still ours), so a deviating one is refused in the guard phase as a retriable
+  no-op, exactly as the bind entry points guard the same reservation.
+
+  No wire, FFI, or error-variant change; a session that saw the old fatal `Mls`
+  here now sees a retriable `DecryptionFailed`.
+
+- [#116](https://github.com/germ-network/TwoMLSPQ/pull/116) [`8d85b4f`](https://github.com/germ-network/TwoMLSPQ/commit/8d85b4fe8d595caa3849f8ccf26657109a0b4f3c) Thanks [@germ-mark](https://github.com/germ-mark)! - Remove `derive_session_id`
+
+  A session pins its identifier at its **founding** pair — the invitation identity
+  the initiator addressed — and never moves it again. The client ids it was derived
+  from do move: a principal rotation replaces them, and a born-dedicated acceptor
+  never operated under its founding id at all. So a caller re-deriving the id from
+  the ids it currently holds got a value that silently disagreed with the one the
+  session carries, and the disagreement surfaced after a rotation, in whatever
+  local state had been keyed by it.
+
+  Removed rather than deprecated, because a deprecation is an instruction to
+  substitute and no substitution is value-preserving here: swapping in the session
+  accessor changes the bytes for exactly the sessions that had drifted, while
+  ignoring the warning keeps a value that does not match the session. The call
+  answered two different questions, and they have different answers:
+
+  - _"What is this session's id?"_ — `TwoMlsPqSession::active_session_id()`. The
+    stored founding value: identical on both sides, available from construction,
+    preserved across archive restore.
+  - _"What is a stable key for this pair, before a session exists?"_ — compute your
+    own digest. It was only `SHA-256(min(a,b) ‖ max(a,b))` over two public
+    `ClientId`s, with nothing secret and nothing protocol-specific in it, so it
+    never needed to live in this crate. Just don't call the result a session id: it
+    stops matching the session's as soon as either party rotates.
+
+  The derivation itself survives crate-internally as `pair_session_id`, called only
+  by the two constructors, which are the only places the founding pair is in scope.
+
+  Binding contract 30 → 31, with no wire or error-variant change. Removing an
+  exported function drops its FFI symbol, so the vendored binding is re-synced here
+  and must be paired with a matching binary. Swift consumers of the `TwoMLSPQ`
+  product are unaffected: the generated binding is an internal target, so this
+  function was never reachable from the vended surface.
+
+- [#121](https://github.com/germ-network/TwoMLSPQ/pull/121) [`86dff6d`](https://github.com/germ-network/TwoMLSPQ/commit/86dff6d9816e92df943673265f91a9a54b6381a1) Thanks [@germ-mark](https://github.com/germ-mark)! - The session id is the initiator's group id; remove the client-id-pair hash
+
+  `active_session_id()` and its `SessionId` type returned a hash of the two client
+  ids — `SHA-256(min(a,b) ‖ max(a,b))`, no seed. That is a participant-**pair**
+  fingerprint, not a session id: anyone holding the two public client ids can
+  compute it, and it is identical across every session the pair ever opens. Both
+  are removed (finishing what contract 31 began by dropping the free
+  `derive_session_id`).
+
+  The real session id is the **initiator's randomly-generated group id** — fresh
+  per session, unpredictable, and already shared, because the initiator's send
+  group is the acceptor's receive group. Read it with `send_group_id()` on the
+  initiator and `receive_group_id()` on the acceptor (the classical half, present
+  from construction); both name the same value, and it survives archive restore
+  with the group state. The tests now assert this, including that two sessions
+  between the _same_ pair get different ids — the property the old hash could never
+  satisfy.
+
+  Nothing downstream breaks: the vended Swift wrapper never forwarded the accessor,
+  AbstractTwoMLS never called it, and the app already keys on group ids
+  (`receiveGroupId` / `sendGroupId`). The stored field is dropped from the live
+  session; its slot stays vestigial in the archive (written empty, ignored on
+  decode) so a released 0.14 archive still decodes under the v3 migration.
+
+  Binding contract 31 → 32 — two FFI symbols removed, re-pair the vendored binding.
+  No wire change (archive layout stays v3) and no error-variant change.
+
 ## 0.14.0
 
 ### Minor Changes
