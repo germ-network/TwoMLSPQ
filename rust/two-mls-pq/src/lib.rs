@@ -391,7 +391,36 @@ pub fn version() -> String {
 // WITHIN a round, so a leg re-delivered from a closed round reaches that decrypt, and a frame
 // a host could not open must never be answered with `fatal` — which asks it to discard the
 // session. No wire or FFI signature change.
-const BINDING_CONTRACT_VERSION: u64 = 28;
+//
+// v29 (2026-07-27): the A.4 legs move from the send-PQ group to each sender's own
+// send-CLASSICAL group (EK in the initiator's, CT in the responder's — not the mirror the EK
+// arrived in, whose cached `Upd` would block the encrypt after the EK's generation was spent),
+// sealed under the classical header family. Both factors are fresher there (the classical leaf
+// and epoch secrets heal every round, where a send-PQ leaf waits for A.5) at no loss of
+// strength — both halves sign Ed25519 — and the round stays bound to the PQ group through
+// `ct_seal_psk`. A classical-carried leg is pinned to the epoch it was minted at, which
+// ordinary traffic advances, so an unanswered leg is RE-MINTED at the current epoch on each
+// send (`rewrap_side_band`); without that a stalled round would wedge permanently. That makes
+// one logical leg several valid wraps, and mls-rs keeps the keys of SKIPPED generations, so a
+// superseded wrap redelivered late still decrypts where a replay of the consumed one does not
+// — both receive paths therefore reject, pre-decrypt, any leg strictly below the receiver's
+// classical epoch (`StaleFrame`), which is exact: reaching epoch E proves the sender committed
+// E and that commit re-minted the live leg to E. Opening and ANSWERING a round are now
+// classical-only mutations (the PQ half is read once, through the repeatable `ct_seal_psk`
+// exporter), so neither pushes a `Checkpoint` any more — only the bind, which commits the PQ
+// half, still does.
+// WIRE-BREAKING for the A.4 side-band, with a deliberate compatibility tail: `pq_ratchet_bind`
+// still accepts a PQ-carried CT (all a migrated pre-v29 responder can re-send — the payload is
+// MLS-encrypted to the peer and cannot be rebuilt), while `pq_ratchet_respond` accepts only
+// the classical form and DROPS a PQ-carried EK non-fatally, so the two forms never interleave
+// in a round. An old-form EK is instead MIGRATED: the first send after restoring such a round
+// re-mints it classical from the ephemeral it still holds, trading a window against a 0.14
+// peer (transient — it heals when that peer upgrades) for one against an upgraded peer
+// (permanent, since both ends upgrading is the end state). Archive layout bumps to v3, which
+// for the first time still ACCEPTS v2 (see `SESSION_ARCHIVE_VERSION`): 0.14 shipped to real
+// sessions, and the migration is what keeps them alive. No FFI signature or error-variant
+// change.
+const BINDING_CONTRACT_VERSION: u64 = 29;
 
 /// See `BINDING_CONTRACT_VERSION`. Exported so the Swift layer can verify the
 /// binding it was generated with matches the binary it loaded.
