@@ -18,7 +18,7 @@
 
 use mls_rs::{
     error::IntoAnyError,
-    group::{GroupContext, Roster, Sender},
+    group::{proposal::ProposalType, GroupContext, Roster, Sender},
     mls_rules::{CommitDirection, CommitOptions, CommitSource, EncryptionOptions, ProposalBundle},
     MlsRules,
 };
@@ -73,6 +73,29 @@ pub struct TwoMlsRules;
 
 impl MlsRules for TwoMlsRules {
     type Error = RuleError;
+
+    /// `APP_DATA_UPDATE` never forces an updatePath.
+    ///
+    /// It carries an attestation only — it does not change group membership — so RFC 9420
+    /// §12.4 leaves the path at the committer's discretion. The PQ half depends on that:
+    /// a bind commit must stay pathless, or it carries an ML-KEM updatePath and grows past
+    /// a whole ML-KEM-768 ciphertext (`test_bind_pq_commit_is_pathless`).
+    ///
+    /// Where a path IS wanted on the classical half — the FULL commit discharging an owed
+    /// bind — [`Self::commit_options`] pins it explicitly. That is the one place this
+    /// decision belongs.
+    ///
+    /// mls-rs added this hook in awslabs/mls-rs#364 with a default of `true`, which would
+    /// silently put a path on every custom proposal. Overriding it restores the behaviour
+    /// this crate was written against; it is not a new policy.
+    fn custom_proposal_requires_update_path(&self, custom_proposal_type: ProposalType) -> bool {
+        debug_assert_eq!(
+            custom_proposal_type, APP_DATA_UPDATE,
+            "filter_proposals rejects every other custom proposal type"
+        );
+        let _ = custom_proposal_type;
+        false
+    }
 
     fn filter_proposals(
         &self,
