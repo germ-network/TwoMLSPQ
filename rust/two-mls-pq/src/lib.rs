@@ -469,13 +469,28 @@ pub fn version() -> String {
 // classical-only (Linear ruling on GER-1985: the classical key schedule already absorbs a
 // PQ-derived PSK, so the export is downstream of ML-KEM entropy without needing to combine
 // both APQ halves). Send must be called after `prepare_to_encrypt`, before `encrypt`; recv
-// is keyed by the frame's OWN classical epoch (`MlsSenderMessage.epoch`, already on the
-// decrypt outcome — no new field needed), read from a session-owned ledger since
+// is keyed by the frame's OWN classical epoch, read from a session-owned ledger since
 // `safe_export_secret` only exports at a group's CURRENT epoch and a delayed frame's epoch
-// may already be behind it. One error variant appended, `AttachmentComponentUnavailable`
-// (the recv ledger missed or evicted the requested epoch — not retriable; the attachment is
-// unopenable by this session). Archive layout stays v3 (still unreleased — see
-// `SESSION_ARCHIVE_VERSION`): the two ledgers ride the existing tail in place.
+// may already be behind it.
+//
+// `MlsSenderMessage.epoch`'s MEANING CHANGES here, not just its plumbing: it used to report
+// the recv group's CURRENT epoch at the moment of decrypt; it now reports the FRAME's own
+// authenticated epoch (`MlsMessage::epoch()`, read before the frame is consumed — the same
+// accessor `commit.epoch()` already used elsewhere in this crate). The two agree for every
+// in-order frame, which is every frame any existing caller has ever observed — this is why
+// the change is field-compatible rather than a new field — and diverge only for a frame
+// processed after a LATER commit has already landed, which is exactly the case
+// `export_attachment_cek_recv` exists to key correctly. No API signature change; a
+// behavior change worth knowing if anything ever keyed on epoch during a crossed-commit
+// window before GER-1985.
+//
+// One error variant appended, `AttachmentComponentUnavailable` (the recv ledger missed or
+// evicted the requested epoch — not retriable; the attachment is unopenable by this
+// session). Archive layout bumps 3→4 (`SESSION_ARCHIVE_VERSION`): v3 shipped at
+// 0.15.0/0.15.1 with its two-field tail before this change, closing the in-place-mutation
+// exception that field itself documents — the attachment ledgers could NOT land in v3 the
+// way `pq_wedged` did, or every session persisted by a released 0.15.x build would fail
+// `ArchiveInvalid` on restore. v3 joins v2 as an accepted older layout on decode.
 const BINDING_CONTRACT_VERSION: u64 = 33;
 
 /// See `BINDING_CONTRACT_VERSION`. Exported so the Swift layer can verify the
@@ -1019,11 +1034,6 @@ pub enum TwoMlsPqError {
     /// reachable from any honest flow (a peer-forced trigger failure is refused in the guard
     /// phase before anything is consumed); route to re-establishment. Queryable via
     /// `pq_side_band_wedged`.
-    //
-    // Deliberately the LAST variant: uniffi numbers error cases by position, so appending
-    // keeps every prior variant's ordinal stable. Keep appending future variants here (the
-    // contract bump already forces binding/binary pairing, but there is no reason to
-    // renumber the survivors).
     #[error("PQ bind trigger failed past its point of no return; re-establish")]
     BindTriggerFailed,
     /// `export_attachment_cek_recv` was asked for an epoch this session never ledgered
@@ -1035,6 +1045,11 @@ pub enum TwoMlsPqError {
     /// frame itself decrypted fine) — it means the attachment behind this specific frame
     /// cannot be opened by this session and the app should treat the fetch as failed, not
     /// retry it against this session.
+    //
+    // Deliberately the LAST variant: uniffi numbers error cases by position, so appending
+    // keeps every prior variant's ordinal stable. Keep appending future variants here (the
+    // contract bump already forces binding/binary pairing, but there is no reason to
+    // renumber the survivors).
     #[error("no ledgered attachment component for the requested epoch")]
     AttachmentComponentUnavailable,
 }

@@ -240,11 +240,15 @@ import TwoMLSPQBinding
 // v33 (contract 33, GER-1985): two FFI additions, `exportAttachmentCekSend(keyId:)` and
 //     `exportAttachmentCekRecv(keyId:epoch:)` — the wire attachment CEK, derived
 //     classical-only from the group's 0xFF03 exporter component. Send must be called after
-//     `prepareToEncrypt`, before `encrypt`; recv is keyed by the frame's own classical epoch
-//     (already on the decrypt outcome — no new field). New crate error
-//     `.attachmentComponentUnavailable` appended (the recv ledger missed or evicted the
-//     requested epoch — not retriable; the attachment is unopenable by this session). Hosts
-//     must handle the new case (the error map is exhaustive). Archive layout stays v3.
+//     `prepareToEncrypt`, before `encrypt`; recv is keyed by the frame's own classical epoch —
+//     `PQSenderMessage.epoch`'s MEANING changes here (no signature change): it used to report
+//     the recv group's current epoch at decrypt time, now reports the frame's own
+//     authenticated epoch, which only diverges for a frame processed after a later commit has
+//     already landed. New crate error `.attachmentComponentUnavailable` appended (the recv
+//     ledger missed or evicted the requested epoch — not retriable; the attachment is
+//     unopenable by this session). Hosts must handle the new case (the error map is
+//     exhaustive). Archive layout bumps 3→4: v3 shipped at 0.15.0/0.15.1 before this change,
+//     so the attachment ledgers could not land in v3 in place the way earlier tail fields did.
 private let expectedBindingContract: UInt64 = 33
 
 enum TwoMLSPQBindingContract {

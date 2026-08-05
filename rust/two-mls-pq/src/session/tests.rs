@@ -328,7 +328,7 @@ fn test_archive_reencode_is_byte_identical() {
 fn test_session_archive_version_is_pinned() {
     let (alice, _bob) = establish_sessions();
     let archive = assert_ok!(alice.archive());
-    assert_eq!(archive.bytes[0], 3);
+    assert_eq!(archive.bytes[0], 4);
 }
 
 /// The pre-committed bootstrap KP carries the FROZEN establishment credential. Enough
@@ -8421,4 +8421,79 @@ fn test_archive_preserves_attachment_ledgers() {
         cek_recv, cek_recv_restored,
         "restored recv ledger must reproduce the same CEK"
     );
+}
+
+/// The compatibility floor v4 exists for: restore a v3 archive shaped EXACTLY like what
+/// 0.15.0/0.15.1 actually shipped — `responder_wire_ct` and `pq_wedged` only, no attachment
+/// ledgers, because those releases predate GER-1985 — and confirm it restores usable rather
+/// than `ArchiveInvalid`. Mirrors the existing v2 fixtures' technique (decode the current
+/// body, re-encode under the older version byte) one layer further out: truncate the CURRENT
+/// tail down to its v3-shaped subset instead of dropping it entirely.
+///
+/// The recv ledger (not send) is the load-bearing half of this test: a send-side re-export at
+/// the SAME epoch would succeed whether or not the ledger truly survived the downgrade (lazy
+/// hit or fresh export are both silent successes), so it can't distinguish "restored empty" from
+/// "restored with a leftover entry". The recv side can: ledger a DEPARTED epoch's component
+/// before downgrading, and if the v3 fixture wrongly carried it forward, the post-restore fetch
+/// at that epoch would SUCCEED instead of reporting `AttachmentComponentUnavailable`.
+#[test]
+fn test_v3_archive_restores_with_empty_attachment_ledgers() {
+    use mls_rs::mls_rs_codec::{MlsDecode, MlsEncode};
+
+    let (alice, bob) = establish_sessions();
+    let key_id = vec![0x09u8; 32];
+
+    // Epoch 1: alice mints and ledgers the attachment CEK, then encrypts.
+    assert_ok!(alice.prepare_to_encrypt(None));
+    let cek_epoch1 = assert_ok!(alice.export_attachment_cek_send(key_id.clone()));
+    let delayed = assert_ok!(alice.encrypt(b"pre-downgrade-attachment".to_vec()));
+
+    // A routine crossing commit — bob proposes, alice folds and commits — advances alice's
+    // send group (bob's recv group) past epoch 1. Bob applies it via a SEPARATE frame first,
+    // which is exactly where his eager capture ledgers the departing epoch 1 for him.
+    assert_ok!(bob.prepare_to_encrypt(None));
+    let proposal = assert_ok!(bob.encrypt(b"routine".to_vec()));
+    let result = assert_some!(assert_ok!(alice.process_incoming(proposal.cipher_text)));
+    assert_ok!(alice.queue_proposal(assert_some!(result.proposal).digest));
+    assert_ok!(alice.prepare_to_encrypt(None));
+    let crossing = assert_ok!(alice.encrypt(b"crossing-commit".to_vec()));
+    let result = assert_some!(assert_ok!(bob.process_incoming(crossing.cipher_text)));
+    assert!(assert_some!(result.application_message).epoch > 1);
+
+    // Sanity baseline BEFORE any downgrade: bob's ledger genuinely holds epoch 1 — proves the
+    // fixture below is stripping something real, not asserting on an already-empty ledger.
+    let result = assert_some!(assert_ok!(bob.process_incoming(delayed.cipher_text)));
+    let epoch = assert_some!(result.application_message).epoch;
+    assert_eq!(epoch, 1);
+    let cek_before_downgrade = assert_ok!(bob.export_attachment_cek_recv(key_id.clone(), epoch));
+    assert_eq!(cek_before_downgrade, cek_epoch1);
+
+    // Bob's current (v4) archive, rewritten into the v3 layout 0.15.0/0.15.1 shipped: same
+    // header suite bytes, same body, tail truncated to the two fields that layout carried.
+    let v4 = assert_ok!(bob.archive()).bytes;
+    let v3 = {
+        let mut rest = &v4[5..];
+        let body = assert_ok!(super::archive_wire::SessionArchive::mls_decode(&mut rest));
+        let tail = assert_ok!(super::archive_wire::ArchiveTail::mls_decode(&mut rest));
+        let mut out = v4[..5].to_vec();
+        out[0] = 3;
+        assert_ok!(body.mls_encode(&mut out));
+        assert_ok!(super::archive_wire::ArchiveTailV3 {
+            responder_wire_ct: tail.responder_wire_ct,
+            pq_wedged: tail.pq_wedged,
+        }
+        .mls_encode(&mut out));
+        out
+    };
+    let restored = assert_ok!(TwoMlsPqSession::from_archive(crate::Archive { bytes: v3 }));
+
+    // The departed epoch's component is gone — a v3 writer never captured it — so the fetch
+    // must fail explicitly, never silently succeed with stale or wrong material.
+    assert_err!(
+        restored.export_attachment_cek_recv(key_id, epoch),
+        TwoMlsPqError::AttachmentComponentUnavailable
+    );
+
+    // And the session is otherwise perfectly usable across the downgrade-then-restore.
+    message_round(&restored, &alice, b"after-v3-restore");
 }

@@ -1,19 +1,19 @@
 //! Session archive (de)serialization: the versioned single-blob layout, the
 //! `archive_wire` TLS structs, the state<->wire conversions, and the
 //! `archive` / `from_archive` endpoints. The layout version is a whole-blob
-//! compatibility gate, and since v3 it admits exactly one older layout -- see
+//! compatibility gate, and since v4 it admits exactly two older layouts -- see
 //! the note on `SESSION_ARCHIVE_VERSION`.
 
 use super::*;
 
 // The session archive layout version. The byte covers the WHOLE layout, and it is the ONLY
 // thing that decides which layouts a build will read: `decode_wire` accepts the current
-// version and — since v3 — the one named by `SESSION_ARCHIVE_VERSION_V2`, rejecting every
-// other as `ArchiveInvalid`. Anything not on that list simply fails to decode and is
-// regenerated. The header also carries the concrete `ApqCipherSuite` pair (4 bytes, classical
-// then pq, big-endian) in place of the old PQ-mode byte: the suite is a stored session
-// property, and a restored archive whose pair differs from this build's pinned suite fails
-// loudly.
+// version and — since v4 — the two named by `SESSION_ARCHIVE_VERSION_V3` and
+// `SESSION_ARCHIVE_VERSION_V2`, rejecting every other as `ArchiveInvalid`. Anything not on
+// that list simply fails to decode and is regenerated. The header also carries the concrete
+// `ApqCipherSuite` pair (4 bytes, classical then pq, big-endian) in place of the old PQ-mode
+// byte: the suite is a stored session property, and a restored archive whose pair differs
+// from this build's pinned suite fails loudly.
 //
 // MONOTONIC ACROSS RELEASES. Every change to the archive's layout OR its acceptance semantics
 // (a new field, a reshaped field, or a tightened restore-time validation) that a RELEASED
@@ -28,7 +28,10 @@ use super::*;
 // introduced v3 and before any release wrote it. The hatch CLOSES the instant the byte ships:
 // the first RELEASE to write byte N freezes N, and the next layout change bumps to N+1 like
 // any other. So mutating in place is legal only behind a check that no tag has been cut while
-// this byte was current — at 0.15.0, v3 freezes.
+// this byte was current — v3 froze exactly this way, at 0.15.0 (confirmed: `git tag` on the
+// release remote shows v0.15.0/v0.15.1 both shipping `SESSION_ARCHIVE_VERSION = 3`, which is
+// what makes the v4 bump below a hard requirement rather than a nice-to-have — an in-place
+// change here would have made every 0.15.x-persisted session fail `ArchiveInvalid` on restore).
 //
 // This ends the earlier pre-release convention of leaving the byte untouched (and the
 // 2026-07-13 floor reset to 1); those and the original
@@ -38,30 +41,46 @@ use super::*;
 //
 // ACCEPTING AN OLD VERSION IS THE EXCEPTION, NOT THE NEW RULE. It costs a decode path that
 // must stay correct for a layout nobody writes any more, so it is worth paying only to carry
-// real sessions across a release — as v3 does for 0.14 — and the acceptance should be dropped
-// again once those sessions are gone. Keeping the layouts one `else` apart, rather than
-// forking the whole struct, is what makes that removal a deletion instead of a merge.
+// real sessions across a release — as v3 does for 0.14, and v4 now does for 0.15.x — and the
+// acceptance should be dropped again once those sessions are gone. Keeping the layouts one
+// `else`/`match` arm apart, rather than forking the whole struct, is what makes that removal a
+// deletion instead of a merge.
 //
 // v2: restore-time validation tightened — the bootstrap twin-field invariant and the 32-byte
 // commitment length are now enforced on decode (see `session_from_wire`).
 //
-// v3 (this change): the A.4 legs moved to the classical groups, so a `Responding` round now
-// retains its `wire_ct` for re-wrapping (see `PqInflight::Responding`). THIS IS THE FIRST
-// VERSION WITH A MIGRATION, and the hard-cut rule above is relaxed exactly this far: v2 is
-// still ACCEPTED on decode, because 0.14 shipped to real sessions whose connections must
-// survive the upgrade. The mechanism is append-only — the new state rides an `ArchiveTail`
-// encoded AFTER the (byte-unchanged) `SessionArchive`, so a v2 blob decodes as the same
-// prefix and its absent tail restores as `None`, which is exactly right: a v2 round's legs
-// rode the PQ groups, whose `pq_epoch` cannot move mid-round, so they never re-wrap. Writing
-// is always v3. A v3 blob on a 0.14 build still fails there, which is the hard cut's
-// remaining, intended direction.
+// v3: the A.4 legs moved to the classical groups, so a `Responding` round now retains its
+// `wire_ct` for re-wrapping (see `PqInflight::Responding`). THIS IS THE FIRST VERSION WITH A
+// MIGRATION, and the hard-cut rule above is relaxed exactly this far: v2 is still ACCEPTED on
+// decode, because 0.14 shipped to real sessions whose connections must survive the upgrade.
+// The mechanism is append-only — the new state rides an `ArchiveTail` encoded AFTER the
+// (byte-unchanged) `SessionArchive`, so a v2 blob decodes as the same prefix and its absent
+// tail restores as empty, which is exactly right: a v2 round's legs rode the PQ groups, whose
+// `pq_epoch` cannot move mid-round, so they never re-wrap. v3 also LATER took a second tail
+// field, `pq_wedged` (the side-band wedge verdict), in place rather than bumping — the
+// unreleased-byte exception, valid at the time because v3 had not yet shipped. SHIPPED at
+// 0.15.0/0.15.1 with exactly those two tail fields (`responder_wire_ct`, `pq_wedged`) and
+// nothing else — that two-field shape is now frozen as `archive_wire::ArchiveTailV3`, decoded
+// only to translate into the current `ArchiveTail` with empty attachment ledgers (see
+// `decode_wire`). A v3 or v2 blob on a build predating either still fails there, which is the
+// hard cut's remaining, intended direction.
 //
-// v3 also LATER took a second tail field, `pq_wedged` (the side-band wedge verdict), in place
-// rather than bumping — the unreleased-byte exception above, valid because v3 has not shipped.
-// Once 0.15.0 writes v3 that door closes; the next tail change bumps to v4.
-const SESSION_ARCHIVE_VERSION: u8 = 3;
-/// The one older layout still accepted on decode (see the version note): identical to v3
-/// minus the trailing [`archive_wire::ArchiveTail`].
+// v4 (this change, GER-1985): the attachment-CEK send/recv ledgers
+// (`ArchiveTail::send_attachment_ledger` / `recv_attachment_ledger`) join the tail. This MUST
+// bump rather than land in place, unlike v3's own two in-place tail additions: v3 is no longer
+// an unreleased byte (0.15.0/0.15.1 both shipped it with the OLD two-field tail), so mutating
+// `ArchiveTail` further in place would make every session either release persisted fail
+// `ArchiveInvalid` on restore under this build. v3 joins v2 as an accepted old layout — the
+// same append-only mechanism, one version further out.
+const SESSION_ARCHIVE_VERSION: u8 = 4;
+/// The newer of the two older layouts still accepted on decode (see the version note):
+/// identical to v2 plus a trailing two-field tail — `responder_wire_ct` and `pq_wedged`, the
+/// exact shape SHIPPED at 0.15.0/0.15.1, before the attachment ledgers existed. Decoded via
+/// [`archive_wire::ArchiveTailV3`], never `archive_wire::ArchiveTail` directly (whose current
+/// shape a v3 blob was never encoded against).
+const SESSION_ARCHIVE_VERSION_V3: u8 = 3;
+/// The older of the two layouts still accepted on decode (see the version note): identical to
+/// v3 minus the trailing tail entirely (empty, not merely absent fields).
 const SESSION_ARCHIVE_VERSION_V2: u8 = 2;
 
 // In its own module because the derive-generated impls reference the std `Result`, which
@@ -266,10 +285,39 @@ pub(crate) mod archive_wire {
         pub(in crate::session) bytes: Vec<u8>,
     }
 
-    /// State appended AFTER [`SessionArchive`] in a v3 blob. Append-only by construction:
+    /// The v3 shape of the tail — SHIPPED at 0.15.0/0.15.1 with exactly these two fields and
+    /// nothing else (see the `SESSION_ARCHIVE_VERSION` note). Frozen: a v3 blob's tail bytes
+    /// must decode against THIS struct, never the current `ArchiveTail`, whose additional
+    /// fields no v3 writer ever encoded. Exists only as a decode target for
+    /// `decode_wire` — [`Self::into_current`] is the sole consumer. `MlsEncode` is derived
+    /// too, but ONLY so the test suite can construct a genuine v3-shaped fixture through the
+    /// type system rather than hand-slicing bytes (mirroring how the existing v2 fixtures
+    /// build theirs) — production code never encodes this type.
+    #[derive(MlsSize, MlsEncode, MlsDecode)]
+    pub(in crate::session) struct ArchiveTailV3 {
+        pub(in crate::session) responder_wire_ct: Option<CtBlob>,
+        pub(in crate::session) pq_wedged: Option<u8>,
+    }
+
+    impl ArchiveTailV3 {
+        /// Lift a decoded v3 tail into the current shape: the two shared fields carry over
+        /// verbatim, and the attachment ledgers restore empty — correct by construction, since
+        /// a v3 writer never captured them (the ledgers did not exist yet).
+        pub(in crate::session) fn into_current(self) -> ArchiveTail {
+            ArchiveTail {
+                responder_wire_ct: self.responder_wire_ct,
+                pq_wedged: self.pq_wedged,
+                send_attachment_ledger: Vec::new(),
+                recv_attachment_ledger: Vec::new(),
+            }
+        }
+    }
+
+    /// State appended AFTER [`SessionArchive`] in a v4 blob. Append-only by construction:
     /// a v2 blob simply ends where this begins, decoding as the same prefix with an
-    /// all-`None` tail (see the `SESSION_ARCHIVE_VERSION` note). Future additive state
-    /// belongs here too, one field per addition, never reordered.
+    /// all-empty tail; a v3 blob's tail decodes as [`ArchiveTailV3`] and lifts via
+    /// [`ArchiveTailV3::into_current`] (see the `SESSION_ARCHIVE_VERSION` note). Future
+    /// additive state belongs here too, one field per addition, never reordered.
     #[derive(MlsSize, MlsEncode, MlsDecode)]
     pub(in crate::session) struct ArchiveTail {
         /// Set only for a `Responding` round whose CT rode the classical carrier. `None`
@@ -708,7 +756,9 @@ impl TwoMlsPqSession {
 /// `restore`. The restored session starts with no sink — attach one with
 /// `install_sink` (which pushes a fresh baseline checkpoint).
 ///
-/// `tail` is the blob's v3 append-only section, empty for a restored v2 archive.
+/// `tail` is the blob's append-only section (see the `SESSION_ARCHIVE_VERSION` note),
+/// already normalized to the current shape — empty for a restored v2 archive, lifted via
+/// `ArchiveTailV3::into_current` for a restored v3 one.
 fn session_from_wire(
     wire: archive_wire::SessionArchive,
     tail: archive_wire::ArchiveTail,
@@ -1293,12 +1343,14 @@ pub(super) fn encode_core(inner: &mut SessionInner) -> Result<Vec<u8>> {
     encode_archive(&inner.suite, &wire, &tail)
 }
 
-/// Decode + header-validate a single archive blob into its wire struct and v3 tail.
+/// Decode + header-validate a single archive blob into its wire struct and current-shape tail.
 ///
-/// Two layouts are accepted (see the `SESSION_ARCHIVE_VERSION` note): v3, whose body is
-/// followed by an [`archive_wire::ArchiveTail`], and v2, which ends at the body and restores
-/// with an empty tail. Both still require the body to be followed by EXACTLY its version's
-/// remaining bytes, so a truncated or over-long blob fails as before.
+/// Three layouts are accepted (see the `SESSION_ARCHIVE_VERSION` note): v4, whose body is
+/// followed by an [`archive_wire::ArchiveTail`]; v3, whose body is followed by the older
+/// two-field [`archive_wire::ArchiveTailV3`] (lifted via `into_current`); and v2, which ends
+/// at the body and restores with an empty tail. All three still require the body to be
+/// followed by EXACTLY its version's remaining bytes, so a truncated or over-long blob fails
+/// as before.
 fn decode_wire(
     archive: &Archive,
 ) -> Result<(archive_wire::SessionArchive, archive_wire::ArchiveTail)> {
@@ -1307,7 +1359,9 @@ fn decode_wire(
     // build's declared suite — fail loudly across builds rather than misinterpret the group
     // snapshots (a recognized `TwoMlsSuite` variant is a coherent APQ pair by construction).
     let (version, mut rest) = match archive.bytes.as_slice() {
-        [version @ (SESSION_ARCHIVE_VERSION | SESSION_ARCHIVE_VERSION_V2), s0, s1, s2, s3, rest @ ..]
+        [version @ (SESSION_ARCHIVE_VERSION
+        | SESSION_ARCHIVE_VERSION_V3
+        | SESSION_ARCHIVE_VERSION_V2), s0, s1, s2, s3, rest @ ..]
             if crate::suite::TwoMlsSuite::from_wire([*s0, *s1, *s2, *s3])
                 == Some(crate::suite::TwoMlsSuite::CURRENT) =>
         {
@@ -1317,11 +1371,13 @@ fn decode_wire(
     };
     let wire = archive_wire::SessionArchive::mls_decode(&mut rest)
         .map_err(|_| TwoMlsPqError::ArchiveInvalid)?;
-    let tail = if version == SESSION_ARCHIVE_VERSION {
-        archive_wire::ArchiveTail::mls_decode(&mut rest)
+    let tail = match version {
+        SESSION_ARCHIVE_VERSION => archive_wire::ArchiveTail::mls_decode(&mut rest)
+            .map_err(|_| TwoMlsPqError::ArchiveInvalid)?,
+        SESSION_ARCHIVE_VERSION_V3 => archive_wire::ArchiveTailV3::mls_decode(&mut rest)
             .map_err(|_| TwoMlsPqError::ArchiveInvalid)?
-    } else {
-        archive_wire::ArchiveTail::empty()
+            .into_current(),
+        _ => archive_wire::ArchiveTail::empty(),
     };
     if !rest.is_empty() {
         return Err(TwoMlsPqError::ArchiveInvalid);
