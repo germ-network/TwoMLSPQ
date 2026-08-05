@@ -8279,3 +8279,146 @@ fn test_each_bootstrap_leg_re_sends_until_it_is_answered() {
     // The staple answered the welcome: the responder's part is over too.
     assert!(bob.pq_pending_outbound(SideBandSealing::Fresh).is_none());
 }
+
+// ===========================================================================
+// Attachment CEK export (GER-1985)
+// ===========================================================================
+
+/// The common case: alice derives send-side at the epoch her message went out at, bob
+/// decrypts it with no commit in between (the epoch never departs during this test), and
+/// `recv_attachment_component`'s LIVE fallback derives the same value for that
+/// still-current epoch — no eager capture involved.
+#[test]
+fn test_attachment_cek_send_recv_agree_for_current_epoch() {
+    let (alice, bob) = establish_sessions();
+    let key_id = vec![0xAAu8; 32];
+
+    assert_ok!(alice.prepare_to_encrypt(None));
+    let cek_send = assert_ok!(alice.export_attachment_cek_send(key_id.clone()));
+    let enc = assert_ok!(alice.encrypt(b"attachment-bearing".to_vec()));
+    let result = assert_some!(assert_ok!(bob.process_incoming(enc.cipher_text)));
+    let epoch = assert_some!(result.application_message).epoch;
+
+    let cek_recv = assert_ok!(bob.export_attachment_cek_recv(key_id, epoch));
+    assert_eq!(
+        cek_send, cek_recv,
+        "send/recv CEKs disagree for the live-current epoch"
+    );
+}
+
+/// Two attachments riding the same epoch under different `key_id`s must derive distinct
+/// CEKs — the label context is what separates them (the 0xFF03 leaf exports once per
+/// epoch; the repeat call for an already-ledgered `key_id` is a ledger hit, not a second
+/// export, and must reproduce the same value).
+#[test]
+fn test_attachment_cek_key_id_separates_ciphertexts_within_one_epoch() {
+    let (alice, _bob) = establish_sessions();
+    assert_ok!(alice.prepare_to_encrypt(None));
+
+    let cek_a = assert_ok!(alice.export_attachment_cek_send(vec![0x01u8; 32]));
+    let cek_b = assert_ok!(alice.export_attachment_cek_send(vec![0x02u8; 32]));
+    assert_ne!(
+        cek_a, cek_b,
+        "distinct key_ids must not collide within one epoch"
+    );
+
+    let cek_a_again = assert_ok!(alice.export_attachment_cek_send(vec![0x01u8; 32]));
+    assert_eq!(
+        cek_a, cek_a_again,
+        "the same (epoch, key_id) must re-derive identically, not fail as a second export"
+    );
+}
+
+/// The review's key catch: a frame sent at epoch 1, but not PROCESSED by the receiver
+/// until AFTER a later commit has moved his receive group past it — the delayed-frame
+/// case `remember_recv_attachment_component`'s eager capture exists for. Modeled on
+/// `test_psk_ledger_resolves_frame_that_crossed_a_commit`, which proves the same
+/// "commit crosses a still-in-flight frame" shape at the classical layer.
+///
+/// Mutation-verify this one: break the epoch keying (e.g. make the ledger lookup ignore
+/// `epoch`, or key the eager capture by something other than the pre-commit epoch) and
+/// confirm exactly this test fails — the send/recv CEKs would then silently disagree
+/// instead of erroring, which is the failure mode GER-1978's fail-as-retry invariant
+/// forbids.
+#[test]
+fn test_attachment_cek_resolves_frame_delayed_past_a_commit() {
+    let (alice, bob) = establish_sessions();
+    let key_id = vec![0x07u8; 32];
+
+    // Epoch 1: alice mints and ledgers the attachment CEK, then encrypts — but the frame
+    // is held back ("delayed"): bob does not process it yet.
+    assert_ok!(alice.prepare_to_encrypt(None));
+    let cek_send_epoch1 = assert_ok!(alice.export_attachment_cek_send(key_id.clone()));
+    let delayed = assert_ok!(alice.encrypt(b"delayed-attachment".to_vec()));
+
+    // Bob's routine self-Update rides to alice; she approves it, and her NEXT prepare
+    // folds it into a commit on her own send group (== bob's recv group) — advancing it
+    // past epoch 1.
+    assert_ok!(bob.prepare_to_encrypt(None));
+    let proposal = assert_ok!(bob.encrypt(b"routine".to_vec()));
+    let result = assert_some!(assert_ok!(alice.process_incoming(proposal.cipher_text)));
+    assert_ok!(alice.queue_proposal(assert_some!(result.proposal).digest));
+    assert_ok!(alice.prepare_to_encrypt(None));
+    let crossing = assert_ok!(alice.encrypt(b"crossing-commit".to_vec()));
+
+    // Bob applies the crossing commit — this is where `remember_recv_attachment_component`
+    // captures epoch 1's component, right before his recv group moves past it.
+    let result = assert_some!(assert_ok!(bob.process_incoming(crossing.cipher_text)));
+    assert!(
+        assert_some!(result.application_message).epoch > 1,
+        "bob's recv group must have advanced past epoch 1"
+    );
+
+    // NOW the delayed epoch-1 frame finally arrives.
+    let result = assert_some!(assert_ok!(bob.process_incoming(delayed.cipher_text)));
+    let epoch = assert_some!(result.application_message).epoch;
+    assert_eq!(epoch, 1, "the delayed frame's own epoch must still read 1");
+
+    let cek_recv = assert_ok!(bob.export_attachment_cek_recv(key_id, epoch));
+    assert_eq!(
+        cek_send_epoch1, cek_recv,
+        "recv-side CEK for a delayed frame must match what the sender derived at its own epoch"
+    );
+}
+
+/// An epoch bob never captured — neither still current nor ledgered — is a clean, typed
+/// failure, never a silent wrong-epoch derivation.
+#[test]
+fn test_attachment_cek_recv_miss_is_explicit_not_silent() {
+    let (_alice, bob) = establish_sessions();
+    let err = bob
+        .export_attachment_cek_recv(vec![0x00u8; 32], 999)
+        .unwrap_err();
+    assert!(matches!(err, TwoMlsPqError::AttachmentComponentUnavailable));
+}
+
+/// Both ledgers survive an archive/restore round trip at the exact values held before
+/// the cut — a restored session must derive identically to the live one it replaced.
+#[test]
+fn test_archive_preserves_attachment_ledgers() {
+    let (alice, bob) = establish_sessions();
+    let key_id = vec![0x55u8; 32];
+
+    assert_ok!(alice.prepare_to_encrypt(None));
+    let cek_send = assert_ok!(alice.export_attachment_cek_send(key_id.clone()));
+    let enc = assert_ok!(alice.encrypt(b"pre-archive".to_vec()));
+    let result = assert_some!(assert_ok!(bob.process_incoming(enc.cipher_text)));
+    let epoch = assert_some!(result.application_message).epoch;
+    let cek_recv = assert_ok!(bob.export_attachment_cek_recv(key_id.clone(), epoch));
+    assert_eq!(cek_send, cek_recv);
+
+    let alice_restored = round_trip(&alice);
+    let bob_restored = round_trip(&bob);
+
+    let cek_send_restored = assert_ok!(alice_restored.export_attachment_cek_send(key_id.clone()));
+    assert_eq!(
+        cek_send, cek_send_restored,
+        "restored send ledger must reproduce the same CEK"
+    );
+
+    let cek_recv_restored = assert_ok!(bob_restored.export_attachment_cek_recv(key_id, epoch));
+    assert_eq!(
+        cek_recv, cek_recv_restored,
+        "restored recv ledger must reproduce the same CEK"
+    );
+}

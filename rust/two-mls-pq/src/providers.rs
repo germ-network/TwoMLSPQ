@@ -129,6 +129,21 @@ pub(crate) fn header_aead_suite(
         .ok_or(TwoMlsPqError::Mls)
 }
 
+/// The suite provider backing `apq::attachment_cek`'s `ExpandWithLabel` (GER-1985) — the
+/// `classical` facet of `APQ_SUITE`, i.e. the SAME cipher suite that negotiated the
+/// classical group the 0xFF03 component was exported from. Only the suite's KDF
+/// (`kdf_expand`) is used. Deliberately the classical facet, not `header_aead`: the
+/// component is classical-group material, so its expansion must track that group's own
+/// negotiated suite, not the header layer's independently-facet-pinned AEAD.
+pub(crate) fn attachment_cek_suite(
+) -> Result<impl mls_rs::CipherSuiteProvider<Error = impl std::error::Error + Send + Sync + 'static>>
+{
+    use mls_rs::CryptoProvider;
+    classical()
+        .cipher_suite_provider(APQ_SUITE.classical)
+        .ok_or(TwoMlsPqError::Mls)
+}
+
 #[cfg(test)]
 mod tests {
     /// Tripwire for the cryptokit backend's compile-time KEM pin: its `selected::PqKem`

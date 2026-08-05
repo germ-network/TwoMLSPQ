@@ -462,7 +462,21 @@ pub fn version() -> String {
 // released 0.14 archive still decodes under the v3 migration. `pair_session_id` and the
 // `SessionId` uniffi record are gone. Drops two FFI symbols — re-pair the vendored binding —
 // no wire (archive layout stays v3) or error-variant change.
-const BINDING_CONTRACT_VERSION: u64 = 32;
+//
+// v33 (GER-1985): two FFI additions, `export_attachment_cek_send(key_id) -> Vec<u8>` and
+// `export_attachment_cek_recv(key_id, epoch) -> Vec<u8>` — the wire attachment CEK,
+// `ExpandWithLabel(SafeExportSecret_classical(0xFF03), "attachment", key_id, 32)`, derived
+// classical-only (Linear ruling on GER-1985: the classical key schedule already absorbs a
+// PQ-derived PSK, so the export is downstream of ML-KEM entropy without needing to combine
+// both APQ halves). Send must be called after `prepare_to_encrypt`, before `encrypt`; recv
+// is keyed by the frame's OWN classical epoch (`MlsSenderMessage.epoch`, already on the
+// decrypt outcome — no new field needed), read from a session-owned ledger since
+// `safe_export_secret` only exports at a group's CURRENT epoch and a delayed frame's epoch
+// may already be behind it. One error variant appended, `AttachmentComponentUnavailable`
+// (the recv ledger missed or evicted the requested epoch — not retriable; the attachment is
+// unopenable by this session). Archive layout stays v3 (still unreleased — see
+// `SESSION_ARCHIVE_VERSION`): the two ledgers ride the existing tail in place.
+const BINDING_CONTRACT_VERSION: u64 = 33;
 
 /// See `BINDING_CONTRACT_VERSION`. Exported so the Swift layer can verify the
 /// binding it was generated with matches the binary it loaded.
@@ -1012,6 +1026,17 @@ pub enum TwoMlsPqError {
     // renumber the survivors).
     #[error("PQ bind trigger failed past its point of no return; re-establish")]
     BindTriggerFailed,
+    /// `export_attachment_cek_recv` was asked for an epoch this session never ledgered
+    /// (GER-1985): either the epoch predates `ATTACHMENT_LEDGER_WINDOW`'s retention, or
+    /// `remember_recv_attachment_component` lost the race with a commit that advanced
+    /// past it before capturing it (best-effort by design — see its doc comment).
+    /// RETRIABLE from the app's perspective in neither sense of "try again now" (the
+    /// component is gone for good once evicted or missed) nor "this frame is broken" (the
+    /// frame itself decrypted fine) — it means the attachment behind this specific frame
+    /// cannot be opened by this session and the app should treat the fetch as failed, not
+    /// retry it against this session.
+    #[error("no ledgered attachment component for the requested epoch")]
+    AttachmentComponentUnavailable,
 }
 
 /// The protocol digest over `bytes` — the single hashing primitive behind every

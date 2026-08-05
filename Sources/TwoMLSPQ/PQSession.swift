@@ -237,7 +237,15 @@ import TwoMLSPQBinding
 //     the group-id accessors. Nothing to do here either — the removed function was never
 //     reachable from this product, and the whole app stack already keys on the group id. The
 //     bump covers the dropped FFI symbols. No wire, API, or error-variant change.
-private let expectedBindingContract: UInt64 = 32
+// v33 (contract 33, GER-1985): two FFI additions, `exportAttachmentCekSend(keyId:)` and
+//     `exportAttachmentCekRecv(keyId:epoch:)` — the wire attachment CEK, derived
+//     classical-only from the group's 0xFF03 exporter component. Send must be called after
+//     `prepareToEncrypt`, before `encrypt`; recv is keyed by the frame's own classical epoch
+//     (already on the decrypt outcome — no new field). New crate error
+//     `.attachmentComponentUnavailable` appended (the recv ledger missed or evicted the
+//     requested epoch — not retriable; the attachment is unopenable by this session). Hosts
+//     must handle the new case (the error map is exhaustive). Archive layout stays v3.
+private let expectedBindingContract: UInt64 = 33
 
 enum TwoMLSPQBindingContract {
 	static let verified: Void = {
