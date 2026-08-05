@@ -39,6 +39,11 @@ pub const APQ_COMPONENT_ID: u32 = 0xFF01;
 /// (see [`APQ_COMPONENT_ID`]).
 pub const TWOMLS_COMPONENT_ID: u32 = 0xFF02;
 
+/// Germ's attachment-CEK domain (GER-1985), disjoint from both PSK components so an
+/// attachment export can never consume a leaf a PSK binding needs — the exporter tree
+/// deletes each component's leaf on first export. Also 16-bit (see [`APQ_COMPONENT_ID`]).
+pub const ATTACHMENT_COMPONENT_ID: u32 = 0xFF03;
+
 /// The `APQInfo` GroupContext extension type (RFC 9420 private-use extension range).
 pub const APQINFO_EXTENSION_TYPE: ExtensionType = ExtensionType::new(0xF0A1);
 

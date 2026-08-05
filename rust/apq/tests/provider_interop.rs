@@ -216,6 +216,46 @@ mod cryptokit_interop {
         send_and_check(&mut d_recv.classical, &mut c_send.classical, b"aws->ck");
     }
 
+    /// GER-1985: the attachment-CEK export crosses providers — both the
+    /// `SafeExportSecret` component and the local `ExpandWithLabel` expansion must agree
+    /// bit-for-bit across awslc and CryptoKit, or two peers on different platforms would
+    /// derive different CEKs for the same attachment. Also pins the local
+    /// `ExpandWithLabel` encoding (RFC 9420 §8) against a second provider, since mls-rs
+    /// keeps its own implementation `pub(crate)` and this crate reimplements it.
+    #[test]
+    fn attachment_cek_crosses_providers() {
+        let alice = aws_combiner(b"alice-awslc");
+        let bob = ck_combiner(b"bob-cryptokit");
+        let (mut a_send, welcome) = create_combiner_send_group(
+            &bob.generate_classical_key_package().unwrap(),
+            &bob.generate_pq_key_package().unwrap(),
+            &alice,
+            None,
+        )
+        .unwrap();
+        let mut b_recv = join_combiner_group(&welcome, &bob).unwrap();
+
+        let component_a = apq::export_attachment_component(&mut a_send.classical).unwrap();
+        let component_b = apq::export_attachment_component(&mut b_recv.classical).unwrap();
+        assert_eq!(
+            *component_a, *component_b,
+            "component export disagrees across providers"
+        );
+
+        let suite = alice.cipher_suite().classical;
+        let suite_a = AwsLcCryptoProvider::new()
+            .cipher_suite_provider(suite)
+            .unwrap();
+        let suite_b = CryptoKitProvider::default()
+            .cipher_suite_provider(suite)
+            .unwrap();
+        let key_id = vec![0x07u8; 32];
+
+        let cek_a = apq::attachment_cek(&suite_a, &component_a, &key_id).unwrap();
+        let cek_b = apq::attachment_cek(&suite_b, &component_b, &key_id).unwrap();
+        assert_eq!(*cek_a, *cek_b, "CEK expansion disagrees across providers");
+    }
+
     /// A full A.4 PQ ratchet round on a cross-provider session: each side runs its own
     /// provider's ML-KEM for the EK/ct exchange, then the pathless PQ commit and the
     /// classical apq-PSK bind cross providers. Messaging must still flow in the

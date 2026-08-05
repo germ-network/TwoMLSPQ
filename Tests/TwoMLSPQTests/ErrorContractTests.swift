@@ -61,6 +61,7 @@ struct ErrorContractTests {
 			(.establishmentCreatorMismatch, .rejectEstablishment),
 			(.establishmentEnvelopeConflict, .callerBug),
 			(.internalError, .fatal),
+			(.attachmentComponentUnavailable, .discardFrame),
 		]
 		for (code, disposition) in table {
 			#expect(code.disposition == disposition, "\(code) -> \(code.disposition)")
@@ -103,10 +104,11 @@ struct ErrorContractTests {
 			(.EstablishmentEnvelopeConflict, .establishmentEnvelopeConflict),
 			(.StaleFrame, .staleFrame),
 			(.BindTriggerFailed, .bindTriggerFailed),
+			(.AttachmentComponentUnavailable, .attachmentComponentUnavailable),
 		]
 		// + the two per-surface cases (SessionNotReady,
-		// EstablishmentEnvelopeRequired) = all 31 crate cases
-		#expect(expected.count == 29)
+		// EstablishmentEnvelopeRequired) = all 32 crate cases
+		#expect(expected.count == 30)
 		for (crate, code) in expected {
 			let mapped = SessionError(pqError: crate, at: .client)
 			#expect(mapped.code == code, "\(crate) -> \(mapped.code)")

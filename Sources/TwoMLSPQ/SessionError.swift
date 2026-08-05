@@ -186,15 +186,23 @@ public struct SessionError: Error, Sendable {
 		/// Opaque / internal failure: an MLS protocol error, a PSK-binding failure, an FFI decode
 		/// error, or a Rust panic. Discard the session object; do not persist it.
 		case internalError
+		/// `exportAttachmentCEKRecv` was asked for an epoch this session never captured
+		/// (GER-1985): evicted past the recv ledger's retention window, or the
+		/// best-effort eager capture lost its race against the commit that moved past
+		/// it. The session itself is unaffected — only this specific attachment is
+		/// unopenable by it; not worth retrying against this session.
+		case attachmentComponentUnavailable
 
 		public var disposition: Disposition {
 			switch self {
 			case .decryptionFailed:
 				return .retryLater
 			case .staleFrame, .duplicateWelcome, .duplicateSideBand,
-				.unopenableFrame, .malformedFrame, .bootstrapKpMismatch:
+				.unopenableFrame, .malformedFrame, .bootstrapKpMismatch,
+				.attachmentComponentUnavailable:
 				// A.3 KP′ not matching the signed commitment: drop the bad frame, the session is
-				// intact and the genuine re-stapled KP′ still works.
+				// intact and the genuine re-stapled KP′ still works. An unavailable attachment
+				// component is the same shape: this one fetch fails, the session is unaffected.
 				return .discardFrame
 			case .epochDesync, .bindDischargeFailed, .bindTriggerFailed:
 				// The crate words this "re-establish the session" too; the recovery is

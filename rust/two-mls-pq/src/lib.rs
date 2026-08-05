@@ -462,7 +462,25 @@ pub fn version() -> String {
 // released 0.14 archive still decodes under the v3 migration. `pair_session_id` and the
 // `SessionId` uniffi record are gone. Drops two FFI symbols — re-pair the vendored binding —
 // no wire (archive layout stays v3) or error-variant change.
-const BINDING_CONTRACT_VERSION: u64 = 32;
+//
+// v33 (GER-1985): two FFI additions, `export_attachment_cek_send(key_id)` and
+// `export_attachment_cek_recv(key_id, epoch)` — the wire attachment CEK,
+// `ExpandWithLabel(SafeExportSecret_classical(0xFF03), "attachment", key_id, 32)`, derived
+// classical-only: the classical key schedule already absorbs a PQ-derived PSK, so the export
+// is downstream of ML-KEM entropy without combining both APQ halves. Send must be called
+// after `prepare_to_encrypt`, before `encrypt`. Recv is keyed by the frame's OWN classical
+// epoch and read from a session-owned ledger, since `safe_export_secret` exports only at a
+// group's CURRENT epoch while a delayed frame's may already be behind it.
+//
+// `MlsSenderMessage.epoch` changes MEANING, not signature: it now reports the frame's own
+// authenticated epoch rather than the recv group's epoch at decrypt time. Identical for
+// in-order frames — every frame any caller has observed — and different only for one
+// processed after a later commit landed, the case recv derivation must key correctly.
+//
+// One error variant appended, `AttachmentComponentUnavailable`. Archive layout bumps 3→4
+// (`SESSION_ARCHIVE_VERSION`): v3 was already released, so the ledgers could not join its
+// tail in place without failing every 0.15.x-persisted session on restore.
+const BINDING_CONTRACT_VERSION: u64 = 33;
 
 /// See `BINDING_CONTRACT_VERSION`. Exported so the Swift layer can verify the
 /// binding it was generated with matches the binary it loaded.
@@ -1005,13 +1023,24 @@ pub enum TwoMlsPqError {
     /// reachable from any honest flow (a peer-forced trigger failure is refused in the guard
     /// phase before anything is consumed); route to re-establishment. Queryable via
     /// `pq_side_band_wedged`.
+    #[error("PQ bind trigger failed past its point of no return; re-establish")]
+    BindTriggerFailed,
+    /// `export_attachment_cek_recv` was asked for an epoch this session never ledgered
+    /// (GER-1985): either the epoch predates `ATTACHMENT_LEDGER_WINDOW`'s retention, or
+    /// `remember_recv_attachment_component` lost the race with a commit that advanced
+    /// past it before capturing it (best-effort by design — see its doc comment).
+    /// RETRIABLE from the app's perspective in neither sense of "try again now" (the
+    /// component is gone for good once evicted or missed) nor "this frame is broken" (the
+    /// frame itself decrypted fine) — it means the attachment behind this specific frame
+    /// cannot be opened by this session and the app should treat the fetch as failed, not
+    /// retry it against this session.
     //
     // Deliberately the LAST variant: uniffi numbers error cases by position, so appending
     // keeps every prior variant's ordinal stable. Keep appending future variants here (the
     // contract bump already forces binding/binary pairing, but there is no reason to
     // renumber the survivors).
-    #[error("PQ bind trigger failed past its point of no return; re-establish")]
-    BindTriggerFailed,
+    #[error("no ledgered attachment component for the requested epoch")]
+    AttachmentComponentUnavailable,
 }
 
 /// The protocol digest over `bytes` — the single hashing primitive behind every

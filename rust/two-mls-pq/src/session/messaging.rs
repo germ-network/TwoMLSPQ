@@ -453,6 +453,118 @@ impl SessionInner {
         Ok(())
     }
 
+    /// Push `(epoch, component)` onto a ledger, skipping a duplicate epoch and trimming to
+    /// [`ATTACHMENT_LEDGER_WINDOW`]. Shared by both attachment ledgers so their eviction
+    /// policy cannot drift apart.
+    fn ledger_attachment_component(
+        ledger: &mut VecDeque<(u64, Zeroizing<Vec<u8>>)>,
+        epoch: u64,
+        component: Zeroizing<Vec<u8>>,
+    ) {
+        if ledger.iter().any(|(e, _)| *e == epoch) {
+            return;
+        }
+        ledger.push_back((epoch, component));
+        while ledger.len() > ATTACHMENT_LEDGER_WINDOW {
+            ledger.pop_front();
+        }
+    }
+
+    /// The attachment-CEK component for our SEND group's current epoch (GER-1985),
+    /// exporting and ledgering it on first use at that epoch.
+    ///
+    /// Lazy, unlike [`Self::remember_recv_attachment_component`]: our own send epoch is
+    /// always exportable when we are the one sending, so there is no departing-epoch race
+    /// to beat — and exporting eagerly on every commit would consume the 0xFF03 leaf on
+    /// every session whether or not it ever sends an attachment.
+    pub(in crate::session) fn send_attachment_component(&mut self) -> Result<Zeroizing<Vec<u8>>> {
+        let epoch = self
+            .send_group
+            .as_ref()
+            .ok_or(TwoMlsPqError::SessionNotReady)?
+            .classical
+            .current_epoch();
+        if let Some((_, component)) = self
+            .send_attachment_ledger
+            .iter()
+            .find(|(e, _)| *e == epoch)
+        {
+            return Ok(component.clone());
+        }
+        let send = self
+            .send_group
+            .as_mut()
+            .ok_or(TwoMlsPqError::SessionNotReady)?;
+        let component = apq::export_attachment_component(&mut send.classical)
+            .map_err(|_| TwoMlsPqError::Mls)?;
+        Self::ledger_attachment_component(
+            &mut self.send_attachment_ledger,
+            epoch,
+            component.clone(),
+        );
+        Ok(component)
+    }
+
+    /// Capture our RECV group's current-epoch attachment component before a staple advances
+    /// past it. Called on the epoch-advance path, not on demand, and it has to be:
+    /// `safe_export_secret` exports only at the current epoch, but frames SENT at this epoch
+    /// stay decryptable and may still arrive. Deriving one of those later would silently key
+    /// on the wrong epoch and fail at SEAL-open as an opaque commitment mismatch.
+    ///
+    /// [`Self::recv_attachment_component`] covers the other direction, exporting live while
+    /// the epoch is still current. Neither can double-export: both route through
+    /// `Self::ledger_attachment_component`'s skip-if-ledgered guard.
+    ///
+    /// Best-effort: a failure here must not fail the frame — the message is unaffected, and
+    /// the miss surfaces later as `AttachmentComponentUnavailable`.
+    pub(in crate::session) fn remember_recv_attachment_component(&mut self) {
+        let Some(recv) = self.recv_group.as_mut() else {
+            return;
+        };
+        let epoch = recv.classical.current_epoch();
+        if self.recv_attachment_ledger.iter().any(|(e, _)| *e == epoch) {
+            return;
+        }
+        if let Ok(component) = apq::export_attachment_component(&mut recv.classical) {
+            Self::ledger_attachment_component(&mut self.recv_attachment_ledger, epoch, component);
+        }
+    }
+
+    /// The RECV component for `epoch` — the epoch the frame was SENT from, read off the
+    /// decrypted message, never from the group's current state.
+    ///
+    /// Two sources: a ledger hit for an already-departed epoch, or a LIVE export while
+    /// `epoch` is still current. `None` when it is neither — evicted past
+    /// `ATTACHMENT_LEDGER_WINDOW`, or never captured.
+    ///
+    /// The live branch mutates, so this runs inside `mutate_and_persist` like
+    /// [`Self::send_attachment_component`]. It ledgers what it exports, so the later
+    /// eager capture for that epoch finds it already there and skips — the leaf tolerates
+    /// exactly one export.
+    pub(in crate::session) fn recv_attachment_component(
+        &mut self,
+        epoch: u64,
+    ) -> Option<Zeroizing<Vec<u8>>> {
+        if let Some((_, component)) = self
+            .recv_attachment_ledger
+            .iter()
+            .find(|(e, _)| *e == epoch)
+        {
+            return Some(component.clone());
+        }
+        let recv = self.recv_group.as_mut()?;
+        if recv.classical.current_epoch() != epoch {
+            return None;
+        }
+        let component = apq::export_attachment_component(&mut recv.classical).ok()?;
+        Self::ledger_attachment_component(
+            &mut self.recv_attachment_ledger,
+            epoch,
+            component.clone(),
+        );
+        Some(component)
+    }
+
     /// Live-inject the session's PSK ledger, immediately before processing a frame whose
     /// commit may reference one of these PSKs. Injection targets the stores each live
     /// group actually resolves from (captured at the group's creation — the current
@@ -1165,6 +1277,11 @@ impl TwoMlsPqSession {
             let (staple, proposal_bytes, app_bytes) = decode_message_frame(&ciphertext)?;
             let app_msg =
                 MlsMessage::from_bytes(&app_bytes).map_err(|_| TwoMlsPqError::DecryptionFailed)?;
+            // The frame's OWN epoch, read before `app_msg` is consumed — not the group's
+            // epoch after decrypt, which disagrees for a frame delayed past an intervening
+            // commit. Trustworthy once the decrypt below succeeds: a forged value keys the
+            // wrong epoch and fails AEAD auth.
+            let frame_epoch = app_msg.epoch();
 
             let mut inner = self.lock();
 
@@ -1316,6 +1433,9 @@ impl TwoMlsPqSession {
                         // the honest `BindApplyFailed`, and so a host can ask. In-memory
                         // only: this closure persists on success, so the latch never reaches
                         // a blob and a restore predates the failed take.
+                        // Same departing-epoch capture as the plain-commit arm below: a
+                        // bind's classical half advances the recv group too.
+                        inner.remember_recv_attachment_component();
                         let moved = match inner.apply_bind(&s, &stores, &pq_message, &t_message) {
                             Ok(moved) => moved,
                             Err(_) => {
@@ -1358,6 +1478,10 @@ impl TwoMlsPqSession {
                         if inner.send_group.is_some() {
                             inner.inject_send_psks()?;
                         }
+                        // Capture the departing recv epoch's attachment component before
+                        // this commit moves past it — see the method's doc for why this
+                        // must happen here rather than when an attachment is fetched.
+                        inner.remember_recv_attachment_component();
                         let recv = inner
                             .recv_group
                             .as_mut()
@@ -1470,7 +1594,7 @@ impl TwoMlsPqSession {
                         let sender = ClientId {
                             bytes: sender_client_id(&recv.classical, desc.sender_index)?,
                         };
-                        let ep = recv.classical.current_epoch();
+                        let ep = frame_epoch.unwrap_or_else(|| recv.classical.current_epoch());
                         (desc.data().to_vec(), sender, ep)
                     }
                     _ => return Err(TwoMlsPqError::DecryptionFailed),
@@ -1578,6 +1702,9 @@ impl TwoMlsPqSession {
         if ciphertext.first() == Some(&PRE_ESTABLISHMENT_APP_TAG) {
             let app_msg = MlsMessage::from_bytes(&ciphertext[1..])
                 .map_err(|_| TwoMlsPqError::DecryptionFailed)?;
+            // See the identical capture in the message-frame arm above: the frame's own
+            // epoch, read before `app_msg` is consumed, not the group's current epoch.
+            let frame_epoch = app_msg.epoch();
             let mut inner = self.lock();
             let (app_data, sender_id, epoch) = {
                 let recv = inner
@@ -1593,7 +1720,7 @@ impl TwoMlsPqSession {
                         let sender = ClientId {
                             bytes: sender_client_id(&recv.classical, desc.sender_index)?,
                         };
-                        let ep = recv.classical.current_epoch();
+                        let ep = frame_epoch.unwrap_or_else(|| recv.classical.current_epoch());
                         (desc.data().to_vec(), sender, ep)
                     }
                     _ => return Err(TwoMlsPqError::DecryptionFailed),
@@ -1668,6 +1795,48 @@ impl TwoMlsPqSession {
             inner.rewrap_side_band();
             Ok(result)
         })
+    }
+
+    /// Derive the wire attachment CEK for our SEND group's current epoch:
+    /// `ExpandWithLabel(SafeExportSecret_classical(0xFF03), "attachment", key_id, 32)`.
+    ///
+    /// Call order is load-bearing — **after `prepare_to_encrypt`, before `encrypt`**. A
+    /// commit inside `prepare_to_encrypt` can advance the send-classical epoch, and this
+    /// must derive from the epoch that commit lands at, the one `encrypt`'s staple commits
+    /// to. Earlier risks a superseded epoch; later is too late for the frame to carry it.
+    ///
+    /// `key_id` is the caller-minted `AttachmentHeader.keyId`, the label context separating
+    /// each attachment's CEK within an epoch. A cold epoch exports and ledgers the 0xFF03
+    /// component (persisted as `Core`); a warm one is a pure ledger read.
+    pub fn export_attachment_cek_send(&self, key_id: Vec<u8>) -> Result<Vec<u8>> {
+        let component = self.mutate_and_persist(crate::BlobKind::Core, |inner| {
+            inner.send_attachment_component()
+        })?;
+        let suite = providers::attachment_cek_suite()?;
+        let cek = apq::attachment_cek(&suite, &component, &key_id)?;
+        Ok(cek.to_vec())
+    }
+
+    /// Derive the wire attachment CEK for a RECEIVED frame's classical epoch.
+    ///
+    /// `epoch` is the epoch the frame was SENT from, read off its decrypted result — never
+    /// the recv group's current epoch, which diverges once any later commit lands.
+    ///
+    /// `AttachmentComponentUnavailable` means the component is unrecoverable for that
+    /// epoch: neither current nor ledgered. The attachment cannot be opened by this
+    /// session — not a transient condition worth retrying.
+    ///
+    /// May mutate (a live export ledgers what it derives), so this runs inside
+    /// `mutate_and_persist` and pushes a `Core` blob on that path.
+    pub fn export_attachment_cek_recv(&self, key_id: Vec<u8>, epoch: u64) -> Result<Vec<u8>> {
+        let component = self.mutate_and_persist(crate::BlobKind::Core, |inner| {
+            inner
+                .recv_attachment_component(epoch)
+                .ok_or(TwoMlsPqError::AttachmentComponentUnavailable)
+        })?;
+        let suite = providers::attachment_cek_suite()?;
+        let cek = apq::attachment_cek(&suite, &component, &key_id)?;
+        Ok(cek.to_vec())
     }
 
     /// Encrypt `app_message` using the PQ send group.

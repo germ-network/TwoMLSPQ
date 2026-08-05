@@ -237,7 +237,16 @@ import TwoMLSPQBinding
 //     the group-id accessors. Nothing to do here either — the removed function was never
 //     reachable from this product, and the whole app stack already keys on the group id. The
 //     bump covers the dropped FFI symbols. No wire, API, or error-variant change.
-private let expectedBindingContract: UInt64 = 32
+// v33 (contract 33, GER-1985): two FFI additions, `exportAttachmentCekSend(keyId:)` and
+//     `exportAttachmentCekRecv(keyId:epoch:)` — the wire attachment CEK, derived
+//     classical-only from the group's 0xFF03 exporter component. Send must be called after
+//     `prepareToEncrypt`, before `encrypt`; recv is keyed by the frame's own classical epoch.
+//     `PQSenderMessage.epoch` changes MEANING, not signature: it now reports the frame's own
+//     authenticated epoch rather than the recv group's at decrypt time, differing only for a
+//     frame processed after a later commit landed. New crate error
+//     `.attachmentComponentUnavailable` appended — hosts must handle it (the error map is
+//     exhaustive). Archive layout bumps 3→4.
+private let expectedBindingContract: UInt64 = 33
 
 enum TwoMLSPQBindingContract {
 	static let verified: Void = {
@@ -659,6 +668,31 @@ public struct PQSession {
 	) throws(SessionError) -> PQEncryptResult {
 		try mapPQErrors(.encrypt) {
 			PQEncryptResult(try base.encrypt(appMessage: appMessage))
+		}
+	}
+
+	/// Derive the wire attachment CEK for this session's SEND group at its current
+	/// epoch (GER-1985). Call order is load-bearing: **after `prepareToEncrypt`,
+	/// before `encrypt`** — a commit inside `prepareToEncrypt` can advance the send
+	/// epoch, and this must derive from the epoch that commit lands at, the same one
+	/// `encrypt`'s staple commits to. `keyId` is the caller-minted
+	/// `AttachmentHeader.keyId`, separating every attachment's CEK from every
+	/// other's even within one epoch.
+	public func exportAttachmentCEKSend(keyId: Data) throws(SessionError) -> Data {
+		try mapPQErrors(.encrypt) {
+			try base.exportAttachmentCekSend(keyId: keyId)
+		}
+	}
+
+	/// Derive the wire attachment CEK for a RECEIVED frame's classical epoch
+	/// (GER-1985). `epoch` is the epoch the frame was SENT from — read off
+	/// `PQSenderMessage.epoch` on the decrypted result, never this session's current
+	/// epoch (they diverge the moment a later commit lands). `.attachmentComponentUnavailable`
+	/// means the component was never captured for that epoch and this attachment
+	/// cannot be opened by this session — not a transient condition to retry.
+	public func exportAttachmentCEKRecv(keyId: Data, epoch: UInt64) throws(SessionError) -> Data {
+		try mapPQErrors(.encrypt) {
+			try base.exportAttachmentCekRecv(keyId: keyId, epoch: epoch)
 		}
 	}
 
