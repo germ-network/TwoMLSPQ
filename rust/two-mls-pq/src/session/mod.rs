@@ -317,6 +317,28 @@ struct SessionInner {
     /// (the -02 exporter tree consumes each component's leaf on first export), and the
     /// [`ExportedPsk`] carries the store key + value the peer's commit will look up.
     send_psk_ledger: VecDeque<(u64, apq::ExportedPsk)>,
+    /// Attachment-CEK components (GER-1985) for OUR SEND group's recent classical epochs,
+    /// keyed by that epoch. Exported lazily by `remember_attachment_component` at
+    /// `export_attachment_cek_send` time, then reused for every further attachment in the
+    /// same epoch: the exporter tree consumes the 0xFF03 leaf on first export, so the
+    /// per-epoch component must be memoized exactly as the PSK ledger memoizes its own.
+    /// Per-attachment CEKs are expanded from the component by `key_id`, so one export
+    /// serves any number of attachments at that epoch.
+    send_attachment_ledger: VecDeque<(u64, Zeroizing<Vec<u8>>)>,
+    /// The same, for our RECV group — and the reason this side exists at all is subtler
+    /// than the send side's. A frame is decrypted at the epoch it was SENT from, which
+    /// mls-rs still retains after we have applied later commits; but `safe_export_secret`
+    /// only ever exports at the group's CURRENT epoch. So a delayed frame's attachment
+    /// would derive its CEK from the wrong epoch's component — silently, producing a key
+    /// that fails only at SEAL-open as an opaque commitment mismatch, which the receive
+    /// path is required to treat as retry-forever rather than a decodable failure.
+    ///
+    /// The fix is to capture the DEPARTING epoch's component just before an applied
+    /// staple advances the recv group (the same "capture before committing past it" hook
+    /// `remember_send_psk` uses), and to key derivation by the frame's own epoch. An entry
+    /// is therefore written on the epoch-advance path, not on demand — by the time a
+    /// delayed frame arrives, its epoch is no longer exportable.
+    recv_attachment_ledger: VecDeque<(u64, Zeroizing<Vec<u8>>)>,
     /// PSK ids evicted from the ledger (or consumed one-shot) but possibly still present in
     /// the mls-rs secret stores from an earlier injection; the next `inject_send_psks`
     /// deletes them so the stores never resolve PSKs the session no longer vouches for.
@@ -541,6 +563,17 @@ impl BootstrapKpCommitment {
 /// one 32-byte secret, so we keep a generous window and rely on hosts not committing
 /// unboundedly between peer frames.
 const SEND_PSK_WINDOW: usize = 8;
+
+/// Ledger depth for the attachment-CEK component ledgers (GER-1985), send and recv.
+///
+/// The recv side is what sets this: it must cover every epoch a still-undelivered
+/// attachment-bearing frame could have been sent from, i.e. how far our recv group can
+/// advance while one peer frame is in flight. That is the same protocol-unbounded quantity
+/// `SEND_PSK_WINDOW` reasons about, and the same answer applies — a generous window over
+/// 32-byte secrets, relying on hosts not committing unboundedly between frames. A miss is
+/// not silent: `export_attachment_cek_recv` errors rather than deriving at the wrong epoch,
+/// which the app surfaces as a retriable fetch failure (the message itself still decrypts).
+const ATTACHMENT_LEDGER_WINDOW: usize = 8;
 
 /// Retained staged rotation candidates. Only one is usually in flight; the window
 /// exists because the peer's commit picks the winner among candidates proposed on
@@ -1251,6 +1284,8 @@ fn build_session(
             pending_side_band: None,
             owed_bind: None,
             send_psk_ledger: VecDeque::new(),
+            send_attachment_ledger: VecDeque::new(),
+            recv_attachment_ledger: VecDeque::new(),
             retired_send_psks: Vec::new(),
             last_cross_injected: None,
             // No evidence until the peer's first frame: a fresh session has nothing

@@ -286,6 +286,28 @@ pub(crate) mod archive_wire {
         /// mutations being real. A latch that healed on restore would hand the honest label
         /// back to the retriable lie the restored state still embodies.
         pub(in crate::session) pq_wedged: Option<u8>,
+        /// Attachment-CEK components for our SEND group's recent epochs (GER-1985).
+        ///
+        /// ARCHIVED because the exporter leaf is CONSUMED on first export: a restore that
+        /// dropped these could never re-derive them, so every attachment sent at a
+        /// still-live epoch would become unreadable to us on retry. Same reasoning as
+        /// `send_psk_ledger`, which rides the body for the same reason.
+        pub(in crate::session) send_attachment_ledger: Vec<AttachmentEntry>,
+        /// The same for our RECV group — and MORE load-bearing, because these entries can
+        /// only ever be captured at the instant their epoch departs (see
+        /// `SessionInner::recv_attachment_ledger`). A restore that lost them would leave
+        /// every in-flight attachment from a superseded epoch permanently underivable,
+        /// which the receive path cannot distinguish from a corrupt key.
+        pub(in crate::session) recv_attachment_ledger: Vec<AttachmentEntry>,
+    }
+
+    /// One ledgered attachment-CEK component: the classical epoch it was exported at, and
+    /// the 32-byte component itself (per-attachment CEKs expand from it by `key_id`).
+    #[derive(MlsSize, MlsEncode, MlsDecode)]
+    pub(in crate::session) struct AttachmentEntry {
+        pub(in crate::session) epoch: u64,
+        #[mls_codec(with = "mls_rs_codec::byte_vec")]
+        pub(in crate::session) component: Vec<u8>,
     }
 
     impl ArchiveTail {
@@ -297,6 +319,8 @@ pub(crate) mod archive_wire {
             Self {
                 responder_wire_ct: None,
                 pq_wedged: None,
+                send_attachment_ledger: Vec::new(),
+                recv_attachment_ledger: Vec::new(),
             }
         }
     }
@@ -571,23 +595,38 @@ fn wire_pq_inflight(inflight: &PqInflight) -> archive_wire::WirePqInflight {
     }
 }
 
-/// The v3 tail for `inner`: a `Responding` round's retained `wire_ct`, plus the wedge latch.
+/// The v3 tail for `inner`: a `Responding` round's retained `wire_ct`, the wedge latch, and
+/// the two attachment-CEK component ledgers.
 ///
 /// A whole-state view rather than an inflight one, because the wedge is not round state and
 /// must ride BOTH blob kinds: it is set inside a `Checkpoint` closure, but a later ordinary
 /// `Core` push can win the `state_seq` race in `reconcile_persisted`, and a winner without
-/// the verdict would restore a session that reports healthy and deadlocks.
+/// the verdict would restore a session that reports healthy and deadlocks. The attachment
+/// ledgers ride both kinds for the same reason — they are written from the ordinary
+/// message path (`Core`), so a `Checkpoint` winner that omitted them would drop consumed,
+/// unrecoverable exporter output.
 fn tail_from(inner: &SessionInner) -> archive_wire::ArchiveTail {
-    use archive_wire::{ArchiveTail, CtBlob};
+    use archive_wire::{ArchiveTail, AttachmentEntry, CtBlob};
     let responder_wire_ct = match inner.pq_inflight.as_ref() {
         Some(PqInflight::Responding {
             wire_ct: Some(ct), ..
         }) => Some(CtBlob { bytes: ct.clone() }),
         _ => None,
     };
+    let entries = |ledger: &VecDeque<(u64, Zeroizing<Vec<u8>>)>| {
+        ledger
+            .iter()
+            .map(|(epoch, component)| AttachmentEntry {
+                epoch: *epoch,
+                component: component.to_vec(),
+            })
+            .collect()
+    };
     ArchiveTail {
         responder_wire_ct,
         pq_wedged: inner.pq_wedged.map(|w| w as u8),
+        send_attachment_ledger: entries(&inner.send_attachment_ledger),
+        recv_attachment_ledger: entries(&inner.recv_attachment_ledger),
     }
 }
 
@@ -677,6 +716,11 @@ fn session_from_wire(
     // Structural invariants the live session maintains; reject blobs that violate
     // them rather than resurrecting an impossible state.
     if wire.send_psk_ledger.len() > SEND_PSK_WINDOW {
+        return Err(TwoMlsPqError::ArchiveInvalid);
+    }
+    if tail.send_attachment_ledger.len() > ATTACHMENT_LEDGER_WINDOW
+        || tail.recv_attachment_ledger.len() > ATTACHMENT_LEDGER_WINDOW
+    {
         return Err(TwoMlsPqError::ArchiveInvalid);
     }
     let digest_ok = |d: &[u8]| d.len() == 32;
@@ -910,6 +954,16 @@ fn session_from_wire(
                         .map(|exported| (entry.epoch, exported))
                 })
                 .collect::<std::result::Result<_, _>>()?,
+            send_attachment_ledger: tail
+                .send_attachment_ledger
+                .iter()
+                .map(|entry| (entry.epoch, Zeroizing::new(entry.component.clone())))
+                .collect(),
+            recv_attachment_ledger: tail
+                .recv_attachment_ledger
+                .iter()
+                .map(|entry| (entry.epoch, Zeroizing::new(entry.component.clone())))
+                .collect(),
             retired_send_psks: wire.retired_send_psks,
             last_cross_injected: wire.last_cross_injected,
             peer_applied_send_epoch: wire.peer_applied_send_epoch,

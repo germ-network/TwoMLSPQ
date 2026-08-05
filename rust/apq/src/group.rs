@@ -412,6 +412,79 @@ pub fn export_psk<Cfg: MlsConfig>(
     })
 }
 
+/// Export the attachment-CEK parent for `group`'s current epoch (GER-1985): a bare
+/// `SafeExportSecret(ATTACHMENT_COMPONENT_ID)` off the epoch's exporter tree. Like
+/// [`export_psk`], the leaf is **consumed** — a given (group, epoch) can be exported at
+/// most once, so callers memoize (the session's attachment ledgers). Both parties derive
+/// identical bytes from the same epoch. Per-attachment CEKs are then expanded from this
+/// one parent by [`attachment_cek`], so many attachments in one epoch cost one export.
+pub fn export_attachment_component<Cfg: MlsConfig>(
+    group: &mut Group<Cfg>,
+) -> Result<Zeroizing<Vec<u8>>> {
+    group
+        .safe_export_secret(crate::component::ATTACHMENT_COMPONENT_ID)
+        .map(|secret| Zeroizing::new(secret.as_bytes().to_vec()))
+        .map_err(|_| CombinerError::Mls)
+}
+
+/// RFC 9420 §8 `KDFLabel`, encoded with the MLS codec so the expansion below is exactly
+/// the spec's `ExpandWithLabel` — mls-rs keeps its own implementation `pub(crate)`
+/// (`group::key_schedule::kdf_expand_with_label`), and the one function it exposes,
+/// `Group::derive_secret`, hard-codes an empty context and cannot take `key_id`.
+///
+/// **This struct is verified field-for-field against mls-rs's own private `Label`**
+/// (`group/key_schedule.rs`, pinned rev — struct defined a few lines above
+/// `kdf_expand_with_label`): identical field order (`length, label, context`), identical
+/// `#[mls_codec(with = "mls_rs_codec::byte_vec")]` on both variable-length fields, and an
+/// identical `label` construction (`[b"MLS 1.0 ", label].concat()`, matched below by
+/// `[b"MLS 1.0 ".as_slice(), b"attachment"].concat()`). This is the actual correctness
+/// basis — NOT the cross-provider interop test in `tests/provider_interop.rs`, which
+/// only proves two providers' `kdf_expand` agree given identical input bytes; both sides
+/// of that test run this same struct, so it cannot catch a wrong label independent of
+/// this comparison. If mls-rs's `Label` ever changes shape, this must change with it.
+mod kdf_label {
+    use mls_rs::mls_rs_codec::{self, MlsEncode, MlsSize};
+
+    #[derive(MlsSize, MlsEncode)]
+    pub(super) struct KdfLabel {
+        pub length: u16,
+        #[mls_codec(with = "mls_rs_codec::byte_vec")]
+        pub label: Vec<u8>,
+        #[mls_codec(with = "mls_rs_codec::byte_vec")]
+        pub context: Vec<u8>,
+    }
+}
+
+/// The CEK length: 32 bytes, the SEAL profile's key size.
+pub const ATTACHMENT_CEK_LEN: u16 = 32;
+
+/// Expand one attachment's wire CEK from the epoch's exported component (GER-1985):
+/// `CEK = ExpandWithLabel(component, "attachment", key_id, 32)` per RFC 9420 §8 — label
+/// prefixed `"MLS 1.0 "`, context the caller's random 32-byte `key_id`, which namespaces
+/// the expansion only and never reaches any server. Deterministic given (component,
+/// key_id), so both parties derive the same CEK; distinct `key_id`s yield independent
+/// CEKs from one component.
+///
+/// The suite must be the pinned classical suite both parties share — never inferred from
+/// ambient state (a KDF disagreement here fails only at SEAL-open, as an opaque
+/// commitment mismatch).
+pub fn attachment_cek<C: mls_rs::CipherSuiteProvider>(
+    suite: &C,
+    component: &[u8],
+    key_id: &[u8],
+) -> Result<Zeroizing<Vec<u8>>> {
+    use mls_rs::mls_rs_codec::MlsEncode;
+    let label = kdf_label::KdfLabel {
+        length: ATTACHMENT_CEK_LEN,
+        label: [b"MLS 1.0 ".as_slice(), b"attachment"].concat(),
+        context: key_id.to_vec(),
+    };
+    let info = label.mls_encode_to_vec().map_err(|_| CombinerError::Mls)?;
+    suite
+        .kdf_expand(component, &info, usize::from(ATTACHMENT_CEK_LEN))
+        .map_err(|_| CombinerError::Mls)
+}
+
 /// Register an exported PSK into every store in `stores` — the caller's registry of
 /// every store its groups resolve PSKs from. The single fan-out loop shared by the
 /// session layer and the PQ ratchet.
@@ -1290,6 +1363,56 @@ mod tests {
         // Establishment already consumed the Apq leaf of both PQ halves (pq -> classical
         // bind), so re-exporting it at the same epoch is likewise rejected.
         assert!(export_psk(send.pq.as_mut().unwrap(), PskDomain::Apq).is_err());
+    }
+
+    #[test]
+    fn test_attachment_component_agrees_across_parties_and_consumes_once() {
+        let alice = client();
+        let bob = client();
+
+        let (mut send, welcome) = create_combiner_send_group(
+            &bob.generate_classical_key_package().unwrap(),
+            &bob.generate_pq_key_package().unwrap(),
+            &alice,
+            None,
+        )
+        .unwrap();
+        let mut recv = join_combiner_group(&welcome, &bob).unwrap();
+
+        // The 0xFF03 leaf is untouched by establishment (which consumes only the Apq
+        // leaves), so both parties export it fresh at the same epoch and agree.
+        let a = export_attachment_component(&mut send.classical).unwrap();
+        let b = export_attachment_component(&mut recv.classical).unwrap();
+        assert_eq!(*a, *b);
+
+        // Consumed: a second export at the same (group, epoch) is rejected.
+        assert!(export_attachment_component(&mut send.classical).is_err());
+
+        // The attachment export did not consume the PSK components' leaves.
+        assert!(export_psk(&mut send.classical, PskDomain::CrossParty).is_ok());
+    }
+
+    #[test]
+    fn test_attachment_cek_expansion_is_deterministic_and_key_id_separated() {
+        let suite = AwsLcCryptoProvider::new()
+            .cipher_suite_provider(mls_rs::CipherSuite::CURVE25519_CHACHA)
+            .unwrap();
+        let component = vec![0x42u8; 32];
+        let key_a = vec![0x01u8; 32];
+        let key_b = vec![0x02u8; 32];
+
+        let cek_a1 = attachment_cek(&suite, &component, &key_a).unwrap();
+        let cek_a2 = attachment_cek(&suite, &component, &key_a).unwrap();
+        let cek_b = attachment_cek(&suite, &component, &key_b).unwrap();
+
+        assert_eq!(cek_a1.len(), usize::from(ATTACHMENT_CEK_LEN));
+        // Deterministic given (component, key_id)...
+        assert_eq!(*cek_a1, *cek_a2);
+        // ...and distinct key_ids yield independent CEKs from one component.
+        assert_ne!(*cek_a1, *cek_b);
+        // A different component never collides.
+        let other = attachment_cek(&suite, &[0x43u8; 32], &key_a).unwrap();
+        assert_ne!(*cek_a1, *other);
     }
 
     #[test]
