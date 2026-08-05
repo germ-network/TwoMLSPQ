@@ -28,10 +28,7 @@ use super::*;
 // introduced v3 and before any release wrote it. The hatch CLOSES the instant the byte ships:
 // the first RELEASE to write byte N freezes N, and the next layout change bumps to N+1 like
 // any other. So mutating in place is legal only behind a check that no tag has been cut while
-// this byte was current — v3 froze exactly this way, at 0.15.0 (confirmed: `git tag` on the
-// release remote shows v0.15.0/v0.15.1 both shipping `SESSION_ARCHIVE_VERSION = 3`, which is
-// what makes the v4 bump below a hard requirement rather than a nice-to-have — an in-place
-// change here would have made every 0.15.x-persisted session fail `ArchiveInvalid` on restore).
+// this byte was current: check `git tag`, not memory. v3 froze at 0.15.0.
 //
 // This ends the earlier pre-release convention of leaving the byte untouched (and the
 // 2026-07-13 floor reset to 1); those and the original
@@ -49,38 +46,24 @@ use super::*;
 // v2: restore-time validation tightened — the bootstrap twin-field invariant and the 32-byte
 // commitment length are now enforced on decode (see `session_from_wire`).
 //
-// v3: the A.4 legs moved to the classical groups, so a `Responding` round now retains its
-// `wire_ct` for re-wrapping (see `PqInflight::Responding`). THIS IS THE FIRST VERSION WITH A
-// MIGRATION, and the hard-cut rule above is relaxed exactly this far: v2 is still ACCEPTED on
-// decode, because 0.14 shipped to real sessions whose connections must survive the upgrade.
-// The mechanism is append-only — the new state rides an `ArchiveTail` encoded AFTER the
-// (byte-unchanged) `SessionArchive`, so a v2 blob decodes as the same prefix and its absent
-// tail restores as empty, which is exactly right: a v2 round's legs rode the PQ groups, whose
-// `pq_epoch` cannot move mid-round, so they never re-wrap. v3 also LATER took a second tail
-// field, `pq_wedged` (the side-band wedge verdict), in place rather than bumping — the
-// unreleased-byte exception, valid at the time because v3 had not yet shipped. SHIPPED at
-// 0.15.0/0.15.1 with exactly those two tail fields (`responder_wire_ct`, `pq_wedged`) and
-// nothing else — that two-field shape is now frozen as `archive_wire::ArchiveTailV3`, decoded
-// only to translate into the current `ArchiveTail` with empty attachment ledgers (see
-// `decode_wire`). A v3 or v2 blob on a build predating either still fails there, which is the
-// hard cut's remaining, intended direction.
+// v3: the A.4 legs moved to the classical groups, so a `Responding` round retains its
+// `wire_ct` for re-wrapping (see `PqInflight::Responding`). First version with a migration:
+// v2 is still ACCEPTED on decode, because 0.14 shipped to real sessions. The mechanism is
+// append-only — the state rides an `ArchiveTail` encoded AFTER the (byte-unchanged)
+// `SessionArchive`, so a v2 blob decodes as the same prefix with an empty tail, which is
+// right: a v2 round's legs rode the PQ groups, whose `pq_epoch` cannot move mid-round, so
+// they never re-wrap. Shipped at 0.15.x carrying exactly two tail fields, frozen as
+// `archive_wire::ArchiveTailV3`.
 //
-// v4 (this change, GER-1985): the attachment-CEK send/recv ledgers
-// (`ArchiveTail::send_attachment_ledger` / `recv_attachment_ledger`) join the tail. This MUST
-// bump rather than land in place, unlike v3's own two in-place tail additions: v3 is no longer
-// an unreleased byte (0.15.0/0.15.1 both shipped it with the OLD two-field tail), so mutating
-// `ArchiveTail` further in place would make every session either release persisted fail
-// `ArchiveInvalid` on restore under this build. v3 joins v2 as an accepted old layout — the
-// same append-only mechanism, one version further out.
+// v4 (GER-1985): the attachment-CEK send/recv ledgers join the tail. v3 was already released,
+// so this bumps rather than landing in place — an in-place tail change would fail every
+// 0.15.x-persisted session on restore. v3 joins v2 as an accepted old layout.
 const SESSION_ARCHIVE_VERSION: u8 = 4;
-/// The newer of the two older layouts still accepted on decode (see the version note):
-/// identical to v2 plus a trailing two-field tail — `responder_wire_ct` and `pq_wedged`, the
-/// exact shape SHIPPED at 0.15.0/0.15.1, before the attachment ledgers existed. Decoded via
-/// [`archive_wire::ArchiveTailV3`], never `archive_wire::ArchiveTail` directly (whose current
-/// shape a v3 blob was never encoded against).
+/// Accepted on decode: v2 plus a two-field tail (`responder_wire_ct`, `pq_wedged`). Decodes
+/// via [`archive_wire::ArchiveTailV3`], never the current `ArchiveTail` — a v3 blob carries
+/// no attachment-ledger bytes for it to read.
 const SESSION_ARCHIVE_VERSION_V3: u8 = 3;
-/// The older of the two layouts still accepted on decode (see the version note): identical to
-/// v3 minus the trailing tail entirely (empty, not merely absent fields).
+/// Accepted on decode: the body with no tail at all.
 const SESSION_ARCHIVE_VERSION_V2: u8 = 2;
 
 // In its own module because the derive-generated impls reference the std `Result`, which
@@ -285,14 +268,10 @@ pub(crate) mod archive_wire {
         pub(in crate::session) bytes: Vec<u8>,
     }
 
-    /// The v3 shape of the tail — SHIPPED at 0.15.0/0.15.1 with exactly these two fields and
-    /// nothing else (see the `SESSION_ARCHIVE_VERSION` note). Frozen: a v3 blob's tail bytes
-    /// must decode against THIS struct, never the current `ArchiveTail`, whose additional
-    /// fields no v3 writer ever encoded. Exists only as a decode target for
-    /// `decode_wire` — [`Self::into_current`] is the sole consumer. `MlsEncode` is derived
-    /// too, but ONLY so the test suite can construct a genuine v3-shaped fixture through the
-    /// type system rather than hand-slicing bytes (mirroring how the existing v2 fixtures
-    /// build theirs) — production code never encodes this type.
+    /// The frozen v3 tail: exactly these two fields, the shape 0.15.x shipped. A v3 blob's
+    /// tail bytes decode against THIS struct, never the current [`ArchiveTail`] — its extra
+    /// fields have no bytes to read there. `MlsEncode` is derived only so tests can build a
+    /// v3 fixture through the type system; production never encodes it.
     #[derive(MlsSize, MlsEncode, MlsDecode)]
     pub(in crate::session) struct ArchiveTailV3 {
         pub(in crate::session) responder_wire_ct: Option<CtBlob>,
@@ -300,9 +279,8 @@ pub(crate) mod archive_wire {
     }
 
     impl ArchiveTailV3 {
-        /// Lift a decoded v3 tail into the current shape: the two shared fields carry over
-        /// verbatim, and the attachment ledgers restore empty — correct by construction, since
-        /// a v3 writer never captured them (the ledgers did not exist yet).
+        /// Lift into the current shape: shared fields verbatim, attachment ledgers empty —
+        /// a v3 writer never captured them.
         pub(in crate::session) fn into_current(self) -> ArchiveTail {
             ArchiveTail {
                 responder_wire_ct: self.responder_wire_ct,
@@ -334,18 +312,15 @@ pub(crate) mod archive_wire {
         /// mutations being real. A latch that healed on restore would hand the honest label
         /// back to the retriable lie the restored state still embodies.
         pub(in crate::session) pq_wedged: Option<u8>,
-        /// Attachment-CEK components for our SEND group's recent epochs (GER-1985).
-        ///
-        /// ARCHIVED because the exporter leaf is CONSUMED on first export: a restore that
-        /// dropped these could never re-derive them, so every attachment sent at a
-        /// still-live epoch would become unreadable to us on retry. Same reasoning as
-        /// `send_psk_ledger`, which rides the body for the same reason.
+        /// Attachment-CEK components for our SEND group's recent epochs. Archived because
+        /// the exporter leaf is CONSUMED on first export — a restore that dropped these
+        /// could never re-derive them, stranding every attachment sent at a still-live
+        /// epoch. Same reasoning as `send_psk_ledger`.
         pub(in crate::session) send_attachment_ledger: Vec<AttachmentEntry>,
-        /// The same for our RECV group — and MORE load-bearing, because these entries can
-        /// only ever be captured at the instant their epoch departs (see
-        /// `SessionInner::recv_attachment_ledger`). A restore that lost them would leave
-        /// every in-flight attachment from a superseded epoch permanently underivable,
-        /// which the receive path cannot distinguish from a corrupt key.
+        /// The same for our RECV group, and more load-bearing: these can only be captured
+        /// at the instant their epoch departs (see `SessionInner::recv_attachment_ledger`),
+        /// so losing them strands every in-flight attachment from a superseded epoch —
+        /// indistinguishable, at the receive path, from a corrupt key.
         pub(in crate::session) recv_attachment_ledger: Vec<AttachmentEntry>,
     }
 

@@ -463,34 +463,23 @@ pub fn version() -> String {
 // `SessionId` uniffi record are gone. Drops two FFI symbols — re-pair the vendored binding —
 // no wire (archive layout stays v3) or error-variant change.
 //
-// v33 (GER-1985): two FFI additions, `export_attachment_cek_send(key_id) -> Vec<u8>` and
-// `export_attachment_cek_recv(key_id, epoch) -> Vec<u8>` — the wire attachment CEK,
+// v33 (GER-1985): two FFI additions, `export_attachment_cek_send(key_id)` and
+// `export_attachment_cek_recv(key_id, epoch)` — the wire attachment CEK,
 // `ExpandWithLabel(SafeExportSecret_classical(0xFF03), "attachment", key_id, 32)`, derived
-// classical-only (Linear ruling on GER-1985: the classical key schedule already absorbs a
-// PQ-derived PSK, so the export is downstream of ML-KEM entropy without needing to combine
-// both APQ halves). Send must be called after `prepare_to_encrypt`, before `encrypt`; recv
-// is keyed by the frame's OWN classical epoch, read from a session-owned ledger since
-// `safe_export_secret` only exports at a group's CURRENT epoch and a delayed frame's epoch
-// may already be behind it.
+// classical-only: the classical key schedule already absorbs a PQ-derived PSK, so the export
+// is downstream of ML-KEM entropy without combining both APQ halves. Send must be called
+// after `prepare_to_encrypt`, before `encrypt`. Recv is keyed by the frame's OWN classical
+// epoch and read from a session-owned ledger, since `safe_export_secret` exports only at a
+// group's CURRENT epoch while a delayed frame's may already be behind it.
 //
-// `MlsSenderMessage.epoch`'s MEANING CHANGES here, not just its plumbing: it used to report
-// the recv group's CURRENT epoch at the moment of decrypt; it now reports the FRAME's own
-// authenticated epoch (`MlsMessage::epoch()`, read before the frame is consumed — the same
-// accessor `commit.epoch()` already used elsewhere in this crate). The two agree for every
-// in-order frame, which is every frame any existing caller has ever observed — this is why
-// the change is field-compatible rather than a new field — and diverge only for a frame
-// processed after a LATER commit has already landed, which is exactly the case
-// `export_attachment_cek_recv` exists to key correctly. No API signature change; a
-// behavior change worth knowing if anything ever keyed on epoch during a crossed-commit
-// window before GER-1985.
+// `MlsSenderMessage.epoch` changes MEANING, not signature: it now reports the frame's own
+// authenticated epoch rather than the recv group's epoch at decrypt time. Identical for
+// in-order frames — every frame any caller has observed — and different only for one
+// processed after a later commit landed, the case recv derivation must key correctly.
 //
-// One error variant appended, `AttachmentComponentUnavailable` (the recv ledger missed or
-// evicted the requested epoch — not retriable; the attachment is unopenable by this
-// session). Archive layout bumps 3→4 (`SESSION_ARCHIVE_VERSION`): v3 shipped at
-// 0.15.0/0.15.1 with its two-field tail before this change, closing the in-place-mutation
-// exception that field itself documents — the attachment ledgers could NOT land in v3 the
-// way `pq_wedged` did, or every session persisted by a released 0.15.x build would fail
-// `ArchiveInvalid` on restore. v3 joins v2 as an accepted older layout on decode.
+// One error variant appended, `AttachmentComponentUnavailable`. Archive layout bumps 3→4
+// (`SESSION_ARCHIVE_VERSION`): v3 was already released, so the ledgers could not join its
+// tail in place without failing every 0.15.x-persisted session on restore.
 const BINDING_CONTRACT_VERSION: u64 = 33;
 
 /// See `BINDING_CONTRACT_VERSION`. Exported so the Swift layer can verify the
