@@ -1981,39 +1981,32 @@ public protocol TwoMlsPqSessionProtocol: AnyObject, Sendable {
     func encrypt(appMessage: Data) throws  -> EncryptResult
     
     /**
-     * Derive the wire attachment CEK for a RECEIVED frame's classical epoch (GER-1985).
+     * Derive the wire attachment CEK for a RECEIVED frame's classical epoch.
      *
-     * `epoch` is the classical epoch the frame was SENT from — read off the frame's own
-     * decrypted result, never the recv group's current epoch (the two diverge the moment
-     * any later commit lands on the recv group).
+     * `epoch` is the epoch the frame was SENT from, read off its decrypted result — never
+     * the recv group's current epoch, which diverges once any later commit lands.
      *
      * `AttachmentComponentUnavailable` means the component is unrecoverable for that
-     * epoch: neither still current (a live export would have covered it) nor ledgered —
-     * evicted past `ATTACHMENT_LEDGER_WINDOW`, or never captured before a commit moved
-     * past it. This attachment cannot be opened by this session; it is not a transient
-     * condition worth retrying.
+     * epoch: neither current nor ledgered. The attachment cannot be opened by this
+     * session — not a transient condition worth retrying.
      *
-     * May mutate (a live export for a not-yet-departed current epoch ledgers it, like
-     * [`Self::export_attachment_cek_send`]'s cold-epoch path), so this runs inside
-     * `mutate_and_persist` and persists a `Core` blob on that path.
+     * May mutate (a live export ledgers what it derives), so this runs inside
+     * `mutate_and_persist` and pushes a `Core` blob on that path.
      */
     func exportAttachmentCekRecv(keyId: Data, epoch: UInt64) throws  -> Data
     
     /**
-     * Derive the wire attachment CEK for our SEND group's current epoch (GER-1985):
+     * Derive the wire attachment CEK for our SEND group's current epoch:
      * `ExpandWithLabel(SafeExportSecret_classical(0xFF03), "attachment", key_id, 32)`.
      *
-     * Call order is load-bearing — **after `prepare_to_encrypt`, before `encrypt`**: a
+     * Call order is load-bearing — **after `prepare_to_encrypt`, before `encrypt`**. A
      * commit inside `prepare_to_encrypt` can advance the send-classical epoch, and this
-     * must derive from the epoch that commit lands at, the same one `encrypt`'s staple
-     * commits to. Deriving before `prepare_to_encrypt` risks a since-superseded epoch;
-     * deriving after `encrypt` is too late for that frame to carry an attachment sealed
-     * under it.
+     * must derive from the epoch that commit lands at, the one `encrypt`'s staple commits
+     * to. Earlier risks a superseded epoch; later is too late for the frame to carry it.
      *
-     * `key_id` is the caller-minted `AttachmentHeader.keyId` — the label context that
-     * separates every attachment's CEK from every other's, even within the same epoch.
-     * Exports and ledgers the 0xFF03 component on a cold epoch (persisted as a `Core`
-     * blob, like every other classical-only mutation); a warm epoch is a pure ledger read.
+     * `key_id` is the caller-minted `AttachmentHeader.keyId`, the label context separating
+     * each attachment's CEK within an epoch. A cold epoch exports and ledgers the 0xFF03
+     * component (persisted as `Core`); a warm one is a pure ledger read.
      */
     func exportAttachmentCekSend(keyId: Data) throws  -> Data
     
@@ -2864,21 +2857,17 @@ open func encrypt(appMessage: Data)throws  -> EncryptResult  {
 }
     
     /**
-     * Derive the wire attachment CEK for a RECEIVED frame's classical epoch (GER-1985).
+     * Derive the wire attachment CEK for a RECEIVED frame's classical epoch.
      *
-     * `epoch` is the classical epoch the frame was SENT from — read off the frame's own
-     * decrypted result, never the recv group's current epoch (the two diverge the moment
-     * any later commit lands on the recv group).
+     * `epoch` is the epoch the frame was SENT from, read off its decrypted result — never
+     * the recv group's current epoch, which diverges once any later commit lands.
      *
      * `AttachmentComponentUnavailable` means the component is unrecoverable for that
-     * epoch: neither still current (a live export would have covered it) nor ledgered —
-     * evicted past `ATTACHMENT_LEDGER_WINDOW`, or never captured before a commit moved
-     * past it. This attachment cannot be opened by this session; it is not a transient
-     * condition worth retrying.
+     * epoch: neither current nor ledgered. The attachment cannot be opened by this
+     * session — not a transient condition worth retrying.
      *
-     * May mutate (a live export for a not-yet-departed current epoch ledgers it, like
-     * [`Self::export_attachment_cek_send`]'s cold-epoch path), so this runs inside
-     * `mutate_and_persist` and persists a `Core` blob on that path.
+     * May mutate (a live export ledgers what it derives), so this runs inside
+     * `mutate_and_persist` and pushes a `Core` blob on that path.
      */
 open func exportAttachmentCekRecv(keyId: Data, epoch: UInt64)throws  -> Data  {
     return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
@@ -2891,20 +2880,17 @@ open func exportAttachmentCekRecv(keyId: Data, epoch: UInt64)throws  -> Data  {
 }
     
     /**
-     * Derive the wire attachment CEK for our SEND group's current epoch (GER-1985):
+     * Derive the wire attachment CEK for our SEND group's current epoch:
      * `ExpandWithLabel(SafeExportSecret_classical(0xFF03), "attachment", key_id, 32)`.
      *
-     * Call order is load-bearing — **after `prepare_to_encrypt`, before `encrypt`**: a
+     * Call order is load-bearing — **after `prepare_to_encrypt`, before `encrypt`**. A
      * commit inside `prepare_to_encrypt` can advance the send-classical epoch, and this
-     * must derive from the epoch that commit lands at, the same one `encrypt`'s staple
-     * commits to. Deriving before `prepare_to_encrypt` risks a since-superseded epoch;
-     * deriving after `encrypt` is too late for that frame to carry an attachment sealed
-     * under it.
+     * must derive from the epoch that commit lands at, the one `encrypt`'s staple commits
+     * to. Earlier risks a superseded epoch; later is too late for the frame to carry it.
      *
-     * `key_id` is the caller-minted `AttachmentHeader.keyId` — the label context that
-     * separates every attachment's CEK from every other's, even within the same epoch.
-     * Exports and ledgers the 0xFF03 component on a cold epoch (persisted as a `Core`
-     * blob, like every other classical-only mutation); a warm epoch is a pure ledger read.
+     * `key_id` is the caller-minted `AttachmentHeader.keyId`, the label context separating
+     * each attachment's CEK within an epoch. A cold epoch exports and ledgers the 0xFF03
+     * component (persisted as `Core`); a warm one is a pure ledger read.
      */
 open func exportAttachmentCekSend(keyId: Data)throws  -> Data  {
     return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
@@ -6522,10 +6508,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_encrypt() != 14453) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_export_attachment_cek_recv() != 46987) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_export_attachment_cek_recv() != 38824) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_export_attachment_cek_send() != 18660) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_export_attachment_cek_send() != 35511) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_forwarded() != 11226) {
