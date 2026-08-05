@@ -1981,6 +1981,43 @@ public protocol TwoMlsPqSessionProtocol: AnyObject, Sendable {
     func encrypt(appMessage: Data) throws  -> EncryptResult
     
     /**
+     * Derive the wire attachment CEK for a RECEIVED frame's classical epoch (GER-1985).
+     *
+     * `epoch` is the classical epoch the frame was SENT from — read off the frame's own
+     * decrypted result, never the recv group's current epoch (the two diverge the moment
+     * any later commit lands on the recv group).
+     *
+     * `AttachmentComponentUnavailable` means the component is unrecoverable for that
+     * epoch: neither still current (a live export would have covered it) nor ledgered —
+     * evicted past `ATTACHMENT_LEDGER_WINDOW`, or never captured before a commit moved
+     * past it. This attachment cannot be opened by this session; it is not a transient
+     * condition worth retrying.
+     *
+     * May mutate (a live export for a not-yet-departed current epoch ledgers it, like
+     * [`Self::export_attachment_cek_send`]'s cold-epoch path), so this runs inside
+     * `mutate_and_persist` and persists a `Core` blob on that path.
+     */
+    func exportAttachmentCekRecv(keyId: Data, epoch: UInt64) throws  -> Data
+    
+    /**
+     * Derive the wire attachment CEK for our SEND group's current epoch (GER-1985):
+     * `ExpandWithLabel(SafeExportSecret_classical(0xFF03), "attachment", key_id, 32)`.
+     *
+     * Call order is load-bearing — **after `prepare_to_encrypt`, before `encrypt`**: a
+     * commit inside `prepare_to_encrypt` can advance the send-classical epoch, and this
+     * must derive from the epoch that commit lands at, the same one `encrypt`'s staple
+     * commits to. Deriving before `prepare_to_encrypt` risks a since-superseded epoch;
+     * deriving after `encrypt` is too late for that frame to carry an attachment sealed
+     * under it.
+     *
+     * `key_id` is the caller-minted `AttachmentHeader.keyId` — the label context that
+     * separates every attachment's CEK from every other's, even within the same epoch.
+     * Exports and ledgers the 0xFF03 component on a cold epoch (persisted as a `Core`
+     * blob, like every other classical-only mutation); a warm epoch is a pure ledger read.
+     */
+    func exportAttachmentCekSend(keyId: Data) throws  -> Data
+    
+    /**
      * Acknowledge a re-delivered pre-establishment frame routed here by the
      * invitation's forward table. `spawn_token` is the caller's opaque identifier for
      * the frame (the same value it computes for
@@ -2822,6 +2859,58 @@ open func encrypt(appMessage: Data)throws  -> EncryptResult  {
     uniffi_two_mls_pq_fn_method_twomlspqsession_encrypt(
             self.uniffiCloneHandle(),
         FfiConverterData.lower(appMessage),$0
+    )
+})
+}
+    
+    /**
+     * Derive the wire attachment CEK for a RECEIVED frame's classical epoch (GER-1985).
+     *
+     * `epoch` is the classical epoch the frame was SENT from — read off the frame's own
+     * decrypted result, never the recv group's current epoch (the two diverge the moment
+     * any later commit lands on the recv group).
+     *
+     * `AttachmentComponentUnavailable` means the component is unrecoverable for that
+     * epoch: neither still current (a live export would have covered it) nor ledgered —
+     * evicted past `ATTACHMENT_LEDGER_WINDOW`, or never captured before a commit moved
+     * past it. This attachment cannot be opened by this session; it is not a transient
+     * condition worth retrying.
+     *
+     * May mutate (a live export for a not-yet-departed current epoch ledgers it, like
+     * [`Self::export_attachment_cek_send`]'s cold-epoch path), so this runs inside
+     * `mutate_and_persist` and persists a `Core` blob on that path.
+     */
+open func exportAttachmentCekRecv(keyId: Data, epoch: UInt64)throws  -> Data  {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
+    uniffi_two_mls_pq_fn_method_twomlspqsession_export_attachment_cek_recv(
+            self.uniffiCloneHandle(),
+        FfiConverterData.lower(keyId),
+        FfiConverterUInt64.lower(epoch),$0
+    )
+})
+}
+    
+    /**
+     * Derive the wire attachment CEK for our SEND group's current epoch (GER-1985):
+     * `ExpandWithLabel(SafeExportSecret_classical(0xFF03), "attachment", key_id, 32)`.
+     *
+     * Call order is load-bearing — **after `prepare_to_encrypt`, before `encrypt`**: a
+     * commit inside `prepare_to_encrypt` can advance the send-classical epoch, and this
+     * must derive from the epoch that commit lands at, the same one `encrypt`'s staple
+     * commits to. Deriving before `prepare_to_encrypt` risks a since-superseded epoch;
+     * deriving after `encrypt` is too late for that frame to carry an attachment sealed
+     * under it.
+     *
+     * `key_id` is the caller-minted `AttachmentHeader.keyId` — the label context that
+     * separates every attachment's CEK from every other's, even within the same epoch.
+     * Exports and ledgers the 0xFF03 component on a cold epoch (persisted as a `Core`
+     * blob, like every other classical-only mutation); a warm epoch is a pure ledger read.
+     */
+open func exportAttachmentCekSend(keyId: Data)throws  -> Data  {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
+    uniffi_two_mls_pq_fn_method_twomlspqsession_export_attachment_cek_send(
+            self.uniffiCloneHandle(),
+        FfiConverterData.lower(keyId),$0
     )
 })
 }
@@ -5553,6 +5642,18 @@ public enum TwoMlsPqError: Swift.Error, Equatable, Hashable, Foundation.Localize
      * `pq_side_band_wedged`.
      */
     case BindTriggerFailed
+    /**
+     * `export_attachment_cek_recv` was asked for an epoch this session never ledgered
+     * (GER-1985): either the epoch predates `ATTACHMENT_LEDGER_WINDOW`'s retention, or
+     * `remember_recv_attachment_component` lost the race with a commit that advanced
+     * past it before capturing it (best-effort by design — see its doc comment).
+     * RETRIABLE from the app's perspective in neither sense of "try again now" (the
+     * component is gone for good once evicted or missed) nor "this frame is broken" (the
+     * frame itself decrypted fine) — it means the attachment behind this specific frame
+     * cannot be opened by this session and the app should treat the fetch as failed, not
+     * retry it against this session.
+     */
+    case AttachmentComponentUnavailable
 
     
 
@@ -5613,6 +5714,7 @@ public struct FfiConverterTypeTwoMlsPqError: FfiConverterRustBuffer {
         case 29: return .EstablishmentEnvelopeConflict
         case 30: return .StaleFrame
         case 31: return .BindTriggerFailed
+        case 32: return .AttachmentComponentUnavailable
 
          default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -5747,6 +5849,10 @@ public struct FfiConverterTypeTwoMlsPqError: FfiConverterRustBuffer {
         
         case .BindTriggerFailed:
             writeInt(&buf, Int32(31))
+        
+        
+        case .AttachmentComponentUnavailable:
+            writeInt(&buf, Int32(32))
         
         }
     }
@@ -6414,6 +6520,12 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_encrypt() != 14453) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_export_attachment_cek_recv() != 46987) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_export_attachment_cek_send() != 18660) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_forwarded() != 11226) {

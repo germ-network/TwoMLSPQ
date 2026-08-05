@@ -162,6 +162,8 @@ extension SessionError {
 				code = .establishmentEnvelopeConflict
 				detail = "a different establishment envelope is already installed on this "
 					+ "session; one session binds exactly one envelope."
+			case .AttachmentComponentUnavailable:
+				code = .attachmentComponentUnavailable
 			}
 			self.init(code: code, underlying: pq, detail: detail)
 

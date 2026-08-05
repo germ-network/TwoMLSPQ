@@ -670,6 +670,31 @@ public struct PQSession {
 		}
 	}
 
+	/// Derive the wire attachment CEK for this session's SEND group at its current
+	/// epoch (GER-1985). Call order is load-bearing: **after `prepareToEncrypt`,
+	/// before `encrypt`** — a commit inside `prepareToEncrypt` can advance the send
+	/// epoch, and this must derive from the epoch that commit lands at, the same one
+	/// `encrypt`'s staple commits to. `keyId` is the caller-minted
+	/// `AttachmentHeader.keyId`, separating every attachment's CEK from every
+	/// other's even within one epoch.
+	public func exportAttachmentCEKSend(keyId: Data) throws(SessionError) -> Data {
+		try mapPQErrors(.encrypt) {
+			try base.exportAttachmentCekSend(keyId: keyId)
+		}
+	}
+
+	/// Derive the wire attachment CEK for a RECEIVED frame's classical epoch
+	/// (GER-1985). `epoch` is the epoch the frame was SENT from — read off
+	/// `PQSenderMessage.epoch` on the decrypted result, never this session's current
+	/// epoch (they diverge the moment a later commit lands). `.attachmentComponentUnavailable`
+	/// means the component was never captured for that epoch and this attachment
+	/// cannot be opened by this session — not a transient condition to retry.
+	public func exportAttachmentCEKRecv(keyId: Data, epoch: UInt64) throws(SessionError) -> Data {
+		try mapPQErrors(.encrypt) {
+			try base.exportAttachmentCekRecv(keyId: keyId, epoch: epoch)
+		}
+	}
+
 	public func processIncoming(
 		ciphertext: Data
 	) throws(SessionError) -> PQProcessOutcome {
