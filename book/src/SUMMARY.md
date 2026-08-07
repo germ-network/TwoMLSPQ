@@ -5,6 +5,7 @@
 - [Carried Encodings](./carried-encodings.md)
 - [The Rules of a TwoMLS Group](./group-rules.md)
 - [Cipher Suites & Feature Flags](./cipher-suites.md)
+- [Crypto Providers](./crypto-providers.md)
 - [Session Lifecycle](./session-lifecycle.md)
 - [Wire Format](./wire-format.md)
 - [Header Encryption](./header-encryption.md)

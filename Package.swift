@@ -33,6 +33,38 @@ let twoMLSPQrs: Target =
 		checksum: "897071cf3ba8fd278c205aa13dcea3303dc01195167dc39e7eabc7510db51dee"
 	)
 
+// ANDROID (DEPS-1 prototype). xcframeworks are Apple-only: SwiftPM's
+// `BinaryTarget+Extensions.swift` maps the android environment to `nil`, so an xcframework
+// binaryTarget resolves to ZERO libraries on an Android triple — silently, with no diagnostic.
+// Android therefore needs its OWN binary target, and it is an SE-0482 artifactbundle
+// (Swift 6.2+) carrying the STATIC `libtwo_mls_pq.a` plus its headers and modulemap, because
+// `ArtifactsArchiveMetadata` has no `dynamicLibrary` artifact type. iOS stays dynamic for the
+// reasons above; the two platforms ship separate products from the same crate.
+// `binaryTarget` itself cannot be conditioned, so both are declared and the DEPENDENCY EDGE
+// carries the platform condition. Gated on an env var while this is a spike; a release would
+// pin both by url+checksum — note `release-artifacts.yml`'s checksum rewrite is `count=1` and
+// would silently mis-pin the first of two binaryTargets, so it must be anchored to the target
+// name before a second one ships.
+let localAndroid = ProcessInfo.processInfo.environment["TWOMLSPQ_LOCAL_ANDROID"] != nil
+
+let androidBinaryTargets: [Target] =
+	localAndroid
+	? [
+		.binaryTarget(
+			name: "TwoMLSPQrsAndroid",
+			path: "buildAndroid/TwoMLSPQ-android.artifactbundle"
+		)
+	]
+	: []
+
+let bindingDependencies: [Target.Dependency] =
+	localAndroid
+	? [
+		.target(name: "TwoMLSPQrs", condition: .when(platforms: [.iOS, .macOS])),
+		.target(name: "TwoMLSPQrsAndroid", condition: .when(platforms: [.android])),
+	]
+	: ["TwoMLSPQrs"]
+
 let package = Package(
 	name: "TwoMLSPQ",
 	// Import/link floors. The PQ backend's ML-KEM paths additionally require
@@ -60,7 +92,13 @@ let package = Package(
 		.package(
 			url: "https://github.com/germ-network/autonomous-comm-protocol.git",
 			from: "1.2.0"
-		)
+		),
+		// NON-APPLE ONLY, and linked as such: `PQDigest` needs SHA-256, which comes from
+		// CryptoKit on Apple and from swift-crypto everywhere else. The target edge below is
+		// conditioned, so nothing extra is linked into an Apple build — but the package
+		// dependency itself is unconditional, because SwiftPM resolves dependencies before it
+		// knows the target platform. Already in the resolved graph transitively (4.5.0).
+		.package(url: "https://github.com/apple/swift-crypto.git", from: "4.0.0"),
 	],
 	targets: [
 		// The public product: the hand-written concrete PQ types + value/currency types,
@@ -68,7 +106,16 @@ let package = Package(
 		// raw UniFFI interface types stay out of this surface) — no external Swift packages.
 		.target(
 			name: "TwoMLSPQ",
-			dependencies: ["TwoMLSPQBinding"]
+			dependencies: [
+				"TwoMLSPQBinding",
+				// SHA-256 for PQDigest where there is no CryptoKit. Conditioned, so an Apple
+				// build links nothing extra — see the import in PQDigest.swift.
+				.product(
+					name: "Crypto",
+					package: "swift-crypto",
+					condition: .when(platforms: [.android, .linux])
+				),
+			]
 		),
 		// The generated UniFFI binding (`two_mls_pq.swift`, owning its own `RustBuffer` from
 		// `two_mls_pqFFI`). An INTERNAL target — not vended — so its `@unchecked Sendable`
@@ -77,7 +124,17 @@ let package = Package(
 		// `SideBandSealing`/… don't collide with the wrapper's currency types of the same name.
 		.target(
 			name: "TwoMLSPQBinding",
-			dependencies: ["TwoMLSPQrs"]
+			dependencies: bindingDependencies,
+			linkerSettings: [
+				// SE-0482 artifactbundles do not propagate transitive link dependencies, and a
+				// Rust staticlib needs its libc satellites named explicitly. This is what
+				// `rustc --print=native-static-libs` reports for aarch64-linux-android
+				// (`-ldl -llog -lunwind -ldl -lm -lc`, less the two the linker always adds).
+				.linkedLibrary("dl", .when(platforms: [.android])),
+				.linkedLibrary("log", .when(platforms: [.android])),
+				.linkedLibrary("unwind", .when(platforms: [.android])),
+				.linkedLibrary("m", .when(platforms: [.android])),
+			]
 		),
 		twoMLSPQrs,
 		// The concrete/FFI-level suites: raw-FFI invitation flows and the total
@@ -92,6 +149,6 @@ let package = Package(
 				.product(name: "CommProtocol", package: "autonomous-comm-protocol"),
 			]
 		),
-	],
+	] + androidBinaryTargets,
 	swiftLanguageModes: [.v6]
 )

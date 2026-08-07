@@ -28,7 +28,14 @@
 //  the migration. Do not renumber.
 //
 
-import CryptoKit
+// swift-crypto's `Crypto` vends the same SHA256 API as CryptoKit, so `raw(over:)`
+// is byte-identical either way. Android has no CryptoKit — this is the only
+// Apple-only import in the package.
+#if canImport(CryptoKit)
+	import CryptoKit
+#else
+	import Crypto
+#endif
 import Foundation
 
 /// Derivation and framing for the digests this package emits.

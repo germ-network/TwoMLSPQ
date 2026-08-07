@@ -47,6 +47,16 @@ thiserror = { workspace = true }
 uniffi = { workspace = true }
 zeroize = { workspace = true }
 
+# aws-lc-sys ships checked-in bindings for a fixed target list that includes
+# aarch64-linux-android but NOT x86_64-linux-android. Off that list it falls back to CMake,
+# which cannot find the NDK. Its universal bindings are not a way out — they are half the
+# size and drop `EVP_PKEY_keygen_deterministic`, the ML-KEM deterministic keygen entry point
+# MLS DeriveKeyPair needs, along with the whole X.509 surface. So generate real bindings for
+# this one target, and force the cc builder so CMake is never consulted (the build also needs
+# AWS_LC_SYS_CMAKE_BUILDER=0 — see scripts/buildAndroid.sh).
+[target.x86_64-linux-android.dependencies]
+aws-lc-sys = { version = "=0.40.0", features = ["bindgen"] }
+
 [build-dependencies]
 uniffi = { workspace = true, features = ["build"] }
 
