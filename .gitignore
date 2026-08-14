@@ -9,8 +9,10 @@ Cargo.lock
 # UniFFI binding + xcframework build outputs (never committed; released as assets)
 /buildIos
 /buildIosFramework
+/buildAndroid
 /bindings
 *.xcframework
+*.artifactbundle
 
 # Swift / SwiftPM / Xcode
 .build/
