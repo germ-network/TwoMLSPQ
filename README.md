@@ -1,13 +1,13 @@
 # TwoMLSPQ
 
-Germ Network's implementation of 1:1 aysnc, end-to-end encrypted messaging sessions,
+Germ Network's implementation of 1:1 async, end-to-end encrypted messaging sessions,
 built on MLS. It implements a triple ratchet
 (symmetric encryption, asymmetric classical encryption, asymmetric PQ encryption) for forward
 secrecy and post-compromise security. It further bundles MLS handshake plane messages so that
 there is no dependency among in-flight messages, and applies header encryption to the bundle.
 
 This repository holds the whole stack: the Rust/UniFFI core under [`rust/`](rust/), and
-the hand-written Swift wrapper (**AbstractTwoMLS**) that consumes it — `Package.swift`,
+the hand-written Swift wrapper (**TwoMLSPQ**) that consumes it — `Package.swift`,
 [`Sources/`](Sources/), and [`Tests/`](Tests/) — at the top level. A wire change and its
 Swift adapter land in one PR, tested against a **local** xcframework build; there is no
 publish-a-release-to-test-an-integration step.
@@ -29,8 +29,8 @@ just book-serve        # serve at http://localhost:3000
 
 ```
 Package.swift            Swift package manifest (env-gated binaryTarget — see below)
-Sources/AbstractTwoMLS/  Hand-written Swift wrapper (the vended library)
-Sources/TwoMLSPQ/        Vendored UniFFI binding (two_mls_pq.swift) — re-synced from bindings/
+Sources/TwoMLSPQ/        Hand-written Swift wrapper (the vended library)
+Sources/TwoMLSPQBinding/ Vendored UniFFI binding (two_mls_pq.swift) — re-synced from bindings/
 Tests/                   Swift tests
 book/                    mdBook guide + API reference
 scripts/                 iOS build tooling (buildIosDynamic.sh)
@@ -143,14 +143,14 @@ The loop that replaces release-to-test:
 
 ```sh
 bash scripts/buildIosDynamic.sh                       # build the local xcframework + bindings
-cp bindings/two_mls_pq.swift Sources/TwoMLSPQ/        # re-sync the vendored binding in-tree
+cp bindings/two_mls_pq.swift Sources/TwoMLSPQBinding/ # re-sync the vendored binding in-tree
 TWOMLSPQ_LOCAL_XCFRAMEWORK=1 swift test               # build + test against the local build
 ```
 
-Keep `Sources/TwoMLSPQ/two_mls_pq.swift` re-synced from the SAME build as the binary: uniffi
-embeds a checksum contract verified at init, and the `binding_contract_version()` ↔
-`expectedBindingContract` canary (in `Sources/AbstractTwoMLS/AbstractTwoMLS+TwoMLSPQ.swift`)
-guards a stale-binding/fresh-binary mismatch.
+Keep `Sources/TwoMLSPQBinding/two_mls_pq.swift` re-synced from the SAME build as the binary:
+uniffi embeds a checksum contract verified at init, and the `binding_contract_version()` ↔
+`expectedBindingContract` canary (in `Sources/TwoMLSPQ/PQSession.swift`) guards a
+stale-binding/fresh-binary mismatch.
 
 ## Release Process
 
@@ -167,3 +167,19 @@ never blocks development — only the tagged commit carries the pinned checksum,
 lands before any asset is uploaded, so no consumer can resolve a half-finalized tag.
 
 Releases: https://github.com/germ-network/TwoMLSPQ/releases
+
+## License
+
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or
+  http://www.apache.org/licenses/LICENSE-2.0)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
+
+at your option.
+
+### Contribution
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion
+in the work by you, as defined in the Apache-2.0 license, shall be dual licensed as above,
+without any additional terms or conditions.

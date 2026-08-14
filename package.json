@@ -2,6 +2,13 @@
 	"name": "@germ-network/two-mls-pq",
 	"private": true,
 	"version": "0.16.0",
+	"description": "Post-quantum 1:1 end-to-end encrypted messaging sessions built on MLS — Rust/UniFFI core with a Swift package wrapper",
+	"license": "MIT OR Apache-2.0",
+	"author": "Germ Network, Inc.",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/germ-network/TwoMLSPQ.git"
+	},
 	"engines": {
 		"node": ">=24"
 	},

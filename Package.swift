@@ -17,7 +17,7 @@ import PackageDescription
 // SKIPS build+pin+upload when the url already names the tag being finalized. A hand-pre-pinned
 // url therefore ships a release with NO asset — the url 404s. Leave these lagging; the workflow
 // pins each tag forward. (v0.10.0 was shipped asset-less exactly this way; see the guard fix.)
-// EITHER WAY, keep `Sources/TwoMLSPQ/two_mls_pq.swift` re-synced from the SAME build
+// EITHER WAY, keep `Sources/TwoMLSPQBinding/two_mls_pq.swift` re-synced from the SAME build
 // as the binary (uniffi embeds a checksum contract verified at init; the
 // `binding_contract_version()` ↔ `expectedBindingContract` canary guards a mismatch).
 // The packaging stays DYNAMIC so the adopting app can still link the legacy static
