@@ -31,3 +31,12 @@ We also use the [periphery static analyzer](https://github.com/peripheryapp/peri
 ## Changesets
 We use [Changesets](https://github.com/changesets/changesets) to document changes and releases.
 Please [generate a changeset](https://github.com/changesets/changesets/blob/main/docs/adding-a-changeset.md) for your pull requests.
+
+## License
+
+This project is dual licensed under either of [Apache License, Version 2.0](./LICENSE-APACHE)
+or [MIT license](./LICENSE-MIT) at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion
+in the work by you, as defined in the Apache-2.0 license, shall be dual licensed as above,
+without any additional terms or conditions.

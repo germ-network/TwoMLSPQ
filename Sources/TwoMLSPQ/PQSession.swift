@@ -256,7 +256,7 @@ enum TwoMLSPQBindingContract {
 			"""
 			TwoMLSPQ binding/binary mismatch: the vendored two_mls_pq.swift expects \
 			contract \(expectedBindingContract) but the loaded binary provides \(actual). \
-			Re-sync Sources/TwoMLSPQ/two_mls_pq.swift and the TwoMLSPQ xcframework \
+			Re-sync Sources/TwoMLSPQBinding/two_mls_pq.swift and the TwoMLSPQ xcframework \
 			from the SAME build.
 			"""
 		)
