@@ -12,7 +12,6 @@
 import CommProtocol
 import Foundation
 import Testing
-
 import TwoMLSPQBinding
 
 @testable import TwoMLSPQ
@@ -198,7 +197,9 @@ struct LifecycleTests {
 		let kp = try localSession.finishBootstrap(rotating: nil)
 		#expect(kp.kind == .finishBootstrap)
 		// Bootstrap key-package frame — classify by opening the seal (wire tag sealed, v7).
-		#expect(try remoteBase.openIncoming(blob: kp.payload)?.kind == .pqSideBand(kind: .bootstrapKeyPackage))
+		#expect(
+			try remoteBase.openIncoming(blob: kp.payload)?.kind
+				== .pqSideBand(kind: .bootstrapKeyPackage))
 
 		let remoteClassicalBefore = remoteBase.epochs().classicalEpoch
 		let remoteListenBeforeBootstrap = try remoteBase.shouldListenOn()
@@ -225,13 +226,17 @@ struct LifecycleTests {
 		let peek1 = try #require(remoteSession.pendingSideBand(sealing: .fresh))
 		let peek2 = try #require(remoteSession.pendingSideBand(sealing: .fresh))
 		#expect(peek1 != peek2)
-		#expect(try localBase.openIncoming(blob: peek1)?.kind == .pqSideBand(kind: .bootstrapWelcome))
+		#expect(
+			try localBase.openIncoming(blob: peek1)?.kind
+				== .pqSideBand(kind: .bootstrapWelcome))
 
 		let reply = try #require(remoteSession.advance(after: inbound))
 		#expect(reply.kind == .finishBootstrap)
 		// The responder's reply is the new PQ group's Welcome' (v18: the bind is no
 		// longer a side-band frame kind — it rides the message-frame staple).
-		#expect(try localBase.openIncoming(blob: reply.payload)?.kind == .pqSideBand(kind: .bootstrapWelcome))
+		#expect(
+			try localBase.openIncoming(blob: reply.payload)?.kind
+				== .pqSideBand(kind: .bootstrapWelcome))
 		// The consuming take hands the frame out exactly once — retention included.
 		#expect(remoteSession.advance(after: inbound) == nil)
 		#expect(remoteSession.pendingSideBand(sealing: .fresh) == nil)
@@ -272,10 +277,12 @@ struct LifecycleTests {
 		// (A.5 as a rotation credential catch-up is exercised in the Rust crate suite.)
 		#expect(remoteSession.turn == .weInitiate)
 		let remotePqBeforeRatchet = remoteBase.epochs().pqEpoch
-		try remoteSession.send(to: localSession) // opener — auto-stages Remote's A.4 EK
+		try remoteSession.send(to: localSession)  // opener — auto-stages Remote's A.4 EK
 		let ratchetEk = try #require(remoteSession.pendingSideBand(sealing: .fresh))
 		// EK frame — classify by opening the seal (wire tag sealed, v7).
-		#expect(try localBase.openIncoming(blob: ratchetEk)?.kind == .pqSideBand(kind: .ratchetEphemeralKey))
+		#expect(
+			try localBase.openIncoming(blob: ratchetEk)?.kind
+				== .pqSideBand(kind: .ratchetEphemeralKey))
 
 		// Local responds: seals the injected secret to the EK, parking the CT reply.
 		let ratchetInbound1 = try localSession.ingest(ratchetEk)
@@ -283,7 +290,9 @@ struct LifecycleTests {
 		let ratchetReply = try #require(localSession.advance(after: ratchetInbound1))
 		#expect(ratchetReply.kind == .ratchet)
 		// CT frame — classify by opening the seal.
-		#expect(try remoteBase.openIncoming(blob: ratchetReply.payload)?.kind == .pqSideBand(kind: .ratchetCiphertext))
+		#expect(
+			try remoteBase.openIncoming(blob: ratchetReply.payload)?.kind
+				== .pqSideBand(kind: .ratchetCiphertext))
 		// The consuming take hands the frame out exactly once.
 		#expect(localSession.advance(after: ratchetInbound1) == nil)
 
@@ -304,10 +313,13 @@ struct LifecycleTests {
 		// -- Step 8: exchanges still flow on the ratcheted groups.
 		try localSession.exchange(with: remoteSession)
 		_ = try remoteSession.prepareToEncrypt(proposing: nil)
-		let postRatchetFrame = try remoteSession.encrypt(appMessage: Data("post-ratchet".utf8))
+		let postRatchetFrame = try remoteSession.encrypt(
+			appMessage: Data("post-ratchet".utf8))
 		let postRatchet = try #require(
 			try localSession.decrypt(postRatchetFrame.cipherText))
-		#expect(try postRatchet.applicationMessage.tryUnwrap.appMessageData == Data("post-ratchet".utf8))
+		#expect(
+			try postRatchet.applicationMessage.tryUnwrap.appMessageData
+				== Data("post-ratchet".utf8))
 	}
 
 	/// The poster's post address is its recv group's current exporter; the recv

@@ -13,7 +13,6 @@
 
 import Foundation
 import Testing
-
 import TwoMLSPQBinding  // public TwoMlsPqError cases
 
 @testable import TwoMLSPQ  // internal SessionError(pqError:at:) + PQErrorSurface
@@ -124,7 +123,9 @@ struct ErrorContractTests {
 			let e = SessionError(pqError: TwoMlsPqError.SessionNotReady, at: surface)
 			#expect(e.code == .misroutedFrame, "\(surface)")
 		}
-		let sequencing: [PQErrorSurface] = [.prepareToEncrypt, .encrypt, .pqOperation, .receive]
+		let sequencing: [PQErrorSurface] = [
+			.prepareToEncrypt, .encrypt, .pqOperation, .receive,
+		]
 		for surface in sequencing {
 			let e = SessionError(pqError: TwoMlsPqError.SessionNotReady, at: surface)
 			#expect(e.code == .sequenceViolation, "\(surface)")
