@@ -10,7 +10,6 @@
 import CommProtocol
 import Foundation
 import Testing
-
 import TwoMLSPQ
 import TwoMLSPQBinding
 
@@ -47,7 +46,8 @@ struct PQInvitationReceiveTests {
 		let (acceptorSession, stapled) = try invitation.receive(
 			sendGroupWelcome: welcome,
 			remoteKeyPackage: initiatorKp,
-			bootstrapKpCommitment: try #require(initiatorSession.bootstrapKpCommitment()),
+			bootstrapKpCommitment: try #require(
+				initiatorSession.bootstrapKpCommitment()),
 			remoteClientId: initiator.clientId().bytes,
 			welcomeToken: WelcomeToken(PQDigest.over(welcome)),
 			stapledMessage: nil,
@@ -63,16 +63,21 @@ struct PQInvitationReceiveTests {
 		let back = try acceptorSession.encrypt(appMessage: "hello back".utf8Data)
 		let received = try #require(
 			try approveEstablishmentRaw(
-				initiator: initiatorSession, ciphertext: back.cipherText, dedicatedId: dedicatedId)
+				initiator: initiatorSession, ciphertext: back.cipherText,
+				dedicatedId: dedicatedId)
 		)
 		#expect(received.applicationMessage?.appMessageData == "hello back".utf8Data)
 
 		// And a routine round now that the initiator is fully established.
 		_ = try initiatorSession.prepareToEncrypt(proposing: nil)
 		let routine = try initiatorSession.encrypt(appMessage: "routine".utf8Data)
-		guard case .decrypted(let decrypted) =
-			try acceptorSession.processIncoming(ciphertext: routine.cipherText)
-		else { Issue.record("unexpected establishment pause"); throw TestErrors.unexpected }
+		guard
+			case .decrypted(let decrypted) =
+				try acceptorSession.processIncoming(ciphertext: routine.cipherText)
+		else {
+			Issue.record("unexpected establishment pause")
+			throw TestErrors.unexpected
+		}
 		#expect(
 			try decrypted.tryUnwrap.applicationMessage.tryUnwrap.appMessageData
 				== "routine".utf8Data
@@ -185,7 +190,8 @@ struct PQInvitationReceiveTests {
 			_ = try invitation.receive(
 				sendGroupWelcome: welcome,
 				remoteKeyPackage: initiatorKp,
-				bootstrapKpCommitment: Data(repeating: 0, count: 31),  // one byte short of a SHA-256
+				// one byte short of a SHA-256
+				bootstrapKpCommitment: Data(repeating: 0, count: 31),
 				remoteClientId: initiator.clientId().bytes,
 				welcomeToken: token,
 				stapledMessage: nil,
@@ -207,7 +213,8 @@ struct PQInvitationReceiveTests {
 		let (acceptorSession, stapled) = try invitation.receive(
 			sendGroupWelcome: welcome,
 			remoteKeyPackage: initiatorKp,
-			bootstrapKpCommitment: try #require(initiatorSession.bootstrapKpCommitment()),
+			bootstrapKpCommitment: try #require(
+				initiatorSession.bootstrapKpCommitment()),
 			remoteClientId: initiator.clientId().bytes,
 			welcomeToken: token,
 			stapledMessage: nil,
@@ -220,7 +227,8 @@ struct PQInvitationReceiveTests {
 		let back = try acceptorSession.encrypt(appMessage: "established".utf8Data)
 		let received = try #require(
 			try approveEstablishmentRaw(
-				initiator: initiatorSession, ciphertext: back.cipherText, dedicatedId: dedicatedId)
+				initiator: initiatorSession, ciphertext: back.cipherText,
+				dedicatedId: dedicatedId)
 		)
 		#expect(received.applicationMessage?.appMessageData == "established".utf8Data)
 	}

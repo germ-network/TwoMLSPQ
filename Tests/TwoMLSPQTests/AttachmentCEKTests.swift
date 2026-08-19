@@ -12,7 +12,6 @@
 import CommProtocol
 import Foundation
 import Testing
-
 import TwoMLSPQBinding
 
 @testable import TwoMLSPQ
@@ -71,11 +70,14 @@ struct AttachmentCEKTests {
 		let (local, _) = try establishedPair()
 		_ = try local.prepareToEncrypt(proposing: nil)
 
-		let cekA = try local.exportAttachmentCEKSend(keyId: Data(repeating: 0x01, count: 32))
-		let cekB = try local.exportAttachmentCEKSend(keyId: Data(repeating: 0x02, count: 32))
+		let cekA = try local.exportAttachmentCEKSend(
+			keyId: Data(repeating: 0x01, count: 32))
+		let cekB = try local.exportAttachmentCEKSend(
+			keyId: Data(repeating: 0x02, count: 32))
 		#expect(cekA != cekB, "distinct key ids must not collide within one epoch")
 
-		let cekAAgain = try local.exportAttachmentCEKSend(keyId: Data(repeating: 0x01, count: 32))
+		let cekAAgain = try local.exportAttachmentCEKSend(
+			keyId: Data(repeating: 0x01, count: 32))
 		#expect(cekA == cekAAgain, "the same (epoch, keyId) must re-derive identically")
 	}
 

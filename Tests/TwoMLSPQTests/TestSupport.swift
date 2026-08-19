@@ -37,7 +37,9 @@ extension PQSession {
 	/// returning the bytes for the peer-side approval.
 	@discardableResult
 	func installMockEstablishmentEnvelope() throws -> Data {
-		#expect(pendingEstablishmentWelcome != nil, "a born-dedicated acceptor owes a welcome")
+		#expect(
+			pendingEstablishmentWelcome != nil,
+			"a born-dedicated acceptor owes a welcome")
 		try installEstablishmentEnvelope(mockEstablishmentEnvelope)
 		return mockEstablishmentEnvelope
 	}
@@ -54,13 +56,17 @@ extension PQSession {
 	) throws -> PQDecryptResult? {
 		_ = try acceptor.prepareToEncrypt(proposing: nil)
 		let frame = try acceptor.encrypt(appMessage: message)
-		guard case .pendingEstablishment(let pending) = try processIncoming(ciphertext: frame.cipherText)
+		guard
+			case .pendingEstablishment(let pending) = try processIncoming(
+				ciphertext: frame.cipherText)
 		else {
 			Issue.record("expected a born-dedicated establishment pause")
 			throw TestErrors.unexpected
 		}
 		#expect(pending.envelope == mockEstablishmentEnvelope)
-		#expect(pending.welcome.first == 0x01, "the surfaced welcome is a bare APQWelcome_A")
+		#expect(
+			pending.welcome.first == 0x01, "the surfaced welcome is a bare APQWelcome_A"
+		)
 		return try pending.resume(admittedCreator: dedicatedId)
 	}
 }
@@ -109,7 +115,8 @@ extension PQSession {
 	/// pause) and return its payload. For frames past establishment, where a pause
 	/// cannot occur — a pause here is a test-setup bug, surfaced loudly.
 	func decrypt(_ ciphertext: Data) throws -> PQDecryptResult? {
-		guard case .decrypted(let result) = try processIncoming(ciphertext: ciphertext) else {
+		guard case .decrypted(let result) = try processIncoming(ciphertext: ciphertext)
+		else {
 			Issue.record("unexpected establishment pause on a post-establishment frame")
 			throw TestErrors.unexpected
 		}
@@ -126,9 +133,11 @@ extension PQSession {
 
 		// Post-establishment: the receiver decrypts. (A born-dedicated first frame
 		// pauses instead — that path is `acceptEstablishment`, not `send`.)
-		guard case .decrypted(let decrypted) = try remote.processIncoming(
-			ciphertext: encryptedOutgoing.cipherText
-		) else {
+		guard
+			case .decrypted(let decrypted) = try remote.processIncoming(
+				ciphertext: encryptedOutgoing.cipherText
+			)
+		else {
 			Issue.record("unexpected establishment pause in a steady-state send")
 			throw TestErrors.unexpected
 		}

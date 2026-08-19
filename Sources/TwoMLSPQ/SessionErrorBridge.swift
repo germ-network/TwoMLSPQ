@@ -107,14 +107,16 @@ extension SessionError {
 				case .receive:
 					// Establishment door: the commitment the host threaded in from
 					// the signed AppWelcome is not a valid H(A.3 key package).
-					detail = "bootstrap-KP commitment is not H(the initiator's PQ "
+					detail =
+						"bootstrap-KP commitment is not H(the initiator's PQ "
 						+ "key package): a malformed or mis-read 32-byte value, or a "
 						+ "tampered AppWelcome. The invitation is NOT consumed — "
 						+ "re-read the commitment from the signed envelope and retry."
 				default:
 					// A.3 side-band: a KP′ that hashes to something other than the
 					// commitment the signed envelope pinned.
-					detail = "A.3 bootstrap key package (KP′) does not hash to the "
+					detail =
+						"A.3 bootstrap key package (KP′) does not hash to the "
 						+ "commitment the signed establishment envelope carried — a "
 						+ "substituted or tampered KP′. Discard the frame; the genuine "
 						+ "re-stapled KP′ still applies, session state untouched."
@@ -142,25 +144,29 @@ extension SessionError {
 					// Initiator: a bare welcome whose creator differs from the invitation
 					// identity — a born-dedicated establishment must arrive enveloped.
 					code = .establishmentEnvelopeRequired
-					detail = "a born-dedicated establishment arrived un-enveloped (creator "
+					detail =
+						"a born-dedicated establishment arrived un-enveloped (creator "
 						+ "leaf differs from the invitation identity); refused so an "
 						+ "undelegated credential cannot be admitted on the weld alone."
 				default:
 					// Acceptor: an emission door was driven before the signed delegation
 					// was installed — a caller-sequencing bug.
 					code = .sequenceViolation
-					detail = "born-dedicated session is non-emittable until "
+					detail =
+						"born-dedicated session is non-emittable until "
 						+ "installEstablishmentEnvelope supplies the signed delegation; "
 						+ "mint and install it before sending."
 				}
 			case .EstablishmentCreatorMismatch:
 				code = .establishmentCreatorMismatch
-				detail = "the admitted creator id does not match the welcome's creator leaf: "
+				detail =
+					"the admitted creator id does not match the welcome's creator leaf: "
 					+ "the delegation is genuine but names a different key. The join was "
 					+ "discarded whole; do not retry with the same admittedCreator."
 			case .EstablishmentEnvelopeConflict:
 				code = .establishmentEnvelopeConflict
-				detail = "a different establishment envelope is already installed on this "
+				detail =
+					"a different establishment envelope is already installed on this "
 					+ "session; one session binds exactly one envelope."
 			case .AttachmentComponentUnavailable:
 				code = .attachmentComponentUnavailable
