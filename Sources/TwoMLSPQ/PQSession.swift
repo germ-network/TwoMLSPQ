@@ -246,7 +246,13 @@ import TwoMLSPQBinding
 //     frame processed after a later commit landed. New crate error
 //     `.attachmentComponentUnavailable` appended — hosts must handle it (the error map is
 //     exhaustive). Archive layout bumps 3→4.
-private let expectedBindingContract: UInt64 = 33
+// v34 (GER-2484): the invitation migration export — three new Records
+//     (`SwiftInvitationTableEntry`, `SwiftMigratedIdentity`, `SwiftInvitationExport`) and
+//     the new FFI method `TwoMlsPqInvitation.migrationExport()`. The consumer of the
+//     export lives in the `TwoMLSPQMigrate` target (GER-2372 R3), which maps the payload
+//     onto twomlspq-swift's `InvitationMigration.mintArchive`. No wire, API, or
+//     error-variant change beyond the new symbols.
+private let expectedBindingContract: UInt64 = 34
 
 enum TwoMLSPQBindingContract {
 	static let verified: Void = {

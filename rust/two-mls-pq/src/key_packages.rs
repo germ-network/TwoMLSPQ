@@ -160,6 +160,52 @@ pub struct CombinerKeyPackage {
     pub pq: Vec<u8>,
 }
 
+/// One routing-table entry of a migration export: an opaque key (spawn token, welcome
+/// digest, or bootstrap-KP commitment) → the spawned session's receive-group classical
+/// (message-half) group id. Flat key/value form so the three tables share one record.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct MigrationTableEntry {
+    pub key: Vec<u8>,
+    pub classical_group_id: Vec<u8>,
+}
+
+/// The identity + key-package half of a migration export (GER-2372 R2) — the Rust-side
+/// image of twomlspq-swift's `MigratedIdentity`. All `*_secret_key` fields are PLAINTEXT
+/// secret material (the caller seals any persisted form). `*_key_package` are BARE
+/// RFC 9420 KeyPackage bytes. The PQ `*_secret_key` pair is the CryptoKit 96-byte
+/// representation — see `TwoMlsPqInvitation::migration_export` for the provider constraint.
+/// No `Debug`: the record holds plaintext key material, and a derived impl would print it.
+#[derive(Clone, uniffi::Record)]
+pub struct MigrationIdentity {
+    pub signing_key: Vec<u8>,
+    pub pq_signing_key: Vec<u8>,
+    pub signature_key: Vec<u8>,
+    pub pq_signature_key: Vec<u8>,
+    pub classical_leaf_secret_key: Vec<u8>,
+    pub classical_init_secret_key: Vec<u8>,
+    pub pq_leaf_secret_key: Vec<u8>,
+    pub pq_init_secret_key: Vec<u8>,
+    pub classical_key_package: Vec<u8>,
+    pub pq_key_package: Vec<u8>,
+}
+
+/// The full migration export of one invitation (GER-2372 R2): `TwoMlsPqInvitation::
+/// migration_export`'s return. `identity` is `None` for a spent single-use invitation
+/// (the twomlspq-swift mint then takes `identity: nil`). The tables are flat
+/// `SwiftInvitationTableEntry` lists; the Swift side rebuilds its dictionaries from them.
+/// No `Debug` (transitively): the identity block holds plaintext key material.
+#[derive(Clone, uniffi::Record)]
+pub struct MigrationExport {
+    pub client_id: Vec<u8>,
+    pub last_resort: bool,
+    pub state_seq: u64,
+    pub identity: Option<MigrationIdentity>,
+    pub forward_table: Vec<MigrationTableEntry>,
+    pub processed_welcomes: Vec<MigrationTableEntry>,
+    pub bootstrap_routing: Vec<MigrationTableEntry>,
+    pub consumed_remotes: Vec<Vec<u8>>,
+}
+
 /// Parsed identities from a `CombinerKeyPackage`.
 /// Both components must share the same `client_id`; mismatched identities are rejected.
 #[derive(Debug, uniffi::Record)]
@@ -771,6 +817,146 @@ impl TwoMlsPqInvitation {
         }
     }
 
+    /// Export this invitation as the migration payload for the twomlspq-swift mint path
+    /// (GER-2372 R2): everything `InvitationMigration.mintArchive` needs — the signing
+    /// identity and both halves' key-package material, plus the persisted routing tables.
+    /// `identity` is `None` once a single-use invitation has been consumed (its key-package
+    /// material is gone); the caller then mints an `identity: nil` archive.
+    ///
+    /// Emits PLAINTEXT SECRET material (signing keys, HPKE secret keys) — the caller seals:
+    /// this inherits the `ArchiveSink` contract, where the host is responsible for
+    /// encrypting any persisted form. The signature PUBLIC keys are derived here from the
+    /// stored secrets so the payload is byte-complete for the mint's cross-checks.
+    ///
+    /// PQ HPKE secret keys are exported in the **CryptoKit private-key representation**
+    /// (96 B, `integrityCheckedRepresentation`) — correct only under the `cryptokit`
+    /// provider build. Under `awslc` the stored form is the 2400 B FIPS-203 decapsulation
+    /// key and the twomlspq-swift mint (CryptoKit-backed) rejects it as `archiveInvalid`.
+    /// The key-package bytes are the BARE RFC 9420 `KeyPackage` (mls-rs's
+    /// `KeyPackageData.key_package_bytes`), NOT the MLSMessage-framed form this object
+    /// publishes via `combiner_key_package`.
+    pub fn migration_export(&self) -> Result<MigrationExport> {
+        use mls_rs::mls_rs_codec::MlsDecode;
+
+        let inner = self.lock();
+        let invitation = &inner.invitation;
+
+        let identity = match (&invitation.classical_kpd, &invitation.pq_kpd) {
+            (Some(classical_kpd), Some(pq_kpd)) => {
+                // Both halves drop together on consume; a half-and-half state cannot arise
+                // (the consume path sets both `None` in one critical section).
+                let classical_kp =
+                    mls_rs::KeyPackage::mls_decode(&mut &classical_kpd.1.key_package_bytes[..])
+                        .map_err(|_| TwoMlsPqError::ArchiveInvalid)?;
+                let pq_kp = mls_rs::KeyPackage::mls_decode(&mut &pq_kpd.1.key_package_bytes[..])
+                    .map_err(|_| TwoMlsPqError::ArchiveInvalid)?;
+                // The identity bytes pinned into both halves' leaf credentials must agree
+                // with the invitation's own ClientId — the mint cross-checks all three.
+                for kp in [&classical_kp, &pq_kp] {
+                    let basic = kp
+                        .signing_identity()
+                        .credential
+                        .as_basic()
+                        .ok_or(TwoMlsPqError::ArchiveInvalid)?;
+                    if basic.identifier != invitation.client_id {
+                        return Err(TwoMlsPqError::ArchiveInvalid);
+                    }
+                }
+
+                // The stored Ed25519 secrets use the mls-rs provider convention, which
+                // differs by backend: the cryptokit bridge stores `raw ‖ public` (64 B),
+                // awslc stores the bare raw (32 B). The migration consumer (twomlspq-swift)
+                // wants the BARE rawRepresentation, so normalise here — take the leading
+                // 32 bytes when the stored form is the 64-B cryptokit one. The mint's
+                // `derivedEd25519Public` re-derivation cross-checks the result.
+                let bare_ed25519 = |stored: &[u8]| -> Result<Vec<u8>> {
+                    match stored.len() {
+                        32 => Ok(stored.to_vec()),
+                        64 => Ok(stored[..32].to_vec()),
+                        _ => Err(TwoMlsPqError::ArchiveInvalid),
+                    }
+                };
+                let classical_signing_key = bare_ed25519(&invitation.classical_signing_key)?;
+                let pq_signing_key = bare_ed25519(&invitation.pq_signing_key)?;
+
+                // The signature publics ride the decoded key packages' own signing
+                // identities — the SAME source the twomlspq-swift mint cross-checks
+                // against, so a wrong map cannot slide past as a consistent pair.
+                let classical_signature_key = classical_kp
+                    .signing_identity()
+                    .signature_key
+                    .as_bytes()
+                    .to_vec();
+                let pq_signature_key = pq_kp.signing_identity().signature_key.as_bytes().to_vec();
+
+                // HPKE secret representation guard: classical halves are X25519 raw
+                // (32 B), PQ halves the CryptoKit 96-B representation. Anything else
+                // (an awslc build's 2400-B decapsulation keys) fails HERE, at the
+                // export, instead of surfacing three layers away as an opaque Swift
+                // `archiveInvalid`.
+                for (len, bytes) in [
+                    (32, &classical_kpd.1.leaf_node_key),
+                    (32, &classical_kpd.1.init_key),
+                    (96, &pq_kpd.1.leaf_node_key),
+                    (96, &pq_kpd.1.init_key),
+                ] {
+                    if bytes.len() != len {
+                        return Err(TwoMlsPqError::ArchiveInvalid);
+                    }
+                }
+
+                Some(MigrationIdentity {
+                    signing_key: classical_signing_key,
+                    pq_signing_key,
+                    signature_key: classical_signature_key,
+                    pq_signature_key,
+                    classical_leaf_secret_key: classical_kpd.1.leaf_node_key.to_vec(),
+                    classical_init_secret_key: classical_kpd.1.init_key.to_vec(),
+                    pq_leaf_secret_key: pq_kpd.1.leaf_node_key.to_vec(),
+                    pq_init_secret_key: pq_kpd.1.init_key.to_vec(),
+                    classical_key_package: classical_kpd.1.key_package_bytes.clone(),
+                    pq_key_package: pq_kpd.1.key_package_bytes.clone(),
+                })
+            }
+            (None, None) => None,
+            // Half-and-half is unreachable (consume drops both together) but must fail
+            // loudly rather than mint from a torn state.
+            _ => return Err(TwoMlsPqError::ArchiveInvalid),
+        };
+
+        Ok(MigrationExport {
+            client_id: invitation.client_id.clone(),
+            last_resort: invitation.last_resort,
+            state_seq: inner.state_seq,
+            identity,
+            forward_table: inner
+                .spawned
+                .iter()
+                .map(|(token, classical)| MigrationTableEntry {
+                    key: token.clone(),
+                    classical_group_id: classical.clone(),
+                })
+                .collect(),
+            processed_welcomes: inner
+                .processed
+                .iter()
+                .map(|(digest, classical)| MigrationTableEntry {
+                    key: digest.clone(),
+                    classical_group_id: classical.clone(),
+                })
+                .collect(),
+            bootstrap_routing: inner
+                .bootstrap_commitments
+                .iter()
+                .map(|(commitment, classical)| MigrationTableEntry {
+                    key: commitment.clone(),
+                    classical_group_id: classical.clone(),
+                })
+                .collect(),
+            consumed_remotes: inner.consumed.iter().cloned().collect(),
+        })
+    }
+
     /// Receive a remote initiator's APQWelcome and establish the session using this
     /// invitation's captured key package. Rejects a second welcome from the same remote
     /// (`DuplicateWelcome`); a single-use invitation whose key package has already been
@@ -1159,6 +1345,97 @@ mod tests {
         let client = assert_ok!(TwoMlsPqPrincipal::new(id.clone()));
         // The ClientId is exactly the bytes provided — no longer derived from a key.
         assert_eq!(client.client_id().bytes, id);
+    }
+
+    #[test]
+    fn test_migration_export_carries_identity_and_bare_key_packages() {
+        let client = assert_ok!(TwoMlsPqPrincipal::new(test_client_id()));
+        let invitation = assert_ok!(super::TwoMlsPqInvitation::restore(assert_ok!(
+            client.generate_invitation(true)
+        )));
+        let export = assert_ok!(invitation.migration_export());
+        assert_eq!(export.client_id, client.client_id().bytes);
+        assert!(export.last_resort);
+        assert_eq!(export.state_seq, 0);
+        assert!(export.identity.is_some());
+        let identity = export.identity.unwrap();
+
+        // The exported key packages are the BARE RFC 9420 KeyPackages — the same bytes
+        // the published MLSMessage frames carry inside (mls-rs writes `key_package_bytes`
+        // bare; `classical_public`/`pq_public` wrap them in an MlsMessage).
+        let published = invitation.combiner_key_package();
+        use mls_rs::mls_rs_codec::MlsEncode;
+        for (bare, framed) in [
+            (&identity.classical_key_package, &published.classical),
+            (&identity.pq_key_package, &published.pq),
+        ] {
+            // The framed public must decode as a key package message; its inner
+            // re-encode must be the exact bare bytes the export carries.
+            let kp = assert_some!(mls_rs::MlsMessage::from_bytes(framed)
+                .ok()
+                .and_then(|m| m.into_key_package()));
+            let bare_from_frame = assert_ok!(kp.mls_encode_to_vec());
+            assert_eq!(bare, &bare_from_frame);
+        }
+
+        // The exported signature publics are the PUBLICS THE PUBLISHED KEY PACKAGES
+        // carry — the independent source the export must agree with (a self-re-derive
+        // through the same provider call would be tautological). Decoded from the
+        // published frames so the check binds secret → key package, exactly as the
+        // twomlspq-swift mint does downstream.
+        for (framed, exported) in [
+            (&published.classical, &identity.signature_key),
+            (&published.pq, &identity.pq_signature_key),
+        ] {
+            let kp = assert_some!(mls_rs::MlsMessage::from_bytes(framed)
+                .ok()
+                .and_then(|m| m.into_key_package()));
+            assert_eq!(exported, kp.signing_identity().signature_key.as_bytes());
+        }
+
+        // A fresh invitation has no routing state to export.
+        assert!(export.forward_table.is_empty());
+        assert!(export.processed_welcomes.is_empty());
+        assert!(export.bootstrap_routing.is_empty());
+        assert!(export.consumed_remotes.is_empty());
+    }
+
+    #[test]
+    fn test_migration_export_spent_single_use_has_no_identity() {
+        // A single-use invitation whose key package was consumed exports no identity.
+        // The consume logic itself lives behind `receive` (a full welcome flow, covered
+        // Swift-side by the differential suite); here the None/None state is
+        // constructed directly, exactly as `receive`'s commit point leaves it.
+        let client = assert_ok!(TwoMlsPqPrincipal::new(test_client_id()));
+        let invitation = assert_ok!(super::TwoMlsPqInvitation::restore(assert_ok!(
+            client.generate_invitation(false)
+        )));
+        // Simulate the consume: drop both kpds in one critical section, as `receive` does.
+        {
+            let mut inner = invitation.lock();
+            inner.invitation.classical_kpd = None;
+            inner.invitation.pq_kpd = None;
+        }
+        let export = assert_ok!(invitation.migration_export());
+        assert!(export.identity.is_none());
+    }
+
+    #[test]
+    fn test_migration_export_rejects_torn_kpd_state() {
+        // One kpd present, one dropped cannot arise (consume clears both in one
+        // critical section), but must fail loudly rather than mint from a torn state.
+        let client = assert_ok!(TwoMlsPqPrincipal::new(test_client_id()));
+        let invitation = assert_ok!(super::TwoMlsPqInvitation::restore(assert_ok!(
+            client.generate_invitation(true)
+        )));
+        {
+            let mut inner = invitation.lock();
+            inner.invitation.pq_kpd = None;
+        }
+        assert_err!(
+            invitation.migration_export(),
+            crate::TwoMlsPqError::ArchiveInvalid
+        );
     }
 
     #[test]

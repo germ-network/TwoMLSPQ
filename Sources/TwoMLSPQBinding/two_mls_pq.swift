@@ -1107,6 +1107,28 @@ public protocol TwoMlsPqInvitationProtocol: AnyObject, Sendable {
     func installSink(sink: ArchiveSink) throws 
     
     /**
+     * Export this invitation as the migration payload for the twomlspq-swift mint path
+     * (GER-2372 R2): everything `InvitationMigration.mintArchive` needs — the signing
+     * identity and both halves' key-package material, plus the persisted routing tables.
+     * `identity` is `None` once a single-use invitation has been consumed (its key-package
+     * material is gone); the caller then mints an `identity: nil` archive.
+     *
+     * Emits PLAINTEXT SECRET material (signing keys, HPKE secret keys) — the caller seals:
+     * this inherits the `ArchiveSink` contract, where the host is responsible for
+     * encrypting any persisted form. The signature PUBLIC keys are derived here from the
+     * stored secrets so the payload is byte-complete for the mint's cross-checks.
+     *
+     * PQ HPKE secret keys are exported in the **CryptoKit private-key representation**
+     * (96 B, `integrityCheckedRepresentation`) — correct only under the `cryptokit`
+     * provider build. Under `awslc` the stored form is the 2400 B FIPS-203 decapsulation
+     * key and the twomlspq-swift mint (CryptoKit-backed) rejects it as `archiveInvalid`.
+     * The key-package bytes are the BARE RFC 9420 `KeyPackage` (mls-rs's
+     * `KeyPackageData.key_package_bytes`), NOT the MLSMessage-framed form this object
+     * publishes via `combiner_key_package`.
+     */
+    func migrationExport() throws  -> MigrationExport
+    
+    /**
      * Open a §A.1 envelope blob (produced by `initiate`, by every pre-establishment
      * `encrypt`, or by `pq_bootstrap_envelope`), dispatching on the inner authenticated
      * leading tag into [`OpenedInitial`]. Decrypt-only and **state-free** — it does NOT
@@ -1369,6 +1391,34 @@ open func installSink(sink: ArchiveSink)throws   {try rustCallWithError(FfiConve
         FfiConverterTypeArchiveSink_lower(sink),$0
     )
 }
+}
+    
+    /**
+     * Export this invitation as the migration payload for the twomlspq-swift mint path
+     * (GER-2372 R2): everything `InvitationMigration.mintArchive` needs — the signing
+     * identity and both halves' key-package material, plus the persisted routing tables.
+     * `identity` is `None` once a single-use invitation has been consumed (its key-package
+     * material is gone); the caller then mints an `identity: nil` archive.
+     *
+     * Emits PLAINTEXT SECRET material (signing keys, HPKE secret keys) — the caller seals:
+     * this inherits the `ArchiveSink` contract, where the host is responsible for
+     * encrypting any persisted form. The signature PUBLIC keys are derived here from the
+     * stored secrets so the payload is byte-complete for the mint's cross-checks.
+     *
+     * PQ HPKE secret keys are exported in the **CryptoKit private-key representation**
+     * (96 B, `integrityCheckedRepresentation`) — correct only under the `cryptokit`
+     * provider build. Under `awslc` the stored form is the 2400 B FIPS-203 decapsulation
+     * key and the twomlspq-swift mint (CryptoKit-backed) rejects it as `archiveInvalid`.
+     * The key-package bytes are the BARE RFC 9420 `KeyPackage` (mls-rs's
+     * `KeyPackageData.key_package_bytes`), NOT the MLSMessage-framed form this object
+     * publishes via `combiner_key_package`.
+     */
+open func migrationExport()throws  -> MigrationExport  {
+    return try  FfiConverterTypeMigrationExport_lift(try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
+    uniffi_two_mls_pq_fn_method_twomlspqinvitation_migration_export(
+            self.uniffiCloneHandle(),$0
+    )
+})
 }
     
     /**
@@ -4266,6 +4316,244 @@ public func FfiConverterTypeListenChannels_lower(_ value: ListenChannels) -> Rus
 
 
 /**
+ * The full migration export of one invitation (GER-2372 R2): `TwoMlsPqInvitation::
+ * migration_export`'s return. `identity` is `None` for a spent single-use invitation
+ * (the twomlspq-swift mint then takes `identity: nil`). The tables are flat
+ * `SwiftInvitationTableEntry` lists; the Swift side rebuilds its dictionaries from them.
+ * No `Debug` (transitively): the identity block holds plaintext key material.
+ */
+public struct MigrationExport: Equatable, Hashable {
+    public var clientId: Data
+    public var lastResort: Bool
+    public var stateSeq: UInt64
+    public var identity: MigrationIdentity?
+    public var forwardTable: [MigrationTableEntry]
+    public var processedWelcomes: [MigrationTableEntry]
+    public var bootstrapRouting: [MigrationTableEntry]
+    public var consumedRemotes: [Data]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(clientId: Data, lastResort: Bool, stateSeq: UInt64, identity: MigrationIdentity?, forwardTable: [MigrationTableEntry], processedWelcomes: [MigrationTableEntry], bootstrapRouting: [MigrationTableEntry], consumedRemotes: [Data]) {
+        self.clientId = clientId
+        self.lastResort = lastResort
+        self.stateSeq = stateSeq
+        self.identity = identity
+        self.forwardTable = forwardTable
+        self.processedWelcomes = processedWelcomes
+        self.bootstrapRouting = bootstrapRouting
+        self.consumedRemotes = consumedRemotes
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension MigrationExport: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMigrationExport: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MigrationExport {
+        return
+            try MigrationExport(
+                clientId: FfiConverterData.read(from: &buf), 
+                lastResort: FfiConverterBool.read(from: &buf), 
+                stateSeq: FfiConverterUInt64.read(from: &buf), 
+                identity: FfiConverterOptionTypeMigrationIdentity.read(from: &buf), 
+                forwardTable: FfiConverterSequenceTypeMigrationTableEntry.read(from: &buf), 
+                processedWelcomes: FfiConverterSequenceTypeMigrationTableEntry.read(from: &buf), 
+                bootstrapRouting: FfiConverterSequenceTypeMigrationTableEntry.read(from: &buf), 
+                consumedRemotes: FfiConverterSequenceData.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: MigrationExport, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.clientId, into: &buf)
+        FfiConverterBool.write(value.lastResort, into: &buf)
+        FfiConverterUInt64.write(value.stateSeq, into: &buf)
+        FfiConverterOptionTypeMigrationIdentity.write(value.identity, into: &buf)
+        FfiConverterSequenceTypeMigrationTableEntry.write(value.forwardTable, into: &buf)
+        FfiConverterSequenceTypeMigrationTableEntry.write(value.processedWelcomes, into: &buf)
+        FfiConverterSequenceTypeMigrationTableEntry.write(value.bootstrapRouting, into: &buf)
+        FfiConverterSequenceData.write(value.consumedRemotes, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMigrationExport_lift(_ buf: RustBuffer) throws -> MigrationExport {
+    return try FfiConverterTypeMigrationExport.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMigrationExport_lower(_ value: MigrationExport) -> RustBuffer {
+    return FfiConverterTypeMigrationExport.lower(value)
+}
+
+
+/**
+ * The identity + key-package half of a migration export (GER-2372 R2) — the Rust-side
+ * image of twomlspq-swift's `MigratedIdentity`. All `*_secret_key` fields are PLAINTEXT
+ * secret material (the caller seals any persisted form). `*_key_package` are BARE
+ * RFC 9420 KeyPackage bytes. The PQ `*_secret_key` pair is the CryptoKit 96-byte
+ * representation — see `TwoMlsPqInvitation::migration_export` for the provider constraint.
+ * No `Debug`: the record holds plaintext key material, and a derived impl would print it.
+ */
+public struct MigrationIdentity: Equatable, Hashable {
+    public var signingKey: Data
+    public var pqSigningKey: Data
+    public var signatureKey: Data
+    public var pqSignatureKey: Data
+    public var classicalLeafSecretKey: Data
+    public var classicalInitSecretKey: Data
+    public var pqLeafSecretKey: Data
+    public var pqInitSecretKey: Data
+    public var classicalKeyPackage: Data
+    public var pqKeyPackage: Data
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(signingKey: Data, pqSigningKey: Data, signatureKey: Data, pqSignatureKey: Data, classicalLeafSecretKey: Data, classicalInitSecretKey: Data, pqLeafSecretKey: Data, pqInitSecretKey: Data, classicalKeyPackage: Data, pqKeyPackage: Data) {
+        self.signingKey = signingKey
+        self.pqSigningKey = pqSigningKey
+        self.signatureKey = signatureKey
+        self.pqSignatureKey = pqSignatureKey
+        self.classicalLeafSecretKey = classicalLeafSecretKey
+        self.classicalInitSecretKey = classicalInitSecretKey
+        self.pqLeafSecretKey = pqLeafSecretKey
+        self.pqInitSecretKey = pqInitSecretKey
+        self.classicalKeyPackage = classicalKeyPackage
+        self.pqKeyPackage = pqKeyPackage
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension MigrationIdentity: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMigrationIdentity: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MigrationIdentity {
+        return
+            try MigrationIdentity(
+                signingKey: FfiConverterData.read(from: &buf), 
+                pqSigningKey: FfiConverterData.read(from: &buf), 
+                signatureKey: FfiConverterData.read(from: &buf), 
+                pqSignatureKey: FfiConverterData.read(from: &buf), 
+                classicalLeafSecretKey: FfiConverterData.read(from: &buf), 
+                classicalInitSecretKey: FfiConverterData.read(from: &buf), 
+                pqLeafSecretKey: FfiConverterData.read(from: &buf), 
+                pqInitSecretKey: FfiConverterData.read(from: &buf), 
+                classicalKeyPackage: FfiConverterData.read(from: &buf), 
+                pqKeyPackage: FfiConverterData.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: MigrationIdentity, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.signingKey, into: &buf)
+        FfiConverterData.write(value.pqSigningKey, into: &buf)
+        FfiConverterData.write(value.signatureKey, into: &buf)
+        FfiConverterData.write(value.pqSignatureKey, into: &buf)
+        FfiConverterData.write(value.classicalLeafSecretKey, into: &buf)
+        FfiConverterData.write(value.classicalInitSecretKey, into: &buf)
+        FfiConverterData.write(value.pqLeafSecretKey, into: &buf)
+        FfiConverterData.write(value.pqInitSecretKey, into: &buf)
+        FfiConverterData.write(value.classicalKeyPackage, into: &buf)
+        FfiConverterData.write(value.pqKeyPackage, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMigrationIdentity_lift(_ buf: RustBuffer) throws -> MigrationIdentity {
+    return try FfiConverterTypeMigrationIdentity.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMigrationIdentity_lower(_ value: MigrationIdentity) -> RustBuffer {
+    return FfiConverterTypeMigrationIdentity.lower(value)
+}
+
+
+/**
+ * One routing-table entry of a migration export: an opaque key (spawn token, welcome
+ * digest, or bootstrap-KP commitment) → the spawned session's receive-group classical
+ * (message-half) group id. Flat key/value form so the three tables share one record.
+ */
+public struct MigrationTableEntry: Equatable, Hashable {
+    public var key: Data
+    public var classicalGroupId: Data
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(key: Data, classicalGroupId: Data) {
+        self.key = key
+        self.classicalGroupId = classicalGroupId
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension MigrationTableEntry: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMigrationTableEntry: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MigrationTableEntry {
+        return
+            try MigrationTableEntry(
+                key: FfiConverterData.read(from: &buf), 
+                classicalGroupId: FfiConverterData.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: MigrationTableEntry, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.key, into: &buf)
+        FfiConverterData.write(value.classicalGroupId, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMigrationTableEntry_lift(_ buf: RustBuffer) throws -> MigrationTableEntry {
+    return try FfiConverterTypeMigrationTableEntry.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMigrationTableEntry_lower(_ value: MigrationTableEntry) -> RustBuffer {
+    return FfiConverterTypeMigrationTableEntry.lower(value)
+}
+
+
+/**
  * MLS group identifier.
  */
 public struct MlsGroupId: Equatable, Hashable {
@@ -6030,6 +6318,30 @@ fileprivate struct FfiConverterOptionTypeDecryptResult: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeMigrationIdentity: FfiConverterRustBuffer {
+    typealias SwiftType = MigrationIdentity?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeMigrationIdentity.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeMigrationIdentity.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeMlsGroupId: FfiConverterRustBuffer {
     typealias SwiftType = MlsGroupId?
 
@@ -6198,6 +6510,31 @@ fileprivate struct FfiConverterOptionTypePqFrameKind: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceData: FfiConverterRustBuffer {
+    typealias SwiftType = [Data]
+
+    public static func write(_ value: [Data], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterData.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [Data] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [Data]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterData.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeEpochRendezvous: FfiConverterRustBuffer {
     typealias SwiftType = [EpochRendezvous]
 
@@ -6215,6 +6552,31 @@ fileprivate struct FfiConverterSequenceTypeEpochRendezvous: FfiConverterRustBuff
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeEpochRendezvous.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeMigrationTableEntry: FfiConverterRustBuffer {
+    typealias SwiftType = [MigrationTableEntry]
+
+    public static func write(_ value: [MigrationTableEntry], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeMigrationTableEntry.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [MigrationTableEntry] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [MigrationTableEntry]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeMigrationTableEntry.read(from: &buf))
         }
         return seq
     }
@@ -6425,6 +6787,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqinvitation_install_sink() != 4147) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_two_mls_pq_checksum_method_twomlspqinvitation_migration_export() != 43948) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqinvitation_open_initial() != 36225) {
