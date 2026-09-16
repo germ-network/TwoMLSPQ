@@ -1347,6 +1347,10 @@ mod tests {
         assert_eq!(client.client_id().bytes, id);
     }
 
+    // Migration happy path requires the CryptoKit 96-byte ML-KEM representation;
+    // an awslc build uses 2400-byte decapsulation keys that trip migration_export
+    // length guards by design (migration targets the CryptoKit-based swift engine).
+    #[cfg(feature = "cryptokit")]
     #[test]
     fn test_migration_export_carries_identity_and_bare_key_packages() {
         let client = assert_ok!(TwoMlsPqPrincipal::new(test_client_id()));
