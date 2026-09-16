@@ -69,21 +69,21 @@ let package = Package(
 		),
 		// The native-side migrator dependency (GER-2372): twomlspq-swift carries R1's
 		// `InvitationMigration.mintArchive` + `MigratedIdentity`, which `TwoMLSPQMigrate`
-		// maps the Rust migration export onto. Pinned by revision (R1's merge point, the
-		// same convention twomlspq-swift uses for its own swift-mls pin); its transitive
+		// maps the Rust migration export onto. Pinned to the twomlspq-swift 0.1.0
+		// release (its API surface is R1 as merged); its transitive
 		// deps (swift-mls, swift-secret-bytes, swift-crypto, GermConvenience) resolve
 		// automatically.
 		.package(
 			url: "https://github.com/germ-network/twomlspq-swift.git",
-			revision: "01370863c47229c829cd48b006068ab6dcb7279e"
+			.upToNextMinor(from: "0.1.0")
 		),
 		// Declared directly (not just transitively through twomlspq-swift) because
 		// the migrate targets import their products; the pins mirror twomlspq-swift's
-		// own so a resolution conflict cannot arise. swift-mls has no tags — pin by
-		// commit, the same revision twomlspq-swift pins.
+		// own so a resolution conflict cannot arise. swift-mls 0.1.0 is tagged; pin
+		// by version, matching twomlspq-swift 0.1.0's own swift-mls requirement.
 		.package(
 			url: "https://github.com/germ-network/swift-mls.git",
-			revision: "590f16192cfbd32eabeb2d41b4d3d68916c967be"
+			.upToNextMinor(from: "0.1.0")
 		),
 		.package(
 			url: "https://github.com/germ-network/swift-secret-bytes.git",

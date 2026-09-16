@@ -1,5 +1,5 @@
 {
-  "originHash" : "77f16f0c3ebc9531c76d9125568432997e0eeb92f9190bdd8a75d14465b09a7e",
+  "originHash" : "aba894061bced96247d731ed0e1e769d5fe36a023d41b21d97e58e3c1c1ffb1d",
   "pins" : [
     {
       "identity" : "atprototypes",
@@ -78,7 +78,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/germ-network/swift-mls.git",
       "state" : {
-        "revision" : "590f16192cfbd32eabeb2d41b4d3d68916c967be"
+        "revision" : "5c48cc813b808075ac7fc321e49ecf2f8faa5393",
+        "version" : "0.1.0"
       }
     },
     {
@@ -95,7 +96,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/germ-network/twomlspq-swift.git",
       "state" : {
-        "revision" : "01370863c47229c829cd48b006068ab6dcb7279e"
+        "revision" : "275554a4288a5a2a624d889abbc5d6fb257c41e3",
+        "version" : "0.1.0"
       }
     }
   ],
