@@ -480,7 +480,14 @@ pub fn version() -> String {
 // One error variant appended, `AttachmentComponentUnavailable`. Archive layout bumps 3→4
 // (`SESSION_ARCHIVE_VERSION`): v3 was already released, so the ledgers could not join its
 // tail in place without failing every 0.15.x-persisted session on restore.
-const BINDING_CONTRACT_VERSION: u64 = 33;
+//
+// v34 (GER-2484): the invitation migration export — three new Records
+// (`SwiftInvitationTableEntry`, `SwiftMigratedIdentity`, `SwiftInvitationExport`) and one
+// new FFI method, `TwoMlsPqInvitation::migration_export`. Record additions are the
+// rule's core case: uniffi cannot checksum a new Record's field layout, so a stale
+// binding/binary pair would mis-read the export buffer at first call. No wire/archive
+// format or error-variant change.
+const BINDING_CONTRACT_VERSION: u64 = 34;
 
 /// See `BINDING_CONTRACT_VERSION`. Exported so the Swift layer can verify the
 /// binding it was generated with matches the binary it loaded.

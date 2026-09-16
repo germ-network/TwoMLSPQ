@@ -48,6 +48,12 @@ let package = Package(
 		.library(
 			name: "TwoMLSPQ",
 			targets: ["TwoMLSPQ"]
+		),
+		// The invitation migrator library (GER-2372 R3) — consumes the Rust migration
+		// export and mints a native twomlspq-swift invitation archive.
+		.library(
+			name: "TwoMLSPQMigrate",
+			targets: ["TwoMLSPQMigrate"]
 		)
 	],
 	dependencies: [
@@ -60,6 +66,28 @@ let package = Package(
 		.package(
 			url: "https://github.com/germ-network/autonomous-comm-protocol.git",
 			from: "1.2.0"
+		),
+		// The native-side migrator dependency (GER-2372): twomlspq-swift carries R1's
+		// `InvitationMigration.mintArchive` + `MigratedIdentity`, which `TwoMLSPQMigrate`
+		// maps the Rust migration export onto. Pinned to the twomlspq-swift 0.1.0
+		// release (its API surface is R1 as merged); its transitive
+		// deps (swift-mls, swift-secret-bytes, swift-crypto, GermConvenience) resolve
+		// automatically.
+		.package(
+			url: "https://github.com/germ-network/twomlspq-swift.git",
+			.upToNextMinor(from: "0.1.0")
+		),
+		// Declared directly (not just transitively through twomlspq-swift) because
+		// the migrate targets import their products; the pins mirror twomlspq-swift's
+		// own so a resolution conflict cannot arise. swift-mls 0.1.0 is tagged; pin
+		// by version, matching twomlspq-swift 0.1.0's own swift-mls requirement.
+		.package(
+			url: "https://github.com/germ-network/swift-mls.git",
+			.upToNextMinor(from: "0.1.0")
+		),
+		.package(
+			url: "https://github.com/germ-network/swift-secret-bytes.git",
+			.upToNextMinor(from: "0.4.0")
 		)
 	],
 	targets: [
@@ -80,6 +108,21 @@ let package = Package(
 			dependencies: ["TwoMLSPQrs"]
 		),
 		twoMLSPQrs,
+		// The invitation migrator (GER-2372 R3): maps the Rust engine's migration export
+		// (`TwoMlsPqInvitation.migrationExport`, GER-2484 R2) onto twomlspq-swift's
+		// `InvitationMigration.mintArchive`, MINTING a native invitation `SecretArchive`
+		// from a legacy Rust invitation (dual-read / single-write: the Rust engine stays a
+		// read-only legacy decoder). Separate target so its twomlspq-swift dependency —
+		// and that package's `Invitation`/`ClientID` type names, which collide with this
+		// package's — stay out of the public `TwoMLSPQ` product.
+		.target(
+			name: "TwoMLSPQMigrate",
+			dependencies: [
+				"TwoMLSPQBinding",
+				.product(name: "TwoMLSPQSession", package: "twomlspq-swift"),
+				.product(name: "SecretBytes", package: "swift-secret-bytes"),
+			]
+		),
 		// The concrete/FFI-level suites: raw-FFI invitation flows and the total
 		// TwoMlsPqError → SessionError mapping (`@testable` for the internal error bridge +
 		// `import TwoMLSPQBinding` for the raw crate cases). The abstract-surface suites live
@@ -90,6 +133,20 @@ let package = Package(
 				"TwoMLSPQ",
 				"TwoMLSPQBinding",
 				.product(name: "CommProtocol", package: "autonomous-comm-protocol"),
+			]
+		),
+		// The migrator's differential proof: a real Rust invitation migrated → restored
+		// twomlspq-swift → the SAME §A.1 envelope opened by both engines. Drives the raw
+		// FFI directly (the `TwoMLSPQ` wrappers stay out of it), hence the binding plus
+		// the native-side modules the restore and providers need.
+		.testTarget(
+			name: "TwoMLSPQMigrateTests",
+			dependencies: [
+				"TwoMLSPQMigrate",
+				"TwoMLSPQBinding",
+				.product(name: "TwoMLSPQSession", package: "twomlspq-swift"),
+				.product(name: "TwoMLSPQCrypto", package: "twomlspq-swift"),
+				.product(name: "MLSCrypto", package: "swift-mls"),
 			]
 		),
 	],

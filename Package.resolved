@@ -1,13 +1,13 @@
 {
-  "originHash" : "59df2a8f4534c4b8e050b953ee7ccd1ac7c1b8bb1ba8d0f7daf21c1d08682f88",
+  "originHash" : "aba894061bced96247d731ed0e1e769d5fe36a023d41b21d97e58e3c1c1ffb1d",
   "pins" : [
     {
       "identity" : "atprototypes",
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/germ-network/AtprotoTypes.git",
       "state" : {
-        "revision" : "a20c1027bc446bb59efa839c7191b36f3c244052",
-        "version" : "0.4.6"
+        "revision" : "537310dd07df81f20f91e28164d3a97b21ad0c20",
+        "version" : "0.6.1"
       }
     },
     {
@@ -24,8 +24,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/germ-network/GermConvenience.git",
       "state" : {
-        "revision" : "5ec8573dbceb2e03b9a32c3e84a53af471df5b89",
-        "version" : "0.2.4"
+        "revision" : "e474915e5ab3f917d5f5496af5fb4814081fb75c",
+        "version" : "0.8.0"
       }
     },
     {
@@ -71,6 +71,33 @@
       "state" : {
         "revision" : "2aed77ae5ec9a86d8fe42c12275e4c2653a286ee",
         "version" : "1.13.1"
+      }
+    },
+    {
+      "identity" : "swift-mls",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/germ-network/swift-mls.git",
+      "state" : {
+        "revision" : "5c48cc813b808075ac7fc321e49ecf2f8faa5393",
+        "version" : "0.1.0"
+      }
+    },
+    {
+      "identity" : "swift-secret-bytes",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/germ-network/swift-secret-bytes.git",
+      "state" : {
+        "revision" : "f10434b708c8685e28db46258c856ba1b66f4312",
+        "version" : "0.4.0"
+      }
+    },
+    {
+      "identity" : "twomlspq-swift",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/germ-network/twomlspq-swift.git",
+      "state" : {
+        "revision" : "275554a4288a5a2a624d889abbc5d6fb257c41e3",
+        "version" : "0.1.0"
       }
     }
   ],
