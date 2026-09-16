@@ -410,7 +410,7 @@ creator leaf is one she initiated no exchange toward — unlike every other cred
 receive path admits, nothing has signed a delegation to it. The cross-party PSK weld proves the
 group was made by the invitation holder; it does **not** prove the *identity* delegated the
 dedicated key. That delegation rides the establishment wire as a **signed handoff**: Bob's
-staple becomes `ESTABLISHMENT_HANDOFF_TAG` (`0x0B`) — `[0x0B][len][signed blob][len][APQWelcome_A]`
+staple becomes `ESTABLISHMENT_HANDOFF_TAG` (`0x0B`) — `[0x0B][len][signed blob][len][APQWelcome_B]`
 — wrapping the *unmodified, spec-conformant* welcome next to a host-minted artifact whose
 signatures bind `sha256(welcome)` (card: the identity's `IdentityDelegate` + the dedicated
 agent's proof-of-possession; anchor: the invitation/retired agent + anchor + new agent). The
