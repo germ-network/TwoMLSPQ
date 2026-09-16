@@ -592,6 +592,7 @@ use frames::*;
 pub use frames::{pq_frame_kind, OpenedFrame, OpenedFrameKind, PqFrameKind, SideBandSealing};
 
 mod messaging;
+mod migration;
 use messaging::*;
 
 mod pq_ops;

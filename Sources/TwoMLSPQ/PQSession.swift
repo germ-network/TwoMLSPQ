@@ -252,7 +252,12 @@ import TwoMLSPQBinding
 //     export lives in the `TwoMLSPQMigrate` target (GER-2372 R3), which maps the payload
 //     onto twomlspq-swift's `InvitationMigration.mintArchive`. No wire, API, or
 //     error-variant change beyond the new symbols.
-private let expectedBindingContract: UInt64 = 34
+// v35 (GER-2433 C1): the session migration export — the `SessionMigrationExport`
+//     record family + `SessionMigrationPqInflight` enum and the new FFI method
+//     `TwoMlsPqSession.migrationExport()`. The consumer lives in `TwoMLSPQMigrate`
+//     (`SessionMigrator`), mapping onto twomlspq-swift's `SessionMigration.mintArchive`.
+//     No wire, API, or error-variant change beyond the new symbols.
+private let expectedBindingContract: UInt64 = 35
 
 enum TwoMLSPQBindingContract {
 	static let verified: Void = {

@@ -487,7 +487,16 @@ pub fn version() -> String {
 // rule's core case: uniffi cannot checksum a new Record's field layout, so a stale
 // binding/binary pair would mis-read the export buffer at first call. No wire/archive
 // format or error-variant change.
-const BINDING_CONTRACT_VERSION: u64 = 34;
+//
+// v35 (GER-2433 C1): the session migration export — twelve new Records + one new Enum
+// (`SessionMigrationExport` and its parts) and one new FFI method,
+// `TwoMlsPqSession::migration_export`, each group half emitted as a swift-mls format-2
+// snapshot via mls-rs's `swift_export` feature. No wire/archive format or error-variant
+// change. NOTE: the mls-rs pin moves to `llm/mlsrs-format2-export` (82b4dc1) and the
+// `swift_export` feature extends mls-rs's serialized `EpochSecrets`, so group state
+// persisted by a pre-v35 build no longer loads under this one (and vice versa) —
+// persisted Rust session archives must be migrated, not carried, across the repin.
+const BINDING_CONTRACT_VERSION: u64 = 35;
 
 /// See `BINDING_CONTRACT_VERSION`. Exported so the Swift layer can verify the
 /// binding it was generated with matches the binary it loaded.
