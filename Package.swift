@@ -70,21 +70,21 @@ let package = Package(
 		// The native-side migrator dependency (GER-2372): twomlspq-swift carries R1's
 		// `InvitationMigration.mintArchive` + `MigratedIdentity` and R2's
 		// `SessionMigration.mintArchive` + `MigratedSession`, which `TwoMLSPQMigrate`
-		// maps the Rust migration exports onto. Pinned by revision: the 0.1.0 tag
-		// predates SessionMigration, so the pin is the main rev that carries R2
-		// (3e7dc6b + changeset); its transitive deps (swift-mls, swift-secret-bytes,
-		// swift-crypto, GermConvenience) resolve automatically.
+		// maps the Rust migration exports onto. 0.1.1 is the first tag carrying R2
+		// (SessionMigration + the ML-KEM `hpkeSecretKeySize`); its transitive deps
+		// (swift-mls, swift-secret-bytes, swift-crypto, GermConvenience) resolve
+		// automatically.
 		.package(
 			url: "https://github.com/germ-network/twomlspq-swift.git",
-			.revision("e38331dbcb120d79da02f6bb2764c8ea7010efb4")
+			.exact("0.1.1")
 		),
 		// Declared directly (not just transitively through twomlspq-swift) because
 		// the migrate targets import their products; the pins mirror twomlspq-swift's
-		// own so a resolution conflict cannot arise. swift-mls 0.1.0 is tagged; pin
-		// by version, matching twomlspq-swift's own `exact: 0.1.0` swift-mls pin.
+		// own so a resolution conflict cannot arise, matching twomlspq-swift 0.1.1's
+		// own `exact: 0.1.1` swift-mls pin (which carries the C0 `Nsk` length check).
 		.package(
 			url: "https://github.com/germ-network/swift-mls.git",
-			.upToNextMinor(from: "0.1.0")
+			.upToNextMinor(from: "0.1.1")
 		),
 		.package(
 			url: "https://github.com/germ-network/swift-secret-bytes.git",
