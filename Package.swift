@@ -29,8 +29,8 @@ let twoMLSPQrs: Target =
 	: .binaryTarget(
 		name: "TwoMLSPQrs",
 		url:
-			"https://github.com/germ-network/TwoMLSPQ/releases/download/v0.10.0/TwoMLSPQ.xcframework.zip",
-		checksum: "897071cf3ba8fd278c205aa13dcea3303dc01195167dc39e7eabc7510db51dee"
+			"https://github.com/germ-network/TwoMLSPQ/releases/download/v0.18.0/TwoMLSPQ.xcframework.zip",
+		checksum: "ea1672d39bbbf2309e4ea08070eb5a66a1dc59fd597f7dcfd39ca1b22b8bfcca"
 	)
 
 let package = Package(
