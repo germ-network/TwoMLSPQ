@@ -1,5 +1,34 @@
 # @germ-network/two-mls-pq
 
+## 0.17.0
+
+### Minor Changes
+
+- [#131](https://github.com/germ-network/TwoMLSPQ/pull/131) [`330fcc5`](https://github.com/germ-network/TwoMLSPQ/commit/330fcc50fbe975670a72b34db46e011f73ed3069) Thanks [@germ-mark](https://github.com/germ-mark)! - Add the session migration export (GER-2433 C1) — the session-level analogue of the invitation migration export, completing the Rust engine's read-side bridge to the native twomlspq-swift engine.
+
+  `TwoMlsPqSession.migrationExport()` returns an established session's full migration payload: every group half (up to four: send/recv × classical/PQ) as a swift-mls format-2 snapshot via mls-rs's new `swift_export` feature, plus the session metadata (identity, AS sequences, PQ round state, PSK and attachment ledgers, proposal slots, epoch windows) as new UniFFI records. The export admits only established, quiescent sessions and refuses (rather than mis-maps) states the native archive cannot represent: pre-establishment initiators, mid-rotation sessions, installed born-dedicated envelopes, and wedged side-bands. The `TwoMLSPQMigrate` target gains `SessionMigrator`, mapping the payload onto twomlspq-swift's `SessionMigration.mintArchive`.
+
+  `BINDING_CONTRACT_VERSION` bumps 34 → 35 (new records and one new FFI method); the vendored binding and xcframework ship re-synced from the same build. The mls-rs pin moves to `llm/mlsrs-format2-export` (82b4dc1) with the `swift_export` feature, which extends mls-rs's serialized `EpochSecrets` — group state persisted by a build without `swift_export` no longer loads under this one, so persisted Rust session archives must be migrated, not carried, across this release. twomlspq-swift is pinned by revision to the `SessionMigration` merge (28807d6), the 0.1.0 tag predating it.
+
+- [#130](https://github.com/germ-network/TwoMLSPQ/pull/130) [`cc1517d`](https://github.com/germ-network/TwoMLSPQ/commit/cc1517d77f0e4c1aa94e79e31a14a35fcb918b98) Thanks [@germ-mark](https://github.com/germ-mark)! - Add the invitation migration export (GER-2484, GER-2372 R2/R3) — the Rust engine's read-side bridge to the native twomlspq-swift engine.
+
+  `TwoMlsPqInvitation.migrationExport()` returns the invitation's full migration payload (signing identity, both halves' HPKE secrets and bare RFC 9420 KeyPackages, the four routing tables, `stateSeq`) as new UniFFI records. The new `TwoMLSPQMigrate` Swift target maps that payload onto twomlspq-swift's `InvitationMigration.mintArchive`, minting a native invitation `SecretArchive` from a legacy Rust invitation (dual-read / single-write: the Rust engine is a read-only legacy decoder). A differential test suite proves the migrated invitation opens the same §A.1 envelope, carries populated routing tables, handles spent single-use invitations, and rejects perturbed secrets.
+
+  `BINDING_CONTRACT_VERSION` bumps 33 → 34 (new records and one new FFI method); the vendored binding and xcframework ship re-synced from the same build.
+
+### Patch Changes
+
+- [#126](https://github.com/germ-network/TwoMLSPQ/pull/126) [`93a2670`](https://github.com/germ-network/TwoMLSPQ/commit/93a2670e019598603fdbb653a29570045ce0c524) Thanks [@germ-mark](https://github.com/germ-mark)! - Add the dual MIT/Apache-2.0 license and fill in package metadata.
+
+  The repository was public with no license file, while `rust/Cargo.toml` already declared
+  `license = "MIT OR Apache-2.0"`. This adds `LICENSE-MIT` and `LICENSE-APACHE` so that
+  declaration is backed by actual license text, and states the inbound contribution terms in
+  `CONTRIBUTING.md` and `README.md`.
+
+  Also corrects documentation that still referred to `Sources/AbstractTwoMLS/` (moved to a
+  separate package) and to the vendored binding's old location — including the path in the
+  binding-contract mismatch error, which pointed developers at the wrong file to re-sync.
+
 ## 0.16.0
 
 ### Minor Changes
