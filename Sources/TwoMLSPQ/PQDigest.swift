@@ -30,6 +30,7 @@
 
 import CryptoKit
 import Foundation
+import TwoMLSPQTypes
 
 /// Derivation and framing for the digests this package emits.
 ///
