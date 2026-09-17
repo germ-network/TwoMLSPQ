@@ -37,19 +37,20 @@ mls-rs = { version = "0.55", features = [
   "psk",
   "private_message",
   "safe_extensions",
+  "swift_export",
 ] }
-mls-rs-core = { version = "0.27", git = "https://github.com/germ-network/mls-rs", rev = "b43703fbf1244140fe9e5e43e41c373e34191758" }
-mls-rs-crypto-awslc = { version = "0.25", git = "https://github.com/germ-network/mls-rs", rev = "b43703fbf1244140fe9e5e43e41c373e34191758", features = [
+mls-rs-core = { version = "0.27", git = "https://github.com/germ-network/mls-rs", rev = "74917834ccba56ed56399bfa6b679dff2e760e8b" }
+mls-rs-crypto-awslc = { version = "0.25", git = "https://github.com/germ-network/mls-rs", rev = "74917834ccba56ed56399bfa6b679dff2e760e8b", features = [
   "post-quantum",
 ] }
-mls-rs-crypto-cryptokit = { version = "0.11", git = "https://github.com/germ-network/mls-rs", rev = "b43703fbf1244140fe9e5e43e41c373e34191758", features = [
+mls-rs-crypto-cryptokit = { version = "0.11", git = "https://github.com/germ-network/mls-rs", rev = "74917834ccba56ed56399bfa6b679dff2e760e8b", features = [
   "post-quantum",
 ] }
-mls-rs-crypto-traits = { version = "0.22", git = "https://github.com/germ-network/mls-rs", rev = "b43703fbf1244140fe9e5e43e41c373e34191758" }
+mls-rs-crypto-traits = { version = "0.22", git = "https://github.com/germ-network/mls-rs", rev = "74917834ccba56ed56399bfa6b679dff2e760e8b" }
 sha2 = "0.10"
 thiserror = "1"
 uniffi = "0.31"
 zeroize = { version = "1", features = ["derive"] }
 
 [patch.crates-io]
-mls-rs = { git = "https://github.com/germ-network/mls-rs", rev = "b43703fbf1244140fe9e5e43e41c373e34191758" }
+mls-rs = { git = "https://github.com/germ-network/mls-rs", rev = "74917834ccba56ed56399bfa6b679dff2e760e8b" }
