@@ -14,8 +14,15 @@
 //!   * mid-rotation (`staged_candidates` / `deferred_candidate`): the Rust
 //!     model holds up to `CANDIDATE_WINDOW` full successor identities where the
 //!     native one holds a single rotation candidate;
-//!   * born-dedicated, envelope installed: the delegation blob has no native
-//!     slot (`owesEstablishmentEnvelope` covers only the pre-install latch);
+//!   * born-dedicated, either latch state: the delegation blob has no native
+//!     slot post-install, and pre-install the recv-group leaves present the
+//!     INVITATION identity's keys, which the session no longer holds (the
+//!     native `recvLeafPrincipal` custody arm can't be populated);
+//!   * post-rotation leaf-lag: a canonicalized rotation swaps `inner.client`
+//!     to fresh keys while lagging leaves still present the old ones, and the
+//!     export has no `rotationCandidate`/`recvLeafPrincipal` to custody them —
+//!     so every group half's own leaf must present the identity's per-half
+//!     signing key (the custody gate below);
 //!   * a wedged or bind-broken side-band: the native archive carries no wedge
 //!     verdict, so the migrated session would report healthy and deadlock.
 //!
@@ -386,13 +393,14 @@ impl TwoMlsPqSession {
         let mut inner = self.lock();
 
         // The unmigratable states (module note): pre-establishment, mid-rotation,
-        // born-dedicated post-install, or a torn side-band.
+        // born-dedicated (either latch state), or a torn side-band.
         if inner.recv_group.is_none()
             || inner.pending_outbound.is_some()
             || inner.initial_app_payload.is_some()
             || inner.initial_return_kp.is_some()
             || !inner.staged_candidates.is_empty()
             || inner.deferred_candidate.is_some()
+            || inner.requires_establishment_envelope
             || inner.establishment_envelope.is_some()
             || inner.pq_wedged.is_some()
             || inner.bind_apply_broken
@@ -416,12 +424,12 @@ impl TwoMlsPqSession {
         // picked (or freshly minted) per half — see `identity_kp`.
         let client = inner.client.combiner();
         let client_id = client.client_id().to_vec();
-        let (_, classical_kpd) = identity_kp(&client.classical_kp_store(), &client_id, || {
+        let (_, classical_kpd) = identity_kp(client.classical_kp_store(), &client_id, || {
             client
                 .generate_classical_key_package()
                 .map_err(|_| TwoMlsPqError::Mls)
         })?;
-        let (_, pq_kpd) = identity_kp(&client.pq_kp_store(), &client_id, || {
+        let (_, pq_kpd) = identity_kp(client.pq_kp_store(), &client_id, || {
             client
                 .generate_pq_key_package()
                 .map_err(|_| TwoMlsPqError::Mls)
@@ -441,13 +449,13 @@ impl TwoMlsPqSession {
         }
         let identity = SessionMigrationIdentity {
             client_id,
-            signing_key: bare_ed25519(&client.classical_signing_key())?,
+            signing_key: bare_ed25519(client.classical_signing_key())?,
             signature_key: classical_kp
                 .signing_identity()
                 .signature_key
                 .as_bytes()
                 .to_vec(),
-            pq_signing_key: bare_ed25519(&client.pq_signing_key())?,
+            pq_signing_key: bare_ed25519(client.pq_signing_key())?,
             pq_signature_key: pq_kp.signing_identity().signature_key.as_bytes().to_vec(),
             classical_leaf_secret_key: classical_kpd.leaf_node_key.to_vec(),
             // Always None: the mint admits a classical init secret only for a
@@ -457,6 +465,48 @@ impl TwoMlsPqSession {
             classical_key_package: classical_kpd.key_package_bytes.clone(),
             pq_key_package: pq_kpd.key_package_bytes.clone(),
         };
+
+        // The custody gate: every group half's own leaf must present the
+        // identity's per-half signing key. The mint's custody arms resolve a
+        // presented key against identity ∪ rotationCandidate ∪
+        // recvLeafPrincipal, and this export carries only the identity — so a
+        // post-rotation leaf-lag or born-dedicated session admitted here would
+        // fail the mint as `archiveInvalid` (corruption semantics on a healthy
+        // session). Refuse as `SessionNotReady` instead.
+        let leaf_matches = |group: &CombinerGroup| -> Result<bool> {
+            let classical_ok = group
+                .classical
+                .current_member_signing_identity()
+                .map_err(|_| TwoMlsPqError::Mls)?
+                .signature_key
+                .as_bytes()
+                == identity.signature_key;
+            let pq_ok = match group.pq.as_ref() {
+                Some(pq) => {
+                    pq.current_member_signing_identity()
+                        .map_err(|_| TwoMlsPqError::Mls)?
+                        .signature_key
+                        .as_bytes()
+                        == identity.pq_signature_key
+                }
+                None => true,
+            };
+            Ok(classical_ok && pq_ok)
+        };
+        if !leaf_matches(
+            inner
+                .send_group
+                .as_ref()
+                .ok_or(TwoMlsPqError::SessionNotReady)?,
+        )? || !inner
+            .recv_group
+            .as_ref()
+            .map(leaf_matches)
+            .transpose()?
+            .unwrap_or(false)
+        {
+            return Err(TwoMlsPqError::SessionNotReady);
+        }
 
         let (auth_mine, auth_theirs) = inner.with_auth(|core| {
             let seq = |s: &apq::authentication::PartySequence| {
@@ -471,8 +521,12 @@ impl TwoMlsPqSession {
         });
 
         // The staged Upd(self) pair is set together on every established-session
-        // path; half-set is the pre-establishment marker (refused above) or a
-        // torn state.
+        // path. Hash-without-message is the §A.1 pre-establishment marker
+        // (prepare_pre_establishment), which the establishment cutover does NOT
+        // clear: a prepare-then-never-encrypt initiator can carry it across the
+        // cutover, and the next `prepare_to_encrypt` overwrites both — so past
+        // the gates it is stale dead state, dropped rather than exported (the
+        // native side has no hash-only marker). Message-without-hash is torn.
         let pending_proposal = match (
             &inner.pending_proposal_hash,
             &inner.pending_proposal_message,
@@ -482,8 +536,8 @@ impl TwoMlsPqSession {
                 message: message.clone(),
                 hash: hash.clone(),
             }),
-            (None, None) => None,
-            _ => return Err(TwoMlsPqError::ArchiveInvalid),
+            (None, None) | (Some(_), None) => None,
+            (None, Some(_)) => return Err(TwoMlsPqError::ArchiveInvalid),
         };
         let staged_updates = pending_proposal
             .iter()
@@ -613,10 +667,12 @@ impl TwoMlsPqSession {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "cryptokit")]
     use crate::test_utils::{
         commitment_of, establish_confirmed_sessions, make_classical_kp, make_client,
         make_combiner_kp,
     };
+    #[cfg(feature = "cryptokit")]
     use crate::{assert_ok, assert_some, TwoMlsPqError};
 
     // Migration happy paths require the CryptoKit 96-byte ML-KEM representation;
