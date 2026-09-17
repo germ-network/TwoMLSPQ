@@ -166,9 +166,17 @@ pub enum SessionMigrationPqInflight {
     BootstrapResponded,
     /// ML-KEM-768 `integrityCheckedRepresentation` (96 B) decapsulation key +
     /// the encapsulation key.
-    Initiating { secret_key: Vec<u8>, ek: Vec<u8> },
-    Responding { secret: Vec<u8>, wire_ct: Vec<u8> },
-    RekeyInitiated { upd_message: Vec<u8> },
+    Initiating {
+        secret_key: Vec<u8>,
+        ek: Vec<u8>,
+    },
+    Responding {
+        secret: Vec<u8>,
+        wire_ct: Vec<u8>,
+    },
+    RekeyInitiated {
+        upd_message: Vec<u8>,
+    },
     RekeyResponded,
 }
 
@@ -398,23 +406,25 @@ impl TwoMlsPqSession {
                 .as_mut()
                 .ok_or(TwoMlsPqError::SessionNotReady)?,
         )?;
-        let recv_group = inner.recv_group.as_mut().map(export_group_half).transpose()?;
+        let recv_group = inner
+            .recv_group
+            .as_mut()
+            .map(export_group_half)
+            .transpose()?;
 
         // The identity: signing keys from the session client, key packages
         // picked (or freshly minted) per half — see `identity_kp`.
         let client = inner.client.combiner();
         let client_id = client.client_id().to_vec();
-        let (_, classical_kpd) = identity_kp(
-            &client.classical_kp_store(),
-            &client_id,
-            || {
-                client
-                    .generate_classical_key_package()
-                    .map_err(|_| TwoMlsPqError::Mls)
-            },
-        )?;
+        let (_, classical_kpd) = identity_kp(&client.classical_kp_store(), &client_id, || {
+            client
+                .generate_classical_key_package()
+                .map_err(|_| TwoMlsPqError::Mls)
+        })?;
         let (_, pq_kpd) = identity_kp(&client.pq_kp_store(), &client_id, || {
-            client.generate_pq_key_package().map_err(|_| TwoMlsPqError::Mls)
+            client
+                .generate_pq_key_package()
+                .map_err(|_| TwoMlsPqError::Mls)
         })?;
         let classical_kp = decode_checked_kp(&classical_kpd.key_package_bytes, &client_id)?;
         let pq_kp = decode_checked_kp(&pq_kpd.key_package_bytes, &client_id)?;
@@ -553,20 +563,23 @@ impl TwoMlsPqSession {
             last_send_pq_exported: inner.last_send_pq_exported,
             // Mind the live tuples' asymmetric field order: offered is
             // (digest, proposal, proposing), queued (digest, proposing, proposal).
-            offered_proposal: inner.offered_proposal.as_ref().map(|(digest, proposal, proposing)| {
-                SessionMigrationDigestedProposal {
+            offered_proposal: inner.offered_proposal.as_ref().map(
+                |(digest, proposal, proposing)| SessionMigrationDigestedProposal {
                     digest: digest.clone(),
                     proposing: proposing.clone(),
                     message: proposal.clone(),
-                }
-            }),
-            queued_proposal: inner.queued_proposal.as_ref().map(|(digest, proposing, proposal)| {
-                SessionMigrationDigestedProposal {
-                    digest: digest.clone(),
-                    proposing: proposing.clone(),
-                    message: proposal.clone(),
-                }
-            }),
+                },
+            ),
+            queued_proposal: inner
+                .queued_proposal
+                .as_ref()
+                .map(
+                    |(digest, proposing, proposal)| SessionMigrationDigestedProposal {
+                        digest: digest.clone(),
+                        proposing: proposing.clone(),
+                        message: proposal.clone(),
+                    },
+                ),
             send_cross_psk_ledger: inner
                 .send_psk_ledger
                 .iter()
@@ -682,9 +695,8 @@ mod tests {
             None
         ));
         let commitment = commitment_of(&alice_s);
-        let opened = assert_ok!(
-            bob_inv.open_establishment(assert_some!(alice_s.pending_outbound()))
-        );
+        let opened =
+            assert_ok!(bob_inv.open_establishment(assert_some!(alice_s.pending_outbound())));
         let bob_s = assert_ok!(bob_inv.receive(
             assert_some!(opened.welcome),
             alice_kp,
