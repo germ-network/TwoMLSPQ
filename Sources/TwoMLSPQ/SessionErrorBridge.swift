@@ -9,6 +9,7 @@
 
 import Foundation
 import TwoMLSPQBinding
+import TwoMLSPQTypes
 
 /// The wrapper surface an error escaped from — disambiguates the crate's
 /// overloaded `SessionNotReady`, which means "you misrouted a frame" at the

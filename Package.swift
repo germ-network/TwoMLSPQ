@@ -49,6 +49,13 @@ let package = Package(
 			name: "TwoMLSPQ",
 			targets: ["TwoMLSPQ"]
 		),
+		// The Rust-free slice: the pure-Swift currency types, no binding/xcframework.
+		// For all-Swift consumers (e.g. Android builds, where the xcframework has no
+		// slice). `TwoMLSPQ` re-exports it, so `import TwoMLSPQ` is unchanged.
+		.library(
+			name: "TwoMLSPQTypes",
+			targets: ["TwoMLSPQTypes"]
+		),
 		// The invitation migrator library (GER-2372 R3) — consumes the Rust migration
 		// export and mints a native twomlspq-swift invitation archive.
 		.library(
@@ -92,13 +99,17 @@ let package = Package(
 		)
 	],
 	targets: [
-		// The public product: the hand-written concrete PQ types + value/currency types,
-		// top-level in this module. Depends ONLY on the internal binding target below (so the
-		// raw UniFFI interface types stay out of this surface) — no external Swift packages.
+		// The public product: the hand-written concrete PQ types, top-level in this module
+		// (the currency types live in the `TwoMLSPQTypes` target, re-exported). Depends only on
+		// the internal binding target below (so the raw UniFFI interface types stay out of this
+		// surface) — no external Swift packages.
 		.target(
 			name: "TwoMLSPQ",
-			dependencies: ["TwoMLSPQBinding"]
+			dependencies: ["TwoMLSPQBinding", "TwoMLSPQTypes"]
 		),
+		// The binding-free currency types (CoreTypes, PQRatchetTypes, SessionError).
+		// NO dependencies — Foundation only; must never depend on TwoMLSPQBinding.
+		.target(name: "TwoMLSPQTypes"),
 		// The generated UniFFI binding (`two_mls_pq.swift`, owning its own `RustBuffer` from
 		// `two_mls_pqFFI`). An INTERNAL target — not vended — so its `@unchecked Sendable`
 		// interface classes never reach a public consumer; the `TwoMLSPQ` wrapper types are

@@ -44,6 +44,13 @@
 
 import Foundation
 import TwoMLSPQBinding
+import TwoMLSPQTypes
+
+// The binding declares same-named `PrincipalState`/`SideBandSealing`; these aliases
+// restore the same-module shadowing that held when the currency types lived here
+// (public: they appear in public API signatures, as the types themselves did pre-move).
+public typealias PrincipalState = TwoMLSPQTypes.PrincipalState
+public typealias SideBandSealing = TwoMLSPQTypes.SideBandSealing
 
 // MARK: - Binding/binary pairing guard
 
