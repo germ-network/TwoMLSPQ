@@ -76,7 +76,7 @@ let package = Package(
 		// swift-crypto, GermConvenience) resolve automatically.
 		.package(
 			url: "https://github.com/germ-network/twomlspq-swift.git",
-			.revision("28807d68d3d016f7cf350fdfd775c9e9d3929d2d")
+			.revision("e38331dbcb120d79da02f6bb2764c8ea7010efb4")
 		),
 		// Declared directly (not just transitively through twomlspq-swift) because
 		// the migrate targets import their products; the pins mirror twomlspq-swift's

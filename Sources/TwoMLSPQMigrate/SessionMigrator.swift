@@ -79,7 +79,8 @@ public enum SessionMigrator {
 			pqTurnMine: export.pqTurnMine,
 			owedBind: export.owedBind.map {
 				TwoMLSPQSession.MigratedOwedBind(
-					pqCommitMessage: $0.pqCommit, tEpoch: $0.tEpoch, pqEpoch: $0.pqEpoch)
+					pqCommitMessage: $0.pqCommit, tEpoch: $0.tEpoch,
+					pqEpoch: $0.pqEpoch)
 			},
 			pqInflight: export.pqInflight.map(pqInflight),
 			pendingSideBand: export.pendingSideBand,
@@ -90,7 +91,8 @@ public enum SessionMigrator {
 			offeredProposal: export.offeredProposal.map(digestedProposal),
 			queuedProposal: export.queuedProposal.map(digestedProposal),
 			stagedUpdates: export.stagedUpdates.map {
-				TwoMLSPQSession.MigratedStagedUpdate(digest: $0.digest, message: $0.message)
+				TwoMLSPQSession.MigratedStagedUpdate(
+					digest: $0.digest, message: $0.message)
 			},
 			sendCrossPSKLedger: pskLedger(export.sendCrossPskLedger),
 			spawnToken: export.spawnToken,
@@ -99,7 +101,9 @@ public enum SessionMigrator {
 			recvHeaderKeysPQ: epochMap(export.recvHeaderKeysPq),
 			sendAttachmentLedger: attachmentMap(export.sendAttachmentLedger),
 			recvAttachmentLedger: attachmentMap(export.recvAttachmentLedger),
-			initialTheirKP: export.initialTheirKp.map { (classical: $0.classical, pq: $0.pq) },
+			initialTheirKP: export.initialTheirKp.map {
+				(classical: $0.classical, pq: $0.pq)
+			},
 			owesEstablishmentEnvelope: export.owesEstablishmentEnvelope)
 	}
 

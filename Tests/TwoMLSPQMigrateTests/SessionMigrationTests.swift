@@ -33,12 +33,6 @@ final class SessionMigrationTests: XCTestCase {
 		for: .curve25519ChaCha)!
 	private let pqProvider = MLKEM768CipherSuiteProvider()
 
-	override func setUp() async throws {
-		throw XCTSkip(
-			"blocked on mls-rs slice A: check_secret_key_len maps suite 0x0003 to 48 (X25519 is 32)"
-		)
-	}
-
 	// MARK: AC1 — differential session migration (checkpoint kind)
 
 	func testMigratedSessionKeepsMessagingWithRustPeer() throws {
@@ -171,7 +165,8 @@ final class SessionMigrationTests: XCTestCase {
 			throw NSError(
 				domain: "sm", code: 1,
 				userInfo: [
-					NSLocalizedDescriptionKey: "expected a bootstrap-KP envelope, got \(other)"
+					NSLocalizedDescriptionKey:
+						"expected a bootstrap-KP envelope, got \(other)"
 				])
 		}
 		let welcome: Data

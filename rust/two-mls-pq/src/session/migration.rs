@@ -693,7 +693,6 @@ mod tests {
     /// the identity round-trips a self-consistent key-package pair.
     #[cfg(feature = "cryptokit")]
     #[test]
-    #[ignore = "blocked on mls-rs slice A: check_secret_key_len maps suite 0x0003 to 48 (X25519 is 32)"]
     fn test_migration_export_established_session() {
         let (alice, bob) = establish_confirmed_sessions();
 
@@ -736,7 +735,6 @@ mod tests {
     /// topology gate keys off the RECV pair for a responder.
     #[cfg(feature = "cryptokit")]
     #[test]
-    #[ignore = "blocked on mls-rs slice A: check_secret_key_len maps suite 0x0003 to 48 (X25519 is 32)"]
     fn test_migration_export_acceptor_pre_bootstrap() {
         let alice = make_client();
         let bob = make_client();
