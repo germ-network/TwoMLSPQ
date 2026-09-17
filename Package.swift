@@ -126,8 +126,9 @@ let package = Package(
 				.product(name: "SecretBytes", package: "swift-secret-bytes"),
 				// The session mint takes per-half `CipherSuiteProvider`s (the
 				// invitation mint was provider-free) — `MLS.CipherSuiteProvider`
-				// lives in swift-mls's MLSCrypto.
+				// lives in swift-mls's MLSCrypto, its `MLS` namespace in MLSCodec.
 				.product(name: "MLSCrypto", package: "swift-mls"),
+				.product(name: "MLSCodec", package: "swift-mls"),
 			]
 		),
 		// The concrete/FFI-level suites: raw-FFI invitation flows and the total

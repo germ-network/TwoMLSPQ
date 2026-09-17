@@ -457,6 +457,22 @@ fileprivate struct FfiConverterUInt16: FfiConverterPrimitive {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterUInt32: FfiConverterPrimitive {
+    typealias FfiType = UInt32
+    typealias SwiftType = UInt32
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UInt32 {
+        return try lift(readInt(&buf))
+    }
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterUInt64: FfiConverterPrimitive {
     typealias FfiType = UInt64
     typealias SwiftType = UInt64
@@ -2205,6 +2221,24 @@ public protocol TwoMlsPqSessionProtocol: AnyObject, Sendable {
     func shouldListenOn() throws  -> ListenChannels
     
     /**
+     * Export this session as the migration payload for the twomlspq-swift
+     * session mint (GER-2433 C1): every group half as a format-2 snapshot plus
+     * the session metadata `SessionMigration.mintArchive` mints a native
+     * `SessionArchive` from.
+     *
+     * Admits only an ESTABLISHED, quiescent session — see the module note for
+     * the refused states (`SessionNotReady`; `ArchiveInvalid` for torn or
+     * unrecoverable state; `Mls` when a group half refuses its own export,
+     * e.g. a pending commit).
+     *
+     * Emits PLAINTEXT SECRET material — the caller seals (the `ArchiveSink`
+     * contract). PQ secret material is exported in the CryptoKit 96-byte
+     * representation, correct only under the `cryptokit` provider build;
+     * under `awslc` the length guards fail the export as `ArchiveInvalid`.
+     */
+    func migrationExport() throws  -> SessionMigrationExport
+    
+    /**
      * Whose move the PQ side-band is: true when this side owes the next operation.
      * The initiator owes the A.3 bootstrap; completing an operation passes the turn.
      */
@@ -3158,6 +3192,30 @@ open func sendRendezvous()throws  -> RendezvousId?  {
 open func shouldListenOn()throws  -> ListenChannels  {
     return try  FfiConverterTypeListenChannels_lift(try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
     uniffi_two_mls_pq_fn_method_twomlspqsession_should_listen_on(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * Export this session as the migration payload for the twomlspq-swift
+     * session mint (GER-2433 C1): every group half as a format-2 snapshot plus
+     * the session metadata `SessionMigration.mintArchive` mints a native
+     * `SessionArchive` from.
+     *
+     * Admits only an ESTABLISHED, quiescent session — see the module note for
+     * the refused states (`SessionNotReady`; `ArchiveInvalid` for torn or
+     * unrecoverable state; `Mls` when a group half refuses its own export,
+     * e.g. a pending commit).
+     *
+     * Emits PLAINTEXT SECRET material — the caller seals (the `ArchiveSink`
+     * contract). PQ secret material is exported in the CryptoKit 96-byte
+     * representation, correct only under the `cryptokit` provider build;
+     * under `awslc` the length guards fail the export as `ArchiveInvalid`.
+     */
+open func migrationExport()throws  -> SessionMigrationExport  {
+    return try  FfiConverterTypeSessionMigrationExport_lift(try rustCallWithError(FfiConverterTypeTwoMlsPqError_lift) {
+    uniffi_two_mls_pq_fn_method_twomlspqsession_migration_export(
             self.uniffiCloneHandle(),$0
     )
 })
@@ -5139,6 +5197,936 @@ public func FfiConverterTypeRendezvousId_lower(_ value: RendezvousId) -> RustBuf
     return FfiConverterTypeRendezvousId.lower(value)
 }
 
+
+/**
+ * The session-owned A.3 bootstrap KP secret (PQ): both HPKE secrets are the
+ * CryptoKit 96-byte representation, `key_package` the BARE `KeyPackage` bytes.
+ */
+public struct SessionMigrationBootstrapKp: Equatable, Hashable {
+    public var leafSecretKey: Data
+    public var initSecretKey: Data
+    public var keyPackage: Data
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(leafSecretKey: Data, initSecretKey: Data, keyPackage: Data) {
+        self.leafSecretKey = leafSecretKey
+        self.initSecretKey = initSecretKey
+        self.keyPackage = keyPackage
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension SessionMigrationBootstrapKp: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSessionMigrationBootstrapKp: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SessionMigrationBootstrapKp {
+        return
+            try SessionMigrationBootstrapKp(
+                leafSecretKey: FfiConverterData.read(from: &buf), 
+                initSecretKey: FfiConverterData.read(from: &buf), 
+                keyPackage: FfiConverterData.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SessionMigrationBootstrapKp, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.leafSecretKey, into: &buf)
+        FfiConverterData.write(value.initSecretKey, into: &buf)
+        FfiConverterData.write(value.keyPackage, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSessionMigrationBootstrapKp_lift(_ buf: RustBuffer) throws -> SessionMigrationBootstrapKp {
+    return try FfiConverterTypeSessionMigrationBootstrapKp.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSessionMigrationBootstrapKp_lower(_ value: SessionMigrationBootstrapKp) -> RustBuffer {
+    return FfiConverterTypeSessionMigrationBootstrapKp.lower(value)
+}
+
+
+/**
+ * A combiner key package pair as BARE RFC 9420 `KeyPackage` bytes (the
+ * published form is MLSMessage-framed; the native mint decodes bare).
+ */
+public struct SessionMigrationCombinerKp: Equatable, Hashable {
+    public var classical: Data
+    public var pq: Data
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(classical: Data, pq: Data) {
+        self.classical = classical
+        self.pq = pq
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension SessionMigrationCombinerKp: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSessionMigrationCombinerKp: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SessionMigrationCombinerKp {
+        return
+            try SessionMigrationCombinerKp(
+                classical: FfiConverterData.read(from: &buf), 
+                pq: FfiConverterData.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SessionMigrationCombinerKp, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.classical, into: &buf)
+        FfiConverterData.write(value.pq, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSessionMigrationCombinerKp_lift(_ buf: RustBuffer) throws -> SessionMigrationCombinerKp {
+    return try FfiConverterTypeSessionMigrationCombinerKp.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSessionMigrationCombinerKp_lower(_ value: SessionMigrationCombinerKp) -> RustBuffer {
+    return FfiConverterTypeSessionMigrationCombinerKp.lower(value)
+}
+
+
+/**
+ * A digested proposal (offered / queued) in the native
+ * `DigestedProposalArchive` shape.
+ */
+public struct SessionMigrationDigestedProposal: Equatable, Hashable {
+    public var digest: Data
+    public var proposing: Data
+    public var message: Data
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(digest: Data, proposing: Data, message: Data) {
+        self.digest = digest
+        self.proposing = proposing
+        self.message = message
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension SessionMigrationDigestedProposal: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSessionMigrationDigestedProposal: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SessionMigrationDigestedProposal {
+        return
+            try SessionMigrationDigestedProposal(
+                digest: FfiConverterData.read(from: &buf), 
+                proposing: FfiConverterData.read(from: &buf), 
+                message: FfiConverterData.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SessionMigrationDigestedProposal, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.digest, into: &buf)
+        FfiConverterData.write(value.proposing, into: &buf)
+        FfiConverterData.write(value.message, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSessionMigrationDigestedProposal_lift(_ buf: RustBuffer) throws -> SessionMigrationDigestedProposal {
+    return try FfiConverterTypeSessionMigrationDigestedProposal.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSessionMigrationDigestedProposal_lower(_ value: SessionMigrationDigestedProposal) -> RustBuffer {
+    return FfiConverterTypeSessionMigrationDigestedProposal.lower(value)
+}
+
+
+/**
+ * One epoch-keyed byte entry (listen rendezvous, header receive keys,
+ * attachment-CEK ledgers) — flat list form; the Swift side rebuilds its
+ * dictionaries.
+ */
+public struct SessionMigrationEpochEntry: Equatable, Hashable {
+    public var epoch: UInt64
+    public var bytes: Data
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(epoch: UInt64, bytes: Data) {
+        self.epoch = epoch
+        self.bytes = bytes
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension SessionMigrationEpochEntry: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSessionMigrationEpochEntry: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SessionMigrationEpochEntry {
+        return
+            try SessionMigrationEpochEntry(
+                epoch: FfiConverterUInt64.read(from: &buf), 
+                bytes: FfiConverterData.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SessionMigrationEpochEntry, into buf: inout [UInt8]) {
+        FfiConverterUInt64.write(value.epoch, into: &buf)
+        FfiConverterData.write(value.bytes, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSessionMigrationEpochEntry_lift(_ buf: RustBuffer) throws -> SessionMigrationEpochEntry {
+    return try FfiConverterTypeSessionMigrationEpochEntry.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSessionMigrationEpochEntry_lower(_ value: SessionMigrationEpochEntry) -> RustBuffer {
+    return FfiConverterTypeSessionMigrationEpochEntry.lower(value)
+}
+
+
+/**
+ * The full migration export of one session (GER-2433 C1):
+ * `TwoMlsPqSession::migration_export`'s return, the Rust-side image of
+ * twomlspq-swift's `MigratedSession`. The four native manifest fields
+ * (`sendPQEpoch` etc.) are deliberately ABSENT — the mint derives them from
+ * the restored groups so an export cannot disagree with its own snapshots.
+ */
+public struct SessionMigrationExport: Equatable, Hashable {
+    public var stateSeq: UInt64
+    /**
+     * Whether this session initiated (native `initiated`). Sourced as
+     * "no acceptor-side bootstrap-KP commitment" — `receive` always pins one,
+     * `initiate` never does.
+     */
+    public var initiated: Bool
+    public var identity: SessionMigrationIdentity
+    public var authMine: SessionMigrationPartySequence
+    public var authTheirs: SessionMigrationPartySequence
+    public var sendGroup: SessionMigrationGroupHalf
+    /**
+     * `Some` on every export the gates admit (see the module note) — the
+     * field stays `Option` because the native shape allows a
+     * pre-establishment initiator even though this export refuses one.
+     */
+    public var recvGroup: SessionMigrationGroupHalf?
+    public var currentStaple: Data
+    public var pendingProposal: SessionMigrationProposal?
+    /**
+     * The native model retains EVERY Upd(self) staged this recv epoch; the
+     * Rust session holds only the latest, so this is the pending proposal
+     * (when one is outstanding) as a one-element list.
+     */
+    public var stagedUpdates: [SessionMigrationStagedUpdate]
+    public var joinedWelcomeDigest: Data?
+    public var bootstrapKpSecret: SessionMigrationBootstrapKp?
+    public var expectedBootstrapKpCommitment: Data?
+    public var pqTurnMine: Bool
+    public var owedBind: SessionMigrationOwedBind?
+    public var pqInflight: SessionMigrationPqInflight?
+    public var pendingSideBand: Data?
+    public var peerAppliedSendEpoch: UInt64?
+    public var lastCrossInjected: UInt64?
+    public var lastCrossInjectedPq: UInt64?
+    public var lastSendPqExported: UInt64?
+    public var offeredProposal: SessionMigrationDigestedProposal?
+    public var queuedProposal: SessionMigrationDigestedProposal?
+    public var sendCrossPskLedger: [SessionMigrationPskEntry]
+    public var spawnToken: Data?
+    public var listenRendezvous: [SessionMigrationEpochEntry]
+    public var recvHeaderKeys: [SessionMigrationEpochEntry]
+    public var recvHeaderKeysPq: [SessionMigrationEpochEntry]
+    public var sendAttachmentLedger: [SessionMigrationEpochEntry]
+    public var recvAttachmentLedger: [SessionMigrationEpochEntry]
+    public var initialTheirKp: SessionMigrationCombinerKp?
+    /**
+     * `requires_establishment_envelope` under its native name.
+     */
+    public var owesEstablishmentEnvelope: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(stateSeq: UInt64, 
+        /**
+         * Whether this session initiated (native `initiated`). Sourced as
+         * "no acceptor-side bootstrap-KP commitment" — `receive` always pins one,
+         * `initiate` never does.
+         */initiated: Bool, identity: SessionMigrationIdentity, authMine: SessionMigrationPartySequence, authTheirs: SessionMigrationPartySequence, sendGroup: SessionMigrationGroupHalf, 
+        /**
+         * `Some` on every export the gates admit (see the module note) — the
+         * field stays `Option` because the native shape allows a
+         * pre-establishment initiator even though this export refuses one.
+         */recvGroup: SessionMigrationGroupHalf?, currentStaple: Data, pendingProposal: SessionMigrationProposal?, 
+        /**
+         * The native model retains EVERY Upd(self) staged this recv epoch; the
+         * Rust session holds only the latest, so this is the pending proposal
+         * (when one is outstanding) as a one-element list.
+         */stagedUpdates: [SessionMigrationStagedUpdate], joinedWelcomeDigest: Data?, bootstrapKpSecret: SessionMigrationBootstrapKp?, expectedBootstrapKpCommitment: Data?, pqTurnMine: Bool, owedBind: SessionMigrationOwedBind?, pqInflight: SessionMigrationPqInflight?, pendingSideBand: Data?, peerAppliedSendEpoch: UInt64?, lastCrossInjected: UInt64?, lastCrossInjectedPq: UInt64?, lastSendPqExported: UInt64?, offeredProposal: SessionMigrationDigestedProposal?, queuedProposal: SessionMigrationDigestedProposal?, sendCrossPskLedger: [SessionMigrationPskEntry], spawnToken: Data?, listenRendezvous: [SessionMigrationEpochEntry], recvHeaderKeys: [SessionMigrationEpochEntry], recvHeaderKeysPq: [SessionMigrationEpochEntry], sendAttachmentLedger: [SessionMigrationEpochEntry], recvAttachmentLedger: [SessionMigrationEpochEntry], initialTheirKp: SessionMigrationCombinerKp?, 
+        /**
+         * `requires_establishment_envelope` under its native name.
+         */owesEstablishmentEnvelope: Bool) {
+        self.stateSeq = stateSeq
+        self.initiated = initiated
+        self.identity = identity
+        self.authMine = authMine
+        self.authTheirs = authTheirs
+        self.sendGroup = sendGroup
+        self.recvGroup = recvGroup
+        self.currentStaple = currentStaple
+        self.pendingProposal = pendingProposal
+        self.stagedUpdates = stagedUpdates
+        self.joinedWelcomeDigest = joinedWelcomeDigest
+        self.bootstrapKpSecret = bootstrapKpSecret
+        self.expectedBootstrapKpCommitment = expectedBootstrapKpCommitment
+        self.pqTurnMine = pqTurnMine
+        self.owedBind = owedBind
+        self.pqInflight = pqInflight
+        self.pendingSideBand = pendingSideBand
+        self.peerAppliedSendEpoch = peerAppliedSendEpoch
+        self.lastCrossInjected = lastCrossInjected
+        self.lastCrossInjectedPq = lastCrossInjectedPq
+        self.lastSendPqExported = lastSendPqExported
+        self.offeredProposal = offeredProposal
+        self.queuedProposal = queuedProposal
+        self.sendCrossPskLedger = sendCrossPskLedger
+        self.spawnToken = spawnToken
+        self.listenRendezvous = listenRendezvous
+        self.recvHeaderKeys = recvHeaderKeys
+        self.recvHeaderKeysPq = recvHeaderKeysPq
+        self.sendAttachmentLedger = sendAttachmentLedger
+        self.recvAttachmentLedger = recvAttachmentLedger
+        self.initialTheirKp = initialTheirKp
+        self.owesEstablishmentEnvelope = owesEstablishmentEnvelope
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension SessionMigrationExport: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSessionMigrationExport: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SessionMigrationExport {
+        return
+            try SessionMigrationExport(
+                stateSeq: FfiConverterUInt64.read(from: &buf), 
+                initiated: FfiConverterBool.read(from: &buf), 
+                identity: FfiConverterTypeSessionMigrationIdentity.read(from: &buf), 
+                authMine: FfiConverterTypeSessionMigrationPartySequence.read(from: &buf), 
+                authTheirs: FfiConverterTypeSessionMigrationPartySequence.read(from: &buf), 
+                sendGroup: FfiConverterTypeSessionMigrationGroupHalf.read(from: &buf), 
+                recvGroup: FfiConverterOptionTypeSessionMigrationGroupHalf.read(from: &buf), 
+                currentStaple: FfiConverterData.read(from: &buf), 
+                pendingProposal: FfiConverterOptionTypeSessionMigrationProposal.read(from: &buf), 
+                stagedUpdates: FfiConverterSequenceTypeSessionMigrationStagedUpdate.read(from: &buf), 
+                joinedWelcomeDigest: FfiConverterOptionData.read(from: &buf), 
+                bootstrapKpSecret: FfiConverterOptionTypeSessionMigrationBootstrapKp.read(from: &buf), 
+                expectedBootstrapKpCommitment: FfiConverterOptionData.read(from: &buf), 
+                pqTurnMine: FfiConverterBool.read(from: &buf), 
+                owedBind: FfiConverterOptionTypeSessionMigrationOwedBind.read(from: &buf), 
+                pqInflight: FfiConverterOptionTypeSessionMigrationPqInflight.read(from: &buf), 
+                pendingSideBand: FfiConverterOptionData.read(from: &buf), 
+                peerAppliedSendEpoch: FfiConverterOptionUInt64.read(from: &buf), 
+                lastCrossInjected: FfiConverterOptionUInt64.read(from: &buf), 
+                lastCrossInjectedPq: FfiConverterOptionUInt64.read(from: &buf), 
+                lastSendPqExported: FfiConverterOptionUInt64.read(from: &buf), 
+                offeredProposal: FfiConverterOptionTypeSessionMigrationDigestedProposal.read(from: &buf), 
+                queuedProposal: FfiConverterOptionTypeSessionMigrationDigestedProposal.read(from: &buf), 
+                sendCrossPskLedger: FfiConverterSequenceTypeSessionMigrationPskEntry.read(from: &buf), 
+                spawnToken: FfiConverterOptionData.read(from: &buf), 
+                listenRendezvous: FfiConverterSequenceTypeSessionMigrationEpochEntry.read(from: &buf), 
+                recvHeaderKeys: FfiConverterSequenceTypeSessionMigrationEpochEntry.read(from: &buf), 
+                recvHeaderKeysPq: FfiConverterSequenceTypeSessionMigrationEpochEntry.read(from: &buf), 
+                sendAttachmentLedger: FfiConverterSequenceTypeSessionMigrationEpochEntry.read(from: &buf), 
+                recvAttachmentLedger: FfiConverterSequenceTypeSessionMigrationEpochEntry.read(from: &buf), 
+                initialTheirKp: FfiConverterOptionTypeSessionMigrationCombinerKp.read(from: &buf), 
+                owesEstablishmentEnvelope: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SessionMigrationExport, into buf: inout [UInt8]) {
+        FfiConverterUInt64.write(value.stateSeq, into: &buf)
+        FfiConverterBool.write(value.initiated, into: &buf)
+        FfiConverterTypeSessionMigrationIdentity.write(value.identity, into: &buf)
+        FfiConverterTypeSessionMigrationPartySequence.write(value.authMine, into: &buf)
+        FfiConverterTypeSessionMigrationPartySequence.write(value.authTheirs, into: &buf)
+        FfiConverterTypeSessionMigrationGroupHalf.write(value.sendGroup, into: &buf)
+        FfiConverterOptionTypeSessionMigrationGroupHalf.write(value.recvGroup, into: &buf)
+        FfiConverterData.write(value.currentStaple, into: &buf)
+        FfiConverterOptionTypeSessionMigrationProposal.write(value.pendingProposal, into: &buf)
+        FfiConverterSequenceTypeSessionMigrationStagedUpdate.write(value.stagedUpdates, into: &buf)
+        FfiConverterOptionData.write(value.joinedWelcomeDigest, into: &buf)
+        FfiConverterOptionTypeSessionMigrationBootstrapKp.write(value.bootstrapKpSecret, into: &buf)
+        FfiConverterOptionData.write(value.expectedBootstrapKpCommitment, into: &buf)
+        FfiConverterBool.write(value.pqTurnMine, into: &buf)
+        FfiConverterOptionTypeSessionMigrationOwedBind.write(value.owedBind, into: &buf)
+        FfiConverterOptionTypeSessionMigrationPqInflight.write(value.pqInflight, into: &buf)
+        FfiConverterOptionData.write(value.pendingSideBand, into: &buf)
+        FfiConverterOptionUInt64.write(value.peerAppliedSendEpoch, into: &buf)
+        FfiConverterOptionUInt64.write(value.lastCrossInjected, into: &buf)
+        FfiConverterOptionUInt64.write(value.lastCrossInjectedPq, into: &buf)
+        FfiConverterOptionUInt64.write(value.lastSendPqExported, into: &buf)
+        FfiConverterOptionTypeSessionMigrationDigestedProposal.write(value.offeredProposal, into: &buf)
+        FfiConverterOptionTypeSessionMigrationDigestedProposal.write(value.queuedProposal, into: &buf)
+        FfiConverterSequenceTypeSessionMigrationPskEntry.write(value.sendCrossPskLedger, into: &buf)
+        FfiConverterOptionData.write(value.spawnToken, into: &buf)
+        FfiConverterSequenceTypeSessionMigrationEpochEntry.write(value.listenRendezvous, into: &buf)
+        FfiConverterSequenceTypeSessionMigrationEpochEntry.write(value.recvHeaderKeys, into: &buf)
+        FfiConverterSequenceTypeSessionMigrationEpochEntry.write(value.recvHeaderKeysPq, into: &buf)
+        FfiConverterSequenceTypeSessionMigrationEpochEntry.write(value.sendAttachmentLedger, into: &buf)
+        FfiConverterSequenceTypeSessionMigrationEpochEntry.write(value.recvAttachmentLedger, into: &buf)
+        FfiConverterOptionTypeSessionMigrationCombinerKp.write(value.initialTheirKp, into: &buf)
+        FfiConverterBool.write(value.owesEstablishmentEnvelope, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSessionMigrationExport_lift(_ buf: RustBuffer) throws -> SessionMigrationExport {
+    return try FfiConverterTypeSessionMigrationExport.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSessionMigrationExport_lower(_ value: SessionMigrationExport) -> RustBuffer {
+    return FfiConverterTypeSessionMigrationExport.lower(value)
+}
+
+
+/**
+ * One Combiner group half-pair: each present half's swift-mls format-2
+ * snapshot bytes (`Group::export_for_swift` output — plaintext secret
+ * material). `pq` is `None` where the PQ half is deferred (an acceptor's send
+ * group before the A.3 bootstrap).
+ */
+public struct SessionMigrationGroupHalf: Equatable, Hashable {
+    public var classical: Data
+    public var pq: Data?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(classical: Data, pq: Data?) {
+        self.classical = classical
+        self.pq = pq
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension SessionMigrationGroupHalf: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSessionMigrationGroupHalf: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SessionMigrationGroupHalf {
+        return
+            try SessionMigrationGroupHalf(
+                classical: FfiConverterData.read(from: &buf), 
+                pq: FfiConverterOptionData.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SessionMigrationGroupHalf, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.classical, into: &buf)
+        FfiConverterOptionData.write(value.pq, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSessionMigrationGroupHalf_lift(_ buf: RustBuffer) throws -> SessionMigrationGroupHalf {
+    return try FfiConverterTypeSessionMigrationGroupHalf.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSessionMigrationGroupHalf_lower(_ value: SessionMigrationGroupHalf) -> RustBuffer {
+    return FfiConverterTypeSessionMigrationGroupHalf.lower(value)
+}
+
+
+/**
+ * The session's signing identity — the Rust-side image of twomlspq-swift's
+ * `MigratedSessionIdentity`. Byte conventions match the invitation export:
+ * Ed25519 signing keys normalized to the bare 32-byte raw representation, PQ
+ * HPKE secrets the CryptoKit 96-byte `integrityCheckedRepresentation`,
+ * `*_key_package` the BARE RFC 9420 `KeyPackage` bytes. `signature_key` /
+ * `pq_signature_key` are derived from the chosen key packages (the same
+ * source the mint cross-checks against).
+ *
+ * A session identity's retained key packages are normally CONSUMED (mls-rs
+ * deletes each on join), so an established session usually holds none: the
+ * export then mints a fresh, self-consistent key package pair under the
+ * session's signing keys (the identity key packages are dormant in an
+ * established session — every post-establishment flow keys off the group
+ * snapshots or the session-owned bootstrap KP). `classical_init_secret_key`
+ * is always `None`: the mint admits one only for a pre-establishment
+ * initiator, which this export refuses wholesale.
+ */
+public struct SessionMigrationIdentity: Equatable, Hashable {
+    public var clientId: Data
+    public var signingKey: Data
+    public var signatureKey: Data
+    public var pqSigningKey: Data
+    public var pqSignatureKey: Data
+    public var classicalLeafSecretKey: Data
+    public var classicalInitSecretKey: Data?
+    public var pqLeafSecretKey: Data
+    public var classicalKeyPackage: Data
+    public var pqKeyPackage: Data
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(clientId: Data, signingKey: Data, signatureKey: Data, pqSigningKey: Data, pqSignatureKey: Data, classicalLeafSecretKey: Data, classicalInitSecretKey: Data?, pqLeafSecretKey: Data, classicalKeyPackage: Data, pqKeyPackage: Data) {
+        self.clientId = clientId
+        self.signingKey = signingKey
+        self.signatureKey = signatureKey
+        self.pqSigningKey = pqSigningKey
+        self.pqSignatureKey = pqSignatureKey
+        self.classicalLeafSecretKey = classicalLeafSecretKey
+        self.classicalInitSecretKey = classicalInitSecretKey
+        self.pqLeafSecretKey = pqLeafSecretKey
+        self.classicalKeyPackage = classicalKeyPackage
+        self.pqKeyPackage = pqKeyPackage
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension SessionMigrationIdentity: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSessionMigrationIdentity: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SessionMigrationIdentity {
+        return
+            try SessionMigrationIdentity(
+                clientId: FfiConverterData.read(from: &buf), 
+                signingKey: FfiConverterData.read(from: &buf), 
+                signatureKey: FfiConverterData.read(from: &buf), 
+                pqSigningKey: FfiConverterData.read(from: &buf), 
+                pqSignatureKey: FfiConverterData.read(from: &buf), 
+                classicalLeafSecretKey: FfiConverterData.read(from: &buf), 
+                classicalInitSecretKey: FfiConverterOptionData.read(from: &buf), 
+                pqLeafSecretKey: FfiConverterData.read(from: &buf), 
+                classicalKeyPackage: FfiConverterData.read(from: &buf), 
+                pqKeyPackage: FfiConverterData.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SessionMigrationIdentity, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.clientId, into: &buf)
+        FfiConverterData.write(value.signingKey, into: &buf)
+        FfiConverterData.write(value.signatureKey, into: &buf)
+        FfiConverterData.write(value.pqSigningKey, into: &buf)
+        FfiConverterData.write(value.pqSignatureKey, into: &buf)
+        FfiConverterData.write(value.classicalLeafSecretKey, into: &buf)
+        FfiConverterOptionData.write(value.classicalInitSecretKey, into: &buf)
+        FfiConverterData.write(value.pqLeafSecretKey, into: &buf)
+        FfiConverterData.write(value.classicalKeyPackage, into: &buf)
+        FfiConverterData.write(value.pqKeyPackage, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSessionMigrationIdentity_lift(_ buf: RustBuffer) throws -> SessionMigrationIdentity {
+    return try FfiConverterTypeSessionMigrationIdentity.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSessionMigrationIdentity_lower(_ value: SessionMigrationIdentity) -> RustBuffer {
+    return FfiConverterTypeSessionMigrationIdentity.lower(value)
+}
+
+
+/**
+ * A PQ commit awaiting its classical bind (see `SessionInner::owed_bind`).
+ */
+public struct SessionMigrationOwedBind: Equatable, Hashable {
+    public var pqCommit: Data
+    public var tEpoch: UInt64
+    public var pqEpoch: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(pqCommit: Data, tEpoch: UInt64, pqEpoch: UInt64) {
+        self.pqCommit = pqCommit
+        self.tEpoch = tEpoch
+        self.pqEpoch = pqEpoch
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension SessionMigrationOwedBind: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSessionMigrationOwedBind: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SessionMigrationOwedBind {
+        return
+            try SessionMigrationOwedBind(
+                pqCommit: FfiConverterData.read(from: &buf), 
+                tEpoch: FfiConverterUInt64.read(from: &buf), 
+                pqEpoch: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SessionMigrationOwedBind, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.pqCommit, into: &buf)
+        FfiConverterUInt64.write(value.tEpoch, into: &buf)
+        FfiConverterUInt64.write(value.pqEpoch, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSessionMigrationOwedBind_lift(_ buf: RustBuffer) throws -> SessionMigrationOwedBind {
+    return try FfiConverterTypeSessionMigrationOwedBind.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSessionMigrationOwedBind_lower(_ value: SessionMigrationOwedBind) -> RustBuffer {
+    return FfiConverterTypeSessionMigrationOwedBind.lower(value)
+}
+
+
+/**
+ * One party's AS credential sequence (see `apq::authentication::PartySequence`).
+ */
+public struct SessionMigrationPartySequence: Equatable, Hashable {
+    public var history: [Data]
+    public var authorizedNext: [Data]
+    public var pinned: [Data]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(history: [Data], authorizedNext: [Data], pinned: [Data]) {
+        self.history = history
+        self.authorizedNext = authorizedNext
+        self.pinned = pinned
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension SessionMigrationPartySequence: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSessionMigrationPartySequence: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SessionMigrationPartySequence {
+        return
+            try SessionMigrationPartySequence(
+                history: FfiConverterSequenceData.read(from: &buf), 
+                authorizedNext: FfiConverterSequenceData.read(from: &buf), 
+                pinned: FfiConverterSequenceData.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SessionMigrationPartySequence, into buf: inout [UInt8]) {
+        FfiConverterSequenceData.write(value.history, into: &buf)
+        FfiConverterSequenceData.write(value.authorizedNext, into: &buf)
+        FfiConverterSequenceData.write(value.pinned, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSessionMigrationPartySequence_lift(_ buf: RustBuffer) throws -> SessionMigrationPartySequence {
+    return try FfiConverterTypeSessionMigrationPartySequence.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSessionMigrationPartySequence_lower(_ value: SessionMigrationPartySequence) -> RustBuffer {
+    return FfiConverterTypeSessionMigrationPartySequence.lower(value)
+}
+
+
+/**
+ * The staged Upd(self) awaiting the peer's fold: `pending_proposal_hash` +
+ * `pending_proposal_message` combined into the native `PendingProposal`
+ * shape.
+ */
+public struct SessionMigrationProposal: Equatable, Hashable {
+    public var proposing: Data
+    public var message: Data
+    public var hash: Data
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(proposing: Data, message: Data, hash: Data) {
+        self.proposing = proposing
+        self.message = message
+        self.hash = hash
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension SessionMigrationProposal: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSessionMigrationProposal: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SessionMigrationProposal {
+        return
+            try SessionMigrationProposal(
+                proposing: FfiConverterData.read(from: &buf), 
+                message: FfiConverterData.read(from: &buf), 
+                hash: FfiConverterData.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SessionMigrationProposal, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.proposing, into: &buf)
+        FfiConverterData.write(value.message, into: &buf)
+        FfiConverterData.write(value.hash, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSessionMigrationProposal_lift(_ buf: RustBuffer) throws -> SessionMigrationProposal {
+    return try FfiConverterTypeSessionMigrationProposal.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSessionMigrationProposal_lower(_ value: SessionMigrationProposal) -> RustBuffer {
+    return FfiConverterTypeSessionMigrationProposal.lower(value)
+}
+
+
+/**
+ * One cross-party PSK ledger entry. `component_id` is `u32` on the Rust side;
+ * the Swift mapper narrows it (checked) to the native `UInt16`.
+ */
+public struct SessionMigrationPskEntry: Equatable, Hashable {
+    public var epoch: UInt64
+    public var componentId: UInt32
+    public var pskId: Data
+    public var psk: Data
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(epoch: UInt64, componentId: UInt32, pskId: Data, psk: Data) {
+        self.epoch = epoch
+        self.componentId = componentId
+        self.pskId = pskId
+        self.psk = psk
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension SessionMigrationPskEntry: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSessionMigrationPskEntry: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SessionMigrationPskEntry {
+        return
+            try SessionMigrationPskEntry(
+                epoch: FfiConverterUInt64.read(from: &buf), 
+                componentId: FfiConverterUInt32.read(from: &buf), 
+                pskId: FfiConverterData.read(from: &buf), 
+                psk: FfiConverterData.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SessionMigrationPskEntry, into buf: inout [UInt8]) {
+        FfiConverterUInt64.write(value.epoch, into: &buf)
+        FfiConverterUInt32.write(value.componentId, into: &buf)
+        FfiConverterData.write(value.pskId, into: &buf)
+        FfiConverterData.write(value.psk, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSessionMigrationPskEntry_lift(_ buf: RustBuffer) throws -> SessionMigrationPskEntry {
+    return try FfiConverterTypeSessionMigrationPskEntry.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSessionMigrationPskEntry_lower(_ value: SessionMigrationPskEntry) -> RustBuffer {
+    return FfiConverterTypeSessionMigrationPskEntry.lower(value)
+}
+
+
+/**
+ * One `stagedUpdates` entry: the digest + message of a staged Upd(self).
+ */
+public struct SessionMigrationStagedUpdate: Equatable, Hashable {
+    public var digest: Data
+    public var message: Data
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(digest: Data, message: Data) {
+        self.digest = digest
+        self.message = message
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension SessionMigrationStagedUpdate: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSessionMigrationStagedUpdate: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SessionMigrationStagedUpdate {
+        return
+            try SessionMigrationStagedUpdate(
+                digest: FfiConverterData.read(from: &buf), 
+                message: FfiConverterData.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SessionMigrationStagedUpdate, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.digest, into: &buf)
+        FfiConverterData.write(value.message, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSessionMigrationStagedUpdate_lift(_ buf: RustBuffer) throws -> SessionMigrationStagedUpdate {
+    return try FfiConverterTypeSessionMigrationStagedUpdate.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSessionMigrationStagedUpdate_lower(_ value: SessionMigrationStagedUpdate) -> RustBuffer {
+    return FfiConverterTypeSessionMigrationStagedUpdate.lower(value)
+}
+
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
@@ -5589,6 +6577,122 @@ public func FfiConverterTypePrincipalState_lift(_ buf: RustBuffer) throws -> Pri
 #endif
 public func FfiConverterTypePrincipalState_lower(_ value: PrincipalState) -> RustBuffer {
     return FfiConverterTypePrincipalState.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * The archivable `PqInflight` round state in the native `MigratedPQInflight`
+ * shape: the A.4 variants carry the round's KEM material, `RekeyInitiated`
+ * the leg-1 Upd' (lifted out of the retained side-band frame, whose `0x1B`
+ * tag is stripped).
+ */
+
+public enum SessionMigrationPqInflight: Equatable, Hashable {
+    
+    case bootstrapInitiated
+    case bootstrapResponded
+    /**
+     * ML-KEM-768 `integrityCheckedRepresentation` (96 B) decapsulation key +
+     * the encapsulation key.
+     */
+    case initiating(secretKey: Data, ek: Data
+    )
+    case responding(secret: Data, wireCt: Data
+    )
+    case rekeyInitiated(updMessage: Data
+    )
+    case rekeyResponded
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension SessionMigrationPqInflight: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSessionMigrationPqInflight: FfiConverterRustBuffer {
+    typealias SwiftType = SessionMigrationPqInflight
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SessionMigrationPqInflight {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .bootstrapInitiated
+        
+        case 2: return .bootstrapResponded
+        
+        case 3: return .initiating(secretKey: try FfiConverterData.read(from: &buf), ek: try FfiConverterData.read(from: &buf)
+        )
+        
+        case 4: return .responding(secret: try FfiConverterData.read(from: &buf), wireCt: try FfiConverterData.read(from: &buf)
+        )
+        
+        case 5: return .rekeyInitiated(updMessage: try FfiConverterData.read(from: &buf)
+        )
+        
+        case 6: return .rekeyResponded
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: SessionMigrationPqInflight, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .bootstrapInitiated:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .bootstrapResponded:
+            writeInt(&buf, Int32(2))
+        
+        
+        case let .initiating(secretKey,ek):
+            writeInt(&buf, Int32(3))
+            FfiConverterData.write(secretKey, into: &buf)
+            FfiConverterData.write(ek, into: &buf)
+            
+        
+        case let .responding(secret,wireCt):
+            writeInt(&buf, Int32(4))
+            FfiConverterData.write(secret, into: &buf)
+            FfiConverterData.write(wireCt, into: &buf)
+            
+        
+        case let .rekeyInitiated(updMessage):
+            writeInt(&buf, Int32(5))
+            FfiConverterData.write(updMessage, into: &buf)
+            
+        
+        case .rekeyResponded:
+            writeInt(&buf, Int32(6))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSessionMigrationPqInflight_lift(_ buf: RustBuffer) throws -> SessionMigrationPqInflight {
+    return try FfiConverterTypeSessionMigrationPqInflight.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSessionMigrationPqInflight_lower(_ value: SessionMigrationPqInflight) -> RustBuffer {
+    return FfiConverterTypeSessionMigrationPqInflight.lower(value)
 }
 
 
@@ -6486,6 +7590,150 @@ fileprivate struct FfiConverterOptionTypeRendezvousId: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeSessionMigrationBootstrapKp: FfiConverterRustBuffer {
+    typealias SwiftType = SessionMigrationBootstrapKp?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeSessionMigrationBootstrapKp.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeSessionMigrationBootstrapKp.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeSessionMigrationCombinerKp: FfiConverterRustBuffer {
+    typealias SwiftType = SessionMigrationCombinerKp?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeSessionMigrationCombinerKp.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeSessionMigrationCombinerKp.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeSessionMigrationDigestedProposal: FfiConverterRustBuffer {
+    typealias SwiftType = SessionMigrationDigestedProposal?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeSessionMigrationDigestedProposal.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeSessionMigrationDigestedProposal.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeSessionMigrationGroupHalf: FfiConverterRustBuffer {
+    typealias SwiftType = SessionMigrationGroupHalf?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeSessionMigrationGroupHalf.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeSessionMigrationGroupHalf.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeSessionMigrationOwedBind: FfiConverterRustBuffer {
+    typealias SwiftType = SessionMigrationOwedBind?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeSessionMigrationOwedBind.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeSessionMigrationOwedBind.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeSessionMigrationProposal: FfiConverterRustBuffer {
+    typealias SwiftType = SessionMigrationProposal?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeSessionMigrationProposal.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeSessionMigrationProposal.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypePqFrameKind: FfiConverterRustBuffer {
     typealias SwiftType = PqFrameKind?
 
@@ -6502,6 +7750,30 @@ fileprivate struct FfiConverterOptionTypePqFrameKind: FfiConverterRustBuffer {
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypePqFrameKind.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeSessionMigrationPqInflight: FfiConverterRustBuffer {
+    typealias SwiftType = SessionMigrationPqInflight?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeSessionMigrationPqInflight.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeSessionMigrationPqInflight.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -6577,6 +7849,81 @@ fileprivate struct FfiConverterSequenceTypeMigrationTableEntry: FfiConverterRust
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeMigrationTableEntry.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeSessionMigrationEpochEntry: FfiConverterRustBuffer {
+    typealias SwiftType = [SessionMigrationEpochEntry]
+
+    public static func write(_ value: [SessionMigrationEpochEntry], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeSessionMigrationEpochEntry.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [SessionMigrationEpochEntry] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [SessionMigrationEpochEntry]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeSessionMigrationEpochEntry.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeSessionMigrationPskEntry: FfiConverterRustBuffer {
+    typealias SwiftType = [SessionMigrationPskEntry]
+
+    public static func write(_ value: [SessionMigrationPskEntry], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeSessionMigrationPskEntry.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [SessionMigrationPskEntry] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [SessionMigrationPskEntry]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeSessionMigrationPskEntry.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeSessionMigrationStagedUpdate: FfiConverterRustBuffer {
+    typealias SwiftType = [SessionMigrationStagedUpdate]
+
+    public static func write(_ value: [SessionMigrationStagedUpdate], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeSessionMigrationStagedUpdate.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [SessionMigrationStagedUpdate] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [SessionMigrationStagedUpdate]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeSessionMigrationStagedUpdate.read(from: &buf))
         }
         return seq
     }
@@ -6907,6 +8254,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_should_listen_on() != 34726) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_migration_export() != 17140) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_my_pq_turn() != 12380) {

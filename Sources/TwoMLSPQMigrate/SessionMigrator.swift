@@ -1,4 +1,5 @@
 import Foundation
+import MLSCodec
 import MLSCrypto
 import SecretBytes
 import TwoMLSPQBinding
@@ -69,7 +70,7 @@ public enum SessionMigrator {
 			},
 			joinedWelcomeDigest: export.joinedWelcomeDigest,
 			bootstrapKPSecret: export.bootstrapKpSecret.map {
-				TwoMLSPQSession.MigratedBootstrapKPSecret(
+				try TwoMLSPQSession.MigratedBootstrapKPSecret(
 					leafSecretKey: SecretBytes(bytes: $0.leafSecretKey),
 					initSecretKey: SecretBytes(bytes: $0.initSecretKey),
 					keyPackage: $0.keyPackage)
@@ -104,8 +105,8 @@ public enum SessionMigrator {
 
 	private static func migratedIdentity(
 		_ identity: TwoMLSPQBinding.SessionMigrationIdentity
-	) -> TwoMLSPQSession.MigratedSessionIdentity {
-		TwoMLSPQSession.MigratedSessionIdentity(
+	) throws -> TwoMLSPQSession.MigratedSessionIdentity {
+		try TwoMLSPQSession.MigratedSessionIdentity(
 			clientID: identity.clientId,
 			signingKey: SecretBytes(bytes: identity.signingKey),
 			signatureKey: identity.signatureKey,
@@ -113,7 +114,7 @@ public enum SessionMigrator {
 			pqSignatureKey: identity.pqSignatureKey,
 			classicalLeafSecretKey: SecretBytes(bytes: identity.classicalLeafSecretKey),
 			classicalInitSecretKey: identity.classicalInitSecretKey.map {
-				SecretBytes(bytes: $0)
+				try SecretBytes(bytes: $0)
 			},
 			pqLeafSecretKey: SecretBytes(bytes: identity.pqLeafSecretKey),
 			// The native session path never carries a PQ init secret (cleared
@@ -152,16 +153,16 @@ public enum SessionMigrator {
 
 	private static func pqInflight(
 		_ inflight: TwoMLSPQBinding.SessionMigrationPqInflight
-	) -> TwoMLSPQSession.MigratedPQInflight {
+	) throws -> TwoMLSPQSession.MigratedPQInflight {
 		switch inflight {
 		case .bootstrapInitiated:
 			return .bootstrapInitiated
 		case .bootstrapResponded:
 			return .bootstrapResponded
 		case .initiating(let secretKey, let ek):
-			return .initiating(secretKey: SecretBytes(bytes: secretKey), ek: ek)
+			return try .initiating(secretKey: SecretBytes(bytes: secretKey), ek: ek)
 		case .responding(let secret, let wireCt):
-			return .responding(secret: SecretBytes(bytes: secret), wireCT: wireCt)
+			return try .responding(secret: SecretBytes(bytes: secret), wireCT: wireCt)
 		case .rekeyInitiated(let updMessage):
 			return .rekeyInitiated(updMessage: updMessage)
 		case .rekeyResponded:
@@ -183,7 +184,7 @@ public enum SessionMigrator {
 			else {
 				throw TwoMLSPQSession.TwoMLSError.archiveInvalid
 			}
-			ledger[entry.epoch] = TwoMLSPQSession.MigratedExportedPsk(
+			ledger[entry.epoch] = try TwoMLSPQSession.MigratedExportedPsk(
 				componentID: componentID,
 				pskID: entry.pskId,
 				psk: SecretBytes(bytes: entry.psk))
@@ -215,7 +216,7 @@ public enum SessionMigrator {
 			guard map[entry.epoch] == nil else {
 				throw TwoMLSPQSession.TwoMLSError.archiveInvalid
 			}
-			map[entry.epoch] = SecretBytes(bytes: entry.bytes)
+			map[entry.epoch] = try SecretBytes(bytes: entry.bytes)
 		}
 		return map
 	}
