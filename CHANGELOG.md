@@ -1,5 +1,11 @@
 # @germ-network/two-mls-pq
 
+## 0.18.0
+
+### Minor Changes
+
+- [#133](https://github.com/germ-network/TwoMLSPQ/pull/133) [`99578dc`](https://github.com/germ-network/TwoMLSPQ/commit/99578dcb5e5a397b8e3ae1d5478f2af0d21b64bc) Thanks [@germ-mark](https://github.com/germ-mark)! - Add a Rust-free `TwoMLSPQTypes` product carrying the pure-Swift currency types (`ClientID`, `PrincipalState`, `SessionError`, `WelcomeToken`, …) for consumers that build all-Swift and cannot link the `TwoMLSPQrs` xcframework (e.g. Android). `TwoMLSPQ` re-exports the new target, so `import TwoMLSPQ` is unchanged for existing consumers.
+
 ## 0.17.0
 
 ### Minor Changes
