@@ -1,5 +1,5 @@
 {
-  "originHash" : "0098bd3e52a77952cb4f22d7fbcc58b694823954c79174cdedb9c0302a5ca939",
+  "originHash" : "8bbbedc0770f4c34e0b47cbd9e0cb8f515776f4269250ae62052846f288b26f2",
   "pins" : [
     {
       "identity" : "atprototypes",
@@ -96,8 +96,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/germ-network/twomlspq-swift.git",
       "state" : {
-        "revision" : "696eb1d4717cd2199bfa91d4a08bed322d75bf9a",
-        "version" : "0.1.1"
+        "revision" : "16b10af0be7e4e778f56c79d85532ea4d3a8c2ef",
+        "version" : "0.1.3"
       }
     }
   ],
