@@ -16,7 +16,9 @@ public struct SessionError: Error, Sendable {
 	/// What the app should DO about the error — the recovery axis. Derived from `code`; drive
 	/// your recovery loop off this, use `code` for UI / telemetry / precise handling.
 	public enum Disposition: Sendable, Equatable, Hashable {
-		/// Transient: redelivery or reordering heals it. Retry.
+		/// Transient, or a needed artifact not yet minted: redelivery or reordering heals the
+		/// former; for the latter, a `.retryLater` from a restore / construction call retries the
+		/// RESTORE and KEEPS the artifact — there is no frame to spool.
 		case retryLater
 		/// Drop this frame; the session/invitation is unaffected. (See `.unopenableFrame` for
 		/// the re-establish-run heuristic.)
@@ -124,6 +126,19 @@ public struct SessionError: Error, Sendable {
 		/// Persisted blobs are corrupt / incompatible (version or PQ-epoch manifest mismatch).
 		/// Discard and re-establish; regenerate state.
 		case archiveInvalid
+		/// A persisted session archive whose checkpoint slot is not yet sealed. The state is NOT
+		/// KNOWN-CORRUPT — the gap is structural, not corruption, so do NOT discard or re-establish
+		/// over it (that is `archiveInvalid`'s job).
+		///
+		/// A checkpoint is minted only by a PQ round on the LIVE session that persisted this
+		/// archive. An archive whose establishing process exited before any PQ round cannot
+		/// self-heal by retrying — that gap is closed by the engine surfacing the acceptor
+		/// baseline at establishment.
+		///
+		/// Scoped today to the one nil-checkpoint guard in the downstream restore leaf
+		/// (CoreAppLogic `TwoMLSSessionRestore`); never produced by TwoMLSPQ's own
+		/// `SessionErrorBridge` (crate errors map elsewhere).
+		case checkpointPending
 		/// The remote key package's credential doesn't match the authenticated identity. The
 		/// invitation is NOT consumed.
 		case identityMismatch
@@ -213,6 +228,9 @@ public struct SessionError: Error, Sendable {
 			case .bindApplyFailed:
 				// Custody: the poisoned window's frames are recoverable after the restore — never
 				// let an exit ack them away.
+				return .retryLater
+			case .checkpointPending:
+				// Not corruption: retry the restore and keep the artifact — no frame to spool.
 				return .retryLater
 			case .credentialRejected:
 				return .approveAndReprocess

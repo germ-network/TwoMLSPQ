@@ -39,6 +39,7 @@ struct ErrorContractTests {
 			(.credentialRejected, .approveAndReprocess),
 			(.invitationSpent, .discardArtifact),
 			(.archiveInvalid, .discardArtifact),
+			(.checkpointPending, .retryLater),
 			(.identityMismatch, .rejectEstablishment),
 			(.pqUnavailable, .rejectEstablishment),
 			(.cipherSuiteMismatch, .rejectEstablishment),
