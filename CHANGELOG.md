@@ -1,5 +1,11 @@
 # @germ-network/two-mls-pq
 
+## 0.18.1
+
+### Patch Changes
+
+- [#136](https://github.com/germ-network/TwoMLSPQ/pull/136) [`57540c8`](https://github.com/germ-network/TwoMLSPQ/commit/57540c8d188f1e90fa88c92b320d9b3833149a16) Thanks [@germ-mark](https://github.com/germ-mark)! - Loosen the twomlspq-swift requirement from `.exact("0.1.1")` to `.upToNextMinor(from: "0.1.1")`. Library deps stay ranged: the exact pin was what forced a coordinated release of this repo every time a dep patch landed (twomlspq-swift 0.1.3's additive combiner-blob wire codec, needed by the Rust-free reduced Android build, was unresolvable against it). Patches here are additive, so the minor range is safe; exactness belongs to the app-level repo.
+
 ## 0.18.0
 
 ### Minor Changes
