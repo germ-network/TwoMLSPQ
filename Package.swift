@@ -83,7 +83,7 @@ let package = Package(
 		// automatically.
 		.package(
 			url: "https://github.com/germ-network/twomlspq-swift.git",
-			.exact("0.1.1")
+			.exact("0.1.3")
 		),
 		// Declared directly (not just transitively through twomlspq-swift) because
 		// the migrate targets import their products; the pins mirror twomlspq-swift's
