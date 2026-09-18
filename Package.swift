@@ -83,12 +83,15 @@ let package = Package(
 		// automatically.
 		.package(
 			url: "https://github.com/germ-network/twomlspq-swift.git",
-			.exact("0.1.1")
+			.upToNextMinor(from: "0.1.1")
 		),
 		// Declared directly (not just transitively through twomlspq-swift) because
-		// the migrate targets import their products; the pins mirror twomlspq-swift's
-		// own so a resolution conflict cannot arise, matching twomlspq-swift 0.1.1's
-		// own `exact: 0.1.1` swift-mls pin (which carries the C0 `Nsk` length check).
+		// the migrate targets import their products. Library deps stay ranged
+		// (`upToNextMinor`) — an exact pin here is what forces a coordinated
+		// release of THIS repo every time a dep's patch lands, and is what
+		// conflicts against a consumer's own tighter pin; twomlspq-swift's own
+		// swift-mls requirement is ranged the same way (the 0.1.1 floor carries
+		// the C0 `Nsk` length check). Exactness belongs to the app-level repo.
 		.package(
 			url: "https://github.com/germ-network/swift-mls.git",
 			.upToNextMinor(from: "0.1.1")
