@@ -1,5 +1,18 @@
 # @germ-network/two-mls-pq
 
+## 0.19.0
+
+### Minor Changes
+
+- [#138](https://github.com/germ-network/TwoMLSPQ/pull/138) [`ed5c691`](https://github.com/germ-network/TwoMLSPQ/commit/ed5c6911fba11d1bebcee59c64156642d9a27ffb) Thanks [@germ-mark](https://github.com/germ-mark)! - Add `SessionError.Code.checkpointPending`, dispositioned `.retryLater`, so a benign
+  no-checkpoint session archive is distinguishable from `.archiveInvalid`'s discard-and-
+  re-establish. A missing checkpoint is a structural gap, not corruption, so the restore
+  retries and keeps the artifact rather than regenerating it. This enables retiring the
+  free-text `"acceptorGap:"` detail-prefix workaround downstream.
+
+  Caveat: adding a public enum case is technically source-breaking for any downstream
+  exhaustive `switch` over `Code` without a default — in-repo consumers are verified clean.
+
 ## 0.18.1
 
 ### Patch Changes
