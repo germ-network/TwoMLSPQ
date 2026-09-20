@@ -70,9 +70,11 @@ let package = Package(
 		// release. The test target still mints client ids with `AgentPrivateKey` the way
 		// the app does — `ClientID` IS `AgentPublicKey.wireFormat`, carried opaquely but
 		// persisted in MLS group state, so testing against the real encoding is the point.
+		// Temporary revision pin to autonomous-comm-protocol's swift-crypto-5
+		// branch (#59); replace with the released version once it cuts.
 		.package(
 			url: "https://github.com/germ-network/autonomous-comm-protocol.git",
-			from: "1.2.0"
+			revision: "d647004ed104bc8838aef9f4475c4625cb1033fe"
 		),
 		// The native-side migrator dependency (GER-2372): twomlspq-swift carries R1's
 		// `InvitationMigration.mintArchive` + `MigratedIdentity` and R2's
@@ -81,9 +83,12 @@ let package = Package(
 		// (SessionMigration + the ML-KEM `hpkeSecretKeySize`); its transitive deps
 		// (swift-mls, swift-secret-bytes, swift-crypto, GermConvenience) resolve
 		// automatically.
+		// Temporary revision pin to twomlspq-swift's swift-crypto-5 branch
+		// (germ-network/twomlspq-swift#60); replace with the released version
+		// once it cuts.
 		.package(
 			url: "https://github.com/germ-network/twomlspq-swift.git",
-			.upToNextMinor(from: "0.1.1")
+			revision: "34c0a3a42595430fca8707c4b97e49c523144b5a"
 		),
 		// Declared directly (not just transitively through twomlspq-swift) because
 		// the migrate targets import their products. Library deps stay ranged
@@ -92,13 +97,16 @@ let package = Package(
 		// conflicts against a consumer's own tighter pin; twomlspq-swift's own
 		// swift-mls requirement is ranged the same way (the 0.1.1 floor carries
 		// the C0 `Nsk` length check). Exactness belongs to the app-level repo.
+		// Temporary revision pin to swift-mls's swift-crypto-5 branch
+		// (germ-network/swift-mls#103); replace with the released version once
+		// it cuts.
 		.package(
 			url: "https://github.com/germ-network/swift-mls.git",
-			.upToNextMinor(from: "0.1.1")
+			revision: "9182f8755690c2129b57f8ba5b8ef549c57cb9ab"
 		),
 		.package(
 			url: "https://github.com/germ-network/swift-secret-bytes.git",
-			.upToNextMinor(from: "0.4.0")
+			.upToNextMinor(from: "0.5.0")
 		)
 	],
 	targets: [
