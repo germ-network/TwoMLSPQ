@@ -74,7 +74,7 @@ let package = Package(
 		// branch (#59); replace with the released version once it cuts.
 		.package(
 			url: "https://github.com/germ-network/autonomous-comm-protocol.git",
-			revision: "d647004ed104bc8838aef9f4475c4625cb1033fe"
+			revision: "397375188ba7cbffa74e2040ac6042d9587b3a35"
 		),
 		// The native-side migrator dependency (GER-2372): twomlspq-swift carries R1's
 		// `InvitationMigration.mintArchive` + `MigratedIdentity` and R2's
@@ -88,7 +88,7 @@ let package = Package(
 		// once it cuts.
 		.package(
 			url: "https://github.com/germ-network/twomlspq-swift.git",
-			revision: "34c0a3a42595430fca8707c4b97e49c523144b5a"
+			revision: "47cebd1dc278d6bbe67afa46bf319776a6eecf4f"
 		),
 		// Declared directly (not just transitively through twomlspq-swift) because
 		// the migrate targets import their products. Library deps stay ranged
@@ -102,7 +102,7 @@ let package = Package(
 		// it cuts.
 		.package(
 			url: "https://github.com/germ-network/swift-mls.git",
-			revision: "9182f8755690c2129b57f8ba5b8ef549c57cb9ab"
+			revision: "c6bd2c1521174b0fa3efdde512fa1baeb4ba3cfc"
 		),
 		.package(
 			url: "https://github.com/germ-network/swift-secret-bytes.git",
