@@ -1,5 +1,15 @@
 # @germ-network/two-mls-pq
 
+## 0.20.1
+
+### Patch Changes
+
+- [#142](https://github.com/germ-network/TwoMLSPQ/pull/142) [`3cdf38c`](https://github.com/germ-network/TwoMLSPQ/commit/3cdf38c2d3f2b18de4f433972dd8ce229153fe46) Thanks [@germ-mark](https://github.com/germ-mark)! - Raise the package's iOS floor to 18.0 (was 17.0). `swift-secret-bytes` moved
+  to `from: "0.5.0"` (its own floor is iOS 18/macOS 15) without a matching bump
+  here, so `TwoMLSPQMigrate` failed to build for iOS: "the package product
+  'SecretBytes-product' requires minimum platform version 18.0 for the iOS
+  platform, but this target supports 17.0."
+
 ## 0.20.0
 
 ### Minor Changes
