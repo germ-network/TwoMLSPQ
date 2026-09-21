@@ -38,7 +38,9 @@ let package = Package(
 	// Import/link floors. The PQ backend's ML-KEM paths additionally require
 	// OS 26 (CryptoKit ML-KEM-768) at RUNTIME — that floor applies only to
 	// calling the PQ API, not to importing or linking this package.
-	platforms: [.iOS(.v17), .macOS(.v15)],
+	// iOS 18 (not 17): swift-secret-bytes 0.5.0+ (pinned below) raised its own
+	// floor to iOS 18/macOS 15.
+	platforms: [.iOS(.v18), .macOS(.v15)],
 	products: [
 		// The forward-looking PUBLIC product: the concrete PQ types (`PQSession`,
 		// `PQInvitation`, `PQClient`, …), their value/currency types, and the UniFFI
