@@ -88,7 +88,7 @@ let package = Package(
 		// once it cuts.
 		.package(
 			url: "https://github.com/germ-network/twomlspq-swift.git",
-			from: "0.2.0"
+			from: "0.2.1"
 		),
 		// Declared directly (not just transitively through twomlspq-swift) because
 		// the migrate targets import their products. Library deps stay ranged
@@ -102,7 +102,7 @@ let package = Package(
 		// it cuts.
 		.package(
 			url: "https://github.com/germ-network/swift-mls.git",
-			from: "0.1.3"
+			from: "0.1.4"
 		),
 		.package(
 			url: "https://github.com/germ-network/swift-secret-bytes.git",
