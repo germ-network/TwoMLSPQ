@@ -1,12 +1,13 @@
 {
-  "originHash" : "2c9756d0238b424cff19d005ff35632d5518a923716de06a42fd3d59d28007ba",
+  "originHash" : "dce512909c4b52bf34b936932f4d92ceae94a75e0c9b9bcb7656b8ac58317eef",
   "pins" : [
     {
       "identity" : "atprototypes",
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/germ-network/AtprotoTypes.git",
       "state" : {
-        "revision" : "e4cd0028639cb44b8ea24117f51d876954859493"
+        "revision" : "46fbeeac594d236ed992cdffe547eebb9bce7ae6",
+        "version" : "0.7.0"
       }
     },
     {
@@ -14,7 +15,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/germ-network/autonomous-comm-protocol.git",
       "state" : {
-        "revision" : "397375188ba7cbffa74e2040ac6042d9587b3a35"
+        "revision" : "68d3a2432dee6f966edd8403e1778e44e0423bf5",
+        "version" : "1.13.0"
       }
     },
     {

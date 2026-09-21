@@ -74,7 +74,7 @@ let package = Package(
 		// branch (#59); replace with the released version once it cuts.
 		.package(
 			url: "https://github.com/germ-network/autonomous-comm-protocol.git",
-			revision: "397375188ba7cbffa74e2040ac6042d9587b3a35"
+			from: "1.13.0"
 		),
 		// The native-side migrator dependency (GER-2372): twomlspq-swift carries R1's
 		// `InvitationMigration.mintArchive` + `MigratedIdentity` and R2's
