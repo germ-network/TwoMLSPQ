@@ -492,10 +492,13 @@ pub fn version() -> String {
 // (`SessionMigrationExport` and its parts) and one new FFI method,
 // `TwoMlsPqSession::migration_export`, each group half emitted as a swift-mls format-2
 // snapshot via mls-rs's `swift_export` feature. No wire/archive format or error-variant
-// change. NOTE: the mls-rs pin moves to `llm/mlsrs-format2-export` (82b4dc1) and the
-// `swift_export` feature extends mls-rs's serialized `EpochSecrets`, so group state
-// persisted by a pre-v35 build no longer loads under this one (and vice versa) —
-// persisted Rust session archives must be migrated, not carried, across the repin.
+// change. The mls-rs pin moves to `llm/mlsrs-format2-export` (7491783): the `swift_export`
+// feature adds only feature-gated accessors, error variants, and a new export module — no
+// serialized struct changed; the one `EpochSecrets` field its accessor reads was already
+// there, added by `safe_extensions`, which every shipped release of this crate already
+// enabled. Stored group state is unaffected, and a pre-v35-written session archive (down
+// through v0.16.0) still restores here, pinned by the `TwoMLSPQMigrateTests` legacy-row
+// fixtures.
 const BINDING_CONTRACT_VERSION: u64 = 35;
 
 /// See `BINDING_CONTRACT_VERSION`. Exported so the Swift layer can verify the

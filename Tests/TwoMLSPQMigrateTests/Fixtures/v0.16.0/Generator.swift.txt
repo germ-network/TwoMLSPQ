@@ -1,0 +1,632 @@
+//
+//  FixtureGeneratorTests.swift
+//  TwoMLSPQ
+//
+//  SCRATCH — not part of this package's shipped suite. Generates the v0.16.0-written
+//  `PQSession.Persisted` golden-row fixtures pinned under the main-branch repo's
+//  Tests/TwoMLSPQMigrateTests/Fixtures/v0.16.0. See that directory's README for what this
+//  produces and how to re-run it. Modeled on LifecycleTests.testExchange, but routed through
+//  the APP-SHAPED establishment path (`PQClient.createTwoMLSGroup` + `PQInvitation.decodeHeader`)
+//  rather than the bare plaintext reply/receive handoff.
+//
+
+import CommProtocol
+import Foundation
+import Testing
+import TwoMLSPQ
+
+// MARK: - Recording persistence sink
+
+/// Records the latest bytes pushed to each slot, by seq (persists can arrive out of order
+/// per the `PersistenceSink` contract).
+final class RecordingSink: PersistenceSink, @unchecked Sendable {
+	private let lock = NSLock()
+	private var core: (seq: UInt64, bytes: Data)?
+	private var checkpoint: (seq: UInt64, bytes: Data)?
+
+	func persist(seq: UInt64, slot: PersistedSlot, bytes: Data) {
+		lock.lock()
+		defer { lock.unlock() }
+		switch slot {
+		case .core:
+			if core == nil || seq > core!.seq { core = (seq, bytes) }
+		case .checkpoint:
+			if checkpoint == nil || seq > checkpoint!.seq { checkpoint = (seq, bytes) }
+		}
+	}
+
+	/// A `PQSession.Persisted` snapshot of whatever has been pushed so far, plus the seq of
+	/// each slot (nil core seq if no core has been pushed yet).
+	func snapshot() throws -> (persisted: PQSession.Persisted, coreSeq: UInt64?, checkpointSeq: UInt64) {
+		lock.lock()
+		defer { lock.unlock() }
+		guard let checkpoint else {
+			throw TestErrors.unexpected  // installSink always pushes a baseline checkpoint
+		}
+		return (
+			PQSession.Persisted(core: core?.bytes, checkpoint: checkpoint.bytes),
+			core?.seq, checkpoint.seq
+		)
+	}
+}
+
+// MARK: - Opaque test app-welcome codec
+
+/// A throwaway length-prefixed pack/unpack of the four pieces `PQInvitation.receive` needs,
+/// standing in for the app's own identity-envelope format (which lives outside this package).
+/// Only this test constructs and parses it — the crate treats the bytes as fully opaque.
+enum TestAppWelcomeCodec {
+	static func encode(
+		sendGroupWelcome: Data, remoteKeyPackage: Data, bootstrapKpCommitment: Data,
+		remoteClientId: Data
+	) -> Data {
+		var out = Data()
+		for part in [sendGroupWelcome, remoteKeyPackage, bootstrapKpCommitment, remoteClientId] {
+			let len = UInt32(part.count).littleEndian
+			withUnsafeBytes(of: len) { out.append(contentsOf: $0) }
+			out.append(part)
+		}
+		return out
+	}
+
+	static func decode(_ data: Data) throws -> (
+		sendGroupWelcome: Data, remoteKeyPackage: Data, bootstrapKpCommitment: Data,
+		remoteClientId: Data
+	) {
+		var rest = data[...]
+		func takePart() throws -> Data {
+			guard rest.count >= 4 else { throw TestErrors.unexpected }
+			let len = Int(
+				rest.prefix(4).withUnsafeBytes { $0.loadUnaligned(as: UInt32.self) }.littleEndian)
+			rest = rest.dropFirst(4)
+			guard rest.count >= len else { throw TestErrors.unexpected }
+			let part = Data(rest.prefix(len))
+			rest = rest.dropFirst(len)
+			return part
+		}
+		return (try takePart(), try takePart(), try takePart(), try takePart())
+	}
+}
+
+// MARK: - meta.json shape
+
+private struct FixtureMeta: Codable {
+	struct SideInfo: Codable {
+		var coreSeq: UInt64?
+		var checkpointSeq: UInt64
+		var isFullyEstablished: Bool
+		/// `"weInitiate"` / `"theyInitiate"` — this side's own `PQSession.turn`.
+		var turn: String
+		/// Which PQ side-band round (if any) this side's OWN state reflects as in flight —
+		/// `"A.3"`, `"A.4"`, or nil. A side that never received/initiated anything for a round
+		/// records nil even if the OTHER side has one parked (the whole point of p4/p5: the
+		/// parking is one-sided — the peer is oblivious).
+		var roundInFlight: String?
+		/// `pendingSideBand(sealing:)` is non-nil for this side at capture — an unconsumed
+		/// outbound side-band leg this side still owes delivery of.
+		var legParked: Bool
+	}
+	struct PointInfo: Codable {
+		var description: String
+		var steps: [String]
+		/// Per-point, NOT shared: p6 is an independent identity pair from p1-p5 (which all
+		/// share one pair — p4/p5 fork from p2's/p3's own persisted state), so these cannot be
+		/// top-level singular fields the way a single shared pair's ids could be.
+		var initiatorId: String
+		var invitationId: String
+		var dedicatedId: String
+		var initiator: SideInfo
+		var acceptor: SideInfo
+	}
+	var generatorTag: String
+	var generatorCommit: String
+	var bindingContractVersion: Int
+	var xcframeworkProvenance: String
+	var xcframeworkZipSha256Local: String
+	var xcframeworkZipSha256ReleasedAsset: String
+	var harnessPath: String
+	/// Whether the p3 A.4 leg (EK -> CT) was driven to completion (now REQUIRED, not
+	/// conditional — see `#require` below).
+	var a4LegDriven: Bool
+	var points: [String: PointInfo]
+}
+
+// MARK: - Shared round helpers
+
+/// One committing round: `peer` offers an Upd, `binder` approves it and its next
+/// `prepareToEncrypt` reports `didCommit`.
+func committingRound(binder: PQSession, peer: PQSession) throws {
+	_ = try peer.prepareToEncrypt(proposing: nil)
+	let upd = try peer.encrypt(appMessage: Data("upd".utf8))
+	let decrypted = try #require(try binder.decrypt(upd.cipherText))
+	let offered = try #require(decrypted.proposal)
+	try binder.queueProposal(digest: offered.digest)
+	let prepared = try #require(try binder.prepareToEncrypt(proposing: nil))
+	#expect(prepared.didCommit)
+	let commitFrame = try binder.encrypt(appMessage: Data("commit".utf8))
+	_ = try peer.decrypt(commitFrame.cipherText)
+}
+
+/// >= 2 messages each way, including one committing round each way — the "ordinary traffic
+/// keeps flowing" half of the p4/p5 stalled-round scenario.
+func driveSteadyTraffic(alice: PQSession, bob: PQSession) throws {
+	try alice.exchange(with: bob)
+	try committingRound(binder: alice, peer: bob)
+	try committingRound(binder: bob, peer: alice)
+}
+
+private func sideInfo(
+	_ session: PQSession, coreSeq: UInt64?, checkpointSeq: UInt64,
+	roundInFlight: String?, legParked: Bool
+) -> FixtureMeta.SideInfo {
+	.init(
+		coreSeq: coreSeq, checkpointSeq: checkpointSeq,
+		isFullyEstablished: session.isFullyEstablished,
+		turn: session.turn == .weInitiate ? "weInitiate" : "theyInitiate",
+		roundInFlight: roundInFlight, legParked: legParked)
+}
+
+struct FixtureGeneratorTests {
+	@Test func generate() async throws {
+		guard let outDirPath = ProcessInfo.processInfo.environment["FIXTURE_OUT"] else {
+			Issue.record("FIXTURE_OUT not set — see the target repo's Fixtures/v0.16.0/README.md")
+			return
+		}
+		let outDir = URL(fileURLWithPath: outDirPath, isDirectory: true)
+		try FileManager.default.createDirectory(at: outDir, withIntermediateDirectories: true)
+
+		let local = try ClientWrapper()  // alice / initiator
+		let remote = try ClientWrapper()  // bob / acceptor
+
+		// -- App path, step 1: alice forms her send group, then attaches the app welcome via
+		// createTwoMLSGroup (drains the parked envelope) rather than reply()'s bare welcome.
+		let (localSessionRaw, welcome, myKeyPackage, bootstrapKpCommitment) =
+			try local.client.reply(keyPackageMessage: remote.currentInvitation.encodedKeyPackage)
+
+		let aliceSink = RecordingSink()
+		try localSessionRaw.installSink(aliceSink)
+
+		let appWelcomePayload = TestAppWelcomeCodec.encode(
+			sendGroupWelcome: welcome,
+			remoteKeyPackage: myKeyPackage,
+			bootstrapKpCommitment: bootstrapKpCommitment,
+			remoteClientId: try local.clientId)
+
+		let (localSession, encryptedCombinedWelcome) = try local.client.createTwoMLSGroup(
+			remoteAgentId: try remote.clientId,
+			mySendGroup: localSessionRaw,
+			theirKeyPackageMessage: remote.currentInvitation.encodedKeyPackage,
+			appWelcome: appWelcomePayload)
+
+		// -- App path, step 2: bob decodes the header and receives, born-dedicated.
+		let dedicatedId: ClientID = .mock()
+		let decoded = try remote.currentInvitation.decodeHeader(ciphertext: encryptedCombinedWelcome)
+		guard case .appWelcome(let welcomeToken, let appWelcomeBytes, let stapledPrivateMessage) = decoded
+		else {
+			Issue.record("expected an .appWelcome decode result")
+			throw TestErrors.unexpected
+		}
+		let unpacked = try TestAppWelcomeCodec.decode(appWelcomeBytes)
+
+		let (remoteSession, _) = try remote.currentInvitation.receive(
+			sendGroupWelcome: unpacked.sendGroupWelcome,
+			remoteKeyPackage: unpacked.remoteKeyPackage,
+			bootstrapKpCommitment: unpacked.bootstrapKpCommitment,
+			remoteClientId: unpacked.remoteClientId,
+			welcomeToken: welcomeToken,
+			stapledMessage: stapledPrivateMessage,
+			newClientId: dedicatedId)
+
+		let bobSink = RecordingSink()
+		try remoteSession.installSink(bobSink)
+		try remoteSession.installMockEstablishmentEnvelope()
+
+		let sharedInitiatorId = try local.clientId.base64EncodedString()
+		let sharedInvitationId = try remote.clientId.base64EncodedString()
+		let sharedDedicatedId = dedicatedId.base64EncodedString()
+
+		// -- Step 3: bob's first frame (the establishment handoff) pauses/resumes alice. Never
+		// call pendingOutbound() on the acceptor here — the app has no such call.
+		try localSession.acceptEstablishment(from: remoteSession, dedicatedId: dedicatedId)
+
+		let p1AliceSnap = try aliceSink.snapshot()
+		let p1BobSnap = try bobSink.snapshot()
+		let p1Alice = sideInfo(
+			localSession, coreSeq: p1AliceSnap.coreSeq, checkpointSeq: p1AliceSnap.checkpointSeq,
+			roundInFlight: nil, legParked: localSession.pendingSideBand(sealing: .fresh) != nil)
+		let p1Bob = sideInfo(
+			remoteSession, coreSeq: p1BobSnap.coreSeq, checkpointSeq: p1BobSnap.checkpointSeq,
+			roundInFlight: nil, legParked: remoteSession.pendingSideBand(sealing: .fresh) != nil)
+
+		// -- Step 4: alice folds bob's Upd — his classical catch-up, a committing round of hers.
+		try committingRound(binder: localSession, peer: remoteSession)
+
+		let p2AliceSnap = try aliceSink.snapshot()
+		let p2BobSnap = try bobSink.snapshot()
+		let p2Alice = sideInfo(
+			localSession, coreSeq: p2AliceSnap.coreSeq, checkpointSeq: p2AliceSnap.checkpointSeq,
+			roundInFlight: nil, legParked: localSession.pendingSideBand(sealing: .fresh) != nil)
+		let p2Bob = sideInfo(
+			remoteSession, coreSeq: p2BobSnap.coreSeq, checkpointSeq: p2BobSnap.checkpointSeq,
+			roundInFlight: nil, legParked: remoteSession.pendingSideBand(sealing: .fresh) != nil)
+
+		// -- p4 fork: restore FRESH sessions from p2's own persisted bytes (independent live
+		// objects — PQSession wraps a class, so simply re-referencing localSession/remoteSession
+		// would not fork anything), begin A.3 on the fork's alice, and never deliver the KP'.
+		let p4Info = try makeStalledA3Point(
+			aliceRow: p2AliceSnap.persisted, bobRow: p2BobSnap.persisted, outDir: outDir,
+			initiatorId: sharedInitiatorId, invitationId: sharedInvitationId,
+			dedicatedId: sharedDedicatedId)
+
+		// -- Step 5: bob folds one of alice's Upds — a committing round of HIS.
+		try committingRound(binder: remoteSession, peer: localSession)
+
+		// -- Step 6: A.3 bootstrap — alice owes it — then the bind discharge (bob offers, alice
+		// approves + commits, staples the bind).
+		let kp = try localSession.finishBootstrap(rotating: nil)
+		let bootstrapInbound = try remoteSession.ingest(kp.payload)
+		let bootstrapReply = try #require(remoteSession.advance(after: bootstrapInbound))
+		_ = try localSession.ingest(bootstrapReply.payload)
+		try remoteSession.exchange(with: localSession)
+
+		// -- Step 7: A.4 ratchet is session-driven — whoever holds the turn auto-stages an EK
+		// on its next ordinary send. Exactly one side must hold the
+		// turn here, and the EK <-> CT leg must fully resolve.
+		let bobHoldsTurn = remoteSession.turn == .weInitiate
+		let aliceHoldsTurn = localSession.turn == .weInitiate
+		#expect(
+			bobHoldsTurn != aliceHoldsTurn,
+			"expected exactly one side to hold the A.4 turn after bind discharge")
+		let turnHolder = bobHoldsTurn ? remoteSession : localSession
+		let other = bobHoldsTurn ? localSession : remoteSession
+		try turnHolder.send(to: other)
+		let ek = try #require(turnHolder.pendingSideBand(sealing: .fresh))
+		let ratchetInbound = try other.ingest(ek)
+		let ratchetReply = try #require(other.advance(after: ratchetInbound))
+		_ = try turnHolder.ingest(ratchetReply.payload)
+
+		// -- Step 8: a final message each way, so both sides have processed a fresh frame.
+		try localSession.exchange(with: remoteSession)
+
+		let p3AliceSnap = try aliceSink.snapshot()
+		let p3BobSnap = try bobSink.snapshot()
+		let p3Alice = sideInfo(
+			localSession, coreSeq: p3AliceSnap.coreSeq, checkpointSeq: p3AliceSnap.checkpointSeq,
+			roundInFlight: nil, legParked: localSession.pendingSideBand(sealing: .fresh) != nil)
+		let p3Bob = sideInfo(
+			remoteSession, coreSeq: p3BobSnap.coreSeq, checkpointSeq: p3BobSnap.checkpointSeq,
+			roundInFlight: nil, legParked: remoteSession.pendingSideBand(sealing: .fresh) != nil)
+
+		// -- p5 fork: restore FRESH sessions from p3's own persisted bytes, stage a NEW A.4 leg
+		// on whichever fork side holds the turn, and never deliver it.
+		let p5Info = try makeStalledA4Point(
+			aliceRow: p3AliceSnap.persisted, bobRow: p3BobSnap.persisted, outDir: outDir,
+			initiatorId: sharedInitiatorId, invitationId: sharedInvitationId,
+			dedicatedId: sharedDedicatedId)
+
+		// -- p6: a fresh, standalone pair (not a fork) — the real deployed-app shape, where the
+		// piggybacked A.3 KP' answers on the acceptor's side but its response never ships.
+		let p6Info = try makeResponderStalledA3Point(outDir: outDir)
+
+		// -- Write fixtures.
+		let encoder = JSONEncoder()
+
+		func writePoint(
+			_ name: String, description: String, steps: [String],
+			aliceRow: PQSession.Persisted, bobRow: PQSession.Persisted,
+			alice: FixtureMeta.SideInfo, bob: FixtureMeta.SideInfo
+		) throws -> FixtureMeta.PointInfo {
+			let pointDir = outDir.appendingPathComponent(name, isDirectory: true)
+			try FileManager.default.createDirectory(at: pointDir, withIntermediateDirectories: true)
+			try encoder.encode(aliceRow).write(to: pointDir.appendingPathComponent("initiator.json"))
+			try encoder.encode(bobRow).write(to: pointDir.appendingPathComponent("acceptor.json"))
+			return FixtureMeta.PointInfo(
+				description: description, steps: steps,
+				initiatorId: sharedInitiatorId, invitationId: sharedInvitationId,
+				dedicatedId: sharedDedicatedId, initiator: alice, acceptor: bob)
+		}
+
+		let p1Info = try writePoint(
+			"p1-bob-sent-unfolded",
+			description: "bob installed the envelope and sent his first frame; alice paused "
+				+ "and resumed (joined) but has not folded bob's classical catch-up Upd yet.",
+			steps: [
+				"alice: client.reply", "alice: client.createTwoMLSGroup",
+				"bob: invitation.decodeHeader + invitation.receive(newClientId: dedicated)",
+				"bob: installMockEstablishmentEnvelope", "bob: send first frame",
+				"alice: pause on 0x0B handoff, verify, resume",
+			],
+			aliceRow: p1AliceSnap.persisted, bobRow: p1BobSnap.persisted,
+			alice: p1Alice, bob: p1Bob)
+
+		let p2Info = try writePoint(
+			"p2-converged",
+			description: "alice approved and committed bob's catch-up Upd (bob's recv.classical "
+				+ "converged); bob has not made a committing round of his own yet.",
+			steps: [
+				"bob: prepareToEncrypt + encrypt (stages Upd(self))",
+				"alice: decrypt, queueProposal(digest:)",
+				"alice: prepareToEncrypt (didCommit) + encrypt", "bob: decrypt the commit",
+			],
+			aliceRow: p2AliceSnap.persisted, bobRow: p2BobSnap.persisted,
+			alice: p2Alice, bob: p2Bob)
+
+		let p3Info = try writePoint(
+			"p3-steady",
+			description: "bob folded one of alice's Upds (a committing round of his), the A.3 "
+				+ "bootstrap + bind discharge ran, a full A.4 EK<->CT leg was driven (required), "
+				+ "and a final message went each way.",
+			steps: [
+				"alice: prepareToEncrypt + encrypt (stages Upd(self))",
+				"bob: decrypt, queueProposal(digest:)",
+				"bob: prepareToEncrypt (didCommit) + encrypt", "alice: decrypt the commit",
+				"alice: finishBootstrap(rotating: nil)", "bob: ingest + advance (A.3 respond)",
+				"alice: ingest the reply (A.3 bind)", "bob: exchange with alice (bind discharge)",
+				"A.4: turn holder sends, ingests/advances the EK<->CT leg (required)",
+				"alice.exchange(with: bob) — final message each way",
+			],
+			aliceRow: p3AliceSnap.persisted, bobRow: p3BobSnap.persisted,
+			alice: p3Alice, bob: p3Bob)
+
+		let meta = FixtureMeta(
+			generatorTag: "v0.16.0",
+			generatorCommit: "2a09f50",
+			bindingContractVersion: 33,
+			xcframeworkProvenance: "local build of tag v0.16.0 source, not the released asset. "
+				+ "rust/Cargo.lock is gitignored and was not tracked at the tag, so crates.io "
+				+ "dependencies were resolved fresh — but the archive encoding is still pinned "
+				+ "because mls-rs (including mls-rs-codec) is fixed by git rev b43703f in "
+				+ "rust/Cargo.toml's [patch.crates-io], and the generated binding is byte-identical "
+				+ "to the tag's vendored Sources/TwoMLSPQBinding/two_mls_pq.swift",
+			xcframeworkZipSha256Local: "5dc5dce99642288dc68fa12192b81fd419abfb9fcf053fae262945f83a6883c6",
+			xcframeworkZipSha256ReleasedAsset:
+				"3bc63e5648138393e568a988f3657ad06374380163ef635169c8a3fe2c0dfa3a",
+			harnessPath: "createTwoMLSGroup + decodeHeader (app path)",
+			a4LegDriven: true,
+			points: [
+				"p1-bob-sent-unfolded": p1Info,
+				"p2-converged": p2Info,
+				"p3-steady": p3Info,
+				"p4-a3-stalled": p4Info,
+				"p5-a4-stalled": p5Info,
+				"p6-a3-responded-stalled": p6Info,
+			])
+		try encoder.encode(meta).write(to: outDir.appendingPathComponent("meta.json"))
+	}
+
+	/// p4-a3-stalled: fork fresh sessions from p2's own persisted rows, have alice BEGIN the
+	/// A.3 bootstrap through the app-shaped API (`finishBootstrap`, as LifecycleTests step 5
+	/// does) and never deliver the KP' to bob, then drive ordinary steady traffic while it sits
+	/// parked. Returns the point's fixture info AND writes nothing itself — the caller writes
+	/// the rows via the same `writePoint` path as p1-p3 (kept here as a tuple to route through
+	/// it uniformly).
+	private func makeStalledA3Point(
+		aliceRow: PQSession.Persisted, bobRow: PQSession.Persisted, outDir: URL,
+		initiatorId: String, invitationId: String, dedicatedId: String
+	) throws -> FixtureMeta.PointInfo {
+		let alice = try PQSession(persisted: aliceRow)
+		let aliceSink = RecordingSink()
+		try alice.installSink(aliceSink)
+		let bob = try PQSession(persisted: bobRow)
+		let bobSink = RecordingSink()
+		try bob.installSink(bobSink)
+
+		// Begin A.3 — alice's KP' leg — and never deliver it to bob.
+		_ = try alice.finishBootstrap(rotating: nil)
+
+		try driveSteadyTraffic(alice: alice, bob: bob)
+
+		let aliceSnap = try aliceSink.snapshot()
+		let bobSnap = try bobSink.snapshot()
+		let aliceLegParked = alice.pendingSideBand(sealing: .fresh) != nil
+		let bobLegParked = bob.pendingSideBand(sealing: .fresh) != nil
+
+		try writePointRows(
+			"p4-a3-stalled", aliceRow: aliceSnap.persisted, bobRow: bobSnap.persisted, outDir: outDir)
+
+		return FixtureMeta.PointInfo(
+			description: "forked from p2's own persisted rows: alice began the A.3 bootstrap "
+				+ "(finishBootstrap) but her KP' leg was never delivered to bob — parked. This is "
+				+ "the stall a session with NO side-band transport at all reaches: it can never "
+				+ "complete A.3, so it never reaches p3/p5/p6. >= 2 messages each way (including "
+				+ "one committing round each way) ran while it sat parked.",
+			steps: [
+				"fork: PQSession(persisted:) from p2's initiator/acceptor rows, fresh sinks",
+				"alice: finishBootstrap(rotating: nil) — KP' never delivered to bob",
+				"alice.exchange(with: bob) — plain message each way",
+				"committingRound(binder: alice, peer: bob)",
+				"committingRound(binder: bob, peer: alice)",
+			],
+			initiatorId: initiatorId, invitationId: invitationId, dedicatedId: dedicatedId,
+			initiator: sideInfo(
+				alice, coreSeq: aliceSnap.coreSeq, checkpointSeq: aliceSnap.checkpointSeq,
+				roundInFlight: "A.3", legParked: aliceLegParked),
+			acceptor: sideInfo(
+				bob, coreSeq: bobSnap.coreSeq, checkpointSeq: bobSnap.checkpointSeq,
+				roundInFlight: nil, legParked: bobLegParked))
+	}
+
+	/// p5-a4-stalled: fork fresh sessions from p3's own persisted rows (already fully
+	/// established), let the turn holder's next ordinary send auto-stage a NEW A.4 EK, and
+	/// never deliver it, then drive ordinary steady traffic while it sits parked.
+	private func makeStalledA4Point(
+		aliceRow: PQSession.Persisted, bobRow: PQSession.Persisted, outDir: URL,
+		initiatorId: String, invitationId: String, dedicatedId: String
+	) throws -> FixtureMeta.PointInfo {
+		let alice = try PQSession(persisted: aliceRow)
+		let aliceSink = RecordingSink()
+		try alice.installSink(aliceSink)
+		let bob = try PQSession(persisted: bobRow)
+		let bobSink = RecordingSink()
+		try bob.installSink(bobSink)
+
+		let bobHoldsTurn = bob.turn == .weInitiate
+		let aliceHoldsTurn = alice.turn == .weInitiate
+		#expect(
+			bobHoldsTurn != aliceHoldsTurn,
+			"expected exactly one side to hold the A.4 turn at the p3-like fork point")
+		let turnHolder = bobHoldsTurn ? bob : alice
+		let other = bobHoldsTurn ? alice : bob
+
+		// Auto-stage a NEW A.4 EK on the turn holder's next ordinary send, and never deliver it.
+		try turnHolder.send(to: other)
+		let legParkedOnTurnHolder = turnHolder.pendingSideBand(sealing: .fresh) != nil
+
+		try driveSteadyTraffic(alice: alice, bob: bob)
+
+		let aliceSnap = try aliceSink.snapshot()
+		let bobSnap = try bobSink.snapshot()
+		let otherLegParked = other.pendingSideBand(sealing: .fresh) != nil
+
+		try writePointRows(
+			"p5-a4-stalled", aliceRow: aliceSnap.persisted, bobRow: bobSnap.persisted, outDir: outDir)
+
+		let turnHolderInfo = sideInfo(
+			turnHolder,
+			coreSeq: bobHoldsTurn ? bobSnap.coreSeq : aliceSnap.coreSeq,
+			checkpointSeq: bobHoldsTurn ? bobSnap.checkpointSeq : aliceSnap.checkpointSeq,
+			roundInFlight: "A.4", legParked: legParkedOnTurnHolder)
+		let otherInfo = sideInfo(
+			other,
+			coreSeq: bobHoldsTurn ? aliceSnap.coreSeq : bobSnap.coreSeq,
+			checkpointSeq: bobHoldsTurn ? aliceSnap.checkpointSeq : bobSnap.checkpointSeq,
+			roundInFlight: nil, legParked: otherLegParked)
+
+		return FixtureMeta.PointInfo(
+			description: "forked from p3's own persisted rows (already fully established — side-band "
+				+ "DID carry A.3's Welcome' to get here, since full establishment needs it). Side-band "
+				+ "carried A.3, then stopped: the turn holder's next ordinary send auto-staged a new "
+				+ "A.4 EK, and it is parked and never delivered. >= 2 messages each way (including "
+				+ "one committing round each way) ran while it sat parked.",
+			steps: [
+				"fork: PQSession(persisted:) from p3's initiator/acceptor rows, fresh sinks",
+				"turn holder: send(to: other) — auto-stages an A.4 EK, never delivered",
+				"alice.exchange(with: bob) — plain message each way",
+				"committingRound(binder: alice, peer: bob)",
+				"committingRound(binder: bob, peer: alice)",
+			],
+			initiatorId: initiatorId, invitationId: invitationId, dedicatedId: dedicatedId,
+			initiator: bobHoldsTurn ? otherInfo : turnHolderInfo,
+			acceptor: bobHoldsTurn ? turnHolderInfo : otherInfo)
+	}
+
+	/// p6-a3-responded-stalled: the shape a REAL deployed card session is actually in, not p4's
+	/// contrived one. At `reply` time the initiator also calls `bootstrapEnvelope()` and sends
+	/// that `0x13` KP' envelope as an ORDINARY queued message (piggybacked, not the retained
+	/// `finishBootstrap` slot p4 uses) — the acceptor's `decodeHeader` resolves it to `.forward`
+	/// (the invitation pinned `H(KP') -> spawned group` at `receive`, so `receive` must run
+	/// FIRST) and the spawned session's `forwarded(...)` answers A.3 on the acceptor's side,
+	/// parking the acceptor's Welcome' response. The app never transmits that response. A fresh,
+	/// standalone pair — not a fork of another point.
+	private func makeResponderStalledA3Point(outDir: URL) throws -> FixtureMeta.PointInfo {
+		let local = try ClientWrapper()  // alice / initiator
+		let remote = try ClientWrapper()  // bob / acceptor
+
+		let (localSessionRaw, welcome, myKeyPackage, bootstrapKpCommitment) =
+			try local.client.reply(keyPackageMessage: remote.currentInvitation.encodedKeyPackage)
+		let aliceSink = RecordingSink()
+		try localSessionRaw.installSink(aliceSink)
+
+		let appWelcomePayload = TestAppWelcomeCodec.encode(
+			sendGroupWelcome: welcome,
+			remoteKeyPackage: myKeyPackage,
+			bootstrapKpCommitment: bootstrapKpCommitment,
+			remoteClientId: try local.clientId)
+		let (localSession, encryptedCombinedWelcome) = try local.client.createTwoMLSGroup(
+			remoteAgentId: try remote.clientId,
+			mySendGroup: localSessionRaw,
+			theirKeyPackageMessage: remote.currentInvitation.encodedKeyPackage,
+			appWelcome: appWelcomePayload)
+
+		// Pre-establishment: alice ships her pre-committed A.3 KP' as an ordinary piggybacked
+		// send (the app path — NOT `finishBootstrap`, which p4 exercises instead).
+		let bootstrapEnvelopeBytes = try #require(try localSession.bootstrapEnvelope())
+
+		let dedicatedId: ClientID = .mock()
+		let decoded = try remote.currentInvitation.decodeHeader(ciphertext: encryptedCombinedWelcome)
+		guard case .appWelcome(let welcomeToken, let appWelcomeBytes, let stapledPrivateMessage) = decoded
+		else {
+			Issue.record("expected an .appWelcome decode result")
+			throw TestErrors.unexpected
+		}
+		let unpacked = try TestAppWelcomeCodec.decode(appWelcomeBytes)
+		let (remoteSession, _) = try remote.currentInvitation.receive(
+			sendGroupWelcome: unpacked.sendGroupWelcome,
+			remoteKeyPackage: unpacked.remoteKeyPackage,
+			bootstrapKpCommitment: unpacked.bootstrapKpCommitment,
+			remoteClientId: unpacked.remoteClientId,
+			welcomeToken: welcomeToken,
+			stapledMessage: stapledPrivateMessage,
+			newClientId: dedicatedId)
+		let bobSink = RecordingSink()
+		try remoteSession.installSink(bobSink)
+
+		// Deliver the piggybacked 0x13 envelope AFTER receive (receive is what pins the
+		// forward-table entry `decodeHeader` resolves this against — it cannot come first).
+		let bootstrapDecoded = try remote.currentInvitation.decodeHeader(
+			ciphertext: bootstrapEnvelopeBytes)
+		guard case .forward(_, let mlsMessageData) = bootstrapDecoded else {
+			Issue.record("expected a .forward decode result for the piggybacked bootstrap KP'")
+			throw TestErrors.unexpected
+		}
+		// Answers A.3 on bob's side (parks his Welcome' response) — never delivered.
+		_ = try remoteSession.forwarded(headerDecrypted: mlsMessageData)
+
+		try remoteSession.installMockEstablishmentEnvelope()
+		try localSession.acceptEstablishment(from: remoteSession, dedicatedId: dedicatedId)
+
+		try driveSteadyTraffic(alice: localSession, bob: remoteSession)
+
+		let aliceSnap = try aliceSink.snapshot()
+		let bobSnap = try bobSink.snapshot()
+		let aliceLegParked = localSession.pendingSideBand(sealing: .fresh) != nil
+		let bobLegParked = remoteSession.pendingSideBand(sealing: .fresh) != nil
+
+		try writePointRows(
+			"p6-a3-responded-stalled", aliceRow: aliceSnap.persisted, bobRow: bobSnap.persisted,
+			outDir: outDir)
+
+		return FixtureMeta.PointInfo(
+			description: "the field shape: a fresh, standalone pair where alice piggybacked her "
+				+ "pre-committed A.3 KP' as an ordinary queued 0x13 message (bootstrapEnvelope(), "
+				+ "the real app path) rather than the explicit finishBootstrap() retained slot p4 "
+				+ "exercises. Bob's decodeHeader resolved it to .forward and his session's "
+				+ "forwarded(...) answered A.3, parking HIS Welcome' response — the app never "
+				+ "transmits it. Alice paused/resumed on bob's first frame and folded his catch-up "
+				+ "Upd; >= 2 messages each way (including a committing round each way) ran while "
+				+ "bob's response sat parked.",
+			steps: [
+				"alice: client.reply", "alice: client.createTwoMLSGroup",
+				"alice: bootstrapEnvelope() — the pre-committed A.3 KP', piggybacked",
+				"bob: invitation.decodeHeader + invitation.receive(newClientId: dedicated)",
+				"bob: invitation.decodeHeader(bootstrapEnvelopeBytes) -> .forward",
+				"bob: session.forwarded(headerDecrypted:) — answers A.3, parks Welcome', never sent",
+				"bob: installMockEstablishmentEnvelope", "bob: send first frame",
+				"alice: pause on 0x0B handoff, verify, resume",
+				"alice.exchange(with: bob) — plain message each way",
+				"committingRound(binder: alice, peer: bob)",
+				"committingRound(binder: bob, peer: alice)",
+			],
+			initiatorId: try local.clientId.base64EncodedString(),
+			invitationId: try remote.clientId.base64EncodedString(),
+			dedicatedId: dedicatedId.base64EncodedString(),
+			initiator: sideInfo(
+				localSession, coreSeq: aliceSnap.coreSeq, checkpointSeq: aliceSnap.checkpointSeq,
+				roundInFlight: "A.3", legParked: aliceLegParked),
+			acceptor: sideInfo(
+				remoteSession, coreSeq: bobSnap.coreSeq, checkpointSeq: bobSnap.checkpointSeq,
+				roundInFlight: "A.3", legParked: bobLegParked))
+	}
+
+	/// Shared row-writing for the forked points (p4/p5), matching the top-level `writePoint`'s
+	/// file layout without needing its enclosing FixtureMeta-building closure.
+	private func writePointRows(
+		_ name: String, aliceRow: PQSession.Persisted, bobRow: PQSession.Persisted, outDir: URL
+	) throws {
+		let pointDir = outDir.appendingPathComponent(name, isDirectory: true)
+		try FileManager.default.createDirectory(at: pointDir, withIntermediateDirectories: true)
+		let encoder = JSONEncoder()
+		try encoder.encode(aliceRow).write(to: pointDir.appendingPathComponent("initiator.json"))
+		try encoder.encode(bobRow).write(to: pointDir.appendingPathComponent("acceptor.json"))
+	}
+}
