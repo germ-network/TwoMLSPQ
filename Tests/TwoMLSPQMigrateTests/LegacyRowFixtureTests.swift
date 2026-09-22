@@ -6,13 +6,19 @@ import TwoMLSPQMigrate
 import TwoMLSPQSession
 import XCTest
 
-// Proves that `PQSession.Persisted` rows written by TwoMLSPQ v0.16.0 (binding contract 33,
-// pre-`swift_export`) still restore and keep messaging under this engine, and that the
-// initiator row migrates to the native engine. See Fixtures/v0.16.0/README.md for what the
-// six capture points (p1-p6) represent and how they were generated — p4/p5/p6 additionally pin
-// that a PQ round left PARKED (never delivered — a session whose side-band transport stalled,
-// permanently for p4, after A.3 for p5, or in the field shape p6 exercises) still HEALS after
-// restore once the parked leg is finally delivered.
+// Proves that `PQSession.Persisted` rows written by older TwoMLSPQ releases (pre-`swift_export`)
+// still restore and keep messaging under this engine, and that the initiator row migrates to the
+// native engine. Covers two historical binding contracts, one fixture directory each — see
+// Fixtures/v0.15.0/README.md (binding contract 32) and Fixtures/v0.16.0/README.md (binding
+// contract 33) for what the six capture points (p1-p6) represent and how they were generated —
+// p4/p5/p6 additionally pin that a PQ round left PARKED (never delivered — a session whose
+// side-band transport stalled, permanently for p4, after A.3 for p5, or in the field shape p6
+// exercises) still HEALS after restore once the parked leg is finally delivered.
+//
+// `LegacyRowFixtureTests` reads `Fixtures/<Self.fixtureVersion>`; `LegacyRowFixtureTestsV015`
+// overrides that alone to point at v0.15.0's fixtures — XCTest runs every inherited test method
+// on each subclass, so the whole suite below runs twice (once per pinned contract) with no
+// duplicated test bodies.
 //
 // This target does NOT depend on `TwoMLSPQ` (Package.swift name collisions) — rows are decoded
 // with a local `Codable` matching `PQSession.Persisted`'s JSON shape, and restored through the
@@ -52,14 +58,18 @@ private enum FixtureTestError: Error {
 }
 
 @available(macOS 26, iOS 26, *)
-final class LegacyRowFixtureTests: XCTestCase {
+class LegacyRowFixtureTests: XCTestCase {
+	/// The `Fixtures/<version>` subdirectory this run restores from. Override in a subclass to
+	/// point at a different pinned binding contract — see `LegacyRowFixtureTestsV015` below.
+	class var fixtureVersion: String { "v0.16.0" }
+
 	/// The native providers, mirroring `SessionMigrationTests`.
 	private let classicalProvider = SwiftCryptoProvider().cipherSuiteProvider(
 		for: .curve25519ChaCha)!
 	private let pqProvider = MLKEM768CipherSuiteProvider()
 
 	private func fixturesDir() -> URL {
-		Bundle.module.resourceURL!.appendingPathComponent("Fixtures/v0.16.0")
+		Bundle.module.resourceURL!.appendingPathComponent("Fixtures/\(Self.fixtureVersion)")
 	}
 
 	private func loadRow(point: String, side: String) throws -> PersistedRow {
@@ -504,4 +514,11 @@ final class LegacyRowFixtureTests: XCTestCase {
 			XCTAssertEqual(error as? TwoMLSPQBinding.TwoMlsPqError, .SessionNotReady)
 		}
 	}
+}
+
+/// Same suite, against the older v0.15.0 fixtures (binding contract 32, session archive
+/// layout 3) — every inherited `test...` method above runs again here, unmodified.
+@available(macOS 26, iOS 26, *)
+final class LegacyRowFixtureTestsV015: LegacyRowFixtureTests {
+	override class var fixtureVersion: String { "v0.15.0" }
 }

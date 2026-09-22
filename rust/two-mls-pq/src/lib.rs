@@ -497,8 +497,8 @@ pub fn version() -> String {
 // serialized struct changed; the one `EpochSecrets` field its accessor reads was already
 // there, added by `safe_extensions`, which every shipped release of this crate already
 // enabled. Stored group state is unaffected, and a pre-v35-written session archive (down
-// through v0.16.0) still restores here, pinned by the `TwoMLSPQMigrateTests` legacy-row
-// fixtures.
+// through v0.15.0 (archive layout 3)) still restores here, pinned by the
+// `TwoMLSPQMigrateTests` legacy-row fixtures.
 const BINDING_CONTRACT_VERSION: u64 = 35;
 
 /// See `BINDING_CONTRACT_VERSION`. Exported so the Swift layer can verify the
