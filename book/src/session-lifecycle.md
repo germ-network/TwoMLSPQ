@@ -310,10 +310,10 @@ engine, or needing an accommodation beyond the spec.
    complete A.3.
    - *Resolution: healed once the acceptor's host carries side-band frames, as
      [The PQ side-band](#the-pq-side-band) specifies and the anchor host already does.*
-     No protocol change is needed. An upgraded acceptor sends its
-     parked `Welcome'`. The deployed initiator binds, and its bind rides an ordinary
-     frame, so A.3 completes without the initiator upgrading. Every later A.4 or A.5
-     needs the deployed party to send a side-band leg, so those rounds stall, without
-     error, until it upgrades. A conforming host should bound its re-sends of a parked
-     leg to such a peer. A deployed acceptor cannot be healed from the initiator's side,
-     because only it holds the `Welcome'`.
+     No protocol change is needed. An upgraded acceptor sends its parked `Welcome'`. The
+     deployed initiator binds, and its bind rides an ordinary frame, so A.3 completes
+     without the initiator upgrading. Every later A.4 or A.5 needs the deployed party to
+     send a side-band leg, so those rounds stay open, without error, until it upgrades.
+     How often a host re-sends its parked leg is host policy, but a host must never drop
+     it. A deployed acceptor cannot be healed from the initiator's side, because only it
+     holds the `Welcome'`.
