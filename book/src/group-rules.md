@@ -151,7 +151,11 @@ sequence is driven by the classical ratchet itself:
    fast-forward to an already-canonical credential; candidates are proposed and
    canonicalized exclusively in the classical ratchet. A credential that a live PQ leaf
    still presents stays admissible past window eviction until that leaf catches up; the
-   A.3 founding pins are one instance of this rule.
+   A.3 founding pins are one instance of this rule. Until a leaf moves, its owner signs
+   in that group with the key the leaf presents. A group joined from a KeyPackage (the
+   A.3 KP′) is signed with that KeyPackage's key, even if the owner has rotated since it
+   was minted. Moving one group's leaf never retires a key that another group's leaf
+   still presents.
 
 Enforcement is the mls-rs `IdentityProvider` (`apq/src/authentication.rs`):
 `valid_successor` implements same-id / authorized-step / catch-up; `validate_member`

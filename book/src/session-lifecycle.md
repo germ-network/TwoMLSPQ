@@ -212,27 +212,38 @@ against the AS history window, and a credential that a live PQ leaf still presen
 admissible past window eviction until that leaf catches up (see
 [Group Rules](./group-rules.md), rule 4).
 
-> **Shipped anomaly (deployed Rust engine).** The deployed engine opens an A.5 when its own
-> *send*-PQ leaf lags, not when a leaf in its receive group lags, and it never opens the
-> reciprocal A.5 for the peer. Its trigger reads its send-PQ leaf, but its own round can
-> only move its receive-PQ leaf, so the trigger never clears itself. After a one-sided
-> rotation, the rotated party's A.5 moves
-> only its leaf in the peer's send group. The peer never opens the reciprocal round, so
-> the rotated party's own send-PQ leaf keeps its pre-rotation credential. Because that
-> leaf still lags, the rotated party opens another A.5 on every PQ turn it holds; after
-> the first, each is a same-id key refresh. A conforming peer heals it: the deployed
-> engine's responder `Commit'` does carry its current credential, so the reciprocal A.5
-> completes the catch-up. Against a deployed peer, a conforming rotated party's own
-> send-PQ leaf stays behind, because that peer never opens the reciprocal round, and that
-> party must keep signing that group under the credential its leaf presents. For the same
-> reason, a deployed born-dedicated acceptor never catches up its leaf in the initiator's
-> send-PQ group: its own send-PQ leaf was minted at A.3 under the dedicated id, so it
-> never lags, and its trigger never fires. The deployed AS also pins only the A.3 founding
-> ids, so a leaf left behind for more than the history window can no longer catch up at
-> all. Separately, a born-dedicated acceptor's catch-up Upds
-> propose the identity the peer already treats as canonical (`proposing == sender`). A
-> host that folds only offers where `proposing` differs from `sender` never commits one,
-> so that recv-group leaf keeps presenting the invitation identity.
+> **Shipped anomaly (deployed Rust engine).**
+>
+> - **Wrong trigger.** It opens an A.5 when its own *send*-PQ leaf lags, not when a leaf
+>   in its receive group lags, and it never opens the reciprocal A.5. Its own round can
+>   only move its receive-PQ leaf, so the trigger never clears itself. After a one-sided
+>   rotation, the rotated party therefore opens another A.5 on every PQ turn it holds
+>   (after the first, each is a same-id key refresh), and its own send-PQ leaf keeps its
+>   pre-rotation credential.
+> - **A conforming peer heals it.** The deployed responder `Commit'` does carry its
+>   current credential, so a conforming peer's reciprocal A.5 completes the catch-up. In
+>   the other direction, a conforming rotated party's own send-PQ leaf stays behind
+>   against a deployed peer, and that party must keep signing the group under the
+>   credential its leaf presents.
+> - **Born-dedicated acceptor.** A deployed born-dedicated acceptor never catches up its
+>   leaf in the initiator's send-PQ group: its own send-PQ leaf was minted at A.3 under
+>   the dedicated id, so its trigger never fires. Separately, its catch-up Upds propose
+>   the identity the peer already treats as canonical (`proposing == sender`). A host
+>   that folds only offers where `proposing` differs from `sender` never commits one, so
+>   its recv-group leaf keeps presenting the invitation identity.
+> - **History window.** The deployed AS pins only the A.3 founding ids, so a leaf left
+>   behind for longer than the history window can no longer catch up.
+> - **Unchecked join.** Its A.3 bind joins the peer's send-PQ group signing with its
+>   *current* PQ key, not the KP′ key its leaf there presents. After a rotation before
+>   the bind, its A.5 `Upd'` in that group is mis-signed and always rejected, and the
+>   presented key survives only as its own send-PQ group's signer. When it later answers
+>   a peer's A.5, including a reciprocal one, its responder `Commit'` replaces that
+>   signer, and the leaf is orphaned for good: no copy of its key remains. Moving the
+>   party onto a conforming engine before then heals it, because that engine drops the
+>   mis-signed `Upd'` and re-proposes under the carried key. So a conforming peer defers
+>   a reciprocal A.5 until the peer's own A.5 has succeeded, meaning the peer's leaf in
+>   our send-PQ group is current. Against a conforming peer this costs at most one extra
+>   round.
 
 For the common "dedicated agent per session" pattern, don't rotate at establishment
 at all: pass the agent's id to `receive(…, new_client_id:)` and the session is born
