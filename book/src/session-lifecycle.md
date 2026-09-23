@@ -258,7 +258,7 @@ re-staple from the same initiator resolves to the same token).
 This book specifies intended behavior. The deployed Rust engine, and the host it first
 shipped in, deviate from it in six ways. Each item notes how it resolves: healed by a
 conforming peer following the spec, healed only once the deployed party runs a conforming
-engine, needing an accommodation beyond the spec, or pending a design decision.
+engine, or needing an accommodation beyond the spec.
 
 1. **Wrong trigger.** The deployed engine opens an A.5 when its own *send*-PQ leaf lags, not when a leaf
    in its receive group lags, and it never opens the reciprocal A.5. Its own round can
@@ -300,14 +300,17 @@ engine, needing an accommodation beyond the spec, or pending a design decision.
      A conforming engine that takes the party over drops its mis-signed parked `Upd'`
      and re-proposes under the carried key, which heals it. Once the leaf is orphaned,
      nothing heals it.
-6. **A.3 never completes under the deployed host.** That host ships the initiator's KP′
+6. **The deployed card host never sends side-band frames.** It ships the initiator's KP′
    inside an ordinary message, which the acceptor answers, standing up its send-PQ half
-   and parking `Welcome'`. But the host never sends side-band frames, so `Welcome'` never
-   leaves: the initiator waits for it indefinitely, and neither side becomes fully
-   established. No A.4 or A.5 ever runs, so the session keeps only the PQ protection its
-   establishment seeded.
-   - *Resolution: pending a design decision.* Either a host must carry side-band frames,
-     as [The PQ side-band](#the-pq-side-band) specifies, and a host that does completes the round from the parked
-     `Welcome'`, including after the session moves to a conforming engine. Or the
-     protocol carries A.3's `Welcome'` in-band on ordinary frames, as it already carries
-     the pre-delivered KP′ and the bind.
+   and parking `Welcome'`. But the host never sends that frame, so the initiator waits
+   for it indefinitely, and neither side becomes fully established. No A.4 or A.5 ever
+   runs, so the session keeps only the PQ protection its establishment seeded. The same
+   host does *receive* side-band frames and hands them to the session.
+   - *Resolution: healed once the acceptor's host carries side-band frames, as
+     [The PQ side-band](#the-pq-side-band) specifies.* An upgraded acceptor sends its
+     parked `Welcome'`. The deployed initiator binds, and its bind rides an ordinary
+     frame, so A.3 completes without the initiator upgrading. Every later A.4 or A.5
+     needs the deployed party to send a side-band leg, so those rounds stall, without
+     error, until it upgrades. A conforming host should bound its re-sends of a parked
+     leg to such a peer. A deployed acceptor cannot be healed from the initiator's side,
+     because only it holds the `Welcome'`.
