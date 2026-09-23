@@ -1,4 +1,4 @@
 ---
 ---
 
-Book-only: define `proposal_context` and describe the shipped A.5 catch-up; nothing ships.
+Book-only: define `proposal_context` and note the shipped A.5 catch-up anomaly; nothing ships.

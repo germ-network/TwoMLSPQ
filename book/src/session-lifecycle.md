@@ -190,29 +190,26 @@ slot frees. On the receiver, `queue_proposal` is a single-occupancy latest-wins 
 (`queued_remote_successor()` reveals it), epoch-locked so it is dropped when the send
 epoch advances by an A.4 bind.
 
-The winner's other leaves **lag and catch up**. Each one moves only when a commit in its
-own group moves it:
+The winner's other leaves **lag and catch up**: the proposer's own send-group leaf
+moves at its next approved commit (the peer observes `new_sender` on that staple, and
+message attribution follows); the PQ leaves catch up at the next A.3/A.5 handoff (the
+session self-drives this — when a rotation leaves the send-PQ leaf lagging, the next A.5
+it opens announces the session's *current*, already-canonical principal as the handoff,
+and the handoff's new leaf carries that credential); the acceptor's recv-group leaf
+converges from the invitation identity to the dedicated establishment principal via its
+first committed Upd. Every catch-up is validated
+against the AS history window.
 
-- The proposer's own send-group leaf moves at its next approved commit. The peer
-  observes `new_sender` on that staple, and message attribution follows.
-- Its leaf in the peer's send-PQ group (its own recv-PQ half) moves through an A.5
-  re-key. While its own send-PQ leaf lags the canonical principal, the session
-  self-drives an A.5 whose Upd′ announces that principal, and the peer's Commit′
-  installs it.
-- Its own send-PQ leaf moves only when it *responds* to an A.5 the peer opened: the
-  responder's Commit′ carries its current credential. After a one-sided rotation none of
-  the peer's leaves lag, so the peer never opens one. The rotated party's send-PQ leaf
-  keeps its pre-rotation credential, and because that leaf still lags, the session opens
-  another A.5 on every PQ turn it holds. After the first, that A.5 is a same-id key
-  refresh. Whether the non-rotated peer should instead open a round that heals the
-  lagging send-PQ leaf is **pending a design decision**.
-- The acceptor's recv-group leaf converges from the invitation identity to the dedicated
-  establishment principal when the peer commits one of its Upds. Those Upds propose the
-  identity the peer already treats as canonical (`proposing == sender`), so a host that
-  folds only offers where `proposing` differs from `sender` never commits one, and that
-  leaf keeps presenting the invitation identity.
-
-Every catch-up is validated against the AS history window.
+> **Shipped anomaly (deployed Rust engine).** The A.5 that a rotated party opens moves
+> only its leaf in the *peer's* send-PQ group. Its own send-PQ leaf moves only when it
+> responds to an A.5 the peer opens. After a one-sided rotation none of the peer's leaves
+> lag, so the peer never opens one. The rotated party's send-PQ leaf therefore keeps its
+> pre-rotation credential, and the session opens another A.5 on every PQ turn it holds;
+> after the first, each is a same-id key refresh. How that leaf should reach its handoff
+> is **pending a design decision**. Separately, a born-dedicated acceptor's catch-up Upds
+> propose the identity the peer already treats as canonical (`proposing == sender`). A
+> host that folds only offers where `proposing` differs from `sender` never commits one,
+> so that recv-group leaf keeps presenting the invitation identity.
 
 For the common "dedicated agent per session" pattern, don't rotate at establishment
 at all: pass the agent's id to `receive(…, new_client_id:)` and the session is born
