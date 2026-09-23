@@ -12,3 +12,7 @@ side. `BINDING_CONTRACT_VERSION` bumps 35 → 36 for the new record and field.
 Also corrects the 0.17.0 changelog's claim that group state written before that
 release ("pre-v35") no longer loads: it does. Sessions written by v0.16.0 restore and
 keep messaging under this engine, pinned by fixtures.
+
+`SessionError.Code.misroutedFrame` now has disposition `.discardFrame` (was `.callerBug`): an ill-timed
+side-band re-send is normal traffic, and the peer re-sends until answered, so dropping it is lossless.
+This shifts app-side handling and any analytics bucketed by disposition.
