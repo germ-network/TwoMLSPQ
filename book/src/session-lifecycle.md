@@ -255,7 +255,7 @@ re-staple from the same initiator resolves to the same token).
 
 ## Shipped anomalies
 
-This book specifies intended behavior. The deployed Rust engine, and the host it first
+This book specifies intended behavior. The deployed Rust engine, and the card host it
 shipped in, deviate from it in six ways. Each item notes how it resolves: healed by a
 conforming peer following the spec, healed only once the deployed party runs a conforming
 engine, or needing an accommodation beyond the spec.
@@ -305,9 +305,12 @@ engine, or needing an accommodation beyond the spec.
    and parking `Welcome'`. But the host never sends that frame, so the initiator waits
    for it indefinitely, and neither side becomes fully established. No A.4 or A.5 ever
    runs, so the session keeps only the PQ protection its establishment seeded. The same
-   host does *receive* side-band frames and hands them to the session.
+   host does *receive* side-band frames and hands them to the session, and the deployed
+   anchor host co-sends each parked frame with the next message, so anchor sessions
+   complete A.3.
    - *Resolution: healed once the acceptor's host carries side-band frames, as
-     [The PQ side-band](#the-pq-side-band) specifies.* An upgraded acceptor sends its
+     [The PQ side-band](#the-pq-side-band) specifies and the anchor host already does.*
+     No protocol change is needed. An upgraded acceptor sends its
      parked `Welcome'`. The deployed initiator binds, and its bind rides an ordinary
      frame, so A.3 completes without the initiator upgrading. Every later A.4 or A.5
      needs the deployed party to send a side-band leg, so those rounds stall, without
