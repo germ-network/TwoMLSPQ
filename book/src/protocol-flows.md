@@ -139,7 +139,7 @@ Independently, we have an exchange of large PQ key messages, carried as dedicate
     2. Alice and Bob take turns initiating PQ operations. Alice is first, and makes a variation of PQ re-keying to bootstrap Bob’s group:
         1. (In place of a proposal) Alice sends a PQ keyPackage to Bob
         2. (In place of a commit) Bob constructs the PQ half of his send group from it and replies with a Welcome (for that group)
-        3. Alice joins via the Welcome and closes the round with a bind, exactly as the PQ ratchet's — the only difference is where S comes from (a group exporter off the joined group's birth epoch rather than a KEM exchange). The bind rides her next classical commit as the staple; Bob takes the turn on applying it
+        3. Alice joins via the Welcome — signing in that group with KP′'s key, which her leaf there presents, until her own A.5 moves it — and closes the round with a bind, exactly as the PQ ratchet's — the only difference is where S comes from (a group exporter off the joined group's birth epoch rather than a KEM exchange). The bind rides her next classical commit as the staple; Bob takes the turn on applying it
     
     (Bob’s dedicated principal is selected at session establishment, not here. Alice started with a principal she generated to talk to Bob’s invitation principal; Bob accepts under a principal dedicated to Alice — his send group is created directly under it, and Alice adopts it when she joins his group. The PQ bootstrap and re-key only carry already-canonical credentials onto the PQ leaves.)
 
