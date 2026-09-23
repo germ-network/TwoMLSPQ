@@ -56,7 +56,8 @@ is not a lag. "A.4 begins immediately" is just the first send after the turn bec
 ratchet then ping-pongs, turn-gated so the two sides never both open at once. Staging is
 best-effort (a transient KEM/proposal failure simply retries on the next send) and the staged
 frame rides that send's re-staple peek (`pq_pending_outbound`), so the host's role is
-`.finishBootstrap` plus sending messages.
+`.finishBootstrap` plus sending messages. A deployed host deviates here; see
+[Shipped anomalies](#shipped-anomalies).
 
 - **Bootstrap** (`0x13`/`0x15`, then a stapled bind) — stands up Group_B's deferred PQ half
   off the critical path: Alice sends her PQ key package (`0x13`) — the one PRE-COMMITTED at
@@ -212,50 +213,8 @@ against the AS history window, and a credential that a live PQ leaf still presen
 admissible past window eviction until that leaf catches up (see
 [Group Rules](./group-rules.md), rule 4).
 
-> **Shipped anomaly (deployed Rust engine).** Five deviations. Each notes how it resolves:
-> healed by a conforming peer following the spec, healed only once the deployed party runs
-> a conforming engine, or needing an accommodation beyond the spec.
->
-> 1. **Wrong trigger.** It opens an A.5 when its own *send*-PQ leaf lags, not when a leaf
->    in its receive group lags, and it never opens the reciprocal A.5. Its own round can
->    only move its receive-PQ leaf, so the trigger never clears itself. After a one-sided
->    rotation, the rotated party therefore opens another A.5 on every PQ turn it holds
->    (after the first, each is a same-id key refresh), and its own send-PQ leaf keeps its
->    pre-rotation credential.
->    - *Resolution: healed by spec behavior.* The deployed responder `Commit'` does carry
->      its current credential, so a conforming peer's reciprocal A.5 completes the
->      catch-up and the loop stops. In the other direction, a conforming rotated party's
->      own send-PQ leaf stays behind against a deployed peer. That needs no accommodation:
->      rule 4 already has it keep signing that group with the key its leaf presents.
-> 2. **Born-dedicated acceptor's PQ leaf.** A deployed born-dedicated acceptor never
->    catches up its leaf in the initiator's send-PQ group: its own send-PQ leaf was minted
->    at A.3 under the dedicated id, so its trigger never fires.
->    - *Resolution: healed once the acceptor runs a conforming engine,* whose own A.5
->      fires. The peer cannot heal it, since only the acceptor's own `Upd'` moves that
->      leaf.
-> 3. **Born-dedicated acceptor's catch-up Upds.** They propose the identity the peer
->    already treats as canonical (`proposing == sender`). A host that folds only offers
->    where `proposing` differs from `sender` never commits one, so the acceptor's
->    recv-group leaf keeps presenting the invitation identity.
->    - *Resolution: healed by the peer's host.* A conforming engine marks such an offer
->      as a catch-up, which the host can approve without authorizing a new credential.
-> 4. **History window.** The deployed AS pins only the A.3 founding ids.
->    - *Resolution: healed by spec behavior wherever a conforming engine validates the
->      move,* because it keeps any id a live PQ leaf presents admissible (rule 4). A
->      deployed validator still refuses a leaf left behind for longer than the history
->      window, and nothing heals that.
-> 5. **Unchecked join.** Its A.3 bind joins the peer's send-PQ group signing with its
->    *current* PQ key, not the KP′ key its leaf there presents (contrary to rule 4). After
->    a rotation before the bind, its A.5 `Upd'` in that group is mis-signed and always
->    rejected, and the presented key survives only as its own send-PQ group's signer.
->    When it later answers a peer's A.5, its responder `Commit'` replaces that signer,
->    and the leaf is orphaned for good: no copy of its key remains.
->    - *Resolution: needs an accommodation.* A conforming peer defers a reciprocal A.5
->      until the peer's own A.5 has succeeded, meaning the peer's leaf in our send-PQ
->      group is current. Against a conforming peer this costs at most one extra round.
->      A conforming engine that takes the party over drops its mis-signed parked `Upd'`
->      and re-proposes under the carried key, which heals it. Once the leaf is orphaned,
->      nothing heals it.
+The deployed engine deviates from this catch-up; see
+[Shipped anomalies](#shipped-anomalies).
 
 For the common "dedicated agent per session" pattern, don't rotate at establishment
 at all: pass the agent's id to `receive(…, new_client_id:)` and the session is born
@@ -293,3 +252,62 @@ table (contract 23) — so all four survive a restore. The token is opaque
 to this crate — the caller picks the convention (Germ's adapter digests the envelope's
 STABLE PREFIX — the app payload, else the bare welcome — so every pre-establishment
 re-staple from the same initiator resolves to the same token).
+
+## Shipped anomalies
+
+This book specifies intended behavior. The deployed Rust engine, and the host it first
+shipped in, deviate from it in six ways. Each item notes how it resolves: healed by a
+conforming peer following the spec, healed only once the deployed party runs a conforming
+engine, needing an accommodation beyond the spec, or pending a design decision.
+
+1. **Wrong trigger.** The deployed engine opens an A.5 when its own *send*-PQ leaf lags, not when a leaf
+   in its receive group lags, and it never opens the reciprocal A.5. Its own round can
+   only move its receive-PQ leaf, so the trigger never clears itself. After a one-sided
+   rotation, the rotated party therefore opens another A.5 on every PQ turn it holds
+   (after the first, each is a same-id key refresh), and its own send-PQ leaf keeps its
+   pre-rotation credential.
+   - *Resolution: healed by spec behavior.* The deployed responder `Commit'` does carry
+     its current credential, so a conforming peer's reciprocal A.5 completes the
+     catch-up and the loop stops. In the other direction, a conforming rotated party's
+     own send-PQ leaf stays behind against a deployed peer. That needs no accommodation:
+     rule 4 already has it keep signing that group with the key its leaf presents.
+2. **Born-dedicated acceptor's PQ leaf.** A deployed born-dedicated acceptor never
+   catches up its leaf in the initiator's send-PQ group: its own send-PQ leaf was minted
+   at A.3 under the dedicated id, so its trigger never fires.
+   - *Resolution: healed once the acceptor runs a conforming engine,* whose own A.5
+     fires. The peer cannot heal it, since only the acceptor's own `Upd'` moves that
+     leaf.
+3. **Born-dedicated acceptor's catch-up Upds.** They propose the identity the peer
+   already treats as canonical (`proposing == sender`). A host that folds only offers
+   where `proposing` differs from `sender` never commits one, so the acceptor's
+   recv-group leaf keeps presenting the invitation identity.
+   - *Resolution: healed by the peer's host.* A conforming engine marks such an offer
+     as a catch-up, which the host can approve without authorizing a new credential.
+4. **History window.** The deployed AS pins only the A.3 founding ids.
+   - *Resolution: healed by spec behavior wherever a conforming engine validates the
+     move,* because it keeps any id a live PQ leaf presents admissible (rule 4). A
+     deployed validator still refuses a leaf left behind for longer than the history
+     window, and nothing heals that.
+5. **Unchecked join.** The deployed engine's A.3 bind joins the peer's send-PQ group signing with its
+   *current* PQ key, not the KP′ key its leaf there presents (contrary to rule 4). After
+   a rotation before the bind, its A.5 `Upd'` in that group is mis-signed and always
+   rejected, and the presented key survives only as its own send-PQ group's signer.
+   When it later answers a peer's A.5, its responder `Commit'` replaces that signer,
+   and the leaf is orphaned for good: no copy of its key remains.
+   - *Resolution: needs an accommodation.* A conforming peer defers a reciprocal A.5
+     until the peer's own A.5 has succeeded, meaning the peer's leaf in our send-PQ
+     group is current. Against a conforming peer this costs at most one extra round.
+     A conforming engine that takes the party over drops its mis-signed parked `Upd'`
+     and re-proposes under the carried key, which heals it. Once the leaf is orphaned,
+     nothing heals it.
+6. **A.3 never completes under the deployed host.** That host ships the initiator's KP′
+   inside an ordinary message, which the acceptor answers, standing up its send-PQ half
+   and parking `Welcome'`. But the host never sends side-band frames, so `Welcome'` never
+   leaves: the initiator waits for it indefinitely, and neither side becomes fully
+   established. No A.4 or A.5 ever runs, so the session keeps only the PQ protection its
+   establishment seeded.
+   - *Resolution: pending a design decision.* Either a host must carry side-band frames,
+     as [The PQ side-band](#the-pq-side-band) specifies, and a host that does completes the round from the parked
+     `Welcome'`, including after the session moves to a conforming engine. Or the
+     protocol carries A.3's `Welcome'` in-band on ordinary frames, as it already carries
+     the pre-delivered KP′ and the bind.
