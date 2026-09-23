@@ -142,7 +142,8 @@ sequence is driven by the classical ratchet itself:
    authorizations expire.
 4. **Everything else lags and catches up.** The sender's own send-group leaf moves at
    its next approved commit (the peer observes `new_sender`); the PQ leaves catch up
-   at the next A.3/A.5 handoff; the acceptor's recv-group leaf converges from the
+   at the next A.3 handoff or over two A.5 rounds, one per PQ group — the sender's own
+   A.5, then the peer's reciprocal A.5; the acceptor's recv-group leaf converges from the
    invitation identity to the dedicated principal via its first committed Upd.
    The AS validates every catch-up against the sequence *history*
    (`CREDENTIAL_HISTORY_WINDOW = 8` canonical steps) — a lagging leaf may only

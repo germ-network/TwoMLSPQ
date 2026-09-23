@@ -1,4 +1,4 @@
 ---
 ---
 
-Book-only: define `proposal_context` and note the shipped A.5 catch-up anomaly; nothing ships.
+Book-only: specify the reciprocal A.5 credential catch-up, define `proposal_context`, and note the shipped anomaly; nothing ships.

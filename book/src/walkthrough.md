@@ -30,9 +30,9 @@ The narrative, step by step:
 7. **Continued messaging** — bidirectional traffic continues post-refresh.
 8. **Rotation** — Alice `prepare_to_encrypt(Some(new_id))` (lazy: the successor's keys
    are minted and authorized on the fly — no separate stage call); Bob
-   observes `CommitResult.new_sender`. Her PQ leaves catch up automatically: the session
-   opens an A.5 re-key on her next send once the rotation leaves the send-PQ leaf lagging
-   (no host call — see Session Lifecycle).
+   observes `CommitResult.new_sender`. Her PQ leaves catch up automatically over two A.5
+   re-keys: hers on her next PQ turn, then Bob's reciprocal one on his (no host call — see
+   Session Lifecycle).
 
 For the full flow detail — the PQ side-band rounds, routing, and rotation — see the
 [Session Lifecycle](./session-lifecycle.md) chapter, and the [Wire Format](./wire-format.md)
