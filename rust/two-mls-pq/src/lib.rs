@@ -499,7 +499,17 @@ pub fn version() -> String {
 // enabled. Stored group state is unaffected, and a pre-v35-written session archive (down
 // through v0.15.0 (archive layout 3)) still restores here, pinned by the
 // `TwoMLSPQMigrateTests` legacy-row fixtures.
-const BINDING_CONTRACT_VERSION: u64 = 35;
+//
+// v36: the session migration export now admits a born-dedicated acceptor once its
+// establishment envelope has installed and its recv-classical leaf has caught up, and an
+// acceptor still holding a parked return welcome (dropped from the export rather than
+// refused). One new Record, `SessionMigrationPqLeafCustody`, and one field appended to
+// `SessionMigrationExport` — a stale binding/binary pair would mis-read the export buffer.
+// No wire, archive, or error-variant change. The mls-rs pin moves to the fork's
+// `germ-integration` head (fcd822c), adding a read-only accessor for a group's current
+// signing secret (gated behind the same `swift_export` feature as v35's pin) — no
+// serialized struct changed.
+const BINDING_CONTRACT_VERSION: u64 = 36;
 
 /// See `BINDING_CONTRACT_VERSION`. Exported so the Swift layer can verify the
 /// binding it was generated with matches the binary it loaded.

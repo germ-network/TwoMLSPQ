@@ -1,30 +1,62 @@
-//! Session migration export (GER-2433 C1): `TwoMlsPqSession::migration_export`,
-//! the session-level analogue of `TwoMlsPqInvitation::migration_export`
-//! (GER-2484). Emits everything twomlspq-swift's `SessionMigration.mintArchive`
-//! needs to mint a native `SessionArchive`: each group half as a swift-mls
-//! format-2 snapshot (mls-rs's `Group::export_for_swift`, slice A) plus the
-//! combiner/session metadata as flat records.
+//! Session migration export: `TwoMlsPqSession::migration_export`, the
+//! session-level analogue of `TwoMlsPqInvitation::migration_export`. Emits
+//! everything twomlspq-swift's `SessionMigration.mintArchive` needs to mint a
+//! native `SessionArchive`: each group half as a swift-mls format-2 snapshot
+//! (mls-rs's `Group::export_for_swift`, slice A) plus the combiner/session
+//! metadata as flat records.
 //!
-//! Scope: an ESTABLISHED, quiescent session. The export refuses (rather than
-//! mis-maps) the states the native archive cannot represent:
+//! Admits an established session — an established initiator or acceptor need
+//! not be quiescent first: a parked side-band leg, an in-flight PQ round
+//! (`pq_inflight`), and an owed classical bind (`owed_bind`) are all carried
+//! in the export rather than required to settle before migrating, so the
+//! round in progress completes normally on whichever engine finishes it:
+//!
+//!   * one still holding a parked return welcome (an acceptor's
+//!     `pending_outbound`) — the export drops that parked copy rather than
+//!     refusing it. The same welcome rides `current_staple` until the
+//!     acceptor's own first send-group commit, and the native session
+//!     re-staples `currentStaple` the same way, so nothing is stranded;
+//!   * a born-dedicated acceptor, once its establishment envelope has
+//!     installed AND its recv-classical leaf has caught up to the dedicated
+//!     identity. Its recv-PQ leaf, which nothing in Rust ever catches up,
+//!     exports as `pq_leaf_custody` instead of refusing (see the custody gate
+//!     below).
+//!
+//! Refuses (rather than mis-maps) the states the native archive cannot
+//! represent:
 //!
 //!   * pre-establishment initiator (no recv group yet): the parked §A.1
 //!     envelope and app payload have no native slots, so the migrated session
 //!     could never complete establishment;
+//!   * a born-dedicated acceptor pre-install, or installed but pre-convergence:
+//!     until the peer folds the classical catch-up Upd, the recv-classical
+//!     leaf still presents the invitation identity's key, and mls-rs replaces
+//!     that leaf's only signer exactly when the catch-up commit lands — before
+//!     then there is nothing native could sign that leaf with;
 //!   * mid-rotation (`staged_candidates` / `deferred_candidate`): the Rust
 //!     model holds up to `CANDIDATE_WINDOW` full successor identities where the
 //!     native one holds a single rotation candidate;
-//!   * born-dedicated, either latch state: the delegation blob has no native
-//!     slot post-install, and pre-install the recv-group leaves present the
-//!     INVITATION identity's keys, which the session no longer holds (the
-//!     native `recvLeafPrincipal` custody arm can't be populated);
-//!   * post-rotation leaf-lag: a canonicalized rotation swaps `inner.client`
-//!     to fresh keys while lagging leaves still present the old ones, and the
-//!     export has no `rotationCandidate`/`recvLeafPrincipal` to custody them —
-//!     so every group half's own leaf must present the identity's per-half
-//!     signing key (the custody gate below);
+//!   * post-rotation leaf-lag: every group half's own leaf must present the
+//!     identity's per-half signing key, or (recv-PQ only) resolve through the
+//!     custody gate — anything else refuses. Applies to a born-dedicated
+//!     session too, for every half EXCEPT its already-custodied recv-PQ leaf
+//!     (e.g. a lagging send-PQ leaf after a rotation, which has no custody
+//!     slot of its own yet);
 //!   * a wedged or bind-broken side-band: the native archive carries no wedge
 //!     verdict, so the migrated session would report healthy and deadlock.
+//!
+//! These refusals return `SessionNotReady` — retryable in principle, once the
+//! session advances past the blocking state. One retry ceiling: custody also
+//! requires the leaf's id still be within the `auth.mine` history window (8
+//! entries) — past enough further rotations without ever migrating, that
+//! stops being true and the refusal becomes permanent. Rare in practice, but
+//! not retryable when it happens. `ArchiveInvalid` means something else
+//! entirely: the stored state is corrupt and retrying will not help — e.g. a
+//! stored group whose cipher suite no longer matches the session's expected
+//! suite (checked before any half's signer touches a provider, since deriving
+//! a key through the wrong suite's provider is unrecoverable rather than a
+//! clean failure), or a custodied PQ signer that doesn't derive to its
+//! presented key.
 //!
 //! A pending mls-rs commit or a signer-rotating pending self-Update fails
 //! inside `export_for_swift` itself.
@@ -35,7 +67,7 @@
 //! on any record: a derived impl would print plaintext key material.
 
 use mls_rs::mls_rs_codec::{MlsDecode, MlsEncode};
-use mls_rs::MlsMessage;
+use mls_rs::{CipherSuiteProvider, MlsMessage};
 use zeroize::Zeroizing;
 
 use crate::key_package_store::{CombinerGroup, KeyPackageSecret, SyntheticKeyPackageStore};
@@ -163,6 +195,20 @@ pub struct SessionMigrationBootstrapKp {
     pub key_package: Vec<u8>,
 }
 
+/// Custody over the PQ signing key that one of this session's own PQ leaves still
+/// presents in place of the identity's — today, a born-dedicated acceptor's recv-PQ
+/// leaf, which keeps presenting the INVITATION identity's key because nothing in
+/// Rust ever catches it up (see the module note). Only the PQ pair: every classical
+/// own leaf must already present the identity's key, and mls-rs drops the old
+/// classical signer at that catch-up, so no classical half is ever left to custody.
+/// A follow-up reuses this for a lagging send-PQ leaf after a rotation.
+#[derive(Clone, uniffi::Record)]
+pub struct SessionMigrationPqLeafCustody {
+    pub client_id: Vec<u8>,
+    pub pq_signing_key: Vec<u8>,
+    pub pq_signature_key: Vec<u8>,
+}
+
 /// The archivable `PqInflight` round state in the native `MigratedPQInflight`
 /// shape: the A.4 variants carry the round's KEM material, `RekeyInitiated`
 /// the leg-1 Upd' (lifted out of the retained side-band frame, whose `0x1B`
@@ -236,6 +282,9 @@ pub struct SessionMigrationExport {
     pub initial_their_kp: Option<SessionMigrationCombinerKp>,
     /// `requires_establishment_envelope` under its native name.
     pub owes_establishment_envelope: bool,
+    /// `Some` exactly when the recv-PQ leaf still presents a key other than the
+    /// identity's — a born-dedicated acceptor's uncaught-up PQ leaf.
+    pub pq_leaf_custody: Option<SessionMigrationPqLeafCustody>,
 }
 
 /// The stored Ed25519 secrets use the mls-rs provider convention — the
@@ -373,15 +422,60 @@ fn export_pq_inflight(inner: &SessionInner) -> Result<Option<SessionMigrationPqI
     }))
 }
 
+/// The signing key one group half's own leaf currently presents. Generic over both
+/// concrete group configs (classical and PQ) so the custody gate can apply it to either.
+pub(super) fn own_signature_key<Cfg: mls_rs::client_builder::MlsConfig>(
+    group: &mls_rs::Group<Cfg>,
+) -> Result<Vec<u8>> {
+    Ok(group
+        .current_member_signing_identity()
+        .map_err(|_| TwoMlsPqError::Mls)?
+        .signature_key
+        .as_bytes()
+        .to_vec())
+}
+
+/// A PQ half's own leaf, once it no longer presents the identity's key: builds custody
+/// over its signer, provided the leaf's own credential is one of THIS session's own past
+/// identities (`auth.mine` history, not the peer's) and the signer derives to the
+/// presented key. Derivation runs through the EXPECTED suite's provider (never one chosen
+/// by the group's own stored suite — the caller checks that separately, first).
+pub(super) fn leaf_pq_custody(
+    group: &crate::key_package_store::PqMlsGroup,
+    presented: &[u8],
+    identity_client_id: &[u8],
+    auth_mine_history: &[Vec<u8>],
+) -> Result<SessionMigrationPqLeafCustody> {
+    let client_id = apq::sender_client_id(group, group.current_member_index())
+        .map_err(|_| TwoMlsPqError::Mls)?;
+    if client_id == identity_client_id || !auth_mine_history.iter().any(|id| id == &client_id) {
+        return Err(TwoMlsPqError::SessionNotReady);
+    }
+    let signer = group.signer_for_swift_export();
+    let derived = crate::providers::pq_envelope_suite()?
+        .signature_key_derive_public(signer)
+        .map_err(|_| TwoMlsPqError::ArchiveInvalid)?;
+    if derived.as_bytes() != presented {
+        return Err(TwoMlsPqError::ArchiveInvalid);
+    }
+    Ok(SessionMigrationPqLeafCustody {
+        client_id,
+        pq_signing_key: bare_ed25519(signer.as_bytes())?,
+        pq_signature_key: presented.to_vec(),
+    })
+}
+
 #[uniffi::export]
 impl TwoMlsPqSession {
     /// Export this session as the migration payload for the twomlspq-swift
-    /// session mint (GER-2433 C1): every group half as a format-2 snapshot plus
-    /// the session metadata `SessionMigration.mintArchive` mints a native
-    /// `SessionArchive` from.
+    /// session mint: every group half as a format-2 snapshot plus the session
+    /// metadata `SessionMigration.mintArchive` mints a native `SessionArchive`
+    /// from.
     ///
-    /// Admits only an ESTABLISHED, quiescent session — see the module note for
-    /// the refused states (`SessionNotReady`; `ArchiveInvalid` for torn or
+    /// Admits only an established session — including one with a parked
+    /// side-band leg, an in-flight PQ round, or an owed bind, all carried so
+    /// the round completes after migration — see the module note for the
+    /// refused states (`SessionNotReady`; `ArchiveInvalid` for torn or
     /// unrecoverable state; `Mls` when a group half refuses its own export,
     /// e.g. a pending commit).
     ///
@@ -391,34 +485,49 @@ impl TwoMlsPqSession {
     /// under `awslc` the length guards fail the export as `ArchiveInvalid`.
     pub fn migration_export(&self) -> Result<SessionMigrationExport> {
         let mut inner = self.lock();
+        let initiated = inner.expected_bootstrap_kp_commitment.is_none();
 
-        // The unmigratable states (module note): pre-establishment, mid-rotation,
-        // born-dedicated (either latch state), or a torn side-band.
+        // The unmigratable states (module note): pre-establishment, mid-rotation, a
+        // born-dedicated session not yet installed, or a torn side-band. An
+        // acceptor's parked return welcome is fine — dropped below, not refused
+        // here, because the app never drains it and the same welcome still rides
+        // `current_staple` — so only an initiator's park blocks the export
+        // (already implied by `recv_group.is_none()`; kept as belt-and-braces).
         if inner.recv_group.is_none()
-            || inner.pending_outbound.is_some()
+            || (inner.pending_outbound.is_some() && initiated)
             || inner.initial_app_payload.is_some()
             || inner.initial_return_kp.is_some()
             || !inner.staged_candidates.is_empty()
             || inner.deferred_candidate.is_some()
-            || inner.requires_establishment_envelope
-            || inner.establishment_envelope.is_some()
+            || (inner.requires_establishment_envelope && inner.establishment_envelope.is_none())
             || inner.pq_wedged.is_some()
             || inner.bind_apply_broken
         {
             return Err(TwoMlsPqError::SessionNotReady);
         }
 
-        let send_group = export_group_half(
+        // SUITE CHECK FIRST, before any crypto: a stored group half whose cipher
+        // suite disagrees with the session's own declared suite is corrupt — and
+        // must never reach a provider it doesn't belong to (see the module note).
+        let expected_suite = inner.client.combiner().cipher_suite();
+        for half in [
             inner
                 .send_group
-                .as_mut()
+                .as_ref()
                 .ok_or(TwoMlsPqError::SessionNotReady)?,
-        )?;
-        let recv_group = inner
-            .recv_group
-            .as_mut()
-            .map(export_group_half)
-            .transpose()?;
+            inner
+                .recv_group
+                .as_ref()
+                .ok_or(TwoMlsPqError::SessionNotReady)?,
+        ] {
+            let pq_ok = half
+                .pq
+                .as_ref()
+                .is_none_or(|pq| pq.cipher_suite() == expected_suite.pq);
+            if half.classical.cipher_suite() != expected_suite.classical || !pq_ok {
+                return Err(TwoMlsPqError::ArchiveInvalid);
+            }
+        }
 
         // The identity: signing keys from the session client, key packages
         // picked (or freshly minted) per half — see `identity_kp`.
@@ -467,46 +576,65 @@ impl TwoMlsPqSession {
         };
 
         // The custody gate: every group half's own leaf must present the
-        // identity's per-half signing key. The mint's custody arms resolve a
-        // presented key against identity ∪ rotationCandidate ∪
-        // recvLeafPrincipal, and this export carries only the identity — so a
-        // post-rotation leaf-lag or born-dedicated session admitted here would
-        // fail the mint as `archiveInvalid` (corruption semantics on a healthy
-        // session). Refuse as `SessionNotReady` instead.
-        let leaf_matches = |group: &CombinerGroup| -> Result<bool> {
-            let classical_ok = group
-                .classical
-                .current_member_signing_identity()
-                .map_err(|_| TwoMlsPqError::Mls)?
-                .signature_key
-                .as_bytes()
-                == identity.signature_key;
-            let pq_ok = match group.pq.as_ref() {
-                Some(pq) => {
-                    pq.current_member_signing_identity()
-                        .map_err(|_| TwoMlsPqError::Mls)?
-                        .signature_key
-                        .as_bytes()
-                        == identity.pq_signature_key
-                }
-                None => true,
-            };
-            Ok(classical_ok && pq_ok)
-        };
-        if !leaf_matches(
-            inner
-                .send_group
-                .as_ref()
-                .ok_or(TwoMlsPqError::SessionNotReady)?,
-        )? || !inner
+        // identity's per-half signing key, except a born-dedicated acceptor's
+        // recv-PQ leaf, which nothing in Rust ever catches up (module note) —
+        // captured as `pq_leaf_custody` instead of matched. The mint's custody
+        // arms resolve a presented key against identity ∪ rotationCandidate ∪
+        // recvLeafPrincipal; anything else admitted here would fail the mint as
+        // `archiveInvalid` (corruption semantics on a healthy session), so this
+        // refuses as `SessionNotReady` first — before the export ever surfaces
+        // an `Mls` error for merely not having converged yet.
+        let send = inner
+            .send_group
+            .as_ref()
+            .ok_or(TwoMlsPqError::SessionNotReady)?;
+        let recv = inner
             .recv_group
             .as_ref()
-            .map(leaf_matches)
-            .transpose()?
-            .unwrap_or(false)
+            .ok_or(TwoMlsPqError::SessionNotReady)?;
+        if own_signature_key(&send.classical)? != identity.signature_key
+            || own_signature_key(&recv.classical)? != identity.signature_key
         {
             return Err(TwoMlsPqError::SessionNotReady);
         }
+        if let Some(pq) = send.pq.as_ref() {
+            if own_signature_key(pq)? != identity.pq_signature_key {
+                return Err(TwoMlsPqError::SessionNotReady);
+            }
+        }
+        let pq_leaf_custody = match recv.pq.as_ref() {
+            None => None,
+            Some(pq) => {
+                let presented = own_signature_key(pq)?;
+                if presented == identity.pq_signature_key {
+                    None
+                } else if inner.requires_establishment_envelope {
+                    let auth_mine_history = inner.with_auth(|core| core.mine.to_parts().0);
+                    Some(leaf_pq_custody(
+                        pq,
+                        &presented,
+                        &identity.client_id,
+                        &auth_mine_history,
+                    )?)
+                } else {
+                    // The existing post-rotation leaf-lag refusal for a
+                    // non-dedicated session: no custody slot to fall back to.
+                    return Err(TwoMlsPqError::SessionNotReady);
+                }
+            }
+        };
+
+        let send_group = export_group_half(
+            inner
+                .send_group
+                .as_mut()
+                .ok_or(TwoMlsPqError::SessionNotReady)?,
+        )?;
+        let recv_group = inner
+            .recv_group
+            .as_mut()
+            .map(export_group_half)
+            .transpose()?;
 
         let (auth_mine, auth_theirs) = inner.with_auth(|core| {
             let seq = |s: &apq::authentication::PartySequence| {
@@ -588,7 +716,7 @@ impl TwoMlsPqSession {
 
         Ok(SessionMigrationExport {
             state_seq: inner.state_seq,
-            initiated: inner.expected_bootstrap_kp_commitment.is_none(),
+            initiated,
             identity,
             auth_mine,
             auth_theirs,
@@ -660,7 +788,11 @@ impl TwoMlsPqSession {
                     })
                 })
                 .transpose()?,
-            owes_establishment_envelope: inner.requires_establishment_envelope,
+            // Always false on an admitted export — the pre-install latch above
+            // refuses otherwise — kept for native-shape parity.
+            owes_establishment_envelope: inner.requires_establishment_envelope
+                && inner.establishment_envelope.is_none(),
+            pq_leaf_custody,
         })
     }
 }
@@ -721,9 +853,11 @@ mod tests {
         ));
     }
 
-    /// A fresh acceptor (recv group joined, its send-PQ half still deferred,
-    /// return welcome already drained) exports fine — the native mint's
-    /// topology gate keys off the RECV pair for a responder.
+    /// A fresh acceptor (recv group joined, its send-PQ half still deferred) exports fine
+    /// with its parked return welcome still UNDRAINED: the app never drains an
+    /// acceptor's `pending_outbound`, so refusing it would mean no acceptor session ever
+    /// migrates. The export drops the parked copy; the same welcome still rides
+    /// `current_staple` until this acceptor's own first send-group commit.
     #[cfg(feature = "cryptokit")]
     #[test]
     fn test_migration_export_acceptor_pre_bootstrap() {
@@ -751,13 +885,10 @@ mod tests {
             None,
             None,
         ));
-        // Drain the parked return welcome — a session whose pre-establishment
-        // output is still parked is refused (the native archive has no slot
-        // for it).
-        assert_some!(bob_s.pending_outbound());
         let export = assert_ok!(bob_s.migration_export());
         assert!(!export.initiated);
         assert!(export.send_group.pq.is_none());
         assert!(assert_some!(export.recv_group).pq.is_some());
+        assert!(export.pq_leaf_custody.is_none());
     }
 }

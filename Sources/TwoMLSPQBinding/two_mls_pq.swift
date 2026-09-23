@@ -2222,12 +2222,14 @@ public protocol TwoMlsPqSessionProtocol: AnyObject, Sendable {
     
     /**
      * Export this session as the migration payload for the twomlspq-swift
-     * session mint (GER-2433 C1): every group half as a format-2 snapshot plus
-     * the session metadata `SessionMigration.mintArchive` mints a native
-     * `SessionArchive` from.
+     * session mint: every group half as a format-2 snapshot plus the session
+     * metadata `SessionMigration.mintArchive` mints a native `SessionArchive`
+     * from.
      *
-     * Admits only an ESTABLISHED, quiescent session — see the module note for
-     * the refused states (`SessionNotReady`; `ArchiveInvalid` for torn or
+     * Admits only an established session — including one with a parked
+     * side-band leg, an in-flight PQ round, or an owed bind, all carried so
+     * the round completes after migration — see the module note for the
+     * refused states (`SessionNotReady`; `ArchiveInvalid` for torn or
      * unrecoverable state; `Mls` when a group half refuses its own export,
      * e.g. a pending commit).
      *
@@ -3199,12 +3201,14 @@ open func shouldListenOn()throws  -> ListenChannels  {
     
     /**
      * Export this session as the migration payload for the twomlspq-swift
-     * session mint (GER-2433 C1): every group half as a format-2 snapshot plus
-     * the session metadata `SessionMigration.mintArchive` mints a native
-     * `SessionArchive` from.
+     * session mint: every group half as a format-2 snapshot plus the session
+     * metadata `SessionMigration.mintArchive` mints a native `SessionArchive`
+     * from.
      *
-     * Admits only an ESTABLISHED, quiescent session — see the module note for
-     * the refused states (`SessionNotReady`; `ArchiveInvalid` for torn or
+     * Admits only an established session — including one with a parked
+     * side-band leg, an in-flight PQ round, or an owed bind, all carried so
+     * the round completes after migration — see the module note for the
+     * refused states (`SessionNotReady`; `ArchiveInvalid` for torn or
      * unrecoverable state; `Mls` when a group half refuses its own export,
      * e.g. a pending commit).
      *
@@ -5497,6 +5501,11 @@ public struct SessionMigrationExport: Equatable, Hashable {
      * `requires_establishment_envelope` under its native name.
      */
     public var owesEstablishmentEnvelope: Bool
+    /**
+     * `Some` exactly when the recv-PQ leaf still presents a key other than the
+     * identity's — a born-dedicated acceptor's uncaught-up PQ leaf.
+     */
+    public var pqLeafCustody: SessionMigrationPqLeafCustody?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -5518,7 +5527,11 @@ public struct SessionMigrationExport: Equatable, Hashable {
          */stagedUpdates: [SessionMigrationStagedUpdate], joinedWelcomeDigest: Data?, bootstrapKpSecret: SessionMigrationBootstrapKp?, expectedBootstrapKpCommitment: Data?, pqTurnMine: Bool, owedBind: SessionMigrationOwedBind?, pqInflight: SessionMigrationPqInflight?, pendingSideBand: Data?, peerAppliedSendEpoch: UInt64?, lastCrossInjected: UInt64?, lastCrossInjectedPq: UInt64?, lastSendPqExported: UInt64?, offeredProposal: SessionMigrationDigestedProposal?, queuedProposal: SessionMigrationDigestedProposal?, sendCrossPskLedger: [SessionMigrationPskEntry], spawnToken: Data?, listenRendezvous: [SessionMigrationEpochEntry], recvHeaderKeys: [SessionMigrationEpochEntry], recvHeaderKeysPq: [SessionMigrationEpochEntry], sendAttachmentLedger: [SessionMigrationEpochEntry], recvAttachmentLedger: [SessionMigrationEpochEntry], initialTheirKp: SessionMigrationCombinerKp?, 
         /**
          * `requires_establishment_envelope` under its native name.
-         */owesEstablishmentEnvelope: Bool) {
+         */owesEstablishmentEnvelope: Bool, 
+        /**
+         * `Some` exactly when the recv-PQ leaf still presents a key other than the
+         * identity's — a born-dedicated acceptor's uncaught-up PQ leaf.
+         */pqLeafCustody: SessionMigrationPqLeafCustody?) {
         self.stateSeq = stateSeq
         self.initiated = initiated
         self.identity = identity
@@ -5551,6 +5564,7 @@ public struct SessionMigrationExport: Equatable, Hashable {
         self.recvAttachmentLedger = recvAttachmentLedger
         self.initialTheirKp = initialTheirKp
         self.owesEstablishmentEnvelope = owesEstablishmentEnvelope
+        self.pqLeafCustody = pqLeafCustody
     }
 
     
@@ -5600,7 +5614,8 @@ public struct FfiConverterTypeSessionMigrationExport: FfiConverterRustBuffer {
                 sendAttachmentLedger: FfiConverterSequenceTypeSessionMigrationEpochEntry.read(from: &buf), 
                 recvAttachmentLedger: FfiConverterSequenceTypeSessionMigrationEpochEntry.read(from: &buf), 
                 initialTheirKp: FfiConverterOptionTypeSessionMigrationCombinerKp.read(from: &buf), 
-                owesEstablishmentEnvelope: FfiConverterBool.read(from: &buf)
+                owesEstablishmentEnvelope: FfiConverterBool.read(from: &buf), 
+                pqLeafCustody: FfiConverterOptionTypeSessionMigrationPqLeafCustody.read(from: &buf)
         )
     }
 
@@ -5637,6 +5652,7 @@ public struct FfiConverterTypeSessionMigrationExport: FfiConverterRustBuffer {
         FfiConverterSequenceTypeSessionMigrationEpochEntry.write(value.recvAttachmentLedger, into: &buf)
         FfiConverterOptionTypeSessionMigrationCombinerKp.write(value.initialTheirKp, into: &buf)
         FfiConverterBool.write(value.owesEstablishmentEnvelope, into: &buf)
+        FfiConverterOptionTypeSessionMigrationPqLeafCustody.write(value.pqLeafCustody, into: &buf)
     }
 }
 
@@ -5939,6 +5955,73 @@ public func FfiConverterTypeSessionMigrationPartySequence_lift(_ buf: RustBuffer
 #endif
 public func FfiConverterTypeSessionMigrationPartySequence_lower(_ value: SessionMigrationPartySequence) -> RustBuffer {
     return FfiConverterTypeSessionMigrationPartySequence.lower(value)
+}
+
+
+/**
+ * Custody over the PQ signing key that one of this session's own PQ leaves still
+ * presents in place of the identity's — today, a born-dedicated acceptor's recv-PQ
+ * leaf, which keeps presenting the INVITATION identity's key because nothing in
+ * Rust ever catches it up (see the module note). Only the PQ pair: every classical
+ * own leaf must already present the identity's key, and mls-rs drops the old
+ * classical signer at that catch-up, so no classical half is ever left to custody.
+ * A follow-up reuses this for a lagging send-PQ leaf after a rotation.
+ */
+public struct SessionMigrationPqLeafCustody: Equatable, Hashable {
+    public var clientId: Data
+    public var pqSigningKey: Data
+    public var pqSignatureKey: Data
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(clientId: Data, pqSigningKey: Data, pqSignatureKey: Data) {
+        self.clientId = clientId
+        self.pqSigningKey = pqSigningKey
+        self.pqSignatureKey = pqSignatureKey
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension SessionMigrationPqLeafCustody: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSessionMigrationPqLeafCustody: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SessionMigrationPqLeafCustody {
+        return
+            try SessionMigrationPqLeafCustody(
+                clientId: FfiConverterData.read(from: &buf), 
+                pqSigningKey: FfiConverterData.read(from: &buf), 
+                pqSignatureKey: FfiConverterData.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SessionMigrationPqLeafCustody, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.clientId, into: &buf)
+        FfiConverterData.write(value.pqSigningKey, into: &buf)
+        FfiConverterData.write(value.pqSignatureKey, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSessionMigrationPqLeafCustody_lift(_ buf: RustBuffer) throws -> SessionMigrationPqLeafCustody {
+    return try FfiConverterTypeSessionMigrationPqLeafCustody.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSessionMigrationPqLeafCustody_lower(_ value: SessionMigrationPqLeafCustody) -> RustBuffer {
+    return FfiConverterTypeSessionMigrationPqLeafCustody.lower(value)
 }
 
 
@@ -7710,6 +7793,30 @@ fileprivate struct FfiConverterOptionTypeSessionMigrationOwedBind: FfiConverterR
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeSessionMigrationPqLeafCustody: FfiConverterRustBuffer {
+    typealias SwiftType = SessionMigrationPqLeafCustody?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeSessionMigrationPqLeafCustody.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeSessionMigrationPqLeafCustody.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeSessionMigrationProposal: FfiConverterRustBuffer {
     typealias SwiftType = SessionMigrationProposal?
 
@@ -8256,7 +8363,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_should_listen_on() != 34726) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_migration_export() != 17140) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqsession_migration_export() != 59429) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_my_pq_turn() != 12380) {

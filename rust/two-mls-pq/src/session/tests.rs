@@ -8501,3 +8501,534 @@ fn test_v3_archive_restores_with_empty_attachment_ledgers() {
     // And the session is otherwise perfectly usable across the downgrade-then-restore.
     message_round(&restored, &alice, b"after-v3-restore");
 }
+
+/// A born-dedicated acceptor's `migration_export` at the moment its recv-classical leaf
+/// catches up (before its own first send-group commit, so the staple is still the §26
+/// handoff) and again once the full lifecycle (A.3 bootstrap, bind, an A.4 round each way)
+/// has completed — including once more after an archive/restore of Bob, proving the
+/// custodied signer survives the ordinary (non-swift) archive round-trip.
+#[cfg(feature = "cryptokit")]
+#[test]
+fn test_migration_export_born_dedicated_converged() {
+    use crate::key_packages::TwoMlsPqInvitation;
+    use mls_rs::{CipherSuiteProvider, CryptoProvider};
+
+    let alice = make_client();
+    let bob = make_client();
+    let alice_kp = make_classical_kp(&alice);
+    let bob_inv = assert_ok!(TwoMlsPqInvitation::restore(assert_ok!(
+        bob.generate_invitation(true)
+    )));
+    let bob_kp = bob_inv.combiner_key_package();
+    let invitation_identity = bob_inv.client_id().bytes;
+
+    let alice_s = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
+    let opened = assert_ok!(bob_inv.open_establishment(assert_some!(alice_s.pending_outbound())));
+    let dedicated = crate::test_utils::test_client_id();
+    let bob_s = assert_ok!(bob_inv.receive(
+        assert_some!(opened.welcome),
+        alice_kp,
+        commitment_of(&alice_s),
+        b"tok".to_vec(),
+        Some(dedicated.clone()),
+        None,
+        None
+    ));
+
+    let envelope = crate::test_utils::install_mock_envelope(&bob_s);
+    assert_ok!(bob_s.prepare_to_encrypt(None));
+    let enc = assert_ok!(bob_s.encrypt(b"confirm-b".to_vec()));
+    let res = assert_some!(crate::test_utils::approve_establishment(
+        &alice_s,
+        enc.cipher_text,
+        &envelope,
+        &dedicated
+    ));
+    let bob_upd = assert_some!(res.proposal);
+    assert_ok!(alice_s.prepare_to_encrypt(None));
+    let enc = assert_ok!(alice_s.encrypt(b"confirm-a".to_vec()));
+    let res = assert_some!(assert_ok!(bob_s.process_incoming(enc.cipher_text)));
+    assert_some!(res.proposal);
+
+    // Alice folds Bob's catch-up Upd: his recv-classical leaf converges.
+    assert_ok!(alice_s.queue_proposal(bob_upd.digest));
+    let prep = assert_ok!(alice_s.prepare_to_encrypt(None));
+    assert!(prep.did_commit);
+    let enc = assert_ok!(alice_s.encrypt(b"full-a".to_vec()));
+    let res = assert_some!(assert_ok!(bob_s.process_incoming(enc.cipher_text)));
+    let alice_upd = assert_some!(res.proposal);
+
+    // Converged, but Bob has not yet committed into his OWN send group: the staple is
+    // still the §26 handoff frame installed at `install_mock_envelope`.
+    assert_eq!(
+        bob_s.lock().current_staple.first(),
+        Some(&super::frames::ESTABLISHMENT_HANDOFF_TAG),
+        "staple still the handoff — Bob's own first send-group commit hasn't happened"
+    );
+    let export = assert_ok!(bob_s.migration_export());
+    assert!(!export.initiated);
+    assert!(!export.owes_establishment_envelope);
+    assert_eq!(
+        assert_some!(export.pq_leaf_custody).client_id,
+        invitation_identity
+    );
+
+    // And in Bob's direction: his send group commits Alice's Upd.
+    assert_ok!(bob_s.queue_proposal(alice_upd.digest));
+    let prep = assert_ok!(bob_s.prepare_to_encrypt(None));
+    assert!(prep.did_commit);
+    let enc = assert_ok!(bob_s.encrypt(b"full-b".to_vec()));
+    assert_some!(assert_ok!(alice_s.process_incoming(enc.cipher_text)));
+
+    // A.3 bootstrap + bind, then an A.4 round each way.
+    let kp = assert_ok!(alice_s.pq_bootstrap_begin(None));
+    assert_ok!(bob_s.pq_bootstrap_respond(kp));
+    let welcome = assert_some!(bob_s.pq_take_pending_outbound());
+    assert_ok!(alice_s.pq_bootstrap_bind(welcome));
+    discharge_bind(&alice_s, &bob_s, b"bootstrap-bind");
+    assert!(alice_s.is_fully_established());
+    assert!(bob_s.is_fully_established());
+    ratchet_round(&bob_s, &alice_s, b"pq-app-1");
+    ratchet_round(&alice_s, &bob_s, b"pq-app-2");
+
+    let export = assert_ok!(bob_s.migration_export());
+    assert!(!export.initiated);
+    assert!(!export.owes_establishment_envelope);
+    let custody = assert_some!(export.pq_leaf_custody);
+    assert_eq!(custody.client_id, invitation_identity);
+    // The pq pair derives (the same cross-check the mint performs).
+    let pq_cs = assert_some!(
+        crate::providers::pq().cipher_suite_provider(crate::providers::pq_cipher_suite())
+    );
+    let signer = mls_rs::crypto::SignatureSecretKey::new(custody.pq_signing_key.clone());
+    let derived = assert_ok!(pq_cs.signature_key_derive_public(&signer));
+    assert_eq!(derived.as_bytes(), custody.pq_signature_key);
+
+    // The export also succeeds after an archive→restore of Bob — the restored group's
+    // signer is not swift-export-only state, so it survives the ordinary archive.
+    let archive = assert_ok!(bob_s.archive());
+    let restored = assert_ok!(TwoMlsPqSession::from_archive(archive));
+    let export = assert_ok!(restored.migration_export());
+    assert_eq!(
+        assert_some!(export.pq_leaf_custody).client_id,
+        invitation_identity
+    );
+
+    // The pre-install latch is what the gate actually checks, not an incidental side
+    // effect of having gone through installation: erase Bob's installed envelope (as if
+    // it had never landed) and the export must refuse again, even though every OTHER
+    // convergence condition still holds.
+    bob_s.lock().establishment_envelope = None;
+    assert!(matches!(
+        bob_s.migration_export(),
+        Err(TwoMlsPqError::SessionNotReady)
+    ));
+}
+
+/// A born-dedicated acceptor pre-install: the establishment envelope has not landed yet, so
+/// the export refuses rather than mis-mapping the missing delegation.
+#[cfg(feature = "cryptokit")]
+#[test]
+fn test_migration_export_refuses_born_dedicated_pre_install() {
+    let d = crate::test_utils::born_dedicated_pending();
+    assert!(matches!(
+        d.bob.migration_export(),
+        Err(TwoMlsPqError::SessionNotReady)
+    ));
+}
+
+/// A born-dedicated acceptor, installed and sent, but whose catch-up Upd the peer has only
+/// PROCESSED (paused → approved) and not yet folded: Bob's recv-classical leaf still
+/// presents the invitation identity's key, and mls-rs still holds a signer-carrying pending
+/// update for it — the custody gate must catch this as `SessionNotReady` before
+/// `export_for_swift` ever runs and surfaces it as `Mls`.
+#[cfg(feature = "cryptokit")]
+#[test]
+fn test_migration_export_refuses_born_dedicated_pre_convergence() {
+    let d = crate::test_utils::born_dedicated_pending();
+    let envelope = crate::test_utils::install_mock_envelope(&d.bob);
+    assert_ok!(d.bob.prepare_to_encrypt(None));
+    let enc = assert_ok!(d.bob.encrypt(b"confirm-b".to_vec()));
+    assert_some!(crate::test_utils::approve_establishment(
+        &d.alice,
+        enc.cipher_text,
+        &envelope,
+        &d.dedicated,
+    ));
+    assert!(matches!(
+        d.bob.migration_export(),
+        Err(TwoMlsPqError::SessionNotReady)
+    ));
+}
+
+/// A staged (in-flight, unfolded) rotation candidate blocks the export.
+#[cfg(feature = "cryptokit")]
+#[test]
+fn test_migration_export_refuses_staged_rotation_candidate() {
+    let (alice, _bob) = establish_confirmed_sessions();
+    let new_id = make_client().client_id();
+    assert_ok!(alice.prepare_to_encrypt(Some(new_id)));
+    assert!(matches!(
+        alice.migration_export(),
+        Err(TwoMlsPqError::SessionNotReady)
+    ));
+}
+
+/// A staged candidate that is never committed stays in `staged_candidates` indefinitely —
+/// canonicalization only prunes the set when a candidate itself is the thing committed, not
+/// on any unrelated commit — so a later PLAIN round that the peer folds instead still
+/// leaves the export refused.
+#[cfg(feature = "cryptokit")]
+#[test]
+fn test_migration_export_refuses_superseded_staged_candidate() {
+    let (alice, bob) = establish_confirmed_sessions();
+    let new_id = make_client().client_id();
+    assert_ok!(alice.prepare_to_encrypt(Some(new_id)));
+    let rotation = assert_ok!(alice.encrypt(b"rotate".to_vec()));
+    assert_some!(assert_ok!(bob.process_incoming(rotation.cipher_text)));
+
+    // Bob never queues/commits the candidate; a later PLAIN round supersedes it instead.
+    assert_ok!(alice.prepare_to_encrypt(None));
+    let plain = assert_ok!(alice.encrypt(b"plain".to_vec()));
+    let got = assert_some!(assert_ok!(bob.process_incoming(plain.cipher_text)));
+    let offered = assert_some!(got.proposal);
+    assert_ok!(bob.queue_proposal(offered.digest));
+    assert!(assert_ok!(bob.prepare_to_encrypt(None)).did_commit);
+    let staple = assert_ok!(bob.encrypt(b"fold-plain".to_vec()));
+    assert_some!(assert_ok!(alice.process_incoming(staple.cipher_text)));
+
+    assert!(matches!(
+        alice.migration_export(),
+        Err(TwoMlsPqError::SessionNotReady)
+    ));
+}
+
+/// Post-rotation leaf lag: the peer's commit canonicalizes the new identity, but the
+/// rotated party's own send-group leaf lags until its own next commit. The custody gate
+/// must refuse this as `SessionNotReady` — pinning that the gate runs BEFORE
+/// `export_group_half`, so a lagging leaf never reaches `export_for_swift` and surfaces as
+/// the unrelated `Mls` error instead.
+#[cfg(feature = "cryptokit")]
+#[test]
+fn test_migration_export_refuses_post_rotation_leaf_lag() {
+    let (alice, bob) = establish_confirmed_sessions();
+    let new_alice = make_client().client_id();
+    rotate_round(&alice, &bob, new_alice);
+    assert!(matches!(
+        alice.migration_export(),
+        Err(TwoMlsPqError::SessionNotReady)
+    ));
+}
+
+/// A rotation's catch-up A.5 mid-round (Upd' sent, Commit' produced but not yet applied):
+/// the rotated party's send-PQ leaf still lags, same as the plain post-rotation case, and
+/// must refuse as `SessionNotReady` even with a genuinely in-flight round.
+#[cfg(feature = "cryptokit")]
+#[test]
+fn test_migration_export_refuses_mid_a5_round_on_rotated_session() {
+    let (alice, bob) = establish_full();
+    // Flip the turn so Bob is the non-turn-holder rekey initiator (`rekey_to_commit`'s
+    // precondition), then rotate him and drive the A.5 up to — but not through — his apply.
+    ratchet_round(&bob, &alice, b"flip");
+    let new_bob_id = make_client().client_id();
+    let _responder_commit = rekey_to_commit(&bob, &alice, new_bob_id);
+    assert!(matches!(
+        bob.migration_export(),
+        Err(TwoMlsPqError::SessionNotReady)
+    ));
+}
+
+/// A ROTATED party (Bob) at rest — no A.5 in flight, nothing owed — whose credential
+/// handoff has converged everywhere except his own send-PQ leaf: `rekey_round`'s Upd'
+/// moves his recv-PQ mirror (the proposal replaces the proposer) and its own trailing
+/// discharge catches up his send-classical/recv-classical, but his send-PQ leaf moves
+/// only on a round HE responds to (`own_pq_leaf_signature_keys`'s doc), which hasn't
+/// happened. The export must still refuse this settled state (`SessionNotReady`) — only
+/// recv.pq has a custody slot; send.pq has none. Named descriptively because a follow-up
+/// (W2d) is expected to extend custody to this exact shape (a lagging send-PQ leaf after
+/// a rotation).
+#[cfg(feature = "cryptokit")]
+#[test]
+fn test_migration_export_refuses_send_pq_lag_after_rotation_converges_everything_else() {
+    let (alice, bob) = establish_full();
+    // Flip the turn so Bob is the non-turn-holder — `rekey_round`'s precondition for
+    // driving his own catch-up A.5 as its initiator.
+    ratchet_round(&bob, &alice, b"flip");
+    let new_bob_id = make_client().client_id();
+    rekey_round(&bob, &alice, new_bob_id);
+
+    assert!(bob.lock().owed_bind.is_none(), "settled, not mid-bind");
+    assert!(bob.lock().pq_inflight.is_none(), "no A.5 in flight");
+    let new_key = bob
+        .lock()
+        .client
+        .combiner()
+        .pq_signature_keypair()
+        .1
+        .as_bytes()
+        .to_vec();
+    let (send_pq, recv_pq) = own_pq_leaf_signature_keys(&bob);
+    assert_eq!(recv_pq, new_key, "recv.pq should have converged already");
+    assert_ne!(
+        send_pq, new_key,
+        "send.pq should still lag — the state under test"
+    );
+
+    assert!(matches!(
+        bob.migration_export(),
+        Err(TwoMlsPqError::SessionNotReady)
+    ));
+}
+
+/// `leaf_pq_custody`'s history-membership check in isolation: an empty `auth_mine`
+/// history can never contain the leaf's own credential, whatever it is, so custody must
+/// refuse — even though the leaf's id here genuinely differs from `identity_client_id`
+/// (the OTHER check this call could otherwise trip instead, which would mask this one).
+#[cfg(feature = "cryptokit")]
+#[test]
+fn test_leaf_pq_custody_refuses_when_history_is_empty() {
+    let (_alice, bob) = establish_full();
+    let inner = bob.lock();
+    let recv_pq = inner.recv_group.as_ref().unwrap().pq.as_ref().unwrap();
+    let presented = assert_ok!(super::migration::own_signature_key(recv_pq));
+    let other_identity = crate::test_utils::test_client_id();
+    assert!(matches!(
+        super::migration::leaf_pq_custody(recv_pq, &presented, &other_identity, &[]),
+        Err(TwoMlsPqError::SessionNotReady)
+    ));
+}
+
+/// `leaf_pq_custody`'s identity-mismatch check in isolation: the leaf's own credential
+/// equalling `identity_client_id` refuses even though the history genuinely DOES contain
+/// it (the OTHER check this call could otherwise trip instead) — a leaf cannot be both
+/// "the identity itself" and "an identity needing custody" at once.
+#[cfg(feature = "cryptokit")]
+#[test]
+fn test_leaf_pq_custody_refuses_when_leaf_is_the_identity() {
+    let (_alice, bob) = establish_full();
+    let inner = bob.lock();
+    let recv_pq = inner.recv_group.as_ref().unwrap().pq.as_ref().unwrap();
+    let presented = assert_ok!(super::migration::own_signature_key(recv_pq));
+    let own_client_id = assert_ok!(apq::sender_client_id(
+        recv_pq,
+        recv_pq.current_member_index()
+    ));
+    assert!(matches!(
+        super::migration::leaf_pq_custody(
+            recv_pq,
+            &presented,
+            &own_client_id,
+            std::slice::from_ref(&own_client_id)
+        ),
+        Err(TwoMlsPqError::SessionNotReady)
+    ));
+}
+
+/// A wedged PQ side-band blocks the export: the native archive carries no wedge verdict,
+/// so a migrated session would report healthy and deadlock instead.
+#[cfg(feature = "cryptokit")]
+#[test]
+fn test_migration_export_refuses_pq_wedged() {
+    let (alice, _bob) = establish_confirmed_sessions();
+    alice.lock().pq_wedged = Some(super::pq_ops::PqWedge::Bootstrap);
+    assert!(matches!(
+        alice.migration_export(),
+        Err(TwoMlsPqError::SessionNotReady)
+    ));
+}
+
+/// A torn bind application blocks the export for the same reason a wedge does — no native
+/// slot represents it, and the migrated session must not silently drop the tear.
+#[cfg(feature = "cryptokit")]
+#[test]
+fn test_migration_export_refuses_bind_apply_broken() {
+    let (alice, _bob) = establish_confirmed_sessions();
+    alice.lock().bind_apply_broken = true;
+    assert!(matches!(
+        alice.migration_export(),
+        Err(TwoMlsPqError::SessionNotReady)
+    ));
+}
+
+/// The custody derive check catches a corrupted signer: locate the born-dedicated
+/// acceptor's ACTUAL recv-PQ signer bytes inside his own archive (a unique 64-byte hit —
+/// the cryptokit raw‖public form `signer_for_swift_export` returns), flip one bit, and
+/// restore. The presented public key (read off the group's leaf, untouched by the
+/// corruption) no longer matches what the corrupted signer derives to, so the export
+/// must refuse as `ArchiveInvalid`, not silently custody an unusable key.
+#[cfg(feature = "cryptokit")]
+#[test]
+fn test_migration_export_rejects_corrupted_custody_signer() {
+    use crate::key_packages::TwoMlsPqInvitation;
+
+    let alice = make_client();
+    let bob = make_client();
+    let alice_kp = make_classical_kp(&alice);
+    let bob_inv = assert_ok!(TwoMlsPqInvitation::restore(assert_ok!(
+        bob.generate_invitation(true)
+    )));
+    let bob_kp = bob_inv.combiner_key_package();
+    let alice_s = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
+    let opened = assert_ok!(bob_inv.open_establishment(assert_some!(alice_s.pending_outbound())));
+    let dedicated = crate::test_utils::test_client_id();
+    let bob_s = assert_ok!(bob_inv.receive(
+        assert_some!(opened.welcome),
+        alice_kp,
+        commitment_of(&alice_s),
+        b"tok".to_vec(),
+        Some(dedicated.clone()),
+        None,
+        None,
+    ));
+    let envelope = crate::test_utils::install_mock_envelope(&bob_s);
+    assert_ok!(bob_s.prepare_to_encrypt(None));
+    let enc = assert_ok!(bob_s.encrypt(b"confirm-b".to_vec()));
+    let res = assert_some!(crate::test_utils::approve_establishment(
+        &alice_s,
+        enc.cipher_text,
+        &envelope,
+        &dedicated
+    ));
+    let bob_upd = assert_some!(res.proposal);
+    assert_ok!(alice_s.prepare_to_encrypt(None));
+    let enc = assert_ok!(alice_s.encrypt(b"confirm-a".to_vec()));
+    assert_some!(assert_ok!(bob_s.process_incoming(enc.cipher_text)));
+    // Alice folds Bob's catch-up Upd — his recv-classical leaf converges, and his
+    // recv-PQ leaf's custody becomes exportable (still presenting the invitation key).
+    assert_ok!(alice_s.queue_proposal(bob_upd.digest));
+    let prep = assert_ok!(alice_s.prepare_to_encrypt(None));
+    assert!(prep.did_commit);
+    let enc = assert_ok!(alice_s.encrypt(b"full-a".to_vec()));
+    assert_some!(assert_ok!(bob_s.process_incoming(enc.cipher_text)));
+    assert_some!(assert_ok!(bob_s.migration_export()).pq_leaf_custody);
+
+    let signer_bytes = {
+        let inner = bob_s.lock();
+        inner
+            .recv_group
+            .as_ref()
+            .unwrap()
+            .pq
+            .as_ref()
+            .unwrap()
+            .signer_for_swift_export()
+            .as_bytes()
+            .to_vec()
+    };
+    assert_eq!(signer_bytes.len(), 64, "cryptokit raw‖public form");
+
+    let mut archive = assert_ok!(bob_s.archive()).bytes;
+    let hits: Vec<_> = archive
+        .windows(signer_bytes.len())
+        .enumerate()
+        .filter(|(_, w)| *w == signer_bytes.as_slice())
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(hits.len(), 1, "expected a unique hit for the signer bytes");
+    archive[hits[0]] ^= 0xFF;
+
+    let restored = assert_ok!(TwoMlsPqSession::from_archive(crate::Archive {
+        bytes: archive
+    }));
+    assert!(matches!(
+        restored.migration_export(),
+        Err(TwoMlsPqError::ArchiveInvalid)
+    ));
+}
+
+/// A restored session whose CLASSICAL group's stored `GroupContext.cipher_suite` disagrees
+/// with the session's declared classical suite must refuse `migration_export` rather than
+/// restore silently and let a later crypto operation derive a key through the wrong suite's
+/// provider — unrecoverable in the native CryptoKit bridge (see the module note). The
+/// classical provider recognizes several suites, so `Group::load` itself does not catch
+/// this: build the corrupted row by locating the GroupContext via its own (unique) group id
+/// and flipping the suite byte, the way a torn or bit-rotted archive would look.
+#[cfg(feature = "cryptokit")]
+#[test]
+fn test_migration_export_rejects_corrupted_classical_suite() {
+    let (_alice, bob) = establish_confirmed_sessions();
+    let send_gid = bob
+        .lock()
+        .send_group
+        .as_ref()
+        .unwrap()
+        .classical
+        .group_id()
+        .to_vec();
+    let mut archive = assert_ok!(bob.archive()).bytes;
+
+    let mut pattern = vec![0x00u8, 0x01];
+    pattern.extend_from_slice(&u16::from(mls_rs::CipherSuite::CURVE25519_CHACHA).to_be_bytes());
+    pattern.push(send_gid.len() as u8);
+    pattern.extend_from_slice(&send_gid);
+    // The group id can appear more than once (e.g. a creator's own cached creation
+    // record) — empirically, the byte-for-byte earliest match is always the live
+    // GroupContext `Group::load` actually reads; a later one, if any, is inert.
+    let pos = archive
+        .windows(pattern.len())
+        .position(|w| w == pattern.as_slice())
+        .unwrap();
+    // 0x0003 (CURVE25519_CHACHA) -> 0x0002 (P256_AES128): still a suite the classical
+    // provider recognizes, so `Group::load` does not itself catch the corruption.
+    archive[pos + 3] = 0x02;
+
+    let restored = assert_ok!(TwoMlsPqSession::from_archive(crate::Archive {
+        bytes: archive
+    }));
+    assert_eq!(
+        restored
+            .lock()
+            .send_group
+            .as_ref()
+            .unwrap()
+            .classical
+            .cipher_suite(),
+        mls_rs::CipherSuite::new(2),
+        "the corrupted suite really does restore — the hazard the suite check guards against"
+    );
+    assert!(matches!(
+        restored.migration_export(),
+        Err(TwoMlsPqError::ArchiveInvalid)
+    ));
+}
+
+/// The PQ-half analogue does NOT reproduce the same hazard in this build: unlike the
+/// classical provider (which recognizes several suites), `CryptoKitMlKemProvider` — the PQ
+/// half's sole crypto provider — recognizes EXACTLY ML-KEM-768, so `Group::load` itself
+/// already refuses any other stored suite value for a PQ group before the suite check in
+/// `migration_export` ever runs. There is no PQ-half suite corruption that "restores and
+/// lies" the way the classical half's does; this pins that boundary instead of asserting a
+/// scenario that cannot occur under this build's single-PQ-suite provider.
+#[cfg(feature = "cryptokit")]
+#[test]
+fn test_migration_export_pq_suite_corruption_fails_at_restore() {
+    let (_alice, bob) = establish_full();
+    let send_gid = bob
+        .lock()
+        .send_group
+        .as_ref()
+        .unwrap()
+        .pq
+        .as_ref()
+        .unwrap()
+        .group_id()
+        .to_vec();
+    let mut archive = assert_ok!(bob.archive()).bytes;
+
+    let pq_suite = crate::providers::pq_cipher_suite();
+    let mut pattern = vec![0x00u8, 0x01];
+    pattern.extend_from_slice(&u16::from(pq_suite).to_be_bytes());
+    pattern.push(send_gid.len() as u8);
+    pattern.extend_from_slice(&send_gid);
+    // As above: take the earliest match — the live GroupContext `Group::load` reads.
+    let pos = archive
+        .windows(pattern.len())
+        .position(|w| w == pattern.as_slice())
+        .unwrap();
+    archive[pos + 3] ^= 0x01;
+
+    assert!(matches!(
+        TwoMlsPqSession::from_archive(crate::Archive { bytes: archive }),
+        Err(TwoMlsPqError::Mls)
+    ));
+}

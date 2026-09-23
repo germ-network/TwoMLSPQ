@@ -104,7 +104,39 @@ public enum SessionMigrator {
 			initialTheirKP: export.initialTheirKp.map {
 				(classical: $0.classical, pq: $0.pq)
 			},
+			recvLeafPrincipal: try export.pqLeafCustody.map {
+				try recvLeafPrincipal($0, identity: export.identity)
+			},
 			owesEstablishmentEnvelope: export.owesEstablishmentEnvelope)
+	}
+
+	/// The Rust session no longer holds the invitation's classical signer —
+	/// mls-rs drops it at the recv-classical catch-up this export requires —
+	/// so the classical slot carries the identity's own pair instead. That is
+	/// exactly what the converged recv-classical leaf presents.
+	///
+	/// This makes native's classical custody arm for `recvLeafPrincipal`
+	/// (`classicalSigningKey(presenting:)`) unreachable for a session this
+	/// mapper produces: that arm is gated on `recvLeafPrincipal.signatureKey`
+	/// matching the presented key, but this mapper sets it to
+	/// `identity.signatureKey` — the SAME value the identity arm above it
+	/// already matches first. The recv-leaf catch-up arms, which read the
+	/// classical custody key directly, never fire either: they require the
+	/// recv-classical leaf to still lag the canonical identity and to present
+	/// `clientID` (the invitation id), and this export requires that leaf to
+	/// have converged. Only the PQ half of this mixed record is ever read back
+	/// out (`pqSigningKey(presenting:)`'s `recvLeafPrincipal` arm, where
+	/// `pqSignatureKey` is the genuinely different custodied key).
+	private static func recvLeafPrincipal(
+		_ custody: TwoMLSPQBinding.SessionMigrationPqLeafCustody,
+		identity: TwoMLSPQBinding.SessionMigrationIdentity
+	) throws -> TwoMLSPQSession.MigratedRecvLeafPrincipal {
+		try TwoMLSPQSession.MigratedRecvLeafPrincipal(
+			clientID: custody.clientId,
+			signingKey: SecretBytes(bytes: identity.signingKey),
+			signatureKey: identity.signatureKey,
+			pqSigningKey: SecretBytes(bytes: custody.pqSigningKey),
+			pqSignatureKey: custody.pqSignatureKey)
 	}
 
 	private static func migratedIdentity(

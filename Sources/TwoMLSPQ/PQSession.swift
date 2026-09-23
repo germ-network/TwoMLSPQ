@@ -264,7 +264,14 @@ public typealias SideBandSealing = TwoMLSPQTypes.SideBandSealing
 //     `TwoMlsPqSession.migrationExport()`. The consumer lives in `TwoMLSPQMigrate`
 //     (`SessionMigrator`), mapping onto twomlspq-swift's `SessionMigration.mintArchive`.
 //     No wire, API, or error-variant change beyond the new symbols.
-private let expectedBindingContract: UInt64 = 35
+// v36: the session migration export now admits a born-dedicated acceptor once its
+//     establishment envelope has installed and its recv-classical leaf has caught up, and
+//     an acceptor still holding a parked return welcome. One new record,
+//     `SessionMigrationPqLeafCustody`, and one field (`pqLeafCustody`) appended to
+//     `SessionMigrationExport` — its memberwise init gains a parameter — mapped by
+//     `SessionMigrator` onto twomlspq-swift's `MigratedRecvLeafPrincipal`. No wire or
+//     error-variant change.
+private let expectedBindingContract: UInt64 = 36
 
 enum TwoMLSPQBindingContract {
 	static let verified: Void = {
