@@ -141,13 +141,17 @@ sequence is driven by the classical ratchet itself:
    (`remote_commit.new_recipient`, `my_principal_state` → `Sync`); losing candidates'
    authorizations expire.
 4. **Everything else lags and catches up.** The sender's own send-group leaf moves at
-   its next approved commit (the peer observes `new_sender`); the PQ leaves catch up
-   at the next A.3/A.5 handoff; the acceptor's recv-group leaf converges from the
-   invitation identity to the dedicated principal via its first committed Upd.
+   its next approved commit (the peer observes `new_sender`); a PQ leaf minted at A.3
+   is born under its owner's then-canonical id, and every other PQ leaf catches up over
+   A.5 rounds, one per PQ group — the owner's own A.5, then the peer's reciprocal A.5;
+   the acceptor's recv-group leaf converges from the invitation identity to the
+   dedicated principal via its first committed Upd.
    The AS validates every catch-up against the sequence *history*
    (`CREDENTIAL_HISTORY_WINDOW = 8` canonical steps) — a lagging leaf may only
    fast-forward to an already-canonical credential; candidates are proposed and
-   canonicalized exclusively in the classical ratchet.
+   canonicalized exclusively in the classical ratchet. A credential that a live PQ leaf
+   still presents stays admissible past window eviction until that leaf catches up; the
+   A.3 founding pins are one instance of this rule.
 
 Enforcement is the mls-rs `IdentityProvider` (`apq/src/authentication.rs`):
 `valid_successor` implements same-id / authorized-step / catch-up; `validate_member`

@@ -53,7 +53,7 @@ In its place we have two PQ operations:
     
     One round re-keys ONE group; the turn alternation brings the other group’s round next. The large updatePath commit happens in isolation on the PQ group, otherwise we block the classical ratchet on transmitting it — only the small pathless ack rides the classical staple.
 
-**Who opens a round — the session, not the host.** The host never selects or opens A.4/A.5; the session self-drives them. Whenever it is our turn, the PQ side-band is idle, and both halves are live (post-A.3), the next `encrypt` opens the next round automatically: an **A.5 re-key** if our send-PQ leaf still lags the canonical (classically committed) identity — the credential catch-up, announcing that identity — else an **A.4 ratchet**. Opening is send-driven and best-effort (a transient staging failure just retries on the next send), and the frame it stages rides that same send's re-staple. So the abstract "initiator (Alice) sends…" above is, concretely, *Alice's next ordinary message once the turn is hers*. One subtlety: a rotation that lands while an A.4 is already staged does not upgrade that A.4 to an A.5 mid-flight — the catch-up defers to the following turn.
+**Who opens a round — the session, not the host.** The host never selects or opens A.4/A.5; the session self-drives them. Whenever it is our turn, the PQ side-band is idle and not wedged, and both halves are live (post-A.3), the next `encrypt` opens the next round automatically: an **A.5 re-key** if either leaf in the PQ half of our receive group (the group our A.5 re-keys) lags, else an **A.4 ratchet**. A leaf *lags* when it presents a credential id other than its owner's *current* canonical (classically committed) id; a same-id key refresh is not a lag. If the lagging leaf is ours, the round is the credential catch-up: our `Upd'` announces our identity. If it is the peer's, the round is the reciprocal catch-up: the peer's responder `Commit'` carries theirs. Opening is send-driven and best-effort (a transient staging failure just retries on the next send), and the frame it stages rides that same send's re-staple. So the abstract "initiator (Alice) sends…" above is, concretely, *Alice's next ordinary message once the turn is hers*. One subtlety: a rotation that lands while an A.4 is staged, or while an A.5 `Upd'` is in flight, does not re-mint that round, and a responder whose own rotation staple has not yet applied answers with a `Commit'` that moves nothing. Either way the leaf still lags after the round and the next turn's trigger opens the catch-up — a race costs one extra round, never a stall. The deployed Rust engine deviates here after a one-sided rotation; see the shipped-anomaly note in [Session Lifecycle](./session-lifecycle.md).
 
 1. Session establishment
     1. Bob posts an APQ keyPackage
@@ -700,6 +700,12 @@ classical may in principle hold up the PQ ratchet. In practice it does not: the 
 > signals receipt through the classical channel. One round re-keys ONE group —
 > the turn alternation brings the other group's round next, at the same bytes
 > per group as a two-in-one full commit, and no large frame is ever terminal.
+>
+> **A credential catch-up therefore takes two rounds.** After Alice's rotation,
+> her own A.5 moves her leaf in [BSG-PQ] through her `Upd'`. Her leaf in
+> [ASG-PQ] still lags, so Bob's next turn opens the reciprocal A.5 on [ASG-PQ],
+> and Alice's responder `Commit'` carries her credential onto that leaf. Bob's
+> `Upd'` in that round is a same-id refresh.
 
 ```mermaid
 sequenceDiagram

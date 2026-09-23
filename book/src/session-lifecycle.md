@@ -48,9 +48,11 @@ initiator owes the bootstrap; completing an operation passes the turn to the pee
 
 **The host drives only the A.3 bootstrap and then ordinary sends — the SESSION self-drives A.4
 and A.5.** There is no `begin(.ratchet/.rekey)` for the host to call: on each `encrypt`, when it
-is our turn and the side-band is idle, the session opens the next round automatically — an **A.5**
-re-key when our send-PQ leaf still lags the canonical (classically committed) identity, else an
-**A.4** ratchet. "A.4 begins immediately" is just the first send after the turn becomes ours; the
+is our turn and the side-band is idle (and never while it is wedged), the session opens the next
+round automatically — an **A.5** re-key when either leaf in the PQ half of our receive group (the
+group our A.5 re-keys) lags, else an **A.4** ratchet. A leaf *lags* when it presents a credential
+id other than its owner's *current* canonical (classically committed) id; a same-id key refresh
+is not a lag. "A.4 begins immediately" is just the first send after the turn becomes ours; the
 ratchet then ping-pongs, turn-gated so the two sides never both open at once. Staging is
 best-effort (a transient KEM/proposal failure simply retries on the next send) and the staged
 frame rides that send's re-staple peek (`pq_pending_outbound`), so the host's role is
@@ -78,16 +80,20 @@ frame rides that send's re-staple peek (`pq_pending_outbound`), so the host's ro
 - **PQ re-key** (`0x1B`/`0x1D`, then a stapled bind) — updatePath commits run on the two
   send groups' PQ halves **alone**, so the classical ratchet is never blocked behind a large
   ML-KEM updatePath. It is not a host call either: the session opens it in place of an A.4 when
-  our send-PQ leaf still lags the canonical principal (a Phase 8 classical rotation moved the
-  session client; the PQ leaf catches up here), announcing that principal as the handoff. The
+  either leaf in the PQ half of our receive group lags its owner's canonical principal. When
+  that leaf is ours (a Phase 8 classical rotation moved the session client), our `Upd'`
+  announces our principal as the handoff. When it is the peer's, the peer's responder `Commit'`
+  carries the peer's principal onto its own send-PQ leaf: the reciprocal catch-up. The
   initiator's send auto-stages `Upd'(self)` into the PQ half of the peer's send group (`0x1B`);
   the responder commits it with its own `Commit'` (`pq_rekey_respond`, `0x1D`) — whose updatePath
   rotates the committer's leaf and cross-injects a PSK exported from the PQ half of the *opposite*
   send group. The round's third leg is not a side-band frame: the initiator acks with a pathless
   partial commit stapled onto its next classical commit (`pq_rekey_apply`), a FULL commit whose
-  `AppDataUpdate` reconciles the bumped `pq_epoch` **in-round**. (One credential catch-up can defer
-  a round when an A.4 is already in flight — a staged A.4 is not upgraded mid-flight; the A.5 fires
-  on the next turn.)
+  `AppDataUpdate` reconciles the bumped `pq_epoch` **in-round**. (A rotation that lands while an
+  A.4 is staged, or while an A.5 `Upd'` is in flight, does not re-mint that round. Likewise, a
+  responder whose own rotation staple has not yet applied answers with a `Commit'` that moves
+  nothing. Either way the leaf still lags after the round, and the next turn's trigger opens the
+  catch-up: a race costs one extra round, never a stall.)
 
 ## Routing
 
@@ -192,13 +198,41 @@ epoch advances by an A.4 bind.
 
 The winner's other leaves **lag and catch up**: the proposer's own send-group leaf
 moves at its next approved commit (the peer observes `new_sender` on that staple, and
-message attribution follows); the PQ leaves catch up at the next A.3/A.5 handoff (the
-session self-drives this — when a rotation leaves the send-PQ leaf lagging, the next A.5
-it opens announces the session's *current*, already-canonical principal as the handoff,
-and the handoff's new leaf carries that credential); the acceptor's recv-group leaf
+message attribution follows). A PQ leaf minted at A.3 is born under its owner's
+then-canonical id; every other PQ leaf catches up over A.5 rounds, one per PQ group, which
+the session self-drives. The rotated party's own
+A.5 announces its *current*, already-canonical principal in the PQ half of the peer's
+send group, and the handoff's new leaf carries that credential. The peer's next turn then
+opens the reciprocal A.5, because the rotated party's leaf in the peer's receive group
+still lags. The rotated party answers as responder, and its `Commit'` carries the
+credential onto its own send-PQ leaf. The acceptor's recv-group leaf
 converges from the invitation identity to the dedicated establishment principal via its
 first committed Upd. Every catch-up is validated
-against the AS history window.
+against the AS history window, and a credential that a live PQ leaf still presents stays
+admissible past window eviction until that leaf catches up (see
+[Group Rules](./group-rules.md), rule 4).
+
+> **Shipped anomaly (deployed Rust engine).** The deployed engine opens an A.5 when its own
+> *send*-PQ leaf lags, not when a leaf in its receive group lags, and it never opens the
+> reciprocal A.5 for the peer. Its trigger reads its send-PQ leaf, but its own round can
+> only move its receive-PQ leaf, so the trigger never clears itself. After a one-sided
+> rotation, the rotated party's A.5 moves
+> only its leaf in the peer's send group. The peer never opens the reciprocal round, so
+> the rotated party's own send-PQ leaf keeps its pre-rotation credential. Because that
+> leaf still lags, the rotated party opens another A.5 on every PQ turn it holds; after
+> the first, each is a same-id key refresh. A conforming peer heals it: the deployed
+> engine's responder `Commit'` does carry its current credential, so the reciprocal A.5
+> completes the catch-up. Against a deployed peer, a conforming rotated party's own
+> send-PQ leaf stays behind, because that peer never opens the reciprocal round, and that
+> party must keep signing that group under the credential its leaf presents. For the same
+> reason, a deployed born-dedicated acceptor never catches up its leaf in the initiator's
+> send-PQ group: its own send-PQ leaf was minted at A.3 under the dedicated id, so it
+> never lags, and its trigger never fires. The deployed AS also pins only the A.3 founding
+> ids, so a leaf left behind for more than the history window can no longer catch up at
+> all. Separately, a born-dedicated acceptor's catch-up Upds
+> propose the identity the peer already treats as canonical (`proposing == sender`). A
+> host that folds only offers where `proposing` differs from `sender` never commits one,
+> so that recv-group leaf keeps presenting the invitation identity.
 
 For the common "dedicated agent per session" pattern, don't rotate at establishment
 at all: pass the agent's id to `receive(…, new_client_id:)` and the session is born

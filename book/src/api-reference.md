@@ -199,7 +199,13 @@ unchanged; its result carries the staged Upd both raw
 (`proposal_hash`), from one critical section, so a host binding a signature to the
 proposal (the anchor agent handoff) applies its own digest to the returned bytes with
 no staged-slot read a later prepare could have replaced; `encrypt`;
-`process_incoming`; `proposal_context`;
+`process_incoming`; `proposal_context() -> Option<Vec<u8>>` — the SHA-256 of the
+receive group's classical group id, `None` until the receive group exists. The receive
+group is the peer's send group, so this equals the `QueuedRemoteProposal.context` the
+peer reports for proposals it receives from us. The Swift wrapper's `proposalContext` and
+`PQQueuedRemoteProposal.context` return it in the tagged `PQDigest` form
+(`[0x01] ‖ digest`), and a proposal's `digest` is the SHA-256 of the proposal message in
+the same form;
 `queue_proposal` — approve the peer's Upd (single-occupancy running tally,
 latest-wins; validates then leaves the proposal cache untouched, so a rejected call is
 a no-op and a replacement never doubles up; dropped when the send epoch advances via an
