@@ -17,14 +17,6 @@ import XCTest
 //
 // Suite note: `two_mls_pq` type names collide with this package's wrapper
 // names, so FFI record types are module-qualified throughout.
-//
-// BLOCKED (slice A finding): the pinned mls-rs `Group.export_for_swift`
-// (82b4dc1) maps cipher suite 0x0003 — X25519+ChaCha20Poly1305, the deployed
-// classical suite — to a 48-byte secret-key length (`3 | 7 => 48` in
-// `check_secret_key_len`; only suite 7/P-384 is 48, suite 3 is 32). Every
-// classical group export fails `SwiftExportSecretKeyLengthMismatch`, so
-// `migrationExport()` cannot succeed and every test here skips until slice A
-// fixes the table. Remove the skip when the mls-rs pin moves past the fix.
 
 @available(macOS 26, iOS 26, *)
 final class SessionMigrationTests: XCTestCase {
@@ -214,24 +206,13 @@ final class SessionMigrationTests: XCTestCase {
 	/// Rust peer's message for the MIGRATED session to open.
 	private var lastRustFrame: Data?
 
-	/// The bind discharge, mirroring the Rust test helper: the peer offers an
-	/// Upd, the binder approves it, and the binder's next round commits (the
-	/// bind rides the commit's staple), with the app payload round-tripping on
-	/// the bind's frame.
+	/// The bind discharge is just a committing round (the peer offers an Upd, the binder
+	/// approves + commits it — the bind rides that commit's staple); delegate to the shared
+	/// helper rather than duplicating it.
 	private func dischargeBind(
 		binder: TwoMLSPQBinding.TwoMlsPqSession, peer: TwoMLSPQBinding.TwoMlsPqSession
 	) throws {
-		_ = try peer.prepareToEncrypt(proposing: nil)
-		let upd = try peer.encrypt(appMessage: Data("upd".utf8))
-		let offered = try XCTUnwrap(
-			binder.processIncoming(ciphertext: upd.cipherText)?.proposal)
-		try binder.queueProposal(digest: offered.digest)
-
-		let prepared = try binder.prepareToEncrypt(proposing: nil)
-		XCTAssertTrue(prepared.didCommit, "a bind needs a committing round")
-		let frame = try binder.encrypt(appMessage: Data("bind".utf8))
-		let got = try XCTUnwrap(peer.processIncoming(ciphertext: frame.cipherText))
-		XCTAssertEqual(got.applicationMessage?.appMessageData, Data("bind".utf8))
+		try RustSessionTestHelpers.committingRound(binder: binder, peer: peer)
 	}
 
 	/// Prepare + encrypt on a Rust session; deliver to `deliverTo` when given,

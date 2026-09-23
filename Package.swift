@@ -179,7 +179,8 @@ let package = Package(
 				.product(name: "TwoMLSPQSession", package: "twomlspq-swift"),
 				.product(name: "TwoMLSPQCrypto", package: "twomlspq-swift"),
 				.product(name: "MLSCrypto", package: "swift-mls"),
-			]
+			],
+			resources: [.copy("Fixtures")]
 		),
 	],
 	swiftLanguageModes: [.v6]

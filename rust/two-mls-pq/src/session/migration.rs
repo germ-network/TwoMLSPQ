@@ -678,15 +678,6 @@ mod tests {
     // Migration happy paths require the CryptoKit 96-byte ML-KEM representation;
     // an awslc build's 2400-byte decapsulation keys trip the export's length
     // guards by design (migration targets the CryptoKit-based swift engine).
-    //
-    // BLOCKED (slice A finding, GER-2433 C1 return handoff): the pinned mls-rs
-    // `Group::export_for_swift` (82b4dc1) maps cipher suite 0x0003
-    // (X25519+ChaCha20Poly1305 — the deployed classical suite) to a 48-byte
-    // secret-key length (`3 | 7 => 48` in `check_secret_key_len`; only suite 7
-    // is 48 — suite 3 is X25519, 32 bytes). Every classical group export fails
-    // `SwiftExportSecretKeyLengthMismatch`, so no session export can succeed
-    // until slice A fixes the table. The snapshot-bearing tests below are
-    // ignored until then.
 
     /// An established (classical) session exports: the initiator's send group
     /// carries its PQ half, its recv group is still classical-only pre-A.3, and
