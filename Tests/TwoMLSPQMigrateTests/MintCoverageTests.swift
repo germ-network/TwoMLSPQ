@@ -6,7 +6,7 @@ import TwoMLSPQMigrate
 import TwoMLSPQSession
 import XCTest
 
-// A totality sweep, not a regression pin: seven export shapes the round-trip suites
+// A totality sweep, not a regression pin: eight export shapes the round-trip suites
 // don't otherwise exercise, pushed through export -> map -> mint -> restore with minimal
 // assertions. The point is coverage of native's acceptance, not any field's exact value
 // — a native refusal here is a bug to report, not to paper over.
@@ -305,6 +305,56 @@ final class MintCoverageTests: XCTestCase {
 			core: nil, checkpoint: minted.archive,
 			classicalProvider: classicalProvider, pqProvider: pqProvider)
 		XCTAssertTrue(restored.noCustody.contains(.recvPQ))
+	}
+
+	// MARK: - 8. Pre-A.3 acceptor
+
+	/// A confirmed pair before A.3: bob's send-PQ isn't founded yet, so his export carries the
+	/// canonical empty set, neither a reservation nor no-custody. Native bob then answers A.3
+	/// himself on a freshly minted key, and Rust alice binds and discharges.
+	func testPreA3AcceptorExportsEmptySendPqAndAnswersA3Natively() throws {
+		let (alice, bob) = try establishConfirmedNonDedicatedPair()
+
+		let export = try bob.migrationExport()
+		XCTAssertNil(export.leafKeys.sendPq.current)
+		XCTAssertTrue(export.leafKeys.sendPq.pending.isEmpty)
+		XCTAssertFalse(export.deployedState?.noCustody.sendPq ?? false)
+
+		let minted = try SessionMigrator.mint(
+			kind: .checkpoint, from: export,
+			classicalProvider: classicalProvider, pqProvider: pqProvider)
+		var nativeBob = try TwoMLSPQSession.TwoMLSSession.restore(
+			core: nil, checkpoint: minted.archive,
+			classicalProvider: classicalProvider, pqProvider: pqProvider)
+		XCTAssertFalse(nativeBob.isFullyEstablished)
+
+		let kp = try alice.pqBootstrapBegin(rotating: nil)
+		let welcomePrime = try nativeBob.pqBootstrapRespond(kp).frame
+		XCTAssertTrue(nativeBob.isFullyEstablished)
+		let opened = try XCTUnwrap(try alice.openIncoming(blob: welcomePrime))
+		try alice.pqBootstrapBind(welcomeMsg: opened.frame)
+
+		// Discharge the bind: native bob offers, Rust alice commits.
+		_ = try nativeBob.prepareToEncrypt()
+		let bobUpd = try nativeBob.encrypt(Data("mc-a3-bob-upd".utf8))
+		let offered = try XCTUnwrap(
+			alice.processIncoming(ciphertext: bobUpd.frame)?.proposal)
+		try alice.queueProposal(digest: offered.digest)
+		XCTAssertTrue(try alice.prepareToEncrypt(proposing: nil).didCommit)
+		let aliceCommit = try alice.encrypt(appMessage: Data("mc-a3-alice-commit".utf8))
+		let bobOpened = try nativeBob.processIncoming(aliceCommit.cipherText)
+		guard case .decrypted(let bobDecrypted) = bobOpened else {
+			XCTFail("expected a decrypted application frame, got \(bobOpened)")
+			return
+		}
+		XCTAssertEqual(bobDecrypted.applicationMessage, Data("mc-a3-alice-commit".utf8))
+		XCTAssertTrue(alice.isFullyEstablished())
+
+		_ = try nativeBob.prepareToEncrypt()
+		let bobMsg = try nativeBob.encrypt(Data("mc-a3-bob-msg".utf8))
+		let aliceGot = try XCTUnwrap(alice.processIncoming(ciphertext: bobMsg.frame))
+		XCTAssertEqual(
+			aliceGot.applicationMessage?.appMessageData, Data("mc-a3-bob-msg".utf8))
 	}
 
 	// MARK: - Shared establishment scaffolding

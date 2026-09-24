@@ -6086,7 +6086,8 @@ public func FfiConverterTypeSessionMigrationKeyPair_lower(_ value: SessionMigrat
 /**
  * Every own leaf's resolved custody. All four groups are always present: a
  * group that doesn't exist yet carries a reservation in `current` (the key
- * it will present once created or joined) with `pending` empty.
+ * it will present once created or joined) with `pending` empty, except a
+ * pre-A.3 acceptor's `send_pq`, which is empty (A.3 founding mints its key).
  */
 public struct SessionMigrationLeafKeys: Equatable, Hashable {
     public var sendClassical: SessionMigrationGroupKeys

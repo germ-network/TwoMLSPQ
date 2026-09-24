@@ -85,10 +85,11 @@ let package = Package(
 		// (SessionMigration + the ML-KEM `hpkeSecretKeySize`); its transitive deps
 		// (swift-mls, swift-secret-bytes, swift-crypto, GermConvenience) resolve
 		// automatically. Pinned to unreleased main for the deployed-state migration
-		// inputs; move to the release that ships them before merging.
+		// inputs and the empty pre-A.3 send-PQ shape; move to the release that ships
+		// them before merging.
 		.package(
 			url: "https://github.com/germ-network/twomlspq-swift.git",
-			revision: "dd62668945e85bdfcb26c2c1653cc1c4082c61ef"
+			revision: "902feadc916cdfa36676bd627b1098ef9b804142"
 		),
 		// Declared directly (not just transitively through twomlspq-swift) because
 		// the migrate targets import their products. Library deps stay ranged

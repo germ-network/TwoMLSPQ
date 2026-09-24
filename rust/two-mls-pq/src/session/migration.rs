@@ -40,7 +40,8 @@
 //!     `recv_classical`, `send_pq`, `recv_pq`), never `None`: a group that
 //!     doesn't exist yet carries a reservation in `current` (the key it will
 //!     present once created or joined) with empty `pending` — see
-//!     `reservation`;
+//!     `reservation` — except a pre-A.3 acceptor's send-PQ, which is empty
+//!     because A.3 founding mints its own key;
 //!   * generalized catch-up: any own leaf whose presented credential lags
 //!     `auth.mine`'s current one gets a synthesized `pending[mine.current]`
 //!     entry carrying the identity's current key of that half's kind — see
@@ -307,7 +308,8 @@ pub struct SessionMigrationGroupKeys {
 
 /// Every own leaf's resolved custody. All four groups are always present: a
 /// group that doesn't exist yet carries a reservation in `current` (the key
-/// it will present once created or joined) with `pending` empty.
+/// it will present once created or joined) with `pending` empty, except a
+/// pre-A.3 acceptor's `send_pq`, which is empty (A.3 founding mints its key).
 #[derive(Clone, uniffi::Record)]
 pub struct SessionMigrationLeafKeys {
     pub send_classical: SessionMigrationGroupKeys,
@@ -890,11 +892,11 @@ fn resolve_leaf_key<Cfg: mls_rs::client_builder::MlsConfig>(
     Ok((SessionMigrationGroupKeys { current, pending }, no_custody))
 }
 
-/// A group that doesn't exist yet still carries a reservation key in
-/// `current` (the key it will present once created or joined), with
-/// `pending` empty. `current: None` is the reservation's own no-custody
-/// case, since native's `validateLeafKeys` requires `current` to be `nil`
-/// exactly when the group's role is in `noCustody`.
+/// A group that doesn't exist yet holds a reservation key in `current` (the
+/// key it will present once created or joined), with `pending` empty.
+/// `current: None` is the reservation's own no-custody case, since native's
+/// `validateLeafKeys` requires `current` to be `nil` exactly when the group's
+/// role is in `noCustody`.
 fn reservation(current: Option<SessionMigrationKeyPair>) -> (SessionMigrationGroupKeys, bool) {
     let no_custody = current.is_none();
     (
@@ -1618,9 +1620,9 @@ impl TwoMlsPqSession {
             )
         };
 
-        // send_pq: the reservation for a pre-A.3 acceptor (the identity's
-        // current PQ key), otherwise resolved plus the generalized catch-up
-        // (no candidates: rotation is classical-only).
+        // send_pq: empty for a pre-A.3 acceptor (the group isn't founded yet, and
+        // A.3 founding mints its own key), otherwise resolved plus the generalized
+        // catch-up (no candidates: rotation is classical-only).
         let (send_pq_leaf, send_pq_no_custody) = match send_ref.pq.as_ref().zip(send_pq.as_ref()) {
             Some((group, (_, pending))) => {
                 let (leaf, no_custody) = resolve_leaf_key(group, &pq_provider, &pool, pending)?;
@@ -1634,7 +1636,13 @@ impl TwoMlsPqSession {
                     no_custody,
                 )
             }
-            None => reservation(Some(identity_pq_pair.clone())),
+            None => (
+                SessionMigrationGroupKeys {
+                    current: None,
+                    pending: Vec::new(),
+                },
+                false,
+            ),
         };
 
         // recv_classical: the reservation for a pre-join initiator (the

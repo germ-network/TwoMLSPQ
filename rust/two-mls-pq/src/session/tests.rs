@@ -8909,11 +8909,11 @@ fn test_migration_export_two_rotations_carry_three_live_pq_keys() {
     }
 }
 
-/// A pre-A.3 acceptor (send.pq deferred) reserves `send_pq.current` as the identity's current
-/// PQ key — what `pq_bootstrap_respond` will found with — with empty `pending`.
+/// A pre-A.3 acceptor (send.pq deferred) exports an empty `send_pq`, not a no-custody one: the
+/// group isn't founded, and the native A.3 founding mints its own key.
 #[cfg(feature = "cryptokit")]
 #[test]
-fn test_migration_export_send_pq_reservation_for_pre_a3_acceptor() {
+fn test_migration_export_send_pq_empty_for_pre_a3_acceptor() {
     let (_alice, bob) = establish_confirmed_sessions();
     assert!(
         bob.lock().send_group.as_ref().unwrap().pq.is_none(),
@@ -8921,8 +8921,7 @@ fn test_migration_export_send_pq_reservation_for_pre_a3_acceptor() {
     );
     let export = assert_ok!(bob.migration_export());
     let send_pq = export.leaf_keys.send_pq;
-    let current = assert_some!(send_pq.current);
-    assert_eq!(current.signature_key, export.identity.pq_signature_key);
+    assert!(send_pq.current.is_none());
     assert!(send_pq.pending.is_empty());
     if let Some(deployed) = export.deployed_state {
         assert!(!deployed.no_custody.send_pq);
@@ -11370,6 +11369,8 @@ mod totality_random_walk {
                 (None, Some(_)) => {
                     // The reservation case: no live group to compare against.
                 }
+                // A send-PQ group not founded yet (pre-A.3 acceptor) carries an empty set.
+                (None, None) if name == "send_pq" => {}
                 (_, None) => {
                     if !allow_no_custody {
                         // Unexpected no-custody: dump live state for diagnosis.

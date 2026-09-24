@@ -7,7 +7,8 @@ refusing unsettled ones: pre-establishment initiators, born-dedicated acceptors 
 staged rotation candidates, lagging leaves, and parked or wedged PQ rounds. It fails only on
 corrupt data (`ArchiveInvalid`). The export carries per-group signing keys (`leafKeys`), the
 rotation candidate, an own-offer window with its leaf secrets, and deployed-engine flags
-(`deployedState`). `BINDING_CONTRACT_VERSION` bumps 35 → 36.
+(`deployedState`). A pre-A.3 acceptor's `leafKeys.sendPq` is empty, since A.3 founding mints
+its own key. `BINDING_CONTRACT_VERSION` bumps 35 → 36.
 
 `SessionMigrator.mintArchive(kind:from:classicalProvider:pqProvider:)` is removed.
 `SessionMigrator.mint(kind:from:classicalProvider:pqProvider:)` returns a `MintResult`: the
