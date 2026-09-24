@@ -500,15 +500,14 @@ pub fn version() -> String {
 // through v0.15.0 (archive layout 3)) still restores here, pinned by the
 // `TwoMLSPQMigrateTests` legacy-row fixtures.
 //
-// v36: the session migration export now admits a born-dedicated acceptor once its
-// establishment envelope has installed and its recv-classical leaf has caught up, and an
-// acceptor still holding a parked return welcome (dropped from the export rather than
-// refused). One new Record, `SessionMigrationPqLeafCustody`, and one field appended to
-// `SessionMigrationExport` — a stale binding/binary pair would mis-read the export buffer.
-// No wire, archive, or error-variant change. The mls-rs pin moves to the fork's
-// `germ-integration` head (fcd822c), adding a read-only accessor for a group's current
-// signing secret (gated behind the same `swift_export` feature as v35's pin) — no
-// serialized struct changed.
+// v36: the session migration export admits every reachable deployed session (pre-
+// establishment, born-dedicated, staged rotation, lagging or wedged PQ rounds) instead
+// of refusing unsettled state, erroring only on corrupt or impossible data. New Records
+// carry per-group leaf keys, the rotation candidate, the own-offer window, and
+// deployed-engine flags. Fields are appended to `SessionMigrationExport`, so a stale
+// binding/binary pair would mis-read the export buffer; no wire, archive, or
+// error-variant change. The mls-rs pin moves to the fork's integration head for the
+// pending-signer, own-proposal, and pending-placement exports this needs.
 const BINDING_CONTRACT_VERSION: u64 = 36;
 
 /// See `BINDING_CONTRACT_VERSION`. Exported so the Swift layer can verify the

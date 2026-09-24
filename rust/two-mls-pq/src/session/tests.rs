@@ -939,12 +939,12 @@ fn test_sent_candidate_not_evicted() {
     let (alice, bob) = establish_confirmed_sessions();
     let mut ids = Vec::new();
     let mut first_frame = None;
-    // Stage super::CANDIDATE_WINDOW + 2 candidates. Only the first super::CANDIDATE_WINDOW are in
+    // Stage crate::session::CANDIDATE_WINDOW + 2 candidates. Only the first crate::session::CANDIDATE_WINDOW are in
     // flight (proposable); the rest defer.
-    for i in 0..(super::CANDIDATE_WINDOW + 2) {
+    for i in 0..(crate::session::CANDIDATE_WINDOW + 2) {
         let id = make_client().client_id();
         assert_ok!(alice.stage_rotation(id.bytes.clone()));
-        if i < super::CANDIDATE_WINDOW {
+        if i < crate::session::CANDIDATE_WINDOW {
             assert_ok!(alice.prepare_to_encrypt(Some(id.clone())));
             let frame = assert_ok!(alice.encrypt(format!("cand{i}").into_bytes()));
             if i == 0 {
@@ -975,7 +975,7 @@ fn test_deferred_candidate_promoted_next_round() {
     let (alice, bob) = establish_confirmed_sessions();
     // Fill the window and defer one more.
     let mut ids = Vec::new();
-    for _ in 0..(super::CANDIDATE_WINDOW + 1) {
+    for _ in 0..(crate::session::CANDIDATE_WINDOW + 1) {
         ids.push(make_client().client_id());
     }
     for id in &ids {
@@ -1043,7 +1043,7 @@ fn test_archive_round_trips_deferred_candidate() {
     let (alice, bob) = establish_confirmed_sessions();
     // Fill the window and defer one more.
     let mut ids = Vec::new();
-    for _ in 0..(super::CANDIDATE_WINDOW + 1) {
+    for _ in 0..(crate::session::CANDIDATE_WINDOW + 1) {
         ids.push(make_client().client_id());
     }
     for id in &ids {
@@ -4519,7 +4519,7 @@ fn test_prepare_to_encrypt_lazily_stages_unstaged_candidate() {
 fn test_lazy_prepare_respects_candidate_window() {
     let (alice, _bob) = establish_confirmed_sessions();
     // Propose CANDIDATE_WINDOW distinct candidates, none canonicalized — the pool fills.
-    for i in 0..super::CANDIDATE_WINDOW {
+    for i in 0..crate::session::CANDIDATE_WINDOW {
         let id = make_client().client_id();
         assert_ok!(alice.prepare_to_encrypt(Some(id)));
         assert_ok!(alice.encrypt(format!("cand{i}").into_bytes()));
@@ -8502,11 +8502,8 @@ fn test_v3_archive_restores_with_empty_attachment_ledgers() {
     message_round(&restored, &alice, b"after-v3-restore");
 }
 
-/// A born-dedicated acceptor's `migration_export` at the moment its recv-classical leaf
-/// catches up (before its own first send-group commit, so the staple is still the §26
-/// handoff) and again once the full lifecycle (A.3 bootstrap, bind, an A.4 round each way)
-/// has completed — including once more after an archive/restore of Bob, proving the
-/// custodied signer survives the ordinary (non-swift) archive round-trip.
+/// A born-dedicated acceptor exports at recv-classical catch-up (staple still the §26
+/// handoff) and after the full lifecycle, including across an ordinary archive/restore.
 #[cfg(feature = "cryptokit")]
 #[test]
 fn test_migration_export_born_dedicated_converged() {
@@ -8558,8 +8555,6 @@ fn test_migration_export_born_dedicated_converged() {
     let res = assert_some!(assert_ok!(bob_s.process_incoming(enc.cipher_text)));
     let alice_upd = assert_some!(res.proposal);
 
-    // Converged, but Bob has not yet committed into his OWN send group: the staple is
-    // still the §26 handoff frame installed at `install_mock_envelope`.
     assert_eq!(
         bob_s.lock().current_staple.first(),
         Some(&super::frames::ESTABLISHMENT_HANDOFF_TAG),
@@ -8573,14 +8568,12 @@ fn test_migration_export_born_dedicated_converged() {
         invitation_identity
     );
 
-    // And in Bob's direction: his send group commits Alice's Upd.
     assert_ok!(bob_s.queue_proposal(alice_upd.digest));
     let prep = assert_ok!(bob_s.prepare_to_encrypt(None));
     assert!(prep.did_commit);
     let enc = assert_ok!(bob_s.encrypt(b"full-b".to_vec()));
     assert_some!(assert_ok!(alice_s.process_incoming(enc.cipher_text)));
 
-    // A.3 bootstrap + bind, then an A.4 round each way.
     let kp = assert_ok!(alice_s.pq_bootstrap_begin(None));
     assert_ok!(bob_s.pq_bootstrap_respond(kp));
     let welcome = assert_some!(bob_s.pq_take_pending_outbound());
@@ -8596,7 +8589,7 @@ fn test_migration_export_born_dedicated_converged() {
     assert!(!export.owes_establishment_envelope);
     let custody = assert_some!(export.pq_leaf_custody);
     assert_eq!(custody.client_id, invitation_identity);
-    // The pq pair derives (the same cross-check the mint performs).
+    // Same derive cross-check the mint performs.
     let pq_cs = assert_some!(
         crate::providers::pq().cipher_suite_provider(crate::providers::pq_cipher_suite())
     );
@@ -8604,47 +8597,70 @@ fn test_migration_export_born_dedicated_converged() {
     let derived = assert_ok!(pq_cs.signature_key_derive_public(&signer));
     assert_eq!(derived.as_bytes(), custody.pq_signature_key);
 
-    // The export also succeeds after an archive→restore of Bob — the restored group's
-    // signer is not swift-export-only state, so it survives the ordinary archive.
+    // The signer is not swift-export-only state, so it survives the ordinary archive.
     let archive = assert_ok!(bob_s.archive());
     let restored = assert_ok!(TwoMlsPqSession::from_archive(archive));
     let export = assert_ok!(restored.migration_export());
+    let legacy_custody = assert_some!(export.pq_leaf_custody);
+    assert_eq!(legacy_custody.client_id, invitation_identity);
+    let recv_pq_current = assert_some!(export.leaf_keys.recv_pq.current);
     assert_eq!(
-        assert_some!(export.pq_leaf_custody).client_id,
-        invitation_identity
+        recv_pq_current.signature_key,
+        legacy_custody.pq_signature_key
     );
 
-    // The pre-install latch is what the gate actually checks, not an incidental side
-    // effect of having gone through installation: erase Bob's installed envelope (as if
-    // it had never landed) and the export must refuse again, even though every OTHER
-    // convergence condition still holds.
+    // With the envelope erased (as if it never landed), the export still succeeds and
+    // reports it via `owes_establishment_envelope`.
     bob_s.lock().establishment_envelope = None;
-    assert!(matches!(
-        bob_s.migration_export(),
-        Err(TwoMlsPqError::SessionNotReady)
-    ));
+    let pre_install_export = assert_ok!(bob_s.migration_export());
+    assert!(pre_install_export.owes_establishment_envelope);
 }
 
-/// A born-dedicated acceptor pre-install: the establishment envelope has not landed yet, so
-/// the export refuses rather than mis-mapping the missing delegation.
+/// A born-dedicated acceptor before its establishment envelope lands exports with
+/// `owes_establishment_envelope` and custody for both recv halves: Bob joined both under the
+/// invitation identity, so the custody search's self-match is the real I_c/I_pq signer.
 #[cfg(feature = "cryptokit")]
 #[test]
-fn test_migration_export_refuses_born_dedicated_pre_install() {
+fn test_migration_export_carries_born_dedicated_pre_install() {
     let d = crate::test_utils::born_dedicated_pending();
-    assert!(matches!(
-        d.bob.migration_export(),
-        Err(TwoMlsPqError::SessionNotReady)
-    ));
+    let (presented_classical, presented_pq) = {
+        let inner = d.bob.lock();
+        let recv = inner.recv_group.as_ref().unwrap();
+        (
+            assert_ok!(crate::session::migration::own_signature_key(
+                &recv.classical
+            )),
+            assert_ok!(crate::session::migration::own_signature_key(
+                recv.pq.as_ref().unwrap()
+            )),
+        )
+    };
+    let export = assert_ok!(d.bob.migration_export());
+    assert!(export.owes_establishment_envelope);
+    // Both halves still present the invitation identity's keys, not the dedicated one's.
+    assert_ne!(presented_classical, export.identity.signature_key);
+    assert_ne!(presented_pq, export.identity.pq_signature_key);
+
+    let recv_classical = export.leaf_keys.recv_classical;
+    let recv_classical_current = assert_some!(recv_classical.current);
+    assert_eq!(recv_classical_current.signature_key, presented_classical);
+
+    let recv_pq = export.leaf_keys.recv_pq;
+    let recv_pq_current = assert_some!(recv_pq.current);
+    assert_eq!(recv_pq_current.signature_key, presented_pq);
+
+    let deployed = export.deployed_state;
+    if let Some(deployed) = deployed {
+        assert!(!deployed.no_custody.recv_classical);
+        assert!(!deployed.no_custody.recv_pq);
+    }
 }
 
-/// A born-dedicated acceptor, installed and sent, but whose catch-up Upd the peer has only
-/// PROCESSED (paused → approved) and not yet folded: Bob's recv-classical leaf still
-/// presents the invitation identity's key, and mls-rs still holds a signer-carrying pending
-/// update for it — the custody gate must catch this as `SessionNotReady` before
-/// `export_for_swift` ever runs and surfaces it as `Mls`.
+/// A born-dedicated acceptor whose catch-up Upd the peer processed but hasn't folded exports
+/// mls-rs's signer-carrying pending update in `recv_classical.pending`, targeting the dedicated id.
 #[cfg(feature = "cryptokit")]
 #[test]
-fn test_migration_export_refuses_born_dedicated_pre_convergence() {
+fn test_migration_export_carries_born_dedicated_pre_convergence() {
     let d = crate::test_utils::born_dedicated_pending();
     let envelope = crate::test_utils::install_mock_envelope(&d.bob);
     assert_ok!(d.bob.prepare_to_encrypt(None));
@@ -8655,39 +8671,60 @@ fn test_migration_export_refuses_born_dedicated_pre_convergence() {
         &envelope,
         &d.dedicated,
     ));
-    assert!(matches!(
-        d.bob.migration_export(),
-        Err(TwoMlsPqError::SessionNotReady)
-    ));
+    let export = assert_ok!(d.bob.migration_export());
+    assert!(!export.owes_establishment_envelope);
+    let recv_classical = export.leaf_keys.recv_classical;
+    // mine.current is the dedicated id here, so the real signer and the generalized
+    // catch-up are the same key and must collapse to one entry.
+    let catch_up = recv_classical
+        .pending
+        .iter()
+        .find(|p| p.target == d.dedicated)
+        .expect("recv_classical.pending must carry the dedicated-id catch-up");
+    assert_eq!(
+        catch_up.key.signature_key, export.identity.signature_key,
+        "the catch-up entry carries the identity's OWN (dedicated) classical key"
+    );
+    assert_eq!(
+        recv_classical
+            .pending
+            .iter()
+            .filter(|p| p.target == d.dedicated)
+            .count(),
+        1,
+        "the real signer and the synthetic catch-up entry must collapse to exactly one"
+    );
 }
 
-/// A staged (in-flight, unfolded) rotation candidate blocks the export.
+/// A staged, unfolded rotation candidate is carried as a `recv_classical.pending` entry
+/// keyed by the candidate's client id.
 #[cfg(feature = "cryptokit")]
 #[test]
-fn test_migration_export_refuses_staged_rotation_candidate() {
+fn test_migration_export_carries_staged_rotation_candidate() {
     let (alice, _bob) = establish_confirmed_sessions();
     let new_id = make_client().client_id();
-    assert_ok!(alice.prepare_to_encrypt(Some(new_id)));
-    assert!(matches!(
-        alice.migration_export(),
-        Err(TwoMlsPqError::SessionNotReady)
-    ));
+    assert_ok!(alice.prepare_to_encrypt(Some(new_id.clone())));
+    let export = assert_ok!(alice.migration_export());
+    let recv_classical = export.leaf_keys.recv_classical;
+    let pending = recv_classical
+        .pending
+        .iter()
+        .find(|p| p.target == new_id.bytes);
+    assert_some!(pending);
 }
 
-/// A staged candidate that is never committed stays in `staged_candidates` indefinitely —
-/// canonicalization only prunes the set when a candidate itself is the thing committed, not
-/// on any unrelated commit — so a later PLAIN round that the peer folds instead still
-/// leaves the export refused.
+/// A never-committed staged candidate stays in `staged_candidates` (only committing the
+/// candidate itself prunes it), so it is still carried after the peer folds a later plain round.
 #[cfg(feature = "cryptokit")]
 #[test]
-fn test_migration_export_refuses_superseded_staged_candidate() {
+fn test_migration_export_carries_superseded_staged_candidate() {
     let (alice, bob) = establish_confirmed_sessions();
     let new_id = make_client().client_id();
-    assert_ok!(alice.prepare_to_encrypt(Some(new_id)));
+    assert_ok!(alice.prepare_to_encrypt(Some(new_id.clone())));
     let rotation = assert_ok!(alice.encrypt(b"rotate".to_vec()));
     assert_some!(assert_ok!(bob.process_incoming(rotation.cipher_text)));
 
-    // Bob never queues/commits the candidate; a later PLAIN round supersedes it instead.
+    // Bob never commits the candidate — he folds a later plain round instead.
     assert_ok!(alice.prepare_to_encrypt(None));
     let plain = assert_ok!(alice.encrypt(b"plain".to_vec()));
     let got = assert_some!(assert_ok!(bob.process_incoming(plain.cipher_text)));
@@ -8697,65 +8734,73 @@ fn test_migration_export_refuses_superseded_staged_candidate() {
     let staple = assert_ok!(bob.encrypt(b"fold-plain".to_vec()));
     assert_some!(assert_ok!(alice.process_incoming(staple.cipher_text)));
 
-    assert!(matches!(
-        alice.migration_export(),
-        Err(TwoMlsPqError::SessionNotReady)
-    ));
+    let export = assert_ok!(alice.migration_export());
+    let recv_classical = export.leaf_keys.recv_classical;
+    assert!(recv_classical
+        .pending
+        .iter()
+        .any(|p| p.target == new_id.bytes));
 }
 
-/// Post-rotation leaf lag: the peer's commit canonicalizes the new identity, but the
-/// rotated party's own send-group leaf lags until its own next commit. The custody gate
-/// must refuse this as `SessionNotReady` — pinning that the gate runs BEFORE
-/// `export_group_half`, so a lagging leaf never reaches `export_for_swift` and surfaces as
-/// the unrelated `Mls` error instead.
+/// After a rotation the send-classical leaf presents the old key until its own next commit:
+/// `current` resolves via the leaf's own signer (differs from `identity`, never `no_custody`),
+/// and `pending` carries the catch-up at `mine.current` with the identity's own key.
 #[cfg(feature = "cryptokit")]
 #[test]
-fn test_migration_export_refuses_post_rotation_leaf_lag() {
+fn test_migration_export_carries_post_rotation_leaf_lag() {
     let (alice, bob) = establish_confirmed_sessions();
     let new_alice = make_client().client_id();
-    rotate_round(&alice, &bob, new_alice);
-    assert!(matches!(
-        alice.migration_export(),
-        Err(TwoMlsPqError::SessionNotReady)
-    ));
+    rotate_round(&alice, &bob, new_alice.clone());
+    let export = assert_ok!(alice.migration_export());
+    let send_classical = export.leaf_keys.send_classical;
+    let current = assert_some!(send_classical.current);
+    assert_ne!(
+        current.signature_key, export.identity.signature_key,
+        "send-classical genuinely still lags the (already-rotated) identity"
+    );
+    let catch_up = send_classical
+        .pending
+        .iter()
+        .find(|p| p.target == new_alice.bytes)
+        .expect("send_classical.pending must carry the generalized catch-up at mine.current");
+    assert_eq!(
+        catch_up.key.signature_key, export.identity.signature_key,
+        "the catch-up entry carries the identity's OWN (current) classical key"
+    );
+    if let Some(deployed) = export.deployed_state {
+        assert!(!deployed.no_custody.send_classical);
+    }
 }
 
-/// A rotation's catch-up A.5 mid-round (Upd' sent, Commit' produced but not yet applied):
-/// the rotated party's send-PQ leaf still lags, same as the plain post-rotation case, and
-/// must refuse as `SessionNotReady` even with a genuinely in-flight round.
+/// Mid-A.5 on a rotated session (Upd' sent, Commit' produced but unapplied): `pq_inflight`
+/// is `RekeyInitiated` and the lagging send-PQ leaf still resolves custody.
 #[cfg(feature = "cryptokit")]
 #[test]
-fn test_migration_export_refuses_mid_a5_round_on_rotated_session() {
+fn test_migration_export_carries_mid_a5_round_on_rotated_session() {
     let (alice, bob) = establish_full();
-    // Flip the turn so Bob is the non-turn-holder rekey initiator (`rekey_to_commit`'s
-    // precondition), then rotate him and drive the A.5 up to — but not through — his apply.
+    // `rekey_to_commit` requires Bob to be the non-turn-holder initiator.
     ratchet_round(&bob, &alice, b"flip");
     let new_bob_id = make_client().client_id();
     let _responder_commit = rekey_to_commit(&bob, &alice, new_bob_id);
+    let export = assert_ok!(bob.migration_export());
     assert!(matches!(
-        bob.migration_export(),
-        Err(TwoMlsPqError::SessionNotReady)
+        export.pq_inflight,
+        Some(super::migration::SessionMigrationPqInflight::RekeyInitiated { .. })
     ));
+    let send_pq = export.leaf_keys.send_pq;
+    assert_some!(send_pq.current);
 }
 
-/// A ROTATED party (Bob) at rest — no A.5 in flight, nothing owed — whose credential
-/// handoff has converged everywhere except his own send-PQ leaf: `rekey_round`'s Upd'
-/// moves his recv-PQ mirror (the proposal replaces the proposer) and its own trailing
-/// discharge catches up his send-classical/recv-classical, but his send-PQ leaf moves
-/// only on a round HE responds to (`own_pq_leaf_signature_keys`'s doc), which hasn't
-/// happened. The export must still refuse this settled state (`SessionNotReady`) — only
-/// recv.pq has a custody slot; send.pq has none. Named descriptively because a follow-up
-/// (W2d) is expected to extend custody to this exact shape (a lagging send-PQ leaf after
-/// a rotation).
+/// A rotated party at rest, converged everywhere except send-PQ (which moves only on a round
+/// it responds to): `send_pq.current` resolves the old PQ key via its own signer.
 #[cfg(feature = "cryptokit")]
 #[test]
-fn test_migration_export_refuses_send_pq_lag_after_rotation_converges_everything_else() {
+fn test_migration_export_carries_send_pq_lag_after_rotation_converges_everything_else() {
     let (alice, bob) = establish_full();
-    // Flip the turn so Bob is the non-turn-holder — `rekey_round`'s precondition for
-    // driving his own catch-up A.5 as its initiator.
+    // `rekey_round` requires Bob to be the non-turn-holder initiator.
     ratchet_round(&bob, &alice, b"flip");
     let new_bob_id = make_client().client_id();
-    rekey_round(&bob, &alice, new_bob_id);
+    rekey_round(&bob, &alice, new_bob_id.clone());
 
     assert!(bob.lock().owed_bind.is_none(), "settled, not mid-bind");
     assert!(bob.lock().pq_inflight.is_none(), "no A.5 in flight");
@@ -8774,23 +8819,803 @@ fn test_migration_export_refuses_send_pq_lag_after_rotation_converges_everything
         "send.pq should still lag — the state under test"
     );
 
-    assert!(matches!(
-        bob.migration_export(),
-        Err(TwoMlsPqError::SessionNotReady)
-    ));
+    let export = assert_ok!(bob.migration_export());
+    let send_pq_leaf = export.leaf_keys.send_pq;
+    let current = assert_some!(send_pq_leaf.current);
+    assert_eq!(current.signature_key, send_pq);
+    let catch_up = send_pq_leaf
+        .pending
+        .iter()
+        .find(|p| p.target == new_bob_id.bytes)
+        .expect("send_pq.pending must carry the generalized catch-up at mine.current");
+    assert_eq!(
+        catch_up.key.signature_key, export.identity.pq_signature_key,
+        "the catch-up entry carries the identity's OWN (current) PQ key"
+    );
+    if let Some(deployed) = export.deployed_state {
+        assert!(!deployed.no_custody.send_pq);
+    }
 }
 
-/// `leaf_pq_custody`'s history-membership check in isolation: an empty `auth_mine`
-/// history can never contain the leaf's own credential, whatever it is, so custody must
-/// refuse — even though the leaf's id here genuinely differs from `identity_client_id`
-/// (the OTHER check this call could otherwise trip instead, which would mask this one).
+/// Two rotations (id0 -> id1 with its A.5, then id1 -> id2 purely classical) leave three live
+/// PQ keys: id0 in send_pq.current (moves only when responding to a peer A.5), id1 in
+/// recv_pq.current, and id2 only as each PQ group's catch-up `pending[id2]`.
+#[cfg(feature = "cryptokit")]
+#[test]
+fn test_migration_export_two_rotations_carry_three_live_pq_keys() {
+    let (alice, bob) = establish_full();
+    let (send_pq_id0, _recv_pq_id0) = own_pq_leaf_signature_keys(&bob);
+
+    // `rekey_round` requires Bob to be the non-turn-holder.
+    ratchet_round(&bob, &alice, b"flip1");
+    let id1 = make_client().client_id();
+    rekey_round(&bob, &alice, id1.clone());
+    let (send_pq_after_a5, recv_pq_id1) = own_pq_leaf_signature_keys(&bob);
+    assert_eq!(
+        send_pq_after_a5, send_pq_id0,
+        "send_pq must still lag id0 — it never responded to a peer-opened A.5"
+    );
+    assert_ne!(
+        recv_pq_id1, send_pq_id0,
+        "recv_pq must have converged to id1"
+    );
+
+    let id2 = make_client().client_id();
+    rotate_round(&bob, &alice, id2.clone());
+
+    let export = assert_ok!(bob.migration_export());
+    assert_eq!(
+        export.identity.pq_signature_key,
+        {
+            let inner = bob.lock();
+            inner
+                .client
+                .combiner()
+                .pq_signature_keypair()
+                .1
+                .as_bytes()
+                .to_vec()
+        },
+        "sanity: the identity now reflects id2"
+    );
+
+    let send_pq = export.leaf_keys.send_pq;
+    assert_eq!(assert_some!(send_pq.current).signature_key, send_pq_id0);
+    let send_catch_up = send_pq
+        .pending
+        .iter()
+        .find(|p| p.target == id2.bytes)
+        .expect("send_pq.pending must carry pending[id2]");
+    assert_eq!(
+        send_catch_up.key.signature_key,
+        export.identity.pq_signature_key
+    );
+
+    let recv_pq = export.leaf_keys.recv_pq;
+    assert_eq!(assert_some!(recv_pq.current).signature_key, recv_pq_id1);
+    let recv_catch_up = recv_pq
+        .pending
+        .iter()
+        .find(|p| p.target == id2.bytes)
+        .expect("recv_pq.pending must carry pending[id2]");
+    assert_eq!(
+        recv_catch_up.key.signature_key,
+        export.identity.pq_signature_key
+    );
+
+    if let Some(deployed) = export.deployed_state {
+        assert!(!deployed.no_custody.send_pq);
+        assert!(!deployed.no_custody.recv_pq);
+    }
+}
+
+/// A pre-A.3 acceptor (send.pq deferred) reserves `send_pq.current` as the identity's current
+/// PQ key — what `pq_bootstrap_respond` will found with — with empty `pending`.
+#[cfg(feature = "cryptokit")]
+#[test]
+fn test_migration_export_send_pq_reservation_for_pre_a3_acceptor() {
+    let (_alice, bob) = establish_confirmed_sessions();
+    assert!(
+        bob.lock().send_group.as_ref().unwrap().pq.is_none(),
+        "sanity: bob's send-PQ is still deferred pre-A.3"
+    );
+    let export = assert_ok!(bob.migration_export());
+    let send_pq = export.leaf_keys.send_pq;
+    let current = assert_some!(send_pq.current);
+    assert_eq!(current.signature_key, export.identity.pq_signature_key);
+    assert!(send_pq.pending.is_empty());
+    if let Some(deployed) = export.deployed_state {
+        assert!(!deployed.no_custody.send_pq);
+    }
+}
+
+/// A pre-A.3 initiator (no recv.pq yet) reserves `recv_pq.current` as KP′'s key — absent a
+/// rotation, the identity's current PQ key — with empty `pending`.
+#[cfg(feature = "cryptokit")]
+#[test]
+fn test_migration_export_recv_pq_reservation_for_pre_a3_initiator() {
+    let (alice, _bob) = establish_confirmed_sessions();
+    assert!(
+        alice.lock().recv_group.as_ref().unwrap().pq.is_none(),
+        "sanity: alice's recv-PQ does not exist yet pre-A.3"
+    );
+    let export = assert_ok!(alice.migration_export());
+    let recv_pq = export.leaf_keys.recv_pq;
+    let current = assert_some!(recv_pq.current);
+    assert_eq!(current.signature_key, export.identity.pq_signature_key);
+    assert!(recv_pq.pending.is_empty());
+    if let Some(deployed) = export.deployed_state {
+        assert!(!deployed.no_custody.recv_pq);
+    }
+}
+
+/// A pre-A.3 initiator that rotates classically leaves KP′ presenting id0's PQ key, so
+/// `recv_pq.current` must be id0's (found via send-PQ's unrotated signer), not id1's.
+#[cfg(feature = "cryptokit")]
+#[test]
+fn test_migration_export_recv_pq_reservation_finds_pre_rotation_key() {
+    let (alice, bob) = establish_confirmed_sessions();
+    assert!(alice.lock().recv_group.as_ref().unwrap().pq.is_none());
+    let id0_pq_public = alice
+        .lock()
+        .client
+        .combiner()
+        .pq_signature_keypair()
+        .1
+        .as_bytes()
+        .to_vec();
+
+    let id1 = make_client().client_id();
+    rotate_round(&alice, &bob, id1);
+    assert!(
+        alice.lock().recv_group.as_ref().unwrap().pq.is_none(),
+        "still pre-A.3 after a purely classical rotation"
+    );
+
+    let export = assert_ok!(alice.migration_export());
+    assert_ne!(
+        export.identity.pq_signature_key, id0_pq_public,
+        "sanity: the identity's PQ key really did move to id1's"
+    );
+    let recv_pq = export.leaf_keys.recv_pq;
+    let current = assert_some!(recv_pq.current);
+    assert_eq!(
+        current.signature_key, id0_pq_public,
+        "the reservation must present KP′'s (pre-rotation) key, found via send-PQ's \
+         own still-unrotated signer"
+    );
+    if let Some(deployed) = export.deployed_state {
+        assert!(!deployed.no_custody.recv_pq);
+    }
+}
+
+/// With several retained classical KPs (unreachable via this crate's wrapper, which mints one),
+/// `identity_kp` must pick the one `initial_app_payload` names, not the first stored.
+#[cfg(feature = "cryptokit")]
+#[test]
+fn test_identity_kp_prefers_the_retained_kp_named_in_the_initial_app_payload() {
+    let alice = make_client();
+    let bob = make_client();
+    let bob_inv = assert_ok!(crate::key_packages::TwoMlsPqInvitation::restore(
+        assert_ok!(bob.generate_invitation(true))
+    ));
+    let bob_kp = bob_inv.combiner_key_package();
+    let alice_s = assert_ok!(TwoMlsPqSession::initiate(Arc::clone(&alice), bob_kp, None));
+
+    // `identity_kp` compares the store's bare `key_package_bytes`, not
+    // `generate_classical_key_package`'s MLSMessage-framed return value.
+    let combiner = alice.combiner();
+    let (first_result, first_captured) = combiner
+        .classical_kp_store()
+        .capture(|| combiner.generate_classical_key_package());
+    assert_ok!(first_result);
+    let first_kp_bytes = first_captured
+        .into_iter()
+        .next()
+        .expect("the first generate must insert one entry")
+        .1
+        .key_package_bytes;
+    let (second_result, second_captured) = combiner
+        .classical_kp_store()
+        .capture(|| combiner.generate_classical_key_package());
+    assert_ok!(second_result);
+    let second_kp_bytes = second_captured
+        .into_iter()
+        .next()
+        .expect("the second generate must insert one entry")
+        .1
+        .key_package_bytes;
+    assert_ne!(
+        first_kp_bytes, second_kp_bytes,
+        "sanity: two distinct KPs were actually minted"
+    );
+    assert_eq!(
+        combiner.classical_kp_store().all_entries().len(),
+        2,
+        "sanity: the store now retains both"
+    );
+
+    assert_ok!(alice_s.set_initial_app_payload(second_kp_bytes.clone()));
+
+    let export = assert_ok!(alice_s.migration_export());
+    assert_eq!(
+        export.identity.classical_key_package, second_kp_bytes,
+        "identity_kp must pick the retained KP the payload names, not the first in \
+         storage order"
+    );
+}
+
+/// Re-proposing `mine.current` while send-classical lags mints a real same-id candidate K′:
+/// `send_classical.pending[mine.current]` stays the identity's catch-up key (no own offers),
+/// `recv_classical`'s is K′, and it never exports as `rotation_candidate`.
+#[cfg(feature = "cryptokit")]
+#[test]
+fn test_migration_export_same_id_candidate_send_classical_also_lagging() {
+    let (alice, bob) = establish_confirmed_sessions();
+    let id1 = make_client().client_id();
+    rotate_round(&alice, &bob, id1.clone());
+    assert!(
+        alice.lock().staged_candidates.is_empty(),
+        "sanity: the winning candidate is pruned once canonicalized"
+    );
+
+    // Left unfolded so it stays staged alongside send_classical's lagging catch-up.
+    assert_ok!(alice.prepare_to_encrypt(Some(id1.clone())));
+    assert_ok!(alice.encrypt(b"same-id".to_vec()));
+    let candidate_key = {
+        let inner = alice.lock();
+        let candidate = inner
+            .staged_candidates
+            .last()
+            .expect("the same-id candidate is staged");
+        candidate
+            .combiner()
+            .classical_signature_keypair()
+            .1
+            .as_bytes()
+            .to_vec()
+    };
+
+    let export = assert_ok!(alice.migration_export());
+    let send_entry = export
+        .leaf_keys
+        .send_classical
+        .pending
+        .iter()
+        .find(|p| p.target == id1.bytes)
+        .expect("send_classical must still carry pending[mine.current]");
+    assert_eq!(
+        send_entry.key.signature_key, export.identity.signature_key,
+        "send_classical has no own offers: only the identity's catch-up key can occupy \
+         mine.current"
+    );
+    let recv_entry = export
+        .leaf_keys
+        .recv_classical
+        .pending
+        .iter()
+        .find(|p| p.target == id1.bytes)
+        .expect("recv_classical must carry the candidate's own real offer at mine.current");
+    assert_eq!(
+        recv_entry.key.signature_key, candidate_key,
+        "recv_classical's ONLY real offer at mine.current is the candidate's own K′"
+    );
+    assert_ne!(
+        recv_entry.key.signature_key, send_entry.key.signature_key,
+        "send and recv legitimately disagree at mine.current here"
+    );
+    assert!(
+        export.rotation_candidate.is_none(),
+        "a same-id candidate must never export as rotation_candidate"
+    );
+}
+
+/// With nothing lagging, a same-id candidate K′ still rides `recv_classical.pending` (never as
+/// `rotation_candidate`), and `send_classical` has no entry at all.
+#[cfg(feature = "cryptokit")]
+#[test]
+fn test_migration_export_same_id_candidate_with_nothing_else_lagging() {
+    let (alice, _bob) = establish_confirmed_sessions();
+    let own_id = alice.lock().client.client_id();
+
+    assert_ok!(alice.prepare_to_encrypt(Some(own_id.clone())));
+    assert_ok!(alice.encrypt(b"same-id-fresh".to_vec()));
+    let candidate_key = {
+        let inner = alice.lock();
+        let candidate = inner
+            .staged_candidates
+            .last()
+            .expect("the same-id candidate is staged");
+        candidate
+            .combiner()
+            .classical_signature_keypair()
+            .1
+            .as_bytes()
+            .to_vec()
+    };
+
+    let export = assert_ok!(alice.migration_export());
+    assert!(
+        export
+            .leaf_keys
+            .send_classical
+            .pending
+            .iter()
+            .all(|p| p.target != own_id.bytes),
+        "send_classical isn't lagging and never carries a same-id candidate's own key"
+    );
+    let recv_entry = export
+        .leaf_keys
+        .recv_classical
+        .pending
+        .iter()
+        .find(|p| p.target == own_id.bytes)
+        .expect("recv_classical must carry the candidate's own real offer at mine.current");
+    assert_eq!(recv_entry.key.signature_key, candidate_key);
+    assert!(
+        export.rotation_candidate.is_none(),
+        "a same-id candidate must never export as rotation_candidate"
+    );
+
+    // The "confirm-a" round also left a cached same-key refresh outstanding. A refresh
+    // must not count as an identity offer, or the window would drop K′ (see
+    // `own_offer_window`).
+    let window = assert_some!(assert_some!(export.deployed_state).own_offers);
+    assert!(
+        window
+            .offers
+            .iter()
+            .any(|o| super::migration::decoded_update_target(&o.proposal)
+                .is_some_and(|(_, key)| key == candidate_key)),
+        "the same-id candidate's real K′ offer must ride the window, matching \
+         pending[mine.current]"
+    );
+}
+
+/// With real recv_classical offers under both the identity's key and a same-id K′, the
+/// identity wins `pending[mine.current]` and the K′ offer is dropped from the window. Uses a
+/// born-dedicated acceptor because an identity-signed offer needs a leaf genuinely behind
+/// `mine.current` (a same-identity refresh carries no signer).
+#[cfg(feature = "cryptokit")]
+#[test]
+fn test_migration_export_recv_classical_prefers_identity_when_both_real_offers_outstanding() {
+    let d = crate::test_utils::born_dedicated_pending();
+    let (alice, bob) = (d.alice, d.bob);
+    let envelope = crate::test_utils::install_mock_envelope(&bob);
+
+    // Contract 26's mandatory delegation handoff — must itself name the dedicated id.
+    assert_ok!(bob.prepare_to_encrypt(Some(crate::ClientId {
+        bytes: d.dedicated.clone()
+    })));
+    let enc = assert_ok!(bob.encrypt(b"handoff".to_vec()));
+    assert_some!(crate::test_utils::approve_establishment(
+        &alice,
+        enc.cipher_text,
+        &envelope,
+        &d.dedicated,
+    ));
+
+    // Recv-classical still presents the invitation identity, so this plain refresh is a
+    // real credential change: a signer-carrying entry under the identity's own key.
+    assert_ok!(bob.prepare_to_encrypt(None));
+    let identity_offer_bytes = bob
+        .lock()
+        .pending_proposal_message
+        .as_ref()
+        .unwrap()
+        .1
+        .clone();
+    assert_ok!(bob.encrypt(b"identity-catchup".to_vec()));
+    let identity_ref = {
+        let inner = bob.lock();
+        let recv = inner.recv_group.as_ref().unwrap();
+        let cs = assert_ok!(crate::providers::classical_envelope_suite());
+        let hash = assert_ok!(mls_rs::CipherSuiteProvider::hash(
+            &cs,
+            &identity_offer_bytes
+        ));
+        assert_ok!(recv.classical.own_proposals_for_swift_export())
+            .into_iter()
+            .find(|e| e.message_hash == hash)
+            .expect("the identity-signed catch-up must still be cached")
+            .proposal_ref
+    };
+
+    // Encrypting the same-id K′ offer clears `pending_proposal_message`, so neither offer
+    // is framed at export — both are window candidates.
+    assert_ok!(bob.prepare_to_encrypt(Some(crate::ClientId {
+        bytes: d.dedicated.clone()
+    })));
+    assert_ok!(bob.encrypt(b"same-id-candidate".to_vec()));
+    let candidate_key = {
+        let inner = bob.lock();
+        let candidate = inner
+            .staged_candidates
+            .last()
+            .expect("the same-id candidate is staged");
+        candidate
+            .combiner()
+            .classical_signature_keypair()
+            .1
+            .as_bytes()
+            .to_vec()
+    };
+
+    let export = assert_ok!(bob.migration_export());
+    let recv_entry = export
+        .leaf_keys
+        .recv_classical
+        .pending
+        .iter()
+        .find(|p| p.target == d.dedicated)
+        .expect("recv_classical must carry mine.current");
+    assert_eq!(
+        recv_entry.key.signature_key, export.identity.signature_key,
+        "the identity's key wins when both a real identity offer and a same-id \
+         candidate's are outstanding"
+    );
+
+    let window = assert_some!(assert_some!(export.deployed_state).own_offers);
+    assert!(
+        window.offers.iter().any(|o| o.proposal_ref == identity_ref),
+        "the identity-signed offer must still ride the window"
+    );
+    for offer in &window.offers {
+        let (_, key) = assert_some!(super::migration::decoded_update_target(&offer.proposal));
+        assert!(
+            key != candidate_key || offer.proposal_ref == identity_ref,
+            "no window offer may carry the same-id candidate's own losing key"
+        );
+    }
+}
+
+/// A framed identity catch-up over an at-rest same-id K′ offer wins `pending[mine.current]`,
+/// so the K′ offer must leave the window too — native check 6 rejects a window offer for
+/// `mine.current` that doesn't match `pending[mine.current]`.
+#[cfg(feature = "cryptokit")]
+#[test]
+fn test_migration_export_framed_identity_catchup_drops_the_real_same_id_candidate_offer() {
+    let d = crate::test_utils::born_dedicated_pending();
+    let (alice, bob) = (d.alice, d.bob);
+    let envelope = crate::test_utils::install_mock_envelope(&bob);
+
+    // The mandatory handoff stages the same-id candidate K′; alice never folds it.
+    assert_ok!(bob.prepare_to_encrypt(Some(crate::ClientId {
+        bytes: d.dedicated.clone()
+    })));
+    let enc = assert_ok!(bob.encrypt(b"handoff".to_vec()));
+    assert_some!(crate::test_utils::approve_establishment(
+        &alice,
+        enc.cipher_text,
+        &envelope,
+        &d.dedicated,
+    ));
+    let candidate_key = {
+        let inner = bob.lock();
+        let candidate = inner
+            .staged_candidates
+            .last()
+            .expect("the same-id candidate is staged");
+        candidate
+            .combiner()
+            .classical_signature_keypair()
+            .1
+            .as_bytes()
+            .to_vec()
+    };
+
+    // Recv-classical still presents the invitation identity, so this refresh is a real
+    // identity-signed catch-up — left framed (no `encrypt`).
+    assert_ok!(bob.prepare_to_encrypt(None));
+
+    let export = assert_ok!(bob.migration_export());
+    let recv_entry = export
+        .leaf_keys
+        .recv_classical
+        .pending
+        .iter()
+        .find(|p| p.target == d.dedicated)
+        .expect("recv_classical must carry mine.current");
+    assert_eq!(
+        recv_entry.key.signature_key, export.identity.signature_key,
+        "the framed identity-signed catch-up wins mine.current's pending entry"
+    );
+
+    if let Some(window) = export
+        .deployed_state
+        .as_ref()
+        .and_then(|d| d.own_offers.as_ref())
+    {
+        for offer in &window.offers {
+            let (_, key) = assert_some!(super::migration::decoded_update_target(&offer.proposal));
+            assert_ne!(
+                key, candidate_key,
+                "the real same-id candidate offer must be dropped once the framed \
+                 identity catch-up wins mine.current"
+            );
+        }
+    }
+}
+
+/// A framed same-id K′ re-proposal wins `pending[mine.current]` over an at-rest identity
+/// catch-up: the framed entry rides the snapshot and can never be dropped, so check 6
+/// requires `pending[mine.current]` to match it.
+#[cfg(feature = "cryptokit")]
+#[test]
+fn test_migration_export_framed_same_id_candidate_wins_over_a_real_identity_catchup() {
+    // Born-dedicated, not a plain rotation: bob's `self.client` is the dedicated id from
+    // `receive` while recv-classical presents the invitation identity, so a plain refresh
+    // is already a real catch-up. A rotated party's `self.client` only swaps once the peer
+    // commits, so `None` there is a same-credential no-op.
+    let d = crate::test_utils::born_dedicated_pending();
+    let (alice, bob) = (d.alice, d.bob);
+    let envelope = crate::test_utils::install_mock_envelope(&bob);
+
+    // The mandatory handoff stages the same-id candidate K′; alice never folds it.
+    assert_ok!(bob.prepare_to_encrypt(Some(crate::ClientId {
+        bytes: d.dedicated.clone()
+    })));
+    let enc = assert_ok!(bob.encrypt(b"handoff".to_vec()));
+    assert_some!(crate::test_utils::approve_establishment(
+        &alice,
+        enc.cipher_text,
+        &envelope,
+        &d.dedicated,
+    ));
+    let candidate_key = {
+        let inner = bob.lock();
+        let candidate = inner
+            .staged_candidates
+            .last()
+            .expect("the same-id candidate is staged");
+        candidate
+            .combiner()
+            .classical_signature_keypair()
+            .1
+            .as_bytes()
+            .to_vec()
+    };
+
+    // A real identity-signed catch-up, left at rest.
+    assert_ok!(bob.prepare_to_encrypt(None));
+    let identity_enc = assert_ok!(bob.encrypt(b"identity-catchup".to_vec()));
+    assert_ok!(alice.process_incoming(identity_enc.cipher_text));
+
+    // `admit_candidate` reuses the staged candidate (same K′); this re-proposal stays framed.
+    assert_ok!(bob.prepare_to_encrypt(Some(crate::ClientId {
+        bytes: d.dedicated.clone()
+    })));
+
+    let export = assert_ok!(bob.migration_export());
+    let recv_entry = export
+        .leaf_keys
+        .recv_classical
+        .pending
+        .iter()
+        .find(|p| p.target == d.dedicated)
+        .expect("recv_classical must carry mine.current");
+    assert_eq!(
+        recv_entry.key.signature_key, candidate_key,
+        "the framed same-id candidate offer wins mine.current's pending entry, even \
+         over a real identity-signed catch-up"
+    );
+    assert_ne!(
+        recv_entry.key.signature_key, export.identity.signature_key,
+        "confirms the identity's key did NOT win here"
+    );
+
+    // Check 6: the framed entry (never optional) must match `pending[mine.current]`.
+    let staged = export
+        .staged_updates
+        .first()
+        .expect("the framed proposal rides staged_updates");
+    let cs = assert_ok!(crate::providers::classical_envelope_suite());
+    let hash = assert_ok!(mls_rs::CipherSuiteProvider::hash(&cs, &staged.message));
+    let cache_entry = {
+        let inner = bob.lock();
+        assert_ok!(inner
+            .recv_group
+            .as_ref()
+            .unwrap()
+            .classical
+            .own_proposals_for_swift_export())
+        .into_iter()
+        .find(|e| e.message_hash == hash)
+        .expect("the framed proposal must still be cached")
+    };
+    let (staged_id, staged_key) = assert_some!(super::migration::decoded_update_target(
+        &cache_entry.proposal
+    ));
+    assert_eq!(staged_id, d.dedicated);
+    assert_eq!(staged_key, candidate_key);
+}
+
+/// A framed entry left stale by a peer commit (e.g. the app died between prepare and encrypt;
+/// `pending_proposal_message` isn't epoch-scoped but mls-rs's cache is) exports harmlessly:
+/// no snapshot placement, no effect on `pending`. Folding offer-1 canonicalizes id1, clearing
+/// `staged_candidates` (id2 included) with no lag left, so `pending` ends up empty.
+#[cfg(feature = "cryptokit")]
+#[test]
+fn test_migration_export_carries_a_stale_framed_entry_harmlessly() {
+    let (alice, bob) = establish_confirmed_sessions();
+
+    let id1 = make_client().client_id();
+    assert_ok!(alice.prepare_to_encrypt(Some(id1.clone())));
+    let enc1 = assert_ok!(alice.encrypt(b"offer-1".to_vec()));
+    let got1 = assert_some!(assert_ok!(bob.process_incoming(enc1.cipher_text)));
+    let offer1 = assert_some!(got1.proposal);
+
+    // Offer-2 stays framed (no `encrypt`) — this is what goes stale.
+    let id2 = make_client().client_id();
+    assert_ok!(alice.prepare_to_encrypt(Some(id2.clone())));
+
+    assert_ok!(bob.queue_proposal(offer1.digest));
+    let prepared = assert_ok!(bob.prepare_to_encrypt(None));
+    assert!(prepared.did_commit, "bob's fold of offer-1 must commit");
+    let commit_frame = assert_ok!(bob.encrypt(b"canonicalize".to_vec()));
+
+    assert_ok!(alice.process_incoming(commit_frame.cipher_text));
+
+    let export = assert_ok!(alice.migration_export());
+
+    // The stale bytes must still be carried so native's check-6 tolerance (an
+    // epoch-checked decode failure is skipped, not rejected) sees them.
+    assert!(
+        export.pending_proposal.is_some() || !export.staged_updates.is_empty(),
+        "the stale prepare must still be carried as bookkeeping, not silently dropped"
+    );
+
+    assert!(
+        export.leaf_keys.recv_classical.pending.is_empty(),
+        "recv_classical must carry no pending entry once id1 fully canonicalizes and \
+         id2's own candidacy is abandoned with it"
+    );
+    assert!(
+        export
+            .leaf_keys
+            .recv_classical
+            .pending
+            .iter()
+            .all(|p| p.target != id2.bytes),
+        "the stale offer-2 entry must not surface as a pending target either way"
+    );
+
+    // Never live in this epoch's cache, so it can't be a detached window member either.
+    if let Some(window) = export
+        .deployed_state
+        .as_ref()
+        .and_then(|d| d.own_offers.as_ref())
+    {
+        for offer in &window.offers {
+            let (id, _) = assert_some!(super::migration::decoded_update_target(&offer.proposal));
+            assert_ne!(
+                id, id2.bytes,
+                "the stale offer-2 entry must not ride the window either"
+            );
+        }
+    }
+}
+
+/// A signerless plain refresh at rest must not count as the identity offer: K′ still wins
+/// `pending[mine.current]`, so its offer must stay in the window (else a restored native
+/// session hits a terminal `ownOfferUnavailable` when the peer folds it).
+#[cfg(feature = "cryptokit")]
+#[test]
+fn test_migration_export_window_keeps_same_id_candidate_offers_past_a_plain_refresh_at_rest() {
+    let (alice, bob) = establish_confirmed_sessions();
+    let own_id = alice.lock().client.client_id();
+
+    assert_ok!(alice.prepare_to_encrypt(Some(own_id.clone())));
+    let enc = assert_ok!(alice.encrypt(b"same-id-k-prime".to_vec()));
+    assert_some!(assert_ok!(bob.process_incoming(enc.cipher_text)));
+    let candidate_key = {
+        let inner = alice.lock();
+        let candidate = inner
+            .staged_candidates
+            .last()
+            .expect("the same-id candidate is staged");
+        candidate
+            .combiner()
+            .classical_signature_keypair()
+            .1
+            .as_bytes()
+            .to_vec()
+    };
+
+    // The leaf isn't lagging, so this refresh is cached but carries no signer.
+    assert_ok!(alice.prepare_to_encrypt(None));
+    let enc = assert_ok!(alice.encrypt(b"plain-refresh".to_vec()));
+    assert_some!(assert_ok!(bob.process_incoming(enc.cipher_text)));
+
+    let export = assert_ok!(alice.migration_export());
+    let recv_entry = export
+        .leaf_keys
+        .recv_classical
+        .pending
+        .iter()
+        .find(|p| p.target == own_id.bytes)
+        .expect("recv_classical must carry the candidate's own real offer at mine.current");
+    assert_eq!(
+        recv_entry.key.signature_key, candidate_key,
+        "the same-id candidate's K′ must still win mine.current — the refresh carries \
+         no signer and cannot compete"
+    );
+
+    let window = assert_some!(assert_some!(export.deployed_state).own_offers);
+    assert!(
+        window
+            .offers
+            .iter()
+            .any(|o| super::migration::decoded_update_target(&o.proposal)
+                .is_some_and(|(_, key)| key == candidate_key)),
+        "the K′ offer must ride the window, matching pending[mine.current] above — a \
+         refresh at rest must never evict it"
+    );
+}
+
+/// As above with the plain refresh left framed: a refresh must not set
+/// `own_offer_window`'s `framed_mine_current_key` either.
+#[cfg(feature = "cryptokit")]
+#[test]
+fn test_migration_export_window_keeps_same_id_candidate_offers_past_a_framed_plain_refresh() {
+    let (alice, bob) = establish_confirmed_sessions();
+    let own_id = alice.lock().client.client_id();
+
+    assert_ok!(alice.prepare_to_encrypt(Some(own_id.clone())));
+    let enc = assert_ok!(alice.encrypt(b"same-id-k-prime".to_vec()));
+    assert_some!(assert_ok!(bob.process_incoming(enc.cipher_text)));
+    let candidate_key = {
+        let inner = alice.lock();
+        let candidate = inner
+            .staged_candidates
+            .last()
+            .expect("the same-id candidate is staged");
+        candidate
+            .combiner()
+            .classical_signature_keypair()
+            .1
+            .as_bytes()
+            .to_vec()
+    };
+
+    // Signerless refresh (leaf isn't lagging), left framed.
+    assert_ok!(alice.prepare_to_encrypt(None));
+
+    let export = assert_ok!(alice.migration_export());
+    let recv_entry = export
+        .leaf_keys
+        .recv_classical
+        .pending
+        .iter()
+        .find(|p| p.target == own_id.bytes)
+        .expect("recv_classical must carry the candidate's own real offer at mine.current");
+    assert_eq!(
+        recv_entry.key.signature_key, candidate_key,
+        "the same-id candidate's K′ must still win mine.current — the FRAMED refresh \
+         carries no signer and cannot compete either"
+    );
+
+    let window = assert_some!(assert_some!(export.deployed_state).own_offers);
+    assert!(
+        window
+            .offers
+            .iter()
+            .any(|o| super::migration::decoded_update_target(&o.proposal)
+                .is_some_and(|(_, key)| key == candidate_key)),
+        "the K′ offer must ride the window, matching pending[mine.current] above — a \
+         FRAMED refresh must never evict it either"
+    );
+}
+
+/// `leaf_pq_custody` refuses on an empty `auth_mine` history. The leaf id differs from
+/// `identity_client_id` so the identity-mismatch check can't mask this one.
 #[cfg(feature = "cryptokit")]
 #[test]
 fn test_leaf_pq_custody_refuses_when_history_is_empty() {
     let (_alice, bob) = establish_full();
     let inner = bob.lock();
     let recv_pq = inner.recv_group.as_ref().unwrap().pq.as_ref().unwrap();
-    let presented = assert_ok!(super::migration::own_signature_key(recv_pq));
+    let presented = assert_ok!(crate::session::migration::own_signature_key(recv_pq));
     let other_identity = crate::test_utils::test_client_id();
     assert!(matches!(
         super::migration::leaf_pq_custody(recv_pq, &presented, &other_identity, &[]),
@@ -8798,17 +9623,15 @@ fn test_leaf_pq_custody_refuses_when_history_is_empty() {
     ));
 }
 
-/// `leaf_pq_custody`'s identity-mismatch check in isolation: the leaf's own credential
-/// equalling `identity_client_id` refuses even though the history genuinely DOES contain
-/// it (the OTHER check this call could otherwise trip instead) — a leaf cannot be both
-/// "the identity itself" and "an identity needing custody" at once.
+/// `leaf_pq_custody` refuses a leaf whose credential is `identity_client_id`. The history
+/// does contain it, so the history-membership check can't mask this one.
 #[cfg(feature = "cryptokit")]
 #[test]
 fn test_leaf_pq_custody_refuses_when_leaf_is_the_identity() {
     let (_alice, bob) = establish_full();
     let inner = bob.lock();
     let recv_pq = inner.recv_group.as_ref().unwrap().pq.as_ref().unwrap();
-    let presented = assert_ok!(super::migration::own_signature_key(recv_pq));
+    let presented = assert_ok!(crate::session::migration::own_signature_key(recv_pq));
     let own_client_id = assert_ok!(apq::sender_client_id(
         recv_pq,
         recv_pq.current_member_index()
@@ -8824,41 +9647,38 @@ fn test_leaf_pq_custody_refuses_when_leaf_is_the_identity() {
     ));
 }
 
-/// A wedged PQ side-band blocks the export: the native archive carries no wedge verdict,
-/// so a migrated session would report healthy and deadlock instead.
+/// A wedged PQ side-band is carried via `deployed_state.pq_wedged`, not refused — classical
+/// messaging still works.
 #[cfg(feature = "cryptokit")]
 #[test]
-fn test_migration_export_refuses_pq_wedged() {
+fn test_migration_export_carries_pq_wedged() {
     let (alice, _bob) = establish_confirmed_sessions();
     alice.lock().pq_wedged = Some(super::pq_ops::PqWedge::Bootstrap);
+    let export = assert_ok!(alice.migration_export());
+    let deployed = assert_some!(export.deployed_state);
     assert!(matches!(
-        alice.migration_export(),
-        Err(TwoMlsPqError::SessionNotReady)
+        deployed.pq_wedged,
+        Some(super::migration::SessionMigrationPqWedgeKind::Bootstrap)
     ));
 }
 
-/// A torn bind application blocks the export for the same reason a wedge does — no native
-/// slot represents it, and the migrated session must not silently drop the tear.
+/// A torn bind application refuses (the native archive has no torn-receive verdict, so it
+/// would deadlock) with retryable `Mls`: `bind_apply_broken` is in-memory only and heals on
+/// reload, so the reloaded row can be exported instead.
 #[cfg(feature = "cryptokit")]
 #[test]
 fn test_migration_export_refuses_bind_apply_broken() {
     let (alice, _bob) = establish_confirmed_sessions();
     alice.lock().bind_apply_broken = true;
-    assert!(matches!(
-        alice.migration_export(),
-        Err(TwoMlsPqError::SessionNotReady)
-    ));
+    assert!(matches!(alice.migration_export(), Err(TwoMlsPqError::Mls)));
 }
 
-/// The custody derive check catches a corrupted signer: locate the born-dedicated
-/// acceptor's ACTUAL recv-PQ signer bytes inside his own archive (a unique 64-byte hit —
-/// the cryptokit raw‖public form `signer_for_swift_export` returns), flip one bit, and
-/// restore. The presented public key (read off the group's leaf, untouched by the
-/// corruption) no longer matches what the corrupted signer derives to, so the export
-/// must refuse as `ArchiveInvalid`, not silently custody an unusable key.
+/// A corrupted custody signer with no other copy is indistinguishable from a no-custody
+/// desync, so the export succeeds with `no_custody.recv_pq` set and legacy
+/// `pq_leaf_custody` `None`.
 #[cfg(feature = "cryptokit")]
 #[test]
-fn test_migration_export_rejects_corrupted_custody_signer() {
+fn test_migration_export_no_custody_on_corrupted_signer() {
     use crate::key_packages::TwoMlsPqInvitation;
 
     let alice = make_client();
@@ -8893,8 +9713,7 @@ fn test_migration_export_rejects_corrupted_custody_signer() {
     assert_ok!(alice_s.prepare_to_encrypt(None));
     let enc = assert_ok!(alice_s.encrypt(b"confirm-a".to_vec()));
     assert_some!(assert_ok!(bob_s.process_incoming(enc.cipher_text)));
-    // Alice folds Bob's catch-up Upd — his recv-classical leaf converges, and his
-    // recv-PQ leaf's custody becomes exportable (still presenting the invitation key).
+    // Folding Bob's catch-up makes his recv-PQ custody exportable (still the invitation key).
     assert_ok!(alice_s.queue_proposal(bob_upd.digest));
     let prep = assert_ok!(alice_s.prepare_to_encrypt(None));
     assert!(prep.did_commit);
@@ -8930,19 +9749,176 @@ fn test_migration_export_rejects_corrupted_custody_signer() {
     let restored = assert_ok!(TwoMlsPqSession::from_archive(crate::Archive {
         bytes: archive
     }));
-    assert!(matches!(
-        restored.migration_export(),
-        Err(TwoMlsPqError::ArchiveInvalid)
-    ));
+    let export = assert_ok!(restored.migration_export());
+    assert!(export.pq_leaf_custody.is_none());
+    let recv_pq = export.leaf_keys.recv_pq;
+    assert!(recv_pq.current.is_none());
+    assert!(assert_some!(export.deployed_state).no_custody.recv_pq);
 }
 
-/// A restored session whose CLASSICAL group's stored `GroupContext.cipher_suite` disagrees
-/// with the session's declared classical suite must refuse `migration_export` rather than
-/// restore silently and let a later crypto operation derive a key through the wrong suite's
-/// provider — unrecoverable in the native CryptoKit bridge (see the module note). The
-/// classical provider recognizes several suites, so `Group::load` itself does not catch
-/// this: build the corrupted row by locating the GroupContext via its own (unique) group id
-/// and flipping the suite byte, the way a torn or bit-rotted archive would look.
+/// Every staged candidate (a full `CANDIDATE_WINDOW`) rides both classical `pending` sets with
+/// the identical key; the newest is also `rotation_candidate`, pinned to the current recv epoch.
+#[cfg(feature = "cryptokit")]
+#[test]
+fn test_migration_export_carries_multiple_staged_candidates() {
+    let (alice, _bob) = establish_confirmed_sessions();
+    let mut ids = Vec::new();
+    for i in 0..crate::session::CANDIDATE_WINDOW {
+        let id = make_client().client_id();
+        assert_ok!(alice.prepare_to_encrypt(Some(id.clone())));
+        assert_ok!(alice.encrypt(format!("cand{i}").into_bytes()));
+        ids.push(id);
+    }
+    let export = assert_ok!(alice.migration_export());
+    let recv_classical = &export.leaf_keys.recv_classical;
+    let send_classical = &export.leaf_keys.send_classical;
+    let recv_epoch = {
+        let inner = alice.lock();
+        inner.recv_group.as_ref().unwrap().classical.current_epoch()
+    };
+    for id in &ids {
+        let recv_entry = recv_classical
+            .pending
+            .iter()
+            .find(|p| p.target == id.bytes)
+            .expect("candidate missing from recv_classical");
+        let send_entry = send_classical
+            .pending
+            .iter()
+            .find(|p| p.target == id.bytes)
+            .expect("candidate missing from send_classical");
+        assert_eq!(
+            recv_entry.key.signing_key, send_entry.key.signing_key,
+            "candidate {:?}'s key must be identical in both classical sets",
+            id.bytes
+        );
+    }
+    let newest = ids.last().unwrap();
+    let rotation_candidate = assert_some!(export.rotation_candidate);
+    assert_eq!(rotation_candidate.target_client_id, newest.bytes);
+    let newest_pending = recv_classical
+        .pending
+        .iter()
+        .find(|p| p.target == newest.bytes)
+        .unwrap();
+    assert_eq!(
+        rotation_candidate.signing_key,
+        newest_pending.key.signing_key
+    );
+    assert_eq!(rotation_candidate.proposed_at_recv_epoch, recv_epoch);
+}
+
+/// A `deferred_candidate` (parked while `staged_candidates` is full) is dropped on export —
+/// the app re-proposes its persisted `nextProposal` natively — while the live window is carried.
+#[cfg(feature = "cryptokit")]
+#[test]
+fn test_migration_export_drops_deferred_candidate() {
+    let (alice, _bob) = establish_confirmed_sessions();
+    let mut ids = Vec::new();
+    for i in 0..crate::session::CANDIDATE_WINDOW {
+        let id = make_client().client_id();
+        assert_ok!(alice.prepare_to_encrypt(Some(id.clone())));
+        assert_ok!(alice.encrypt(format!("cand{i}").into_bytes()));
+        ids.push(id);
+    }
+    // The window is full: staging (not proposing) one more parks it as deferred.
+    let deferred = make_client().client_id();
+    assert_ok!(alice.stage_rotation(deferred.bytes.clone()));
+    assert_eq!(
+        alice.lock().deferred_candidate.as_deref(),
+        Some(deferred.bytes.as_slice())
+    );
+
+    let export = assert_ok!(alice.migration_export());
+    let recv_classical = export.leaf_keys.recv_classical;
+    assert!(
+        !recv_classical
+            .pending
+            .iter()
+            .any(|p| p.target == deferred.bytes),
+        "the deferred candidate must not ride the export"
+    );
+    for id in &ids {
+        assert!(recv_classical.pending.iter().any(|p| p.target == id.bytes));
+    }
+}
+
+/// Rotating D -> N before the A.3 bind leaves recv-PQ presenting D_pq while its signer derives
+/// N_pq, so the self-heal A.5 Upd' is rejected and PQ stays `RekeyInitiated` forever. The
+/// export carries it: `recv_pq.current` resolves D_pq via send-PQ's signer (a leaf-local
+/// desync, not `no_custody`), and classical messaging still works.
+#[cfg(feature = "cryptokit")]
+#[test]
+fn test_migration_export_carries_rotate_before_bind_mis_signed_rekey() {
+    let (alice, bob) = establish_confirmed_sessions();
+
+    let (_d_pq_secret, d_pq_public) = {
+        let inner = alice.lock();
+        inner.client.combiner().pq_signature_keypair()
+    };
+
+    let new_alice = make_client().client_id();
+    rotate_round(&alice, &bob, new_alice);
+
+    // `pq_bootstrap_bind` joins recv-PQ under KP' (D) with the ambient signer already N.
+    let kp = assert_ok!(alice.pq_bootstrap_begin(None));
+    assert_ok!(bob.pq_bootstrap_respond(kp));
+    let welcome = assert_some!(bob.pq_pending_outbound(SideBandSealing::Fresh));
+    assert_ok!(alice.pq_bootstrap_bind(welcome));
+    discharge_bind(&alice, &bob, b"bootstrap-bind");
+
+    let recv_presented = {
+        let inner = alice.lock();
+        assert_ok!(crate::session::migration::own_signature_key(
+            inner.recv_group.as_ref().unwrap().pq.as_ref().unwrap()
+        ))
+    };
+    assert_eq!(
+        recv_presented,
+        d_pq_public.as_bytes(),
+        "recv-PQ's own leaf presents the pre-rotation identity D (from KP')"
+    );
+
+    // Bob's rotate-proposing send incidentally stages a plain A.4 EK; draining it hands
+    // alice the PQ turn.
+    let new_bob = make_client().client_id();
+    rotate_round(&bob, &alice, new_bob);
+    assert_some!(bob.pq_pending_outbound(SideBandSealing::Fresh));
+    ratchet_round(&bob, &alice, b"drain-bob-incidental-a4");
+    assert!(alice.my_pq_turn());
+
+    // With send-PQ lagging, alice's next send self-stages an A.5 Upd' signed by the
+    // N-deriving signer, which bob verifies against D_pq and rejects.
+    let self_heal_upd = open_rekey(&alice, &bob);
+    assert_err!(
+        bob.pq_rekey_respond(self_heal_upd),
+        TwoMlsPqError::DecryptionFailed
+    );
+    assert!(matches!(
+        alice.lock().pq_inflight,
+        Some(super::pq_ops::PqInflight::RekeyInitiated)
+    ));
+
+    let export = assert_ok!(alice.migration_export());
+    assert!(matches!(
+        export.pq_inflight,
+        Some(super::migration::SessionMigrationPqInflight::RekeyInitiated { .. })
+    ));
+    let recv_pq = export.leaf_keys.recv_pq;
+    let current = assert_some!(recv_pq.current);
+    assert_eq!(current.signature_key, d_pq_public.as_bytes());
+    if let Some(deployed) = export.deployed_state {
+        assert!(!deployed.no_custody.recv_pq);
+    }
+
+    assert_ok!(alice.prepare_to_encrypt(None));
+    let f = assert_ok!(alice.encrypt(b"post-orphan alice->bob".to_vec()));
+    assert_some!(assert_ok!(bob.process_incoming(f.cipher_text)));
+}
+
+/// A restored classical group whose stored suite disagrees with the session's must refuse
+/// `migration_export` — a wrong-suite derive is unrecoverable in the native bridge, and
+/// `Group::load` accepts it because the classical provider recognizes several suites.
 #[cfg(feature = "cryptokit")]
 #[test]
 fn test_migration_export_rejects_corrupted_classical_suite() {
@@ -8961,15 +9937,13 @@ fn test_migration_export_rejects_corrupted_classical_suite() {
     pattern.extend_from_slice(&u16::from(mls_rs::CipherSuite::CURVE25519_CHACHA).to_be_bytes());
     pattern.push(send_gid.len() as u8);
     pattern.extend_from_slice(&send_gid);
-    // The group id can appear more than once (e.g. a creator's own cached creation
-    // record) — empirically, the byte-for-byte earliest match is always the live
-    // GroupContext `Group::load` actually reads; a later one, if any, is inert.
+    // The group id can recur (e.g. a creator's cached creation record); the earliest
+    // match is the live GroupContext `Group::load` reads.
     let pos = archive
         .windows(pattern.len())
         .position(|w| w == pattern.as_slice())
         .unwrap();
-    // 0x0003 (CURVE25519_CHACHA) -> 0x0002 (P256_AES128): still a suite the classical
-    // provider recognizes, so `Group::load` does not itself catch the corruption.
+    // 0x0003 (CURVE25519_CHACHA) -> 0x0002 (P256_AES128), still a recognized suite.
     archive[pos + 3] = 0x02;
 
     let restored = assert_ok!(TwoMlsPqSession::from_archive(crate::Archive {
@@ -8992,13 +9966,8 @@ fn test_migration_export_rejects_corrupted_classical_suite() {
     ));
 }
 
-/// The PQ-half analogue does NOT reproduce the same hazard in this build: unlike the
-/// classical provider (which recognizes several suites), `CryptoKitMlKemProvider` — the PQ
-/// half's sole crypto provider — recognizes EXACTLY ML-KEM-768, so `Group::load` itself
-/// already refuses any other stored suite value for a PQ group before the suite check in
-/// `migration_export` ever runs. There is no PQ-half suite corruption that "restores and
-/// lies" the way the classical half's does; this pins that boundary instead of asserting a
-/// scenario that cannot occur under this build's single-PQ-suite provider.
+/// The PQ provider recognizes only ML-KEM-768, so a corrupted PQ suite already fails at
+/// `Group::load` — unlike the classical half, it cannot restore and lie.
 #[cfg(feature = "cryptokit")]
 #[test]
 fn test_migration_export_pq_suite_corruption_fails_at_restore() {
@@ -9031,4 +10000,2395 @@ fn test_migration_export_pq_suite_corruption_fails_at_restore() {
         TwoMlsPqSession::from_archive(crate::Archive { bytes: archive }),
         Err(TwoMlsPqError::Mls)
     ));
+}
+
+/// After full reverse delivery Bob's `offered_proposal` (overwritten on every receive) is the
+/// oldest of `DEPTH` unfolded offers, and it still folds. There is no protocol depth bound;
+/// `OWN_OFFER_WINDOW` is a policy margin, not derived from this.
+#[cfg(feature = "cryptokit")]
+#[test]
+fn test_reverse_delivery_folds_a_64_generation_old_offer() {
+    const DEPTH: usize = 64;
+
+    // Not `_confirmed`: recv-classical must start with zero own-proposals for an exact count.
+    let (alice, bob) = establish_sessions();
+    let mut frames = Vec::with_capacity(DEPTH);
+    for i in 0..DEPTH {
+        assert_ok!(alice.prepare_to_encrypt(None));
+        let enc = assert_ok!(alice.encrypt(format!("frame{i}").into_bytes()));
+        frames.push(enc.cipher_text);
+    }
+
+    let export = assert_ok!(alice.migration_export());
+    let deployed = assert_some!(export.deployed_state);
+    assert_eq!(assert_some!(deployed.own_offers).offers.len(), DEPTH);
+
+    let mut last_offered = None;
+    for frame in frames.into_iter().rev() {
+        let got = assert_some!(assert_ok!(bob.process_incoming(frame)));
+        last_offered = got.proposal.or(last_offered);
+    }
+    let offered = assert_some!(last_offered);
+    assert_ok!(bob.queue_proposal(offered.digest));
+    let prepared = assert_ok!(bob.prepare_to_encrypt(None));
+    assert!(
+        prepared.did_commit,
+        "a DEPTH-generation-old offer still folds"
+    );
+}
+
+/// Pins `OWN_OFFER_WINDOW`'s value; the edge/priority tests below exercise the same logic
+/// at a small `TEST_CAP` rather than with 102,400-entry fixtures.
+#[test]
+fn test_own_offer_window_constant_is_102_400() {
+    assert_eq!(super::migration::OWN_OFFER_WINDOW, 102_400);
+}
+
+/// Runs `own_offer_window` on a session's live cache at an explicit `cap` (the export always
+/// uses `OWN_OFFER_WINDOW`), so banding/truncation can be tested at a small scale.
+#[cfg(feature = "cryptokit")]
+fn own_offer_window_for_test(
+    session: &Arc<TwoMlsPqSession>,
+    cap: usize,
+) -> Vec<crate::session::migration::SessionMigrationOwnOffer> {
+    let classical_provider = assert_ok!(crate::providers::classical_envelope_suite());
+    let inner = session.lock();
+    let latest_own_offer = inner
+        .pending_proposal_message
+        .as_ref()
+        .map(|(_, m)| m.as_slice());
+    let recv = inner.recv_group.as_ref().unwrap();
+    let mine_current = inner
+        .with_auth(|core| core.mine.current().map(<[u8]>::to_vec))
+        .expect("auth.mine is always seeded");
+    let identity_key = inner.client.combiner().classical_signature_keypair().1;
+    let (offers, _framed_leaf_key) = assert_ok!(super::migration::own_offer_window(
+        &recv.classical,
+        latest_own_offer,
+        &classical_provider,
+        cap,
+        &mine_current,
+        identity_key.as_bytes(),
+        None,
+    ));
+    offers
+}
+
+/// Exactly `TEST_CAP` own-proposals all survive a window capped at `TEST_CAP`.
+#[cfg(feature = "cryptokit")]
+#[test]
+fn test_own_offer_window_carries_at_the_edge() {
+    const TEST_CAP: usize = 16;
+    let (alice, _bob) = establish_sessions();
+    for i in 0..TEST_CAP {
+        assert_ok!(alice.prepare_to_encrypt(None));
+        assert_ok!(alice.encrypt(format!("frame{i}").into_bytes()));
+    }
+    let window = own_offer_window_for_test(&alice, TEST_CAP);
+    assert_eq!(window.len(), TEST_CAP);
+}
+
+/// One own-proposal past `TEST_CAP` (the accepted wedge risk) drops exactly one generation —
+/// the one the deterministic `proposal_ref`-sorted selection excludes.
+#[cfg(feature = "cryptokit")]
+#[test]
+fn test_own_offer_window_drops_past_the_edge() {
+    const TEST_CAP: usize = 16;
+    let (alice, _bob) = establish_sessions();
+    for i in 0..(TEST_CAP + 1) {
+        assert_ok!(alice.prepare_to_encrypt(None));
+        assert_ok!(alice.encrypt(format!("frame{i}").into_bytes()));
+    }
+
+    // Expected survivors, computed independently: `proposal_ref`-sorted, capped.
+    let all_refs: Vec<Vec<u8>> = {
+        let inner = alice.lock();
+        let recv = inner.recv_group.as_ref().unwrap();
+        assert_ok!(recv.classical.own_proposals_for_swift_export())
+            .into_iter()
+            .map(|e| e.proposal_ref)
+            .collect()
+    };
+    assert_eq!(all_refs.len(), TEST_CAP + 1);
+    let mut sorted = all_refs.clone();
+    sorted.sort();
+    let expected: std::collections::BTreeSet<Vec<u8>> = sorted.into_iter().take(TEST_CAP).collect();
+    let dropped = all_refs
+        .into_iter()
+        .find(|r| !expected.contains(r))
+        .expect("with one more entry than the cap, exactly one must be excluded");
+
+    let window = own_offer_window_for_test(&alice, TEST_CAP);
+    assert_eq!(window.len(), TEST_CAP);
+    let carried: std::collections::BTreeSet<Vec<u8>> =
+        window.iter().map(|e| e.proposal_ref.clone()).collect();
+    assert_eq!(carried, expected);
+    assert!(
+        !carried.contains(&dropped),
+        "the past-edge generation must be DROPPED, not carried"
+    );
+}
+
+/// Past the cap with many refreshes plus a rotation and its re-proposals (the born-dedicated
+/// catch-up shape), every presentation-changing offer survives; only refreshes drop.
+#[cfg(feature = "cryptokit")]
+#[test]
+fn test_own_offer_window_keeps_every_handoff_past_the_edge() {
+    use mls_rs::mls_rs_codec::MlsDecode;
+    const TEST_CAP: usize = 16;
+    // Enough refreshes that a naive ref-sort would drop a handoff (asserted below).
+    const REFRESHES: usize = TEST_CAP * 4;
+    const HANDOFFS: usize = 4; // the rotation proposal + 3 re-proposals
+
+    let (alice, bob) = establish_sessions();
+    let mut frames = Vec::with_capacity(REFRESHES + HANDOFFS);
+    for i in 0..REFRESHES {
+        assert_ok!(alice.prepare_to_encrypt(None));
+        frames.push(assert_ok!(alice.encrypt(format!("refresh{i}").into_bytes())).cipher_text);
+    }
+    let new_id = make_client().client_id();
+    for i in 0..HANDOFFS {
+        assert_ok!(alice.prepare_to_encrypt(Some(new_id.clone())));
+        frames.push(assert_ok!(alice.encrypt(format!("handoff{i}").into_bytes())).cipher_text);
+    }
+
+    let handoff_refs: std::collections::BTreeSet<Vec<u8>> = {
+        let inner = alice.lock();
+        let recv = inner.recv_group.as_ref().unwrap();
+        assert_ok!(recv.classical.own_proposals_for_swift_export())
+            .into_iter()
+            .filter_map(|e| {
+                let proposal =
+                    mls_rs::group::proposal::Proposal::mls_decode(&mut &e.proposal[..]).ok()?;
+                let mls_rs::group::proposal::Proposal::Update(update) = proposal else {
+                    return None;
+                };
+                let is_handoff = update
+                    .signing_identity()
+                    .credential
+                    .as_basic()
+                    .is_some_and(|b| b.identifier == new_id.bytes);
+                is_handoff.then_some(e.proposal_ref)
+            })
+            .collect()
+    };
+    assert_eq!(
+        handoff_refs.len(),
+        HANDOFFS,
+        "expected exactly HANDOFFS distinct handoff entries"
+    );
+
+    // Precondition: a naive ref-sort-then-truncate must lose a handoff, so the priority
+    // band is load-bearing here. If this fails, raise `REFRESHES`.
+    let naive_kept: std::collections::BTreeSet<Vec<u8>> = {
+        let inner = alice.lock();
+        let recv = inner.recv_group.as_ref().unwrap();
+        let mut refs: Vec<Vec<u8>> = assert_ok!(recv.classical.own_proposals_for_swift_export())
+            .into_iter()
+            .map(|e| e.proposal_ref)
+            .collect();
+        refs.sort();
+        refs.into_iter().take(TEST_CAP).collect()
+    };
+    assert!(
+        !handoff_refs.iter().all(|r| naive_kept.contains(r)),
+        "precondition failed: every handoff ref happened to survive a naive sort anyway — \
+         raise REFRESHES so this test actually exercises the priority band"
+    );
+
+    let window = own_offer_window_for_test(&alice, TEST_CAP);
+    assert_eq!(window.len(), TEST_CAP);
+    let carried: std::collections::BTreeSet<Vec<u8>> =
+        window.iter().map(|e| e.proposal_ref.clone()).collect();
+    assert!(
+        handoff_refs.is_subset(&carried),
+        "every handoff-type offer must survive truncation"
+    );
+    assert_eq!(
+        carried.len() - handoff_refs.len(),
+        TEST_CAP - HANDOFFS,
+        "the remainder of the window is refreshes only"
+    );
+
+    // `offered.digest` (sha256 of the MLSMessage) matches a cache entry's `message_hash`
+    // because this classical suite's hash is sha256.
+    let mut last_offered = None;
+    for frame in frames {
+        let got = assert_some!(assert_ok!(bob.process_incoming(frame)));
+        last_offered = got.proposal.or(last_offered);
+    }
+    let offered = assert_some!(last_offered);
+    assert_eq!(
+        offered.proposing.bytes, new_id.bytes,
+        "bob's last offer is the final handoff"
+    );
+    let would_fold_ref = {
+        let inner = alice.lock();
+        let recv = inner.recv_group.as_ref().unwrap();
+        assert_ok!(recv.classical.own_proposals_for_swift_export())
+            .into_iter()
+            .find(|e| e.message_hash == offered.digest)
+            .map(|e| e.proposal_ref)
+    };
+    let would_fold_ref = assert_some!(would_fold_ref);
+    assert!(
+        carried.contains(&would_fold_ref),
+        "the offer bob would actually fold must be in the carried window"
+    );
+}
+
+/// While a prepare is outstanding, the latest offer (`pending_proposal_message`) is never in
+/// the window: it is the framed, snapshot-placed entry whose HPKE pair rides the snapshot.
+#[cfg(feature = "cryptokit")]
+#[test]
+fn test_own_offer_window_excludes_the_latest_while_a_prepare_is_outstanding() {
+    use mls_rs::CipherSuiteProvider;
+    const TEST_CAP: usize = 16;
+    let (alice, _bob) = establish_sessions();
+    for i in 0..(TEST_CAP + 64) {
+        assert_ok!(alice.prepare_to_encrypt(None));
+        assert_ok!(alice.encrypt(format!("base{i}").into_bytes()));
+    }
+    // The latest offer, left framed.
+    assert_ok!(alice.prepare_to_encrypt(None));
+
+    let classical_cs = assert_ok!(crate::providers::classical_envelope_suite());
+    let (latest_ref, latest_bytes) = {
+        let inner = alice.lock();
+        let latest_bytes = inner.pending_proposal_message.as_ref().unwrap().1.clone();
+        let recv = inner.recv_group.as_ref().unwrap();
+        let hash = assert_ok!(classical_cs.hash(&latest_bytes));
+        let proposal_ref = assert_ok!(recv.classical.own_proposals_for_swift_export())
+            .into_iter()
+            .find(|e| e.message_hash == hash)
+            .expect("the latest offer must still be cached")
+            .proposal_ref;
+        (proposal_ref, latest_bytes)
+    };
+
+    let window = own_offer_window_for_test(&alice, TEST_CAP);
+    assert!(
+        window.iter().all(|o| o.proposal_ref != latest_ref),
+        "the framed/latest offer must never appear in the window"
+    );
+
+    // `staged_update_leaf_key` (the lookup `place`'s Snapshot routing uses) resolves it.
+    let inner = alice.lock();
+    let recv = inner.recv_group.as_ref().unwrap();
+    assert_some!(assert_ok!(super::migration::staged_update_leaf_key(
+        &recv.classical,
+        Some(&latest_bytes),
+        &classical_cs,
+    )));
+}
+
+/// At rest, `encrypt` has consumed `pending_proposal_message`, so nothing identifies a
+/// "latest" offer: nothing is framed and the just-sent offer rides the window with its secret.
+#[cfg(feature = "cryptokit")]
+#[test]
+fn test_own_offer_window_carries_the_just_sent_offer_at_rest() {
+    use mls_rs::CipherSuiteProvider;
+    let (alice, _bob) = establish_sessions();
+    assert_ok!(alice.prepare_to_encrypt(None));
+    let sent_bytes = alice
+        .lock()
+        .pending_proposal_message
+        .as_ref()
+        .unwrap()
+        .1
+        .clone();
+    assert_ok!(alice.encrypt(b"sent".to_vec()));
+    assert!(
+        alice.lock().pending_proposal_message.is_none(),
+        "sanity: encrypt must consume the pending proposal"
+    );
+
+    let classical_cs = assert_ok!(crate::providers::classical_envelope_suite());
+    let (sent_ref, ground_truth) = {
+        let inner = alice.lock();
+        let recv = inner.recv_group.as_ref().unwrap();
+        let hash = assert_ok!(classical_cs.hash(&sent_bytes));
+        let sent_ref = assert_ok!(recv.classical.own_proposals_for_swift_export())
+            .into_iter()
+            .find(|e| e.message_hash == hash)
+            .expect("the just-sent offer must still be cached")
+            .proposal_ref;
+        let (_, _, detached) = assert_ok!(recv.classical.export_for_swift_placing_pending(|_| {
+            mls_rs::group::SwiftExportPendingPlacement::Detached
+        }));
+        let ground_truth: std::collections::HashMap<Vec<u8>, Vec<u8>> = detached
+            .into_iter()
+            .map(|d| (d.leaf_public_key, d.secret.to_vec()))
+            .collect();
+        (sent_ref, ground_truth)
+    };
+
+    let export = assert_ok!(alice.migration_export());
+    assert!(
+        export.staged_updates.is_empty(),
+        "at rest, nothing frames as the latest own offer"
+    );
+    assert!(export.pending_proposal.is_none());
+
+    let deployed = assert_some!(export.deployed_state);
+    let own_offers = assert_some!(deployed.own_offers);
+    let sent_entry = own_offers
+        .offers
+        .iter()
+        .find(|o| o.proposal_ref == sent_ref)
+        .expect("the just-sent offer must be carried in the window at rest");
+    let leaf_key = assert_some!(super::migration::update_leaf_public_key(
+        &sent_entry.proposal
+    ));
+    assert_eq!(
+        Some(&sent_entry.leaf_secret),
+        ground_truth.get(&leaf_key),
+        "the just-sent offer's carried secret must match its own leaf key's secret"
+    );
+}
+
+/// Measures an own-offer entry's carried size (ref + encoded Update; sender index, epoch and
+/// group id are hoisted onto the window), the figure `OWN_OFFER_WINDOW`'s doc estimates from.
+/// The range catches drift without pinning mls-rs's exact encoding.
+#[cfg(feature = "cryptokit")]
+#[test]
+fn test_own_offer_window_entry_size_estimate() {
+    let (alice, _bob) = establish_sessions();
+    assert_ok!(alice.prepare_to_encrypt(None));
+    assert_ok!(alice.encrypt(b"measure".to_vec()));
+
+    let window = own_offer_window_for_test(&alice, 16);
+    let entry = window
+        .first()
+        .expect("at least one own-proposal must be cached");
+    let measured = entry.proposal_ref.len() + entry.proposal.len();
+    assert!(
+        (100..2000).contains(&measured),
+        "measured own-proposal entry size {measured} bytes is outside the expected \
+         range — update OWN_OFFER_WINDOW's doc comment with the new per-entry estimate \
+         and worst-case cap size"
+    );
+    println!(
+        "own-offer-window entry size: {measured} bytes measured; worst case at cap {} \
+         is ~{} MB",
+        super::migration::OWN_OFFER_WINDOW,
+        entry_bytes_to_mb(measured, super::migration::OWN_OFFER_WINDOW)
+    );
+}
+
+#[cfg(feature = "cryptokit")]
+fn entry_bytes_to_mb(entry_bytes: usize, cap: usize) -> f64 {
+    (entry_bytes * cap) as f64 / 1_000_000.0
+}
+
+/// Asserts window order by position: index 0 is band 2 (presentation-changing, proposing
+/// `new_id`) and every band-2 entry precedes every band-3 refresh. The framed band-1 entry
+/// is excluded from the window since its HPKE pair rides the snapshot.
+#[cfg(feature = "cryptokit")]
+fn assert_own_offer_window_order(
+    alice: &Arc<TwoMlsPqSession>,
+    new_id: &crate::ClientId,
+    cap: usize,
+) {
+    use mls_rs::mls_rs_codec::MlsDecode;
+
+    let window = own_offer_window_for_test(alice, cap);
+    assert!(!window.is_empty());
+
+    let is_band2 = |proposal: &[u8]| -> bool {
+        let Ok(proposal) = mls_rs::group::proposal::Proposal::mls_decode(&mut &proposal[..]) else {
+            return false;
+        };
+        let mls_rs::group::proposal::Proposal::Update(update) = proposal else {
+            return false;
+        };
+        update
+            .signing_identity()
+            .credential
+            .as_basic()
+            .is_some_and(|b| b.identifier == new_id.bytes)
+    };
+    assert!(
+        is_band2(&window[0].proposal),
+        "index 0 must be a band-2 (presentation-changing) entry, not a refresh"
+    );
+
+    let mut last_band2_index = None;
+    let mut first_band3_index = None;
+    for (i, entry) in window.iter().enumerate() {
+        if is_band2(&entry.proposal) {
+            last_band2_index = Some(i);
+        } else if first_band3_index.is_none() {
+            first_band3_index = Some(i);
+        }
+    }
+    if let (Some(last2), Some(first3)) = (last_band2_index, first_band3_index) {
+        assert!(
+            last2 < first3,
+            "every band-2 entry ({last2} last seen) must precede every surviving \
+             band-3 entry ({first3} first seen)"
+        );
+    }
+}
+
+#[cfg(feature = "cryptokit")]
+#[test]
+fn test_own_offer_window_order_band2_then_band3() {
+    const TEST_CAP: usize = 32;
+    let (alice, _bob) = establish_sessions();
+    for i in 0..4 {
+        assert_ok!(alice.prepare_to_encrypt(None));
+        assert_ok!(alice.encrypt(format!("refresh{i}").into_bytes()));
+    }
+    let new_id = make_client().client_id();
+    assert_ok!(alice.prepare_to_encrypt(Some(new_id.clone())));
+    assert_ok!(alice.encrypt(b"rotate".to_vec()));
+    for i in 4..8 {
+        assert_ok!(alice.prepare_to_encrypt(None));
+        assert_ok!(alice.encrypt(format!("refresh{i}").into_bytes()));
+    }
+
+    assert_own_offer_window_order(&alice, &new_id, TEST_CAP);
+}
+
+/// The band order still holds when a tiny cap truncates most band-3 refreshes.
+#[cfg(feature = "cryptokit")]
+#[test]
+fn test_own_offer_window_order_holds_past_the_edge() {
+    const TEST_CAP: usize = 3;
+    let (alice, _bob) = establish_sessions();
+    for i in 0..8 {
+        assert_ok!(alice.prepare_to_encrypt(None));
+        assert_ok!(alice.encrypt(format!("refresh{i}").into_bytes()));
+    }
+    let new_id = make_client().client_id();
+    assert_ok!(alice.prepare_to_encrypt(Some(new_id.clone())));
+    assert_ok!(alice.encrypt(b"rotate".to_vec()));
+    for i in 8..16 {
+        assert_ok!(alice.prepare_to_encrypt(None));
+        assert_ok!(alice.encrypt(format!("refresh{i}").into_bytes()));
+    }
+
+    let window = own_offer_window_for_test(&alice, TEST_CAP);
+    assert_eq!(window.len(), TEST_CAP, "truncated to the tiny cap");
+    assert_own_offer_window_order(&alice, &new_id, TEST_CAP);
+}
+
+/// Public keys of a format-2 CBOR snapshot's first membership's `pending_updates`
+/// (spec/snapshot.md §4.1.2 key 1), or empty if that key is absent.
+#[cfg(feature = "cryptokit")]
+fn snapshot_recv_pending_update_keys(snapshot_bytes: &[u8]) -> Vec<Vec<u8>> {
+    use ciborium::Value;
+    fn find(map: &[(Value, Value)], k: u64) -> Option<&Value> {
+        map.iter()
+            .find(|(key, _)| key == &Value::from(k))
+            .map(|(_, v)| v)
+    }
+    let value: Value = ciborium::from_reader(snapshot_bytes).expect("valid CBOR snapshot");
+    let top = value.into_map().expect("top level is a map");
+    let memberships = find(&top, 2)
+        .expect("memberships (key 2) present")
+        .as_map()
+        .expect("memberships is a map");
+    let membership = memberships[0]
+        .1
+        .as_map()
+        .expect("membership entry is a map");
+    let Some(pending) = find(membership, 1) else {
+        return Vec::new();
+    };
+    let pending = pending.as_map().expect("pending_updates is a map");
+    pending
+        .iter()
+        .map(|(_, entry)| {
+            let entry = entry.as_map().expect("PendingUpdateEntry is a map");
+            find(entry, 0)
+                .expect("public_key (key 0) present")
+                .as_bytes()
+                .expect("public_key is bytes")
+                .clone()
+        })
+        .collect()
+}
+
+/// Recv-classical's snapshot carries only the framed entry; every other own-proposal is
+/// placed `Detached` or `Omit`.
+#[cfg(feature = "cryptokit")]
+#[test]
+fn test_placement_snapshot_pending_holds_only_the_framed_key() {
+    let (alice, _bob) = establish_sessions();
+    for i in 0..5 {
+        assert_ok!(alice.prepare_to_encrypt(None));
+        assert_ok!(alice.encrypt(format!("refresh{i}").into_bytes()));
+    }
+    // Left framed.
+    assert_ok!(alice.prepare_to_encrypt(None));
+
+    let framed_key = {
+        let inner = alice.lock();
+        let recv = inner.recv_group.as_ref().unwrap();
+        let latest = inner
+            .pending_proposal_message
+            .as_ref()
+            .map(|(_, m)| m.as_slice());
+        let classical_provider = assert_ok!(crate::providers::classical_envelope_suite());
+        assert_some!(assert_ok!(super::migration::staged_update_leaf_key(
+            &recv.classical,
+            latest,
+            &classical_provider,
+        )))
+    };
+
+    let export = assert_ok!(alice.migration_export());
+    let recv_group = assert_some!(export.recv_group);
+    let snapshot_keys = snapshot_recv_pending_update_keys(&recv_group.classical);
+    assert_eq!(
+        snapshot_keys,
+        vec![framed_key],
+        "the snapshot must carry exactly the one framed key, not the other refreshes"
+    );
+}
+
+/// Each window offer's `leaf_secret` is its own leaf key's secret, per an independent
+/// `export_for_swift_placing_pending(|_| Detached)` call; the framed entry is never in the window.
+#[cfg(feature = "cryptokit")]
+#[test]
+fn test_placement_window_offers_carry_matching_leaf_secrets() {
+    let (alice, _bob) = establish_sessions();
+    let new_id = make_client().client_id();
+    assert_ok!(alice.prepare_to_encrypt(Some(new_id)));
+    assert_ok!(alice.encrypt(b"rotate".to_vec()));
+    assert_ok!(alice.prepare_to_encrypt(None));
+    assert_ok!(alice.encrypt(b"refresh".to_vec()));
+    // Left framed.
+    assert_ok!(alice.prepare_to_encrypt(None));
+
+    let (ground_truth, framed_key) = {
+        let inner = alice.lock();
+        let recv = inner.recv_group.as_ref().unwrap();
+        let (_, _, detached) = assert_ok!(recv.classical.export_for_swift_placing_pending(|_| {
+            mls_rs::group::SwiftExportPendingPlacement::Detached
+        }));
+        let ground_truth: std::collections::HashMap<Vec<u8>, Vec<u8>> = detached
+            .into_iter()
+            .map(|d| (d.leaf_public_key, d.secret.to_vec()))
+            .collect();
+        let latest = inner.pending_proposal_message.as_ref().unwrap().1.clone();
+        let classical_provider = assert_ok!(crate::providers::classical_envelope_suite());
+        let framed_key = assert_some!(assert_ok!(super::migration::staged_update_leaf_key(
+            &recv.classical,
+            Some(&latest),
+            &classical_provider,
+        )));
+        (ground_truth, framed_key)
+    };
+
+    let export = assert_ok!(alice.migration_export());
+    let deployed = assert_some!(export.deployed_state);
+    let own_offers = assert_some!(deployed.own_offers);
+    assert!(
+        own_offers.offers.len() >= 2,
+        "need the rotation and the refresh entries in the window"
+    );
+
+    for entry in &own_offers.offers {
+        let leaf_key = assert_some!(super::migration::update_leaf_public_key(&entry.proposal));
+        assert_ne!(
+            leaf_key, framed_key,
+            "the framed entry's ref must never appear in the window"
+        );
+        assert_eq!(
+            Some(&entry.leaf_secret),
+            ground_truth.get(&leaf_key),
+            "a window offer's secret must match ITS OWN leaf key's secret"
+        );
+    }
+}
+
+/// A leaf key placed `Omit` (cache entry cleared, secret still in `pending_updates`) appears in
+/// neither snapshot nor window. A plain refresh is used because a rotation target would still
+/// reach `recv_classical.pending` via `staged_candidates`.
+#[cfg(feature = "cryptokit")]
+#[test]
+fn test_placement_omit_key_appears_nowhere() {
+    let (alice, _bob) = establish_sessions();
+    assert_ok!(alice.prepare_to_encrypt(None));
+
+    let orphan_key = {
+        let inner = alice.lock();
+        let recv = inner.recv_group.as_ref().unwrap();
+        let latest = inner
+            .pending_proposal_message
+            .as_ref()
+            .map(|(_, m)| m.as_slice());
+        let classical_provider = assert_ok!(crate::providers::classical_envelope_suite());
+        assert_some!(assert_ok!(super::migration::staged_update_leaf_key(
+            &recv.classical,
+            latest,
+            &classical_provider,
+        )))
+    };
+    // Clearing the cache directly (bypassing this crate's bookkeeping) leaves the key
+    // unfindable by both `own_offer_window` and `staged_update_leaf_key`.
+    {
+        let mut inner = alice.lock();
+        inner
+            .recv_group
+            .as_mut()
+            .unwrap()
+            .classical
+            .clear_proposal_cache();
+    }
+
+    let export = assert_ok!(alice.migration_export());
+
+    let window_leaf_keys: Vec<Vec<u8>> = export
+        .deployed_state
+        .as_ref()
+        .and_then(|d| d.own_offers.as_ref())
+        .map(|w| {
+            w.offers
+                .iter()
+                .filter_map(|o| super::migration::update_leaf_public_key(&o.proposal))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        !window_leaf_keys.contains(&orphan_key),
+        "the orphaned key must not appear in the window"
+    );
+    let recv_group = assert_some!(export.recv_group);
+    let snapshot_keys = snapshot_recv_pending_update_keys(&recv_group.classical);
+    assert!(
+        !snapshot_keys.contains(&orphan_key),
+        "the orphaned key must not appear in the snapshot"
+    );
+}
+
+/// Recv-PQ still exports via `export_for_swift_with_pending_signers`, so a parked, uncommitted
+/// A.5 Upd′ survives as a `recv_pq` pending entry.
+#[cfg(feature = "cryptokit")]
+#[test]
+fn test_placement_parked_a5_upd_survives_in_recv_pq() {
+    let (alice, bob) = establish_full();
+    let new_alice = make_client().client_id();
+    rotate_round(&alice, &bob, new_alice.clone());
+    let ek = assert_some!(bob.pq_pending_outbound(SideBandSealing::Fresh));
+    assert_ok!(alice.pq_ratchet_respond(ek));
+    let ct = assert_some!(alice.pq_take_pending_outbound());
+    assert_ok!(bob.pq_ratchet_bind(ct));
+    discharge_bind(&bob, &alice, b"deferral");
+
+    let upd = open_rekey(&alice, &bob);
+    // The Upd' announces alice's identity, so it parks in HER recv-PQ (the group bob
+    // commits), uncommitted until the round's closing ack.
+    assert_eq!(
+        assert_ok!(bob.pq_rekey_respond(upd)),
+        Some(new_alice.clone())
+    );
+
+    let export = assert_ok!(alice.migration_export());
+    let recv_pq = export.leaf_keys.recv_pq;
+    assert!(
+        !recv_pq.pending.is_empty(),
+        "the parked A.5 Upd' must survive as a recv-PQ pending entry"
+    );
+    assert!(
+        recv_pq.pending.iter().any(|p| p.target == new_alice.bytes),
+        "the parked entry must name the announced identity"
+    );
+}
+
+/// A parked A.5 Upd' whose target later leaves `auth.mine.history` is exported as-is: PQ
+/// pending may target a historical id, and Rust never re-mints it.
+#[cfg(feature = "cryptokit")]
+#[test]
+fn test_migration_export_carries_parked_a5_upd_with_historical_target_past_the_window() {
+    let (alice, bob) = establish_full();
+    let new_alice = make_client().client_id();
+    rotate_round(&alice, &bob, new_alice.clone());
+    let ek = assert_some!(bob.pq_pending_outbound(SideBandSealing::Fresh));
+    assert_ok!(alice.pq_ratchet_respond(ek));
+    let ct = assert_some!(alice.pq_take_pending_outbound());
+    assert_ok!(bob.pq_ratchet_bind(ct));
+    discharge_bind(&bob, &alice, b"deferral");
+
+    let upd = open_rekey(&alice, &bob);
+    assert_eq!(
+        assert_ok!(bob.pq_rekey_respond(upd)),
+        Some(new_alice.clone())
+    );
+
+    for _ in 0..(apq::authentication::CREDENTIAL_HISTORY_WINDOW + 1) {
+        let next = make_client().client_id();
+        rotate_round(&alice, &bob, next);
+    }
+    assert!(
+        !alice
+            .lock()
+            .with_auth(|core| core.mine.contains(&new_alice.bytes)),
+        "sanity: new_alice must actually be evicted from history by now"
+    );
+
+    let export = assert_ok!(alice.migration_export());
+    let recv_pq = export.leaf_keys.recv_pq;
+    let historical = recv_pq
+        .pending
+        .iter()
+        .find(|p| p.target == new_alice.bytes)
+        .expect("the parked entry must survive, target unchanged, past the history window");
+    assert!(!historical.key.signature_key.is_empty());
+}
+
+/// A leaf whose secret exists nowhere in the custody pool is carried as `no_custody.<half>`,
+/// reproduced deterministically on `recv_pq`.
+///
+/// `pq_bootstrap_bind` joins recv-PQ via `Group::join_with`, which installs the client's signer
+/// (D, same as send-PQ's from `initiate`) without checking the tree's credential for the leaf.
+/// Alice's later `pq_rekey_respond` catch-up moves send-PQ's signer to her rotated identity,
+/// dropping the last copy of D. Had D also left `CREDENTIAL_HISTORY_WINDOW` by join time, the
+/// join would refuse loudly with `Mls` instead. Reaching this needs two bob rotations and one
+/// alice rotation before her A.3 bind (1-for-1 doesn't), then one bob send to auto-stage his
+/// leaf-lag A.5.
+#[cfg(feature = "cryptokit")]
+#[test]
+fn test_migration_export_carries_no_custody_from_an_unchecked_join_signer() {
+    let (alice, bob) = establish_confirmed_sessions();
+
+    // D: send-PQ's signer from `initiate`, unchanged until the handoff below.
+    let d_signing_key = assert_ok!(alice.migration_export())
+        .leaf_keys
+        .send_pq
+        .current
+        .expect("send_pq exists from `initiate`")
+        .signing_key;
+
+    let kp = assert_ok!(alice.pq_bootstrap_begin(None));
+    assert_ok!(bob.pq_bootstrap_respond(kp));
+    let new_bob1 = make_client().client_id();
+    rotate_round(&bob, &alice, new_bob1);
+    let new_alice1 = make_client().client_id();
+    rotate_round(&alice, &bob, new_alice1);
+    let new_bob_extra = make_client().client_id();
+    rotate_round(&bob, &alice, new_bob_extra);
+
+    let welcome = assert_some!(bob.pq_pending_outbound(SideBandSealing::Fresh));
+    assert_ok!(alice.pq_bootstrap_bind(welcome));
+    discharge_bind(&alice, &bob, b"bind-discharge");
+
+    // The unchecked join installed D on recv_pq too.
+    let export = assert_ok!(alice.migration_export());
+    let recv_pq_at_bind = export
+        .leaf_keys
+        .recv_pq
+        .current
+        .as_ref()
+        .expect("recv_pq resolves right after the bind");
+    assert_eq!(
+        recv_pq_at_bind.signing_key, d_signing_key,
+        "recv_pq's join-installed signer must still be D right after the bind"
+    );
+    let send_pq_at_bind = export
+        .leaf_keys
+        .send_pq
+        .current
+        .as_ref()
+        .expect("send_pq resolves right after the bind");
+    assert_eq!(
+        send_pq_at_bind.signing_key, d_signing_key,
+        "send_pq's signer is still D right after the bind — untouched since `initiate`"
+    );
+
+    // Bob's lagging send-PQ auto-stages an A.5; alice's `pq_rekey_respond` then moves her
+    // send-PQ signer off D.
+    assert_ok!(bob.prepare_to_encrypt(None));
+    let enc = assert_ok!(bob.encrypt(b"post-bind".to_vec()));
+    assert_ok!(alice.process_incoming(enc.cipher_text));
+    for _ in 0..8 {
+        let mut delivered = false;
+        for (from, to) in [(&alice, &bob), (&bob, &alice)] {
+            let Some(leg) = from.pq_pending_outbound(SideBandSealing::Fresh) else {
+                continue;
+            };
+            let Ok(Some(opened)) = to.open_incoming(leg.clone()) else {
+                continue;
+            };
+            let crate::session::OpenedFrameKind::PqSideBand { kind } = opened.kind else {
+                continue;
+            };
+            let _: crate::Result<()> = match kind {
+                crate::session::PqFrameKind::BootstrapKeyPackage => to.pq_bootstrap_respond(leg),
+                crate::session::PqFrameKind::BootstrapWelcome => to.pq_bootstrap_bind(leg),
+                crate::session::PqFrameKind::RatchetEphemeralKey => to.pq_ratchet_respond(leg),
+                crate::session::PqFrameKind::RatchetCiphertext => to.pq_ratchet_bind(leg),
+                crate::session::PqFrameKind::RekeyUpdate => to.pq_rekey_respond(leg).map(|_| ()),
+                crate::session::PqFrameKind::RekeyCommit => to.pq_rekey_apply(leg),
+            };
+            delivered = true;
+        }
+        if !delivered {
+            break;
+        }
+    }
+
+    let export = assert_ok!(alice.migration_export());
+    let deployed = assert_some!(export.deployed_state);
+    assert!(
+        deployed.no_custody.recv_pq,
+        "expected recv_pq no_custody once the handoff drops the last copy of D"
+    );
+    assert!(!deployed.no_custody.send_classical);
+    assert!(!deployed.no_custody.send_pq);
+    assert!(!deployed.no_custody.recv_classical);
+    assert!(export.leaf_keys.recv_pq.current.is_none());
+    let send_pq_after = export
+        .leaf_keys
+        .send_pq
+        .current
+        .as_ref()
+        .expect("send_pq still resolves after the handoff");
+    assert_ne!(
+        send_pq_after.signing_key, d_signing_key,
+        "the handoff must have moved send_pq's signer away from D"
+    );
+    assert!(export.leaf_keys.send_classical.current.is_some());
+}
+
+/// Seeded, bounded random walk over app-legal operations on a Rust pair, asserting invariants
+/// on both sides every step (`assert_invariants`). `process_incoming` must never fail; any
+/// other op's failure must match a named expected refusal (`Coverage::record`).
+///
+/// Modes: CARD (routine traffic, PQ only via the leaf-lag auto-driver), ANCHOR (plus a full
+/// side-band drain every step), MIXED (each side-band leg attempted with probability 1/2 —
+/// intermittent delivery and out-of-turn resends), CARD-A3-STALLED (A.3 registered, side-band
+/// never touched) and the A3-LATE family (stalled, then binds Welcome′; see `Mode`).
+/// Separate walks start from each born-dedicated state. Excluded because the app never calls
+/// them: `pq_take_pending_outbound`, `stage_rotation`.
+#[cfg(feature = "cryptokit")]
+mod totality_random_walk {
+    use super::*;
+    use mls_rs::CipherSuiteProvider;
+
+    /// splitmix64: deterministic per seed without a `rand` dependency.
+    struct Rng(u64);
+    impl Rng {
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E3779B97F4A7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+            z ^ (z >> 31)
+        }
+        /// Uniform in `0..bound` (bound > 0).
+        fn below(&mut self, bound: u32) -> u32 {
+            (self.next_u64() % u64::from(bound)) as u32
+        }
+    }
+
+    /// One op's named, legitimate refusal kind and the predicate matching it.
+    type RefusalPredicate = (&'static str, fn(&TwoMlsPqError) -> bool);
+
+    /// isNewClient: the host queues an offer only when `proposing != sender`. Bind
+    /// discharges are the one place a same-identity offer is folded (they skip this filter).
+    fn handoff_fold_if_legal(
+        receiver: &Arc<TwoMlsPqSession>,
+        offered: &crate::QueuedRemoteProposal,
+    ) {
+        if offered.proposing.bytes != offered.sender.bytes {
+            let _ = receiver.queue_proposal(offered.digest.clone());
+        }
+    }
+
+    /// Outcome ledger: `attempted`/`ok` count ops (not steps), `refusals` counts each
+    /// expected-refusal kind seen. Unexpected failures panic in `record` instead.
+    #[derive(Default)]
+    struct Coverage {
+        attempted: u32,
+        ok: u32,
+        refusals: std::collections::BTreeMap<&'static str, u32>,
+        // Success-only op counters.
+        sends: u32,
+        rotations: u32,
+        restores: u32,
+        reorders: u32,
+        legs_delivered: u32,
+        saw_rekey_initiated: bool,
+        saw_owed_bind: bool,
+        /// A3-LATE modes: a rotation of alice's identity committed before the Welcome′ bind,
+        /// so KP′ names her old identity. Under A3-LATE that identity is usually also out of
+        /// history, so the bind refuses (`rotate_before_bind_desync`); under A3-LATE-EARLY it
+        /// more often joins with a mismatched signer (`no_custody.recv_pq`).
+        saw_rotate_before_bind: bool,
+        /// A3-LATE-EARLY: an export actually carried `no_custody.recv_pq` (beyond the
+        /// precondition `saw_rotate_before_bind` records).
+        saw_recv_pq_no_custody: bool,
+    }
+
+    impl Coverage {
+        /// An `Err` matching `expected` is counted as that named refusal and returns `None`;
+        /// any other `Err` panics with full context.
+        fn record<T>(
+            &mut self,
+            op: &str,
+            label: &str,
+            seed: u64,
+            step: usize,
+            result: crate::Result<T>,
+            expected: &[RefusalPredicate],
+        ) -> Option<T> {
+            self.attempted += 1;
+            match result {
+                Ok(v) => {
+                    self.ok += 1;
+                    Some(v)
+                }
+                Err(e) => match expected.iter().find(|(_, matches)| matches(&e)) {
+                    Some((name, _)) => {
+                        *self.refusals.entry(name).or_insert(0) += 1;
+                        None
+                    }
+                    None => unreachable!(
+                        "{label} seed {seed} step {step}: unexpected {op} failure: {e:?}"
+                    ),
+                },
+            }
+        }
+
+        fn merge(&mut self, other: Coverage) {
+            self.attempted += other.attempted;
+            self.ok += other.ok;
+            for (k, v) in other.refusals {
+                *self.refusals.entry(k).or_insert(0) += v;
+            }
+            self.sends += other.sends;
+            self.rotations += other.rotations;
+            self.restores += other.restores;
+            self.reorders += other.reorders;
+            self.legs_delivered += other.legs_delivered;
+            self.saw_rekey_initiated |= other.saw_rekey_initiated;
+            self.saw_owed_bind |= other.saw_owed_bind;
+            self.saw_rotate_before_bind |= other.saw_rotate_before_bind;
+            self.saw_recv_pq_no_custody |= other.saw_recv_pq_no_custody;
+        }
+    }
+
+    /// Delivers a frame; `process_incoming` has no legitimate refusal here since every
+    /// frame is one the pair itself generated.
+    fn deliver(
+        to: &Arc<TwoMlsPqSession>,
+        label: &str,
+        seed: u64,
+        step: usize,
+        frame: Vec<u8>,
+    ) -> Option<crate::QueuedRemoteProposal> {
+        let result = to.process_incoming(frame);
+        assert!(
+            result.is_ok(),
+            "{label} seed {seed} step {step}: process_incoming must never fail: {:?}",
+            result.as_ref().err()
+        );
+        result.unwrap().and_then(|got| got.proposal)
+    }
+
+    /// Sends `from` -> `to` under the handoff fold policy; returns whether prepare, encrypt
+    /// and delivery all succeeded. A rotating send's only expected refusal is
+    /// `SessionNotReady` with a full `CANDIDATE_WINDOW`; a plain send has none.
+    fn step_send(
+        cov: &mut Coverage,
+        ctx: (&str, u64, usize),
+        from: &Arc<TwoMlsPqSession>,
+        to: &Arc<TwoMlsPqSession>,
+        payload: &[u8],
+        rotate: bool,
+    ) -> bool {
+        let (label, seed, step) = ctx;
+        let proposing = if rotate {
+            // Occasionally propose `mine.current()` itself: `admit_candidate` still mints
+            // a fresh key, a reachable same-id candidate. Keyed on `step`, not `rng`.
+            if step % 9 == 0 {
+                from.lock()
+                    .with_auth(|core| core.mine.current().map(<[u8]>::to_vec))
+                    .map(|bytes| crate::ClientId { bytes })
+            } else {
+                Some(make_client().client_id())
+            }
+        } else {
+            None
+        };
+        let rotate_expected: &[RefusalPredicate] =
+            &[("candidate_window_full", |e: &TwoMlsPqError| {
+                matches!(e, TwoMlsPqError::SessionNotReady)
+            })];
+        let expected: &[RefusalPredicate] = if rotate { rotate_expected } else { &[] };
+        let op = if rotate {
+            "rotate_prepare"
+        } else {
+            "plain_prepare"
+        };
+        let Some(_) = cov.record(
+            op,
+            label,
+            seed,
+            step,
+            from.prepare_to_encrypt(proposing),
+            expected,
+        ) else {
+            return false;
+        };
+        let Some(enc) = cov.record(
+            "encrypt",
+            label,
+            seed,
+            step,
+            from.encrypt(payload.to_vec()),
+            &[],
+        ) else {
+            return false;
+        };
+        if let Some(offered) = deliver(to, label, seed, step, enc.cipher_text) {
+            handoff_fold_if_legal(to, &offered);
+        }
+        if rotate {
+            cov.rotations += 1;
+        } else {
+            cov.sends += 1;
+        }
+        true
+    }
+
+    /// Two plain sends delivered in reverse. mls-rs tolerates bounded out-of-order
+    /// application messages within an epoch, and neither send proposes, so the epoch holds.
+    fn step_send_reordered(
+        cov: &mut Coverage,
+        label: &str,
+        seed: u64,
+        step: usize,
+        from: &Arc<TwoMlsPqSession>,
+        to: &Arc<TwoMlsPqSession>,
+        tag: &str,
+    ) -> bool {
+        let Some(_) = cov.record(
+            "reorder_prepare",
+            label,
+            seed,
+            step,
+            from.prepare_to_encrypt(None),
+            &[],
+        ) else {
+            return false;
+        };
+        let Some(first) = cov.record(
+            "reorder_encrypt",
+            label,
+            seed,
+            step,
+            from.encrypt(format!("{tag}-1").into_bytes()),
+            &[],
+        ) else {
+            return false;
+        };
+        let Some(_) = cov.record(
+            "reorder_prepare",
+            label,
+            seed,
+            step,
+            from.prepare_to_encrypt(None),
+            &[],
+        ) else {
+            return false;
+        };
+        let Some(second) = cov.record(
+            "reorder_encrypt",
+            label,
+            seed,
+            step,
+            from.encrypt(format!("{tag}-2").into_bytes()),
+            &[],
+        ) else {
+            return false;
+        };
+        for frame in [second.cipher_text, first.cipher_text] {
+            if let Some(offered) = deliver(to, label, seed, step, frame) {
+                handoff_fold_if_legal(to, &offered);
+            }
+        }
+        cov.reorders += 1;
+        true
+    }
+
+    /// Archives and restores `party`; neither call has a legitimate refusal.
+    fn step_restore(
+        cov: &mut Coverage,
+        label: &str,
+        seed: u64,
+        step: usize,
+        party: Arc<TwoMlsPqSession>,
+    ) -> Arc<TwoMlsPqSession> {
+        let Some(archive) = cov.record("archive", label, seed, step, party.archive(), &[]) else {
+            return party;
+        };
+        let Some(restored) = cov.record(
+            "restore",
+            label,
+            seed,
+            step,
+            TwoMlsPqSession::from_archive(archive),
+            &[],
+        ) else {
+            return party;
+        };
+        cov.restores += 1;
+        restored
+    }
+
+    /// The key recv-classical currently presents (the ambient signer rotate-before-bind is
+    /// about), or `None` with no recv group yet.
+    fn own_recv_classical_key(session: &Arc<TwoMlsPqSession>) -> Option<Vec<u8>> {
+        let inner = session.lock();
+        inner
+            .recv_group
+            .as_ref()
+            .map(|r| assert_ok!(crate::session::migration::own_signature_key(&r.classical)))
+    }
+
+    /// The deployed card shape: A.3 registered on both sides (KP′ and Welcome′ parked), nothing
+    /// delivered. Uses `pq_bootstrap_begin`/`respond` instead of the app's
+    /// `pq_bootstrap_envelope`, which registers the same round over a different transport.
+    fn establish_a3_stalled() -> (Arc<TwoMlsPqSession>, Arc<TwoMlsPqSession>) {
+        let (alice, bob) = establish_confirmed_sessions();
+        let kp = assert_ok!(alice.pq_bootstrap_begin(None));
+        assert_ok!(bob.pq_bootstrap_respond(kp));
+        (alice, bob)
+    }
+
+    /// Peeks one pending side-band leg from `from` and dispatches it to `to`'s accept call, as
+    /// a host does; returns whether the accept succeeded. Classifying the leg must not fail.
+    /// Expected refusals: `DuplicateSideBand` (stale or out-of-turn resend), `SessionNotReady`
+    /// (round moved on), `CredentialRejected` (A.5 identity not yet canonical on `to`,
+    /// retryable) and, for `RekeyUpdate` only, `DecryptionFailed` (see below).
+    ///
+    /// `wedged` (A3-LATE after a rotate-before-bind desync) also expects `Mls`, since the
+    /// wedged round re-surfaces the join refusal; everywhere else `Mls` stays unexpected.
+    fn deliver_pending_side_band(
+        cov: &mut Coverage,
+        label: &str,
+        seed: u64,
+        step: usize,
+        from: &Arc<TwoMlsPqSession>,
+        to: &Arc<TwoMlsPqSession>,
+        wedged: bool,
+    ) -> bool {
+        let Some(leg) = from.pq_pending_outbound(SideBandSealing::Fresh) else {
+            return false;
+        };
+        let opened = to.open_incoming(leg.clone());
+        assert!(
+            opened.is_ok(),
+            "{label} seed {seed} step {step}: open_incoming must classify a frame we just \
+             peeked: {:?}",
+            opened.as_ref().err()
+        );
+        let Some(opened) = opened.unwrap() else {
+            unreachable!("{label} seed {seed} step {step}: a peeked side-band leg must classify");
+        };
+        let crate::session::OpenedFrameKind::PqSideBand { kind } = opened.kind else {
+            unreachable!(
+                "{label} seed {seed} step {step}: pq_pending_outbound produced a \
+                 non-side-band frame"
+            );
+        };
+        let mut side_band_expected: Vec<RefusalPredicate> = vec![
+            ("duplicate_side_band", |e: &TwoMlsPqError| {
+                matches!(e, TwoMlsPqError::DuplicateSideBand)
+            }),
+            ("side_band_not_ready", |e: &TwoMlsPqError| {
+                matches!(e, TwoMlsPqError::SessionNotReady)
+            }),
+            ("credential_not_yet_canonical", |e: &TwoMlsPqError| {
+                matches!(e, TwoMlsPqError::CredentialRejected)
+            }),
+        ];
+        if wedged {
+            side_band_expected.push(("rotate_before_bind_desync", |e: &TwoMlsPqError| {
+                matches!(e, TwoMlsPqError::Mls)
+            }));
+        }
+        // `pq_rekey_respond` maps any failure validating the peer's Upd' to retryable
+        // `DecryptionFailed` (a credential lag the peer's retry heals). Scoped to
+        // `RekeyUpdate` so a genuine decrypt failure on another leg kind still fails.
+        if matches!(kind, crate::session::PqFrameKind::RekeyUpdate) {
+            side_band_expected.push(("rekey_update_credential_lag", |e: &TwoMlsPqError| {
+                matches!(e, TwoMlsPqError::DecryptionFailed)
+            }));
+        }
+        let result: crate::Result<()> = match kind {
+            crate::session::PqFrameKind::BootstrapKeyPackage => to.pq_bootstrap_respond(leg),
+            crate::session::PqFrameKind::BootstrapWelcome => to.pq_bootstrap_bind(leg),
+            crate::session::PqFrameKind::RatchetEphemeralKey => to.pq_ratchet_respond(leg),
+            crate::session::PqFrameKind::RatchetCiphertext => to.pq_ratchet_bind(leg),
+            crate::session::PqFrameKind::RekeyUpdate => to.pq_rekey_respond(leg).map(|_| ()),
+            crate::session::PqFrameKind::RekeyCommit => to.pq_rekey_apply(leg),
+        };
+        cov.record(
+            "side_band_accept",
+            label,
+            seed,
+            step,
+            result,
+            &side_band_expected,
+        )
+        .is_some()
+    }
+
+    /// ANCHOR (and A3-LATE post-bind): drains pending legs both ways until neither side has
+    /// any (bounded). A completed round only sets `owed_bind` — its closing bind rides the
+    /// next classical frame's staple.
+    fn drain_side_band(
+        cov: &mut Coverage,
+        label: &str,
+        seed: u64,
+        step: usize,
+        alice: &Arc<TwoMlsPqSession>,
+        bob: &Arc<TwoMlsPqSession>,
+        wedged: bool,
+    ) -> u32 {
+        let mut delivered = 0;
+        for _ in 0..8 {
+            let a = deliver_pending_side_band(cov, label, seed, step, alice, bob, wedged);
+            let b = deliver_pending_side_band(cov, label, seed, step, bob, alice, wedged);
+            if !a && !b {
+                break;
+            }
+            delivered += u32::from(a) + u32::from(b);
+        }
+        delivered
+    }
+
+    /// MIXED: each direction's leg is attempted once with probability 1/2, not drained. A
+    /// withheld leg stays pending (peek doesn't consume it) and may land after its round moved
+    /// on, which is why `duplicate_side_band` shows up here but rarely under ANCHOR.
+    fn drain_side_band_mixed(
+        cov: &mut Coverage,
+        label: &str,
+        seed: u64,
+        step: usize,
+        rng: &mut Rng,
+        alice: &Arc<TwoMlsPqSession>,
+        bob: &Arc<TwoMlsPqSession>,
+    ) -> u32 {
+        let mut delivered = 0;
+        if rng.below(2) == 0 && deliver_pending_side_band(cov, label, seed, step, alice, bob, false)
+        {
+            delivered += 1;
+        }
+        if rng.below(2) == 0 && deliver_pending_side_band(cov, label, seed, step, bob, alice, false)
+        {
+            delivered += 1;
+        }
+        delivered
+    }
+
+    /// A3-LATE's transition: binds bob's parked Welcome′ on alice mid-walk and discharges the
+    /// owed bind, as `establish_full` does at setup.
+    ///
+    /// Expected refusal: `Mls` from the bind itself when a rotation of alice's identity landed
+    /// first. KP′ still names her old identity, now evicted from `PartySequence::history`, so
+    /// `validate_member` rejects the join (`UnknownIdentity`, mapped to `Mls`) — the loud
+    /// sibling of the quiet `no_custody` case, where the identity is still in history and the
+    /// join succeeds with a mismatched signer. The round stays open and every retry hits the
+    /// same refusal; the walk continues as ANCHOR so the export is exercised in that state.
+    fn perform_a3_late_bind(
+        cov: &mut Coverage,
+        label: &str,
+        seed: u64,
+        step: usize,
+        alice: &Arc<TwoMlsPqSession>,
+        bob: &Arc<TwoMlsPqSession>,
+    ) -> bool {
+        let welcome = assert_some!(bob.pq_pending_outbound(SideBandSealing::Fresh));
+        let expected: &[RefusalPredicate] =
+            &[("rotate_before_bind_desync", |e: &TwoMlsPqError| {
+                matches!(e, TwoMlsPqError::Mls)
+            })];
+        let Some(()) = cov.record(
+            "a3_late_bind",
+            label,
+            seed,
+            step,
+            alice.pq_bootstrap_bind(welcome),
+            expected,
+        ) else {
+            return false;
+        };
+        discharge_bind(alice, bob, b"a3-late-bind-discharge");
+        true
+    }
+
+    /// Invariants checked on both sides every step; returns whether `no_custody.recv_pq` was seen:
+    /// - each half with a live group has `current` equal to the key its leaf presents, except
+    ///   `recv_pq` under `allow_recv_pq_no_custody` (the unchecked-join case);
+    /// - `pending` targets are non-empty and unique; classical ones are valid successors;
+    /// - `no_custody` is false everywhere except that same `recv_pq` case;
+    /// - the latest own offer, while still cached, is framed and never in the window;
+    /// - native check 6 and its converse hold for the window.
+    fn assert_invariants(
+        label: &str,
+        seed: u64,
+        step: usize,
+        session: &Arc<TwoMlsPqSession>,
+        allow_recv_pq_no_custody: bool,
+    ) -> bool {
+        let export = session.migration_export();
+        assert!(
+            export.is_ok(),
+            "{label} seed {seed} step {step}: export failed: {:?}",
+            export.as_ref().err()
+        );
+        let export = export.unwrap();
+
+        // `mine.current`, for the classical target-membership rule below and for
+        // locating the same-id-candidate target.
+        let mine_current = session
+            .lock()
+            .with_auth(|core| core.mine.current().map(<[u8]>::to_vec))
+            .expect("auth.mine is always seeded");
+
+        let check_half = |name: &str,
+                          presented: Option<Vec<u8>>,
+                          leaf: &crate::session::migration::SessionMigrationGroupKeys,
+                          allow_no_custody: bool,
+                          classical: bool| {
+            let presented_is_none = presented.is_none();
+            match (presented, leaf.current.as_ref()) {
+                (Some(presented), Some(current)) => {
+                    assert_eq!(
+                        current.signature_key, presented,
+                        "{label} seed {seed} step {step}: {name}'s current key doesn't \
+                         match what the leaf presents"
+                    );
+                }
+                (None, Some(_)) => {
+                    // The reservation case: no live group to compare against.
+                }
+                (_, None) => {
+                    if !allow_no_custody {
+                        // Unexpected no-custody: dump live state for diagnosis.
+                        let inner = session.lock();
+                        let inflight = match &inner.pq_inflight {
+                            None => "none",
+                            Some(crate::session::PqInflight::Initiating(_)) => "initiating",
+                            Some(crate::session::PqInflight::BootstrapInitiated) => {
+                                "bootstrap_initiated"
+                            }
+                            Some(crate::session::PqInflight::BootstrapResponded) => {
+                                "bootstrap_responded"
+                            }
+                            Some(crate::session::PqInflight::RekeyInitiated) => "rekey_initiated",
+                            Some(crate::session::PqInflight::RekeyResponded) => "rekey_responded",
+                            Some(crate::session::PqInflight::Responding { .. }) => "responding",
+                        };
+                        eprintln!(
+                            "{name} no-custody diagnostic: pending_count={} \
+                                 pq_inflight={inflight} owed_bind={} staged_candidates={} \
+                                 pq_wedged={}",
+                            leaf.pending.len(),
+                            inner.owed_bind.is_some(),
+                            inner.staged_candidates.len(),
+                            inner.pq_wedged.is_some(),
+                        );
+                    }
+                    assert!(
+                        allow_no_custody,
+                        "{label} seed {seed} step {step}: {name} has no custody"
+                    );
+                }
+            }
+            if presented_is_none {
+                assert!(
+                    leaf.pending.is_empty(),
+                    "{label} seed {seed} step {step}: {name}'s reservation has non-empty \
+                     pending"
+                );
+            }
+            let mut seen = std::collections::HashSet::new();
+            for p in &leaf.pending {
+                assert!(
+                    !p.target.is_empty(),
+                    "{label} seed {seed} step {step}: {name}'s pending has an empty target"
+                );
+                assert!(
+                    seen.insert(p.target.clone()),
+                    "{label} seed {seed} step {step}: {name}'s pending has a duplicate target"
+                );
+                // Classical targets must be in {mine.current} ∪ authorized_next, which
+                // `valid_successor` reduces to when `mine_current` is the newest history
+                // element. PQ pending may target a historical id.
+                if classical {
+                    let authorized = session
+                        .lock()
+                        .with_auth(|core| core.mine.valid_successor(&mine_current, &p.target));
+                    assert!(
+                        authorized,
+                        "{label} seed {seed} step {step}: {name}'s pending target is \
+                         neither mine.current nor authorized_next"
+                    );
+                }
+            }
+        };
+
+        let (send_classical, send_pq, recv_classical, recv_pq, latest_offer) = {
+            let inner = session.lock();
+            let send = inner.send_group.as_ref().expect("send_group always exists");
+            let recv = inner.recv_group.as_ref();
+            (
+                assert_ok!(crate::session::migration::own_signature_key(
+                    &send.classical
+                )),
+                send.pq
+                    .as_ref()
+                    .map(|g| assert_ok!(crate::session::migration::own_signature_key(g))),
+                recv.map(|r| {
+                    assert_ok!(crate::session::migration::own_signature_key(&r.classical))
+                }),
+                recv.and_then(|r| r.pq.as_ref())
+                    .map(|g| assert_ok!(crate::session::migration::own_signature_key(g))),
+                inner
+                    .pending_proposal_message
+                    .as_ref()
+                    .map(|(_, m)| m.clone()),
+            )
+        };
+        check_half(
+            "send_classical",
+            Some(send_classical),
+            &export.leaf_keys.send_classical,
+            false,
+            true,
+        );
+        check_half("send_pq", send_pq, &export.leaf_keys.send_pq, false, false);
+        check_half(
+            "recv_classical",
+            recv_classical,
+            &export.leaf_keys.recv_classical,
+            false,
+            true,
+        );
+        check_half(
+            "recv_pq",
+            recv_pq,
+            &export.leaf_keys.recv_pq,
+            allow_recv_pq_no_custody,
+            false,
+        );
+
+        // Every target but `mine.current` has the same key in both classical sets; there,
+        // recv_classical may carry a same-id K′ while send_classical carries the identity's.
+        for candidate_target in [
+            &export.leaf_keys.send_classical,
+            &export.leaf_keys.recv_classical,
+        ]
+        .iter()
+        .flat_map(|g| g.pending.iter().map(|p| p.target.clone()))
+        .collect::<std::collections::HashSet<_>>()
+        {
+            if candidate_target == mine_current {
+                continue;
+            }
+            let send_key = export
+                .leaf_keys
+                .send_classical
+                .pending
+                .iter()
+                .find(|p| p.target == candidate_target)
+                .map(|p| &p.key);
+            let recv_key = export
+                .leaf_keys
+                .recv_classical
+                .pending
+                .iter()
+                .find(|p| p.target == candidate_target)
+                .map(|p| &p.key);
+            if let (Some(send_key), Some(recv_key)) = (send_key, recv_key) {
+                assert_eq!(
+                    send_key.signing_key, recv_key.signing_key,
+                    "{label} seed {seed} step {step}: target {candidate_target:?} has \
+                     different keys in send_classical vs recv_classical"
+                );
+            }
+        }
+        // `rotation_candidate` (never a same-id candidate) matches its pending entries.
+        if let Some(candidate) = &export.rotation_candidate {
+            assert_ne!(
+                candidate.target_client_id, mine_current,
+                "{label} seed {seed} step {step}: a same-id candidate must never export \
+                 as rotation_candidate"
+            );
+            let matches = [
+                &export.leaf_keys.send_classical,
+                &export.leaf_keys.recv_classical,
+            ]
+            .iter()
+            .flat_map(|g| g.pending.iter())
+            .filter(|p| p.target == candidate.target_client_id)
+            .all(|p| p.key.signing_key == candidate.signing_key);
+            assert!(
+                matches,
+                "{label} seed {seed} step {step}: rotation_candidate's key disagrees with \
+                 its own pending entry"
+            );
+        }
+
+        let mut observed_recv_pq_no_custody = false;
+        if let Some(deployed) = &export.deployed_state {
+            assert!(
+                !deployed.no_custody.send_classical,
+                "{label} seed {seed} step {step}: send_classical no_custody"
+            );
+            assert!(
+                !deployed.no_custody.send_pq,
+                "{label} seed {seed} step {step}: send_pq no_custody"
+            );
+            assert!(
+                !deployed.no_custody.recv_classical,
+                "{label} seed {seed} step {step}: recv_classical no_custody"
+            );
+            assert!(
+                allow_recv_pq_no_custody || !deployed.no_custody.recv_pq,
+                "{label} seed {seed} step {step}: recv_pq no_custody (not allowed at this step)"
+            );
+            observed_recv_pq_no_custody = deployed.no_custody.recv_pq;
+        }
+
+        if let Some(latest) = latest_offer.as_ref() {
+            let inner = session.lock();
+            if let Some(recv) = inner.recv_group.as_ref() {
+                if let (Ok(cs), Ok(cache)) = (
+                    crate::providers::classical_envelope_suite(),
+                    recv.classical.own_proposals_for_swift_export(),
+                ) {
+                    if let Ok(hash) = cs.hash(latest) {
+                        if let Some(entry) = cache.iter().find(|e| e.message_hash == hash) {
+                            // The latest own offer is framed: its HPKE pair rides the
+                            // snapshot, not the window.
+                            let in_window = export.deployed_state.as_ref().is_some_and(|d| {
+                                d.own_offers.as_ref().is_some_and(|w| {
+                                    w.offers
+                                        .iter()
+                                        .any(|o| o.proposal_ref == entry.proposal_ref)
+                                })
+                            });
+                            assert!(
+                                !in_window,
+                                "{label} seed {seed} step {step}: the latest own offer must \
+                                 be framed, not carried in the window"
+                            );
+                            let framed = crate::session::migration::staged_update_leaf_key(
+                                &recv.classical,
+                                Some(latest),
+                                &cs,
+                            )
+                            .ok()
+                            .flatten()
+                            .is_some();
+                            assert!(
+                                framed,
+                                "{label} seed {seed} step {step}: the latest own offer must \
+                                 resolve as the framed (Snapshot-placed) entry"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Native's check 6: every window offer, staged update and pending proposal names
+        // recv_classical's `current` or `pending[its id]`, as a peer's by-reference fold needs.
+        let recv_classical_keys = &export.leaf_keys.recv_classical;
+        let names_current_or_pending = |id: &[u8], key: &[u8]| -> bool {
+            recv_classical_keys
+                .current
+                .as_ref()
+                .is_some_and(|c| c.signature_key == key)
+                || recv_classical_keys
+                    .pending
+                    .iter()
+                    .any(|p| p.target == id && p.key.signature_key == key)
+        };
+        // Window offers are bare cache entries, but `staged_updates`/`pending_proposal` carry
+        // framed MLSMessage bytes, so recover the bare proposal by hash from the same cache,
+        // as `own_offer_window` does. `None` (undecodable, or stale past an epoch advance) is
+        // skipped, mirroring native check 6's tolerance of an own Update failing epoch checks.
+        let decode_framed_update = |framed: &[u8]| -> Option<(Vec<u8>, Vec<u8>)> {
+            let cs = crate::providers::classical_envelope_suite().ok()?;
+            let hash = mls_rs::CipherSuiteProvider::hash(&cs, framed).ok()?;
+            let inner = session.lock();
+            let recv = inner.recv_group.as_ref()?;
+            let cache = recv.classical.own_proposals_for_swift_export().ok()?;
+            let entry = cache.into_iter().find(|e| e.message_hash == hash)?;
+            crate::session::migration::decoded_update_target(&entry.proposal)
+        };
+        if let Some(window) = export
+            .deployed_state
+            .as_ref()
+            .and_then(|d| d.own_offers.as_ref())
+        {
+            for offer in &window.offers {
+                let (id, key) = crate::session::migration::decoded_update_target(&offer.proposal)
+                    .expect("a window offer must decode as an Update");
+                assert!(
+                    names_current_or_pending(&id, &key),
+                    "{label} seed {seed} step {step}: a window offer names neither \
+                     recv_classical's current nor its own pending entry"
+                );
+            }
+        }
+        for staged in &export.staged_updates {
+            let Some((id, key)) = decode_framed_update(&staged.message) else {
+                continue;
+            };
+            assert!(
+                names_current_or_pending(&id, &key),
+                "{label} seed {seed} step {step}: a staged update names neither \
+                 recv_classical's current nor its own pending entry"
+            );
+        }
+        if let Some(pending_proposal) = &export.pending_proposal {
+            if let Some((id, key)) = decode_framed_update(&pending_proposal.message) {
+                assert!(
+                    names_current_or_pending(&id, &key),
+                    "{label} seed {seed} step {step}: pending_proposal names neither \
+                     recv_classical's current nor its own pending entry"
+                );
+            }
+        }
+
+        // Converse of check 6: below the cap, a presentation-changing offer matching
+        // `pending[mine.current]` must ride the window. The framed entry (matched by hash)
+        // doesn't count — it rides the snapshot.
+        if let Some(mine_current_pending) = recv_classical_keys
+            .pending
+            .iter()
+            .find(|p| p.target == mine_current)
+        {
+            let presented_key = recv_classical_keys
+                .current
+                .as_ref()
+                .map(|c| &c.signature_key);
+            if presented_key != Some(&mine_current_pending.key.signature_key) {
+                let window = export
+                    .deployed_state
+                    .as_ref()
+                    .and_then(|d| d.own_offers.as_ref());
+                let at_cap = window
+                    .is_some_and(|w| w.offers.len() >= crate::session::migration::OWN_OFFER_WINDOW);
+                if !at_cap {
+                    let framed_hash = latest_offer.as_ref().and_then(|bytes| {
+                        crate::providers::classical_envelope_suite()
+                            .ok()
+                            .and_then(|cs| mls_rs::CipherSuiteProvider::hash(&cs, bytes).ok())
+                    });
+                    let has_real_entry = {
+                        let inner = session.lock();
+                        inner.recv_group.as_ref().is_some_and(|recv| {
+                            recv.classical
+                                .own_proposals_for_swift_export()
+                                .map(|cache| {
+                                    cache.iter().any(|entry| {
+                                        framed_hash.as_deref()
+                                            != Some(entry.message_hash.as_slice())
+                                            && crate::session::migration::decoded_update_target(
+                                                &entry.proposal,
+                                            )
+                                            .is_some_and(|(id, key)| {
+                                                id == mine_current
+                                                    && key == mine_current_pending.key.signature_key
+                                            })
+                                    })
+                                })
+                                .unwrap_or(false)
+                        })
+                    };
+                    if has_real_entry {
+                        let in_window = window.is_some_and(|w| {
+                            w.offers.iter().any(|o| {
+                                crate::session::migration::decoded_update_target(&o.proposal)
+                                    .is_some_and(|(id, key)| {
+                                        id == mine_current
+                                            && key == mine_current_pending.key.signature_key
+                                    })
+                            })
+                        });
+                        assert!(
+                            in_window,
+                            "{label} seed {seed} step {step}: a presentation-changing \
+                             offer matching pending[mine.current] must ride the window \
+                             (it is not past the cap)"
+                        );
+                    }
+                }
+            }
+        }
+
+        observed_recv_pq_no_custody
+    }
+
+    #[derive(Clone, Copy)]
+    enum Mode {
+        Card,
+        Anchor,
+        Mixed,
+        /// The deployed card shape (A.3 registered, nothing delivered), never delivered.
+        CardA3Stalled,
+        /// A.3-stalled, binding in the walk's latter half so an earlier rotation reliably
+        /// lands first, producing the loud `rotate_before_bind_desync`. Then ANCHOR.
+        A3Late,
+        /// A.3-stalled, binding in `[5, 5 + steps/8)` so the bind races an incidental A.5 on
+        /// the just-bound recv-PQ, producing the quiet `no_custody.recv_pq`. Then ANCHOR.
+        A3LateEarly,
+        /// A.3-stalled, binding before the loop so the post-bind ANCHOR path provably runs on
+        /// a clean bind rather than being vacuously skipped by A3-LATE always wedging.
+        A3LateClean,
+    }
+
+    /// A.3-stalled start, bind, then ANCHOR; only the bind timing differs.
+    fn is_a3_late_family(mode: Mode) -> bool {
+        matches!(mode, Mode::A3Late | Mode::A3LateEarly | Mode::A3LateClean)
+    }
+
+    fn run_walk(label: &str, seed: u64, steps: usize, mode: Mode) -> Coverage {
+        let mut rng = Rng(seed);
+        let (mut alice, mut bob) = if matches!(mode, Mode::Card | Mode::Anchor | Mode::Mixed) {
+            establish_full()
+        } else {
+            establish_a3_stalled()
+        };
+        // `is_fully_established` needs A.3 bound on that side: stalled modes leave alice
+        // unbound, but bob's halves are live from `pq_bootstrap_respond` alone.
+        if matches!(mode, Mode::Card | Mode::Anchor | Mode::Mixed) {
+            assert!(alice.is_fully_established());
+        } else {
+            assert!(!alice.is_fully_established());
+        }
+        assert!(bob.is_fully_established());
+        let mut cov = Coverage::default();
+
+        let half = (steps / 2).max(1);
+        let bind_step = match mode {
+            Mode::A3Late => Some(half + rng.below(half as u32) as usize),
+            Mode::A3LateEarly => Some(5 + rng.below((steps / 8).max(1) as u32) as usize),
+            _ => None,
+        };
+        // Snapshot alice's recv-classical identity at registration to detect a landed
+        // rotation at bind time.
+        let alice_recv_key_at_registration = own_recv_classical_key(&alice);
+        let mut post_bind = false;
+        // Set when the scheduled bind fails after a rotation: the round is then permanently
+        // wedged and every later delivery re-surfaces `Mls`.
+        let mut wedged = false;
+
+        if matches!(mode, Mode::A3LateClean) {
+            let bind_ok = perform_a3_late_bind(&mut cov, label, seed, 0, &alice, &bob);
+            assert!(
+                bind_ok,
+                "{label} seed {seed}: a3-late-clean's bind failed with nothing preceding \
+                 it to desync — the post-bind anchor path this mode exists to exercise \
+                 never ran"
+            );
+            post_bind = true;
+        }
+
+        for step in 0..steps {
+            let bound = if matches!(mode, Mode::Anchor | Mode::Mixed) || post_bind {
+                7
+            } else {
+                6
+            };
+            match rng.below(bound) {
+                0 => {
+                    step_send(&mut cov, (label, seed, step), &alice, &bob, b"a->b", false);
+                }
+                1 => {
+                    step_send(&mut cov, (label, seed, step), &bob, &alice, b"b->a", false);
+                }
+                2 => {
+                    step_send(
+                        &mut cov,
+                        (label, seed, step),
+                        &alice,
+                        &bob,
+                        b"a->b rotate",
+                        true,
+                    );
+                }
+                3 => {
+                    step_send(
+                        &mut cov,
+                        (label, seed, step),
+                        &bob,
+                        &alice,
+                        b"b->a rotate",
+                        true,
+                    );
+                }
+                4 => {
+                    alice = step_restore(&mut cov, label, seed, step, alice);
+                }
+                5 => {
+                    bob = step_restore(&mut cov, label, seed, step, bob);
+                }
+                6 => {
+                    step_send_reordered(&mut cov, label, seed, step, &alice, &bob, "a->b-reorder");
+                }
+                _ => unreachable!("below(bound) is < bound"),
+            }
+
+            if matches!(mode, Mode::A3Late | Mode::A3LateEarly) && !post_bind {
+                let target =
+                    bind_step.expect("A3Late/A3LateEarly always schedule a bind_step at setup");
+                if step == target {
+                    let rotated = own_recv_classical_key(&alice) != alice_recv_key_at_registration;
+                    cov.saw_rotate_before_bind |= rotated;
+                    let bind_ok = perform_a3_late_bind(&mut cov, label, seed, step, &alice, &bob);
+                    // `rotate_before_bind_desync` must not become a catch-all for unrelated
+                    // `Mls` failures.
+                    assert!(
+                        bind_ok || rotated,
+                        "{label} seed {seed} step {step}: a3_late_bind failed WITHOUT a \
+                         preceding rotation — not the documented rotate-before-bind desync"
+                    );
+                    wedged = !bind_ok;
+                    post_bind = true;
+                }
+            }
+
+            // CARD, CARD-A3-STALLED and pre-bind A3-late modes never drive the side-band.
+            if matches!(mode, Mode::Anchor) || (is_a3_late_family(mode) && post_bind) {
+                cov.legs_delivered +=
+                    drain_side_band(&mut cov, label, seed, step, &alice, &bob, wedged);
+            } else if matches!(mode, Mode::Mixed) {
+                cov.legs_delivered +=
+                    drain_side_band_mixed(&mut cov, label, seed, step, &mut rng, &alice, &bob);
+            }
+
+            for s in [&alice, &bob] {
+                let inner = s.lock();
+                cov.saw_rekey_initiated |= matches!(
+                    inner.pq_inflight,
+                    Some(crate::session::PqInflight::RekeyInitiated)
+                );
+                cov.saw_owed_bind |= inner.owed_bind.is_some();
+            }
+
+            // Only a bound A3-LATE-EARLY after a rotation can reach `no_custody.recv_pq`;
+            // even A3-LATE's loud desync must still resolve every half's custody.
+            let allow_recv_pq_no_custody =
+                matches!(mode, Mode::A3LateEarly) && post_bind && cov.saw_rotate_before_bind;
+
+            // Occasionally check invariants mid-prepare: `step_send` always encrypts, so the
+            // framed-entry paths are otherwise unexercised. `Some(mine.current())` covers a
+            // framed same-id candidate.
+            //
+            // Cleared by field reset, not `encrypt`: `encrypt` also drives PQ auto-staging,
+            // which the strict per-step side-band drain doesn't expect (it induced
+            // `DecryptionFailed`). Left set, the prepare would go stale at the next epoch
+            // advance, since `pending_proposal_message` isn't epoch-scoped.
+            //
+            // Gated on both sides being PQ-quiescent: even a bare prepare landing mid-round
+            // induced the same `DecryptionFailed` under ANCHOR/MIXED.
+            let pq_quiescent = |s: &Arc<TwoMlsPqSession>| {
+                let inner = s.lock();
+                inner.pq_inflight.is_none() && inner.pending_side_band.is_none()
+            };
+            if rng.below(20) == 0 && pq_quiescent(&alice) && pq_quiescent(&bob) {
+                let party = if rng.below(2) == 0 { &alice } else { &bob };
+                let proposing = match rng.below(3) {
+                    0 => None,
+                    1 => Some(make_client().client_id()),
+                    _ => party
+                        .lock()
+                        .with_auth(|core| core.mine.current().map(<[u8]>::to_vec))
+                        .map(|bytes| crate::ClientId { bytes }),
+                };
+                if party.prepare_to_encrypt(proposing).is_ok() {
+                    cov.saw_recv_pq_no_custody |=
+                        assert_invariants(label, seed, step, party, allow_recv_pq_no_custody);
+                    let mut inner = party.lock();
+                    inner.pending_proposal_message = None;
+                    inner.pending_proposal_hash = None;
+                }
+            }
+
+            cov.saw_recv_pq_no_custody |=
+                assert_invariants(label, seed, step, &alice, allow_recv_pq_no_custody);
+            cov.saw_recv_pq_no_custody |=
+                assert_invariants(label, seed, step, &bob, allow_recv_pq_no_custody);
+        }
+        cov
+    }
+
+    /// Which born-dedicated state a born-dedicated walk starts from.
+    enum BornDedicatedStart {
+        /// The establishment envelope has not landed yet.
+        PreInstall,
+        /// Installed and sent, but the peer hasn't folded the catch-up Upd yet.
+        InstalledUnfolded,
+        /// Starts pre-install; the walk installs partway through instead of at setup.
+        InstallMidWalk,
+    }
+
+    /// Contract 26: bob's first frame after the delegation installs carries the handoff and
+    /// pauses alice's `process_incoming` until `approve_establishment` re-feeds it. Until then
+    /// neither side can exchange traffic: bob's emission refuses
+    /// (`EstablishmentEnvelopeRequired`) and alice's frames are undecryptable by bob.
+    fn complete_installation(
+        cov: &mut Coverage,
+        ctx: (&str, u64, usize),
+        alice: &Arc<TwoMlsPqSession>,
+        bob: &Arc<TwoMlsPqSession>,
+        envelope: &[u8],
+        dedicated: &[u8],
+    ) {
+        let (label, seed, step) = ctx;
+        let Some(_) = cov.record(
+            "bd_install_prepare",
+            label,
+            seed,
+            step,
+            bob.prepare_to_encrypt(None),
+            &[],
+        ) else {
+            return;
+        };
+        let Some(enc) = cov.record(
+            "bd_install_encrypt",
+            label,
+            seed,
+            step,
+            bob.encrypt(b"catch-up".to_vec()),
+            &[],
+        ) else {
+            return;
+        };
+        let approved =
+            crate::test_utils::approve_establishment(alice, enc.cipher_text, envelope, dedicated);
+        assert!(
+            approved.is_some(),
+            "{label} seed {seed} step {step}: bob's install-completing frame did not pause \
+             as expected"
+        );
+    }
+
+    /// The card step set on both parties of a born-dedicated pair, plus a one-time install for
+    /// `InstallMidWalk`. The side-band is never driven — pre-A.3 the pair is never
+    /// `is_fully_established` — so this covers the classical/custody side.
+    fn run_born_dedicated_walk(
+        label: &str,
+        seed: u64,
+        steps: usize,
+        start: BornDedicatedStart,
+    ) -> Coverage {
+        let mut rng = Rng(seed);
+        let d = crate::test_utils::born_dedicated_pending();
+        let (mut alice, mut bob) = (d.alice, d.bob);
+        let dedicated = d.dedicated;
+        let mut installed = false;
+        let mut cov = Coverage::default();
+
+        // `InstallMidWalk` must stay pre-install here so its pre-install steps run.
+        if matches!(start, BornDedicatedStart::InstalledUnfolded) {
+            let envelope = crate::test_utils::install_mock_envelope(&bob);
+            installed = true;
+            complete_installation(
+                &mut cov,
+                (label, seed, 0),
+                &alice,
+                &bob,
+                &envelope,
+                &dedicated,
+            );
+
+            // One more plain frame alice receives but never folds — the "unfolded" state.
+            if bob.prepare_to_encrypt(None).is_ok() {
+                if let Ok(enc) = bob.encrypt(b"catch-up".to_vec()) {
+                    let _ = alice.process_incoming(enc.cipher_text);
+                }
+            }
+        }
+
+        for step in 0..steps {
+            if !installed
+                && matches!(start, BornDedicatedStart::InstallMidWalk)
+                && step == steps / 3
+            {
+                let envelope = crate::test_utils::install_mock_envelope(&bob);
+                installed = true;
+                complete_installation(
+                    &mut cov,
+                    (label, seed, step),
+                    &alice,
+                    &bob,
+                    &envelope,
+                    &dedicated,
+                );
+            }
+            let bound = if installed { 7 } else { 4 };
+            match rng.below(bound) {
+                0 => {
+                    // Pre-install, bob cannot emit (Contract 26) — a no-op step.
+                    if installed {
+                        step_send(
+                            &mut cov,
+                            (label, seed, step),
+                            &bob,
+                            &alice,
+                            b"bob->alice",
+                            false,
+                        );
+                    }
+                }
+                1 => {
+                    // Pre-install, bob can't decrypt alice's frames either.
+                    if installed {
+                        step_send(
+                            &mut cov,
+                            (label, seed, step),
+                            &alice,
+                            &bob,
+                            b"alice->bob",
+                            false,
+                        );
+                    }
+                }
+                2 => {
+                    bob = step_restore(&mut cov, label, seed, step, bob);
+                }
+                3 => {
+                    alice = step_restore(&mut cov, label, seed, step, alice);
+                }
+                4 => {
+                    if installed {
+                        step_send(
+                            &mut cov,
+                            (label, seed, step),
+                            &bob,
+                            &alice,
+                            b"bob->alice rotate",
+                            true,
+                        );
+                    }
+                }
+                5 => {
+                    if installed {
+                        step_send_reordered(
+                            &mut cov,
+                            label,
+                            seed,
+                            step,
+                            &bob,
+                            &alice,
+                            "bob-reorder",
+                        );
+                    }
+                }
+                6 => {
+                    if installed {
+                        step_send(
+                            &mut cov,
+                            (label, seed, step),
+                            &alice,
+                            &bob,
+                            b"alice->bob rotate",
+                            true,
+                        );
+                    }
+                }
+                _ => unreachable!("below(bound) is < bound"),
+            }
+
+            let _ = assert_invariants(label, seed, step, &alice, false);
+            let _ = assert_invariants(label, seed, step, &bob, false);
+        }
+        cov
+    }
+
+    fn print_outcome_table(mode_name: &str, total: &Coverage) {
+        println!(
+            "{mode_name}: sends={} rotations={} restores={} reorders={} legs_delivered={} \
+             saw_rekey_initiated={} saw_owed_bind={} saw_rotate_before_bind={} \
+             saw_recv_pq_no_custody={}",
+            total.sends,
+            total.rotations,
+            total.restores,
+            total.reorders,
+            total.legs_delivered,
+            total.saw_rekey_initiated,
+            total.saw_owed_bind,
+            total.saw_rotate_before_bind,
+            total.saw_recv_pq_no_custody,
+        );
+        println!(
+            "{mode_name}: attempted={} ok={} refusals={:?}",
+            total.attempted, total.ok, total.refusals
+        );
+    }
+
+    #[test]
+    fn test_totality_random_walk() {
+        const SEEDS: [u64; 6] = [1, 2, 3, 42, 1337, 0xC0FFEE];
+        const STEPS: usize = 300;
+        for (mode_name, mode) in [
+            ("card", Mode::Card),
+            ("anchor", Mode::Anchor),
+            ("mixed", Mode::Mixed),
+            ("card-a3-stalled", Mode::CardA3Stalled),
+            ("a3-late", Mode::A3Late),
+            ("a3-late-early", Mode::A3LateEarly),
+            ("a3-late-clean", Mode::A3LateClean),
+        ] {
+            let mut total = Coverage::default();
+            for seed in SEEDS {
+                total.merge(run_walk(mode_name, seed, STEPS, mode));
+            }
+            print_outcome_table(mode_name, &total);
+            // ANCHOR/MIXED drive the side-band, so zero legs or owed binds means the driver
+            // is a no-op.
+            if matches!(mode, Mode::Anchor | Mode::Mixed) {
+                assert!(
+                    total.legs_delivered > 0,
+                    "{mode_name}: no side-band legs were ever delivered"
+                );
+                assert!(total.saw_owed_bind, "{mode_name}: no bind was ever owed");
+            }
+            if matches!(mode, Mode::CardA3Stalled) {
+                assert_eq!(
+                    total.legs_delivered, 0,
+                    "card-a3-stalled: a leg was delivered, but this mode must never touch \
+                     the side-band"
+                );
+            }
+            if matches!(mode, Mode::A3Late) {
+                // The late bind reliably wedges, so `legs_delivered` staying 0 is expected.
+                assert!(
+                    total.saw_rotate_before_bind,
+                    "a3-late: the rotate-before-bind precondition was never observed across \
+                     any seed — tune the bind-step schedule or seeds"
+                );
+            }
+            if matches!(mode, Mode::A3LateEarly) {
+                // `saw_recv_pq_no_custody` is reported but not asserted: it is
+                // seed/schedule-sensitive, and
+                // `test_migration_export_carries_no_custody_from_an_unchecked_join_signer`
+                // pins that state deterministically.
+                assert!(
+                    total.saw_rotate_before_bind,
+                    "a3-late-early: the rotate-before-bind precondition was never observed \
+                     across any seed — tune the bind-step schedule or seeds"
+                );
+            }
+            if matches!(mode, Mode::A3LateClean) {
+                assert!(
+                    total.legs_delivered > 0,
+                    "a3-late-clean: no side-band legs were ever delivered post-bind"
+                );
+                assert!(
+                    total.saw_rekey_initiated,
+                    "a3-late-clean: rekey was never initiated post-bind"
+                );
+                assert!(
+                    total.saw_owed_bind,
+                    "a3-late-clean: no bind was ever owed post-bind"
+                );
+            }
+        }
+        const BD_SEEDS: [u64; 3] = [7, 77, 777];
+        const BD_STEPS: usize = 60;
+        for (start_name, start) in [
+            ("bd-pre-install", BornDedicatedStart::PreInstall),
+            (
+                "bd-installed-unfolded",
+                BornDedicatedStart::InstalledUnfolded,
+            ),
+            ("bd-install-mid-walk", BornDedicatedStart::InstallMidWalk),
+        ] {
+            let mut total = Coverage::default();
+            for seed in BD_SEEDS {
+                let cov = match start {
+                    BornDedicatedStart::PreInstall => run_born_dedicated_walk(
+                        start_name,
+                        seed,
+                        BD_STEPS,
+                        BornDedicatedStart::PreInstall,
+                    ),
+                    BornDedicatedStart::InstalledUnfolded => run_born_dedicated_walk(
+                        start_name,
+                        seed,
+                        BD_STEPS,
+                        BornDedicatedStart::InstalledUnfolded,
+                    ),
+                    BornDedicatedStart::InstallMidWalk => run_born_dedicated_walk(
+                        start_name,
+                        seed,
+                        BD_STEPS,
+                        BornDedicatedStart::InstallMidWalk,
+                    ),
+                };
+                total.merge(cov);
+            }
+            print_outcome_table(start_name, &total);
+        }
+    }
+}
+
+/// A never-converging born-dedicated acceptor re-proposes its dedicated id N times, never
+/// folded. Each `Some(dedicated)` reuses the one staged same-id candidate (idempotent
+/// `admit_candidate`), so custody resolves and `pending` collapses to one K′ entry, with
+/// derivation bounded by distinct keys rather than N.
+#[cfg(feature = "cryptokit")]
+#[test]
+fn test_born_dedicated_unfolded_catchup_pending_signers_collapse() {
+    let d = crate::test_utils::born_dedicated_pending();
+    let (alice, bob) = (d.alice, d.bob);
+    let envelope = crate::test_utils::install_mock_envelope(&bob);
+
+    // Contract 26's mandatory handoff authorizes bob's birth identity, not a new one.
+    assert_ok!(bob.prepare_to_encrypt(Some(crate::ClientId {
+        bytes: d.dedicated.clone()
+    })));
+    let enc = assert_ok!(bob.encrypt(b"handoff".to_vec()));
+    assert_some!(crate::test_utils::approve_establishment(
+        &alice,
+        enc.cipher_text,
+        &envelope,
+        &d.dedicated,
+    ));
+    let candidate_key = {
+        let inner = bob.lock();
+        let candidate = inner
+            .staged_candidates
+            .last()
+            .expect("the handoff stages bob's own same-id candidate");
+        candidate
+            .combiner()
+            .classical_signature_keypair()
+            .1
+            .as_bytes()
+            .to_vec()
+    };
+
+    const N: usize = 2_000;
+    for i in 0..N {
+        assert_ok!(bob.prepare_to_encrypt(Some(crate::ClientId {
+            bytes: d.dedicated.clone()
+        })));
+        let enc = assert_ok!(bob.encrypt(format!("catchup{i}").into_bytes()));
+        assert_ok!(alice.process_incoming(enc.cipher_text));
+    }
+
+    let export = assert_ok!(bob.migration_export());
+    let recv_classical = export.leaf_keys.recv_classical;
+    assert!(
+        recv_classical.current.is_some(),
+        "custody must still resolve after N re-proposals of the same identity"
+    );
+    // It carries K′, not the identity's key: no plain `None` refresh is ever sent, so
+    // there is no real identity-signed offer.
+    let for_dedicated: Vec<_> = recv_classical
+        .pending
+        .iter()
+        .filter(|p| p.target == d.dedicated)
+        .collect();
+    assert_eq!(
+        for_dedicated.len(),
+        1,
+        "N re-proposals of the SAME identity target must collapse to exactly one pending \
+         entry for that target, not one per frame"
+    );
+    assert_eq!(
+        for_dedicated[0].key.signature_key, candidate_key,
+        "the surviving entry is the reused same-id candidate's own key, not the identity's"
+    );
+}
+
+/// Release-mode scale measurement at N ~ 110,000 catch-up sends, reporting export wall time
+/// and byte sizes (snapshot, own-offer window, pending pairs). Run with `cargo test --release
+/// -p two-mls-pq --features cryptokit -- --ignored
+/// test_born_dedicated_unfolded_catchup_scale_measurement`.
+///
+/// Measured: build ~30s, export ~0.8s, snapshot_bytes=8,770, window_entries=102,400 (capped),
+/// window_bytes=30,003,200, pending_entries=1, pending_pair_bytes=128.
+#[cfg(feature = "cryptokit")]
+#[test]
+#[ignore = "release-mode scale measurement; run explicitly, see doc comment"]
+fn test_born_dedicated_unfolded_catchup_scale_measurement() {
+    let d = crate::test_utils::born_dedicated_pending();
+    let (alice, bob) = (d.alice, d.bob);
+    let envelope = crate::test_utils::install_mock_envelope(&bob);
+
+    assert_ok!(bob.prepare_to_encrypt(Some(crate::ClientId {
+        bytes: d.dedicated.clone()
+    })));
+    let enc = assert_ok!(bob.encrypt(b"handoff".to_vec()));
+    assert_some!(crate::test_utils::approve_establishment(
+        &alice,
+        enc.cipher_text,
+        &envelope,
+        &d.dedicated,
+    ));
+
+    const N: usize = 110_000;
+    let build_start = std::time::Instant::now();
+    for i in 0..N {
+        assert_ok!(bob.prepare_to_encrypt(Some(crate::ClientId {
+            bytes: d.dedicated.clone()
+        })));
+        let enc = assert_ok!(bob.encrypt(format!("catchup{i}").into_bytes()));
+        assert_ok!(alice.process_incoming(enc.cipher_text));
+    }
+    let build_elapsed = build_start.elapsed();
+
+    let export_start = std::time::Instant::now();
+    let export = assert_ok!(bob.migration_export());
+    let export_elapsed = export_start.elapsed();
+
+    let snapshot_bytes = export.send_group.classical.len()
+        + export.send_group.pq.as_ref().map_or(0, Vec::len)
+        + export
+            .recv_group
+            .as_ref()
+            .map(|g| g.classical.len() + g.pq.as_ref().map_or(0, Vec::len))
+            .unwrap_or(0);
+
+    let recv_classical = export.leaf_keys.recv_classical;
+    assert_eq!(recv_classical.pending.len(), 1);
+
+    let window_bytes: usize = export
+        .deployed_state
+        .as_ref()
+        .and_then(|d| d.own_offers.as_ref())
+        .map(|w| {
+            w.group_id.len()
+                + w.offers
+                    .iter()
+                    .map(|o| o.proposal_ref.len() + o.proposal.len())
+                    .sum::<usize>()
+        })
+        .unwrap_or(0);
+    let pending_pair_bytes: usize = recv_classical
+        .pending
+        .iter()
+        .map(|p| p.key.signing_key.len() + p.key.signature_key.len() + p.target.len())
+        .sum();
+
+    println!(
+        "N={N}: build={build_elapsed:?} export={export_elapsed:?} snapshot_bytes={snapshot_bytes} \
+         window_entries={} window_bytes={window_bytes} pending_entries={} \
+         pending_pair_bytes={pending_pair_bytes}",
+        export
+            .deployed_state
+            .as_ref()
+            .and_then(|d| d.own_offers.as_ref())
+            .map(|w| w.offers.len())
+            .unwrap_or(0),
+        recv_classical.pending.len(),
+    );
 }

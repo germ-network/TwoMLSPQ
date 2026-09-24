@@ -56,6 +56,10 @@ criterion = { version = "0.8", default-features = false, features = [
   "html_reports",
   "plotters",
 ] }
+# Test-only: parses the swift-export CBOR snapshot directly, the same technique the
+# mls-rs fork's own `export_for_swift_placing_pending` tests use, to verify recv-classical's
+# snapshot carries only the placement's Snapshot-placed pending_updates keys.
+ciborium = "0.2"
 
 [[bench]]
 harness = false
