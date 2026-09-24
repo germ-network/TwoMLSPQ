@@ -11,13 +11,12 @@ import XCTest
 // A stuck §A.5 rekey, cross-engine: a deployed Rust party (A) rotates its classical
 // identity, its lagging send-PQ leaf opens §A.5 to catch up in the peer-committed PQ
 // group, and the peer (B) has since migrated to native. Companion to
-// `BornDedicatedMigrationTests`'s mechanical A.5 case (native initiates, Rust responds):
-// this drives the other direction. Alice's own send-PQ leaf is never moved by any of
-// this — only a responder's own Commit' carries its current credential
-// (`pq_rekey_respond`'s `set_new_signing_identity`), and nothing here makes alice a
-// responder catching herself up — but `leafKeys`'s general catch-up carries that lag
-// directly, so she migrates too, at the end.
-//
+// `BornDedicatedMigrationTests`'s A.5 case (native initiates, Rust responds): this
+// drives the other direction. Alice's own send-PQ leaf moves only when she answers a
+// round: once her own A.5 has landed, native bob's reciprocal A.5 makes her the
+// responder, and her Commit' carries her current credential
+// (`pq_rekey_respond`'s `set_new_signing_identity`).
+
 // Suite note: `two_mls_pq` type names collide with this package's wrapper names, so FFI
 // record types are module-qualified throughout.
 
@@ -36,8 +35,8 @@ final class RotatedRekeyHealTests: XCTestCase {
 		// below.
 		let earlyBobExport = try bob.migrationExport()
 		// Alice's original PQ key, before rotation swaps her whole identity (classical and
-		// PQ together) to the new principal's — her send-PQ leaf keeps presenting this key
-		// for the rest of the test, since nothing ever moves it.
+		// PQ together) to the new principal's. Her send-PQ leaf presents it until bob's
+		// reciprocal round at the end moves it.
 		let originalAlicePQSignatureKey = try alice.migrationExport().identity
 			.pqSignatureKey
 
@@ -173,121 +172,50 @@ final class RotatedRekeyHealTests: XCTestCase {
 		}
 		XCTAssertEqual(bobCommitDecrypted.applicationMessage, Data("a5-bind-commit".utf8))
 
-		// Postcondition: alice's PQ leaf presents her new id in native bob's view
-		// (`rotatedCredential` above). Passing the turn back needs a full round: bob
-		// (nothing of his lags) opens a plain A.4, and its own discharge hands the turn to
-		// alice.
+		// Postcondition: alice's recv-PQ leaf presents her new id in native bob's view
+		// (`rotatedCredential` above). Her send-PQ leaf, in bob's recv-PQ group, still lags,
+		// and her own A.5 has landed, so bob's next send opens the reciprocal A.5: a
+		// same-id refresh of his own leaf there.
 		_ = try nativeBob.prepareToEncrypt()
-		let followUpOpener = try nativeBob.encrypt(Data("post-a5-opener".utf8))
-		let aliceFollowUpOpened = try alice.processIncoming(
-			ciphertext: followUpOpener.frame)
+		let reciprocalOpener = try nativeBob.encrypt(Data("reciprocal-opener".utf8))
+		_ = try XCTUnwrap(alice.processIncoming(ciphertext: reciprocalOpener.frame))
+		let reciprocalUpd = try XCTUnwrap(nativeBob.pqPendingOutbound())
 		XCTAssertEqual(
-			aliceFollowUpOpened?.applicationMessage?.appMessageData,
-			Data("post-a5-opener".utf8))
-		let followUpEk = try XCTUnwrap(nativeBob.pqPendingOutbound())
-		try alice.pqRatchetRespond(ekMsg: followUpEk)
-		let followUpCt = try XCTUnwrap(alice.pqTakePendingOutbound())
-		_ = try nativeBob.pqRatchetBind(followUpCt)
+			try alice.openIncoming(blob: reciprocalUpd)?.kind,
+			.pqSideBand(kind: .rekeyUpdate))
+		XCTAssertNil(
+			try alice.pqRekeyRespond(updMsg: reciprocalUpd),
+			"bob's same-id refresh announces nothing")
+		_ = try nativeBob.pqRekeyApply(try XCTUnwrap(alice.pqTakePendingOutbound()))
 
+		// Bind discharge: alice offers an Upd, native bob (the binder) folds and commits it.
 		_ = try alice.prepareToEncrypt(proposing: nil)
-		let aliceBindUpd2 = try alice.encrypt(appMessage: Data("post-a5-bind-upd".utf8))
-		let bobBindOpened2 = try nativeBob.processIncoming(aliceBindUpd2.cipherText)
-		guard case .decrypted(let bobDecrypted2) = bobBindOpened2 else {
-			XCTFail("expected a decrypted application frame, got \(bobBindOpened2)")
-			return
+		let aliceBindUpd = try alice.encrypt(appMessage: Data("reciprocal-bind-upd".utf8))
+		guard
+			case .decrypted(let bobBindOpened) = try nativeBob.processIncoming(
+				aliceBindUpd.cipherText)
+		else {
+			return XCTFail("expected native bob to decrypt alice's Upd")
 		}
-		_ = try nativeBob.queueProposal(digest: bobDecrypted2.queuedProposal.digest)
-		let bobPrepared2 = try nativeBob.prepareToEncrypt()
-		XCTAssertTrue(bobPrepared2.didCommit, "the second bind discharge needs a commit")
-		let bobCommit2 = try nativeBob.encrypt(Data("post-a5-bind-commit".utf8))
-		let aliceGotCommit2 = try XCTUnwrap(
-			alice.processIncoming(ciphertext: bobCommit2.frame))
-		XCTAssertEqual(
-			aliceGotCommit2.applicationMessage?.appMessageData,
-			Data("post-a5-bind-commit".utf8))
+		_ = try nativeBob.queueProposal(digest: bobBindOpened.queuedProposal.digest)
+		XCTAssertTrue(try nativeBob.prepareToEncrypt().didCommit)
+		let bobBindCommit = try nativeBob.encrypt(Data("reciprocal-bind-commit".utf8))
+		_ = try XCTUnwrap(alice.processIncoming(ciphertext: bobBindCommit.frame))
 
-		// `send_pq_leaf_lags` checks alice's own send-PQ leaf. A responder's Commit' carries
-		// its current credential when its own send-PQ leaf lags, but alice is always this
-		// round's initiator, never a responder catching herself up — so with the turn back,
-		// her next send auto-stages another A.5, this time a same-id key change: the steady
-		// state for every rotated Rust peer talking to native.
+		// Alice's Commit' moved her send-PQ leaf to her rotated id, so with the turn back
+		// her trigger is quiet: her next send opens a plain A.4.
 		XCTAssertTrue(alice.myPqTurn())
 		_ = try alice.prepareToEncrypt(proposing: nil)
-		let secondOpener = try alice.encrypt(appMessage: Data("open-a5-again".utf8))
-		let bobSecondOpenerResult = try nativeBob.processIncoming(secondOpener.cipherText)
-		guard case .decrypted(let secondOpenerDecrypted) = bobSecondOpenerResult else {
-			XCTFail(
-				"expected a decrypted application frame, got \(bobSecondOpenerResult)"
-			)
-			return
+		let aliceNext = try alice.encrypt(appMessage: Data("post-reciprocal".utf8))
+		guard case .decrypted = try nativeBob.processIncoming(aliceNext.cipherText) else {
+			return XCTFail("expected native bob to decrypt alice's message")
 		}
-		XCTAssertEqual(
-			secondOpenerDecrypted.applicationMessage, Data("open-a5-again".utf8))
-		let secondUpd = try XCTUnwrap(alice.pqPendingOutbound(sealing: .stable))
-		let secondClassified = try nativeBob.openIncoming(secondUpd)
-		XCTAssertEqual(secondClassified?.kind, .pqSideBand(.rekeyUpd))
-		let secondSideBandResult = try nativeBob.pqRekeyRespond(secondUpd)
-		XCTAssertNil(
-			secondSideBandResult.rotatedCredential,
-			"a same-id catch-up hands off nothing"
-		)
-		try alice.pqRekeyApply(msg: secondSideBandResult.frame)
-
-		_ = try nativeBob.prepareToEncrypt()
-		let thirdBindUpd = try nativeBob.encrypt(Data("a5-again-bind-upd".utf8))
-		let aliceThirdBindOpened = try XCTUnwrap(
-			alice.processIncoming(ciphertext: thirdBindUpd.frame))
-		let thirdBindOffered = try XCTUnwrap(aliceThirdBindOpened.proposal)
-		try alice.queueProposal(digest: thirdBindOffered.digest)
-		let aliceThirdPrepared = try alice.prepareToEncrypt(proposing: nil)
-		XCTAssertTrue(
-			aliceThirdPrepared.didCommit,
-			"the repeated A.5's bind discharge needs a commit"
-		)
-		let aliceThirdCommitFrame = try alice.encrypt(
-			appMessage: Data("a5-again-bind-commit".utf8))
-		let bobGotThirdCommit = try nativeBob.processIncoming(
-			aliceThirdCommitFrame.cipherText)
-		guard case .decrypted(let bobThirdCommitDecrypted) = bobGotThirdCommit else {
-			XCTFail("expected a decrypted application frame, got \(bobGotThirdCommit)")
-			return
-		}
-		XCTAssertEqual(
-			bobThirdCommitDecrypted.applicationMessage,
-			Data("a5-again-bind-commit".utf8))
-
-		_ = try alice.prepareToEncrypt(proposing: nil)
-		let finalAliceFrame = try alice.encrypt(appMessage: Data("post-heal-alice".utf8))
-		let finalBobResult = try nativeBob.processIncoming(finalAliceFrame.cipherText)
-		guard case .decrypted(let finalBobDecrypted) = finalBobResult else {
-			XCTFail("expected a decrypted application frame, got \(finalBobResult)")
-			return
-		}
-		XCTAssertEqual(finalBobDecrypted.applicationMessage, Data("post-heal-alice".utf8))
-
-		_ = try nativeBob.prepareToEncrypt()
-		let finalBobFrame = try nativeBob.encrypt(Data("post-heal-bob".utf8))
-		let finalAliceResult = try XCTUnwrap(
-			alice.processIncoming(ciphertext: finalBobFrame.frame))
-		XCTAssertEqual(
-			finalAliceResult.applicationMessage?.appMessageData,
-			Data("post-heal-bob".utf8))
-
-		// Alice's send-PQ leaf never gets bumped by any of this (same reasoning as above) —
-		// mint her and restore natively too.
-		let aliceExport = try alice.migrationExport()
-		XCTAssertEqual(
-			aliceExport.leafKeys.sendPq.current?.signatureKey,
+		let aliceLeg = try XCTUnwrap(alice.pqPendingOutbound(sealing: .stable))
+		XCTAssertEqual(try nativeBob.openIncoming(aliceLeg)?.kind, .pqSideBand(.ratchetEK))
+		XCTAssertNotEqual(
+			try alice.migrationExport().leafKeys.sendPq.current?.signatureKey,
 			originalAlicePQSignatureKey,
-			"alice's send-PQ leaf still presents her ORIGINAL (pre-rotation) PQ key — "
-				+ "nothing in this flow ever moves it")
-		let aliceArchive = try SessionMigrator.mint(
-			kind: .checkpoint, from: aliceExport,
-			classicalProvider: classicalProvider, pqProvider: pqProvider
-		).archive
-		_ = try TwoMLSPQSession.TwoMLSSession.restore(
-			core: nil, checkpoint: aliceArchive,
-			classicalProvider: classicalProvider, pqProvider: pqProvider)
+			"the reciprocal round moved alice's send-PQ leaf off her original key")
 	}
 
 	// MARK: - CHARACTERIZATION: a rotation-before-bind mismatch never heals from the peer
@@ -298,83 +226,7 @@ final class RotatedRekeyHealTests: XCTestCase {
 	/// never matches what the peer's tree has on record, and unlike the heal case above, no
 	/// later classical fold reconciles it — this party heals only by migrating itself.
 	func testNativeBNeverHealsRotationBeforeA3Bind() throws {
-		let alice = try TwoMLSPQBinding.TwoMlsPqPrincipal(clientId: Data("rrh2-alice".utf8))
-		let bobPrincipal = try TwoMLSPQBinding.TwoMlsPqPrincipal(
-			clientId: Data("rrh2-bob".utf8))
-		let bobInvitation = try TwoMLSPQBinding.TwoMlsPqInvitation.restore(
-			archive: bobPrincipal.generateInvitation(lastResort: true))
-
-		let aliceSession = try TwoMLSPQBinding.TwoMlsPqSession.initiate(
-			client: alice, theirKeyPackage: bobInvitation.combinerKeyPackage(),
-			appBinding: nil)
-		let commitment = try XCTUnwrap(aliceSession.bootstrapKpCommitment())
-		let kpEnvelope = try aliceSession.pqBootstrapEnvelope()
-		let replyEnvelope = try XCTUnwrap(aliceSession.pendingOutbound())
-
-		let heldKp: Data
-		switch try bobInvitation.openInitial(blob: kpEnvelope) {
-		case .bootstrapKp(let frame): heldKp = frame
-		case let other:
-			throw NSError(
-				domain: "rrh2", code: 1,
-				userInfo: [
-					NSLocalizedDescriptionKey:
-						"expected a bootstrap-KP envelope, got \(other)"
-				])
-		}
-		let welcome: Data
-		switch try bobInvitation.openInitial(blob: replyEnvelope) {
-		case .establishment(let frame): welcome = try XCTUnwrap(frame.welcome)
-		case let other:
-			throw NSError(
-				domain: "rrh2", code: 2,
-				userInfo: [
-					NSLocalizedDescriptionKey:
-						"expected an establishment envelope, got \(other)"
-				])
-		}
-		let aliceKP = try alice.generateKeyPackage(suite: .init(value: 0x0003))
-		let bobSession = try bobInvitation.receive(
-			welcome: welcome, theirClassicalKeyPackage: aliceKP,
-			bootstrapKpCommitment: commitment, spawnToken: Data("rrh2-spawn".utf8),
-			newClientId: nil, expectedRemote: nil, expectedAppBinding: nil)
-
-		// Bob's send-PQ tree is built here, from alice's KP frozen at `initiate()` — the
-		// leaf presentation that never gets revised.
-		try bobSession.pqBootstrapRespond(kpMsg: heldKp)
-		let welcomePrime = try XCTUnwrap(bobSession.pqTakePendingOutbound())
-		let returnWelcome = try XCTUnwrap(bobSession.pendingOutbound())
-
-		// Alice establishes her classical groups off the return welcome, so she can propose
-		// a rotation before ever closing A.3 with `pqBootstrapBind`.
-		_ = try aliceSession.processIncoming(ciphertext: returnWelcome)
-
-		let newAliceId = TwoMLSPQBinding.ClientId(
-			bytes: Data("rrh2-alice-rotated".utf8))
-		_ = try aliceSession.prepareToEncrypt(proposing: newAliceId)
-		let rotateFrame = try aliceSession.encrypt(appMessage: Data("rotate".utf8))
-		let bobRotateOpened = try XCTUnwrap(
-			bobSession.processIncoming(ciphertext: rotateFrame.cipherText))
-		let rotateOffered = try XCTUnwrap(bobRotateOpened.proposal)
-		try bobSession.queueProposal(digest: rotateOffered.digest)
-		let bobFold = try bobSession.prepareToEncrypt(proposing: nil)
-		XCTAssertTrue(bobFold.didCommit)
-		let canonicalizeFrame = try bobSession.encrypt(
-			appMessage: Data("canonicalize".utf8))
-		let aliceCanonOpened = try XCTUnwrap(
-			aliceSession.processIncoming(ciphertext: canonicalizeFrame.cipherText))
-		let remoteCommit = try XCTUnwrap(aliceCanonOpened.remoteCommit)
-		XCTAssertEqual(remoteCommit.newRecipient, newAliceId)
-
-		// Alice now closes A.3 — binding with her current (rotated) principal, while bob's
-		// send-PQ tree still carries her original KP's presentation for that leaf.
-		try aliceSession.pqBootstrapBind(welcomeMsg: welcomePrime)
-
-		// A.3's own bind discharge: alice (binder) offers the bind riding her commit; bob
-		// applies the staple and gains the turn. Unlike the heal test, neither side's send
-		// auto-stages anything here — alice loses her turn inside this same discharge,
-		// before any auto-stage check runs on her own send.
-		try RustSessionTestHelpers.committingRound(binder: aliceSession, peer: bobSession)
+		let (aliceSession, bobSession, _) = try rotatedBeforeBindPair()
 
 		// Bob (now turn holder, nothing of his lags) opens a plain A.4; draining it hands
 		// the turn to alice, whose leaf already lags the pre-bind rotation.
@@ -439,6 +291,80 @@ final class RotatedRekeyHealTests: XCTestCase {
 		// leave the round — and the same parked Upd' bytes come back byte-identical.
 		let stillParked = try XCTUnwrap(aliceSession.pqPendingOutbound(sealing: .stable))
 		XCTAssertEqual(parkedUpd, stillParked)
+	}
+
+	// MARK: - C2: native defers its reciprocal until the rotated party's own A.5 lands
+
+	/// The rotate-before-bind shape above, with bob migrated while he holds the turn.
+	/// Alice's send-PQ leaf lags, but C2 defers bob's reciprocal A.5 until alice's own A.5
+	/// has landed, so his turn opens a plain A.4. Alice's own A.5 is mis-signed and heals
+	/// only once she migrates. After that, bob's next turn opens the reciprocal, and
+	/// alice's responder Commit' moves her send-PQ leaf to her rotated id.
+	func testNativeBDefersItsReciprocalUntilRotatedAlicesOwnA5Lands() throws {
+		let (aliceSession, bobSession, newAliceId) = try rotatedBeforeBindPair()
+		XCTAssertTrue(bobSession.myPqTurn())
+		var nativeBob = try restoredNatively(bobSession)
+
+		_ = try nativeBob.prepareToEncrypt()
+		let bobOpener = try nativeBob.encrypt(Data("post-a3-opener".utf8))
+		_ = try aliceSession.processIncoming(ciphertext: bobOpener.frame)
+		XCTAssertEqual(
+			try aliceSession.openIncoming(
+				blob: try XCTUnwrap(nativeBob.pqPendingOutbound()))?
+				.kind,
+			.pqSideBand(kind: .ratchetEphemeralKey), "C2 defers the reciprocal")
+		try drainNativeA4(from: &nativeBob, to: aliceSession)
+
+		// Alice's own A.5 is mis-signed, so native bob refuses it.
+		_ = try aliceSession.prepareToEncrypt(proposing: nil)
+		let aliceOpener = try aliceSession.encrypt(appMessage: Data("open-a5".utf8))
+		_ = try nativeBob.processIncoming(aliceOpener.cipherText)
+		let parkedUpd = try XCTUnwrap(aliceSession.pqPendingOutbound(sealing: .stable))
+		XCTAssertThrowsError(try nativeBob.pqRekeyRespond(parkedUpd))
+
+		// Alice migrates. Import drops the parked Upd', and her next send re-drives the
+		// catch-up under her carried key.
+		var nativeAlice = try restoredNatively(aliceSession)
+		XCTAssertNil(nativeAlice.pqPendingOutbound())
+		_ = try nativeAlice.prepareToEncrypt()
+		let healOpener = try nativeAlice.encrypt(Data("heal-open".utf8))
+		_ = try nativeBob.processIncoming(healOpener.frame)
+		let heal = try nativeBob.pqRekeyRespond(
+			try XCTUnwrap(nativeAlice.pqPendingOutbound()))
+		XCTAssertEqual(heal.rotatedCredential, newAliceId.bytes)
+		_ = try nativeAlice.pqRekeyApply(heal.frame)
+
+		// Bind discharge: bob offers an Upd, alice (the binder) folds and commits it.
+		_ = try nativeBob.prepareToEncrypt()
+		let bobUpd = try nativeBob.encrypt(Data("heal-bind-upd".utf8))
+		guard
+			case .decrypted(let aliceOpened) = try nativeAlice.processIncoming(
+				bobUpd.frame)
+		else {
+			return XCTFail("expected native alice to decrypt bob's Upd")
+		}
+		_ = try nativeAlice.queueProposal(digest: aliceOpened.queuedProposal.digest)
+		XCTAssertTrue(try nativeAlice.prepareToEncrypt().didCommit)
+		let aliceBindCommit = try nativeAlice.encrypt(Data("heal-bind-commit".utf8))
+		guard case .decrypted = try nativeBob.processIncoming(aliceBindCommit.frame) else {
+			return XCTFail("expected native bob to decrypt alice's discharge")
+		}
+
+		// Alice's own A.5 has landed, so bob's turn now opens the reciprocal.
+		XCTAssertTrue(nativeBob.myPQTurn)
+		XCTAssertNotEqual(try sendPQLeafID(of: nativeAlice), newAliceId.bytes)
+		_ = try nativeBob.prepareToEncrypt()
+		let reciprocalOpener = try nativeBob.encrypt(Data("reciprocal-open".utf8))
+		guard case .decrypted = try nativeAlice.processIncoming(reciprocalOpener.frame)
+		else {
+			return XCTFail("expected native alice to decrypt bob's message")
+		}
+		let reciprocalUpd = try XCTUnwrap(nativeBob.pqPendingOutbound())
+		XCTAssertEqual(
+			try nativeAlice.openIncoming(reciprocalUpd)?.kind, .pqSideBand(.rekeyUpd))
+		let reciprocal = try nativeAlice.pqRekeyRespond(reciprocalUpd)
+		_ = try nativeBob.pqRekeyApply(reciprocal.frame)
+		XCTAssertEqual(try sendPQLeafID(of: nativeAlice), newAliceId.bytes)
 	}
 
 	// MARK: - Native responder carries its own rotation onto its send-PQ leaf
@@ -575,6 +501,93 @@ final class RotatedRekeyHealTests: XCTestCase {
 		XCTAssertEqual(bobGot.applicationMessage, Data("post-a5-alice".utf8))
 	}
 
+	/// A Rust pair where alice rotates before her A.3 bind, returned at A.3's own bind
+	/// discharge: bob holds the PQ turn, and bob's send-PQ tree still records alice's
+	/// pre-rotation leaf.
+	private func rotatedBeforeBindPair() throws -> (
+		alice: TwoMLSPQBinding.TwoMlsPqSession, bob: TwoMLSPQBinding.TwoMlsPqSession,
+		newAliceId: TwoMLSPQBinding.ClientId
+	) {
+		let alice = try TwoMLSPQBinding.TwoMlsPqPrincipal(clientId: Data("rrh2-alice".utf8))
+		let bobPrincipal = try TwoMLSPQBinding.TwoMlsPqPrincipal(
+			clientId: Data("rrh2-bob".utf8))
+		let bobInvitation = try TwoMLSPQBinding.TwoMlsPqInvitation.restore(
+			archive: bobPrincipal.generateInvitation(lastResort: true))
+
+		let aliceSession = try TwoMLSPQBinding.TwoMlsPqSession.initiate(
+			client: alice, theirKeyPackage: bobInvitation.combinerKeyPackage(),
+			appBinding: nil)
+		let commitment = try XCTUnwrap(aliceSession.bootstrapKpCommitment())
+		let kpEnvelope = try aliceSession.pqBootstrapEnvelope()
+		let replyEnvelope = try XCTUnwrap(aliceSession.pendingOutbound())
+
+		let heldKp: Data
+		switch try bobInvitation.openInitial(blob: kpEnvelope) {
+		case .bootstrapKp(let frame): heldKp = frame
+		case let other:
+			throw NSError(
+				domain: "rrh2", code: 1,
+				userInfo: [
+					NSLocalizedDescriptionKey:
+						"expected a bootstrap-KP envelope, got \(other)"
+				])
+		}
+		let welcome: Data
+		switch try bobInvitation.openInitial(blob: replyEnvelope) {
+		case .establishment(let frame): welcome = try XCTUnwrap(frame.welcome)
+		case let other:
+			throw NSError(
+				domain: "rrh2", code: 2,
+				userInfo: [
+					NSLocalizedDescriptionKey:
+						"expected an establishment envelope, got \(other)"
+				])
+		}
+		let aliceKP = try alice.generateKeyPackage(suite: .init(value: 0x0003))
+		let bobSession = try bobInvitation.receive(
+			welcome: welcome, theirClassicalKeyPackage: aliceKP,
+			bootstrapKpCommitment: commitment, spawnToken: Data("rrh2-spawn".utf8),
+			newClientId: nil, expectedRemote: nil, expectedAppBinding: nil)
+
+		// Bob's send-PQ tree is built here, from alice's KP frozen at `initiate()` — the
+		// leaf presentation that never gets revised.
+		try bobSession.pqBootstrapRespond(kpMsg: heldKp)
+		let welcomePrime = try XCTUnwrap(bobSession.pqTakePendingOutbound())
+		let returnWelcome = try XCTUnwrap(bobSession.pendingOutbound())
+
+		// Alice establishes her classical groups off the return welcome, so she can propose
+		// a rotation before ever closing A.3 with `pqBootstrapBind`.
+		_ = try aliceSession.processIncoming(ciphertext: returnWelcome)
+
+		let newAliceId = TwoMLSPQBinding.ClientId(
+			bytes: Data("rrh2-alice-rotated".utf8))
+		_ = try aliceSession.prepareToEncrypt(proposing: newAliceId)
+		let rotateFrame = try aliceSession.encrypt(appMessage: Data("rotate".utf8))
+		let bobRotateOpened = try XCTUnwrap(
+			bobSession.processIncoming(ciphertext: rotateFrame.cipherText))
+		let rotateOffered = try XCTUnwrap(bobRotateOpened.proposal)
+		try bobSession.queueProposal(digest: rotateOffered.digest)
+		let bobFold = try bobSession.prepareToEncrypt(proposing: nil)
+		XCTAssertTrue(bobFold.didCommit)
+		let canonicalizeFrame = try bobSession.encrypt(
+			appMessage: Data("canonicalize".utf8))
+		let aliceCanonOpened = try XCTUnwrap(
+			aliceSession.processIncoming(ciphertext: canonicalizeFrame.cipherText))
+		let remoteCommit = try XCTUnwrap(aliceCanonOpened.remoteCommit)
+		XCTAssertEqual(remoteCommit.newRecipient, newAliceId)
+
+		// Alice now closes A.3 — binding with her current (rotated) principal, while bob's
+		// send-PQ tree still carries her original KP's presentation for that leaf.
+		try aliceSession.pqBootstrapBind(welcomeMsg: welcomePrime)
+
+		// A.3's own bind discharge: alice (binder) offers the bind riding her commit; bob
+		// applies the staple and gains the turn. Unlike the heal test, neither side's send
+		// auto-stages anything here — alice loses her turn inside this same discharge,
+		// before any auto-stage check runs on her own send.
+		try RustSessionTestHelpers.committingRound(binder: aliceSession, peer: bobSession)
+		return (aliceSession, bobSession, newAliceId)
+	}
+
 	/// Native bob's parked A.4: alice answers, bob binds, and alice's Upd folded by bob
 	/// discharges the bind, passing the turn to alice.
 	private func drainNativeA4(
@@ -630,6 +643,18 @@ final class RotatedRekeyHealTests: XCTestCase {
 		let group = try XCTUnwrap(session.recvGroup?.pq)
 		return try TwoMLSPQSession.basicIdentifier(
 			TwoMLSPQSession.TwoMLSSession.ownLeaf(of: group).credential)
+	}
+
+	private func restoredNatively(
+		_ session: TwoMLSPQBinding.TwoMlsPqSession
+	) throws -> TwoMLSPQSession.TwoMLSSession {
+		let archive = try SessionMigrator.mint(
+			kind: .checkpoint, from: try session.migrationExport(),
+			classicalProvider: classicalProvider, pqProvider: pqProvider
+		).archive
+		return try TwoMLSPQSession.TwoMLSSession.restore(
+			core: nil, checkpoint: archive,
+			classicalProvider: classicalProvider, pqProvider: pqProvider)
 	}
 
 	private func sendPQLeafID(of session: TwoMLSPQSession.TwoMLSSession) throws -> Data {

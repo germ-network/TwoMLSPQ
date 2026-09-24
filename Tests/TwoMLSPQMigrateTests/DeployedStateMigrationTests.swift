@@ -24,8 +24,9 @@ final class DeployedStateMigrationTests: XCTestCase {
 
 	/// Alice rotates D -> N before her A.3 bind, so her self-driven A.5 Upd' is mis-signed
 	/// — framed with N against a leaf the peer's tree still has on record as D. Export must
-	/// carry the parked round; native import drops it and resumes with a plain ratchet.
-	func testRotateBeforeBindWedgeDropsAtImportAndSelfDrivesAPlainRatchet() throws {
+	/// carry the parked round. Native import drops it, and alice's next send re-drives the
+	/// catch-up, signed with D's carried key, which the Rust peer accepts.
+	func testRotateBeforeBindWedgeDropsAtImportAndSelfDrivesTheCatchUp() throws {
 		let alice = try TwoMLSPQBinding.TwoMlsPqPrincipal(clientId: Data("rbb-alice".utf8))
 		let bobPrincipal = try TwoMLSPQBinding.TwoMlsPqPrincipal(
 			clientId: Data("rbb-bob".utf8))
@@ -143,19 +144,46 @@ final class DeployedStateMigrationTests: XCTestCase {
 			nativeAlice.pqPendingOutbound(),
 			"no pending side-band should survive import")
 
-		// Once the PQ turn is alice's, her next send opens a plain A.4 (not an A.5),
-		// classified by the Rust peer as the ratchet EK leg, under the carried key.
+		// Her recv-PQ leaf still presents D, so once the PQ turn is hers, her next send
+		// re-opens the A.5: the Upd' moves D -> N under D's carried key and announces N.
 		XCTAssertTrue(nativeAlice.myPQTurn)
 		_ = try nativeAlice.prepareToEncrypt()
-		let followUp = try nativeAlice.encrypt(Data("post-restore-a4".utf8))
+		let followUp = try nativeAlice.encrypt(Data("post-restore-a5".utf8))
 		let bobOpened = try XCTUnwrap(
 			bobSession.processIncoming(ciphertext: followUp.frame))
 		XCTAssertEqual(
-			bobOpened.applicationMessage?.appMessageData, Data("post-restore-a4".utf8))
-		let ekLeg = try XCTUnwrap(nativeAlice.pqPendingOutbound())
-		let classified = try bobSession.openIncoming(blob: ekLeg)
-		XCTAssertEqual(classified?.kind, .pqSideBand(kind: .ratchetEphemeralKey))
-		XCTAssertNoThrow(try bobSession.pqRatchetRespond(ekMsg: ekLeg))
+			bobOpened.applicationMessage?.appMessageData, Data("post-restore-a5".utf8))
+		let updLeg = try XCTUnwrap(nativeAlice.pqPendingOutbound())
+		XCTAssertEqual(
+			try bobSession.openIncoming(blob: updLeg)?.kind,
+			.pqSideBand(kind: .rekeyUpdate))
+		let announced = try bobSession.pqRekeyRespond(updMsg: updLeg)
+		XCTAssertEqual(announced?.bytes, newAliceId.bytes)
+		_ = try nativeAlice.pqRekeyApply(try XCTUnwrap(bobSession.pqTakePendingOutbound()))
+
+		// Bind discharge: bob offers an Upd, native alice (the binder) folds and commits it.
+		_ = try bobSession.prepareToEncrypt(proposing: nil)
+		let bobUpd = try bobSession.encrypt(appMessage: Data("heal-bind-upd".utf8))
+		guard
+			case .decrypted(let aliceOpened) = try nativeAlice.processIncoming(
+				bobUpd.cipherText)
+		else {
+			return XCTFail("expected native alice to decrypt bob's Upd")
+		}
+		_ = try nativeAlice.queueProposal(digest: aliceOpened.queuedProposal.digest)
+		XCTAssertTrue(try nativeAlice.prepareToEncrypt().didCommit)
+		let aliceCommit = try nativeAlice.encrypt(Data("heal-bind-commit".utf8))
+		_ = try XCTUnwrap(bobSession.processIncoming(ciphertext: aliceCommit.frame))
+
+		// Healed: with the turn, bob opens a plain A.4, and native alice answers it.
+		XCTAssertTrue(bobSession.myPqTurn())
+		_ = try bobSession.prepareToEncrypt(proposing: nil)
+		let postHeal = try bobSession.encrypt(appMessage: Data("post-heal".utf8))
+		guard case .decrypted = try nativeAlice.processIncoming(postHeal.cipherText) else {
+			return XCTFail("expected native alice to decrypt bob's message")
+		}
+		let ekLeg = try XCTUnwrap(bobSession.pqPendingOutbound(sealing: .fresh))
+		XCTAssertNoThrow(try nativeAlice.pqRatchetRespond(ekLeg))
 	}
 
 	// MARK: - Two rotations: each PQ group's `current` is its own presented key
