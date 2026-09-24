@@ -389,9 +389,10 @@ class LegacyRowFixtureTests: XCTestCase {
 		let freshAlice = try restoreAndVerify(point: point, side: "initiator")
 		let export = try freshAlice.migrationExport()
 
-		let archive = try SessionMigrator.mintArchive(
+		let archive = try SessionMigrator.mint(
 			kind: .checkpoint, from: export,
-			classicalProvider: classicalProvider, pqProvider: pqProvider)
+			classicalProvider: classicalProvider, pqProvider: pqProvider
+		).archive
 		var nativeAlice = try TwoMLSPQSession.TwoMLSSession.restore(
 			core: nil, checkpoint: archive,
 			classicalProvider: classicalProvider, pqProvider: pqProvider)
@@ -480,16 +481,15 @@ class LegacyRowFixtureTests: XCTestCase {
 			aliceFinalDecrypted.applicationMessage, Data("\(point)-final-bob".utf8))
 	}
 
-	// MARK: - Acceptor export: p1 still refused, p2-p6 now migrate
+	// MARK: - Acceptor export: p1-p6 now export (the Rust exporter no longer
+	// refuses an unconverged recv-classical leaf)
 
-	/// p1: bob has sent but alice has not yet folded his catch-up Upd — his recv-classical
-	/// leaf still presents the invitation identity's key, and the custody gate refuses it
-	/// (`SessionNotReady`, not `Mls`).
-	func testP1AcceptorExportRefusedSessionNotReady() throws {
-		let bob = try restoreAndVerify(point: "p1-bob-sent-unfolded", side: "acceptor")
-		XCTAssertThrowsError(try bob.migrationExport()) { error in
-			XCTAssertEqual(error as? TwoMLSPQBinding.TwoMlsPqError, .SessionNotReady)
-		}
+	/// p1: bob has sent his catch-up Upd but alice hasn't folded it yet, so his
+	/// recv-classical leaf still presents the invitation identity's key — the custody
+	/// search resolves this, so the export carries it rather than refusing, same as
+	/// every other point.
+	func testP1AcceptorExportNowSucceeds() throws {
+		try assertAcceptorMigrates(point: "p1-bob-sent-unfolded")
 	}
 
 	func testP2AcceptorMigratesAndMessagesRustInitiator() throws {
@@ -512,27 +512,25 @@ class LegacyRowFixtureTests: XCTestCase {
 		try assertAcceptorMigrates(point: "p6-a3-responded-stalled")
 	}
 
-	/// The 0.16.0 ACCEPTOR row at `point` (converged onward) now exports, mints, and
-	/// restores natively: a message each way with a FRESH Rust restore of the initiator
-	/// row, then a cross-engine committing round each way — mirrors
-	/// `assertInitiatorMigrates` with the roles swapped. This is the app's real
-	/// population: born-dedicated, 0.16-written, never-drained parked welcome.
+	/// The 0.16.0 ACCEPTOR row at `point` exports, mints, and restores natively; a message
+	/// each way plus a cross-engine committing round each way against a fresh Rust
+	/// initiator — mirrors `assertInitiatorMigrates` with the roles swapped.
 	private func assertAcceptorMigrates(point: String) throws {
 		let freshBob = try restoreAndVerify(point: point, side: "acceptor")
 		let export = try freshBob.migrationExport()
 		XCTAssertNotNil(
 			export.pqLeafCustody, "\(point): the acceptor's PQ custody should export")
 
-		let archive = try SessionMigrator.mintArchive(
+		let archive = try SessionMigrator.mint(
 			kind: .checkpoint, from: export,
-			classicalProvider: classicalProvider, pqProvider: pqProvider)
+			classicalProvider: classicalProvider, pqProvider: pqProvider
+		).archive
 		var nativeBob = try TwoMLSPQSession.TwoMLSSession.restore(
 			core: nil, checkpoint: archive,
 			classicalProvider: classicalProvider, pqProvider: pqProvider)
 
 		let alice = try restoreAndVerify(point: point, side: "initiator")
 
-		// Message each way.
 		_ = try alice.prepareToEncrypt(proposing: nil)
 		let aliceFrame = try alice.encrypt(
 			appMessage: Data("\(point)-alice-to-migrated-bob".utf8))
@@ -551,9 +549,7 @@ class LegacyRowFixtureTests: XCTestCase {
 			aliceGot.applicationMessage?.appMessageData,
 			Data("\(point)-migrated-bob-to-alice".utf8))
 
-		// Cross-engine committing round, native bob as binder: Rust alice offers an Upd,
-		// native bob queues it and his next `prepareToEncrypt` must commit it; Rust alice
-		// applies the resulting commit.
+		// Cross-engine committing round, native bob as binder.
 		_ = try alice.prepareToEncrypt(proposing: nil)
 		let aliceUpdFrame = try alice.encrypt(appMessage: Data("\(point)-alice-upd".utf8))
 		let bobOpened = try nativeBob.processIncoming(aliceUpdFrame.cipherText)
@@ -572,8 +568,7 @@ class LegacyRowFixtureTests: XCTestCase {
 			aliceGotCommit.applicationMessage?.appMessageData,
 			Data("\(point)-bob-commit".utf8))
 
-		// Cross-engine committing round, Rust alice as binder: native bob offers an Upd,
-		// Rust alice queues + commits it; native bob sees the remote commit applied.
+		// Cross-engine committing round, Rust alice as binder.
 		_ = try nativeBob.prepareToEncrypt()
 		let bobUpdFrame = try nativeBob.encrypt(Data("\(point)-bob-upd".utf8))
 		let aliceDecrypted = try XCTUnwrap(
@@ -596,7 +591,6 @@ class LegacyRowFixtureTests: XCTestCase {
 			bobCommitDecrypted.didApplyRemoteCommit,
 			"native bob should see the remote commit applied")
 
-		// Final message each way.
 		_ = try nativeBob.prepareToEncrypt()
 		let finalFromBob = try nativeBob.encrypt(Data("\(point)-final-bob".utf8))
 		let aliceGotFinal = try XCTUnwrap(
@@ -619,12 +613,10 @@ class LegacyRowFixtureTests: XCTestCase {
 
 	// MARK: - Field-state healing across engines (the real card shape)
 
-	/// p6(i): the acceptor (bob) migrates to native; the initiator (alice) stays Rust. Bob's
-	/// parked Welcome' response (never shipped before capture) must survive BOTH the export
-	/// and the native restore — shown by taking it off native bob's OWN side-band peek,
-	/// exactly as a live native host would to re-send a dropped leg. Delivered to Rust
-	/// alice, the owed bind then discharges with a cross-engine committing round (native bob
-	/// as the peer, Rust alice as the binder — `assertAcceptorMigrates`'s own pattern).
+	/// p6(i): the acceptor (bob) migrates to native, the initiator (alice) stays Rust. Bob's
+	/// parked Welcome' response must survive export and restore, taken off native bob's own
+	/// side-band peek — as a live host would to re-send a dropped leg — then discharged with
+	/// alice as binder.
 	func testP6AcceptorMigratedHealsA3WithRustInitiator() throws {
 		let alice = try restoreAndVerify(
 			point: "p6-a3-responded-stalled", side: "initiator")
@@ -635,28 +627,26 @@ class LegacyRowFixtureTests: XCTestCase {
 			export.pendingSideBand, "bob's parked Welcome' should be in the export")
 		XCTAssertNotNil(export.pqInflight, "bob's bootstrap-responded state should export")
 
-		let archive = try SessionMigrator.mintArchive(
+		let archive = try SessionMigrator.mint(
 			kind: .checkpoint, from: export,
-			classicalProvider: classicalProvider, pqProvider: pqProvider)
+			classicalProvider: classicalProvider, pqProvider: pqProvider
+		).archive
 		var nativeBob = try TwoMLSPQSession.TwoMLSSession.restore(
 			core: nil, checkpoint: archive,
 			classicalProvider: classicalProvider, pqProvider: pqProvider)
 
-		// Bob's own send.pq was already founded before capture (he answered A.3 himself),
-		// and his recv.pq (mirroring alice's Group_A.pq) has been his from the initial
-		// establishment — so native bob is ALREADY fully established right off the
-		// restore, before the heal below ever runs. Migration must preserve that.
+		// Bob answered A.3 himself before capture, so his send.pq and recv.pq are already
+		// founded — native bob is fully established right off restore, before the heal
+		// below even runs. Migration must preserve that.
 		XCTAssertTrue(
 			nativeBob.isFullyEstablished,
 			"native bob's own A.3 response should already be complete after restore")
 
-		// The native side-band take: bob still holds the parked Welcome' after migration.
 		let welcomePrimeSealed = try XCTUnwrap(
 			nativeBob.pqPendingOutbound(),
 			"native bob should still hold the parked Welcome' after migration")
 
-		// Deliver to Rust alice and discharge the owed bind across engines: native bob (the
-		// peer) offers an Upd, Rust alice (the binder) queues + commits it.
+		// Discharge across engines: native bob (peer) offers, Rust alice (binder) commits.
 		let opened = try XCTUnwrap(try alice.openIncoming(blob: welcomePrimeSealed))
 		try alice.pqBootstrapBind(welcomeMsg: opened.frame)
 
@@ -683,14 +673,13 @@ class LegacyRowFixtureTests: XCTestCase {
 		)
 		XCTAssertNil(
 			nativeBob.pqPendingOutbound(), "native bob should have nothing parked")
-		// The discharge passes the PQ turn from the binder (alice, who owed the bind) to
-		// the peer (bob) — same shape as the Rust-only p6 heal test above.
+		// The discharge passes the PQ turn from the binder (alice) to the peer (bob), same
+		// as the Rust-only p6 heal above.
 		XCTAssertFalse(
 			alice.myPqTurn(), "the discharge should pass the PQ turn away from alice")
 		XCTAssertTrue(
 			nativeBob.myPQTurn, "the discharge should pass the PQ turn to native bob")
 
-		// A message each way.
 		_ = try alice.prepareToEncrypt(proposing: nil)
 		let aliceMsg = try alice.encrypt(appMessage: Data("p6h-alice-msg".utf8))
 		let bobGotMsg = try nativeBob.processIncoming(aliceMsg.cipherText)
@@ -706,7 +695,6 @@ class LegacyRowFixtureTests: XCTestCase {
 		XCTAssertEqual(
 			aliceGotMsg.applicationMessage?.appMessageData, Data("p6h-bob-msg".utf8))
 
-		// A committing round each way.
 		_ = try alice.prepareToEncrypt(proposing: nil)
 		let aliceUpdFrame = try alice.encrypt(appMessage: Data("p6h-alice-upd".utf8))
 		let bobOpened2 = try nativeBob.processIncoming(aliceUpdFrame.cipherText)
@@ -748,19 +736,18 @@ class LegacyRowFixtureTests: XCTestCase {
 			"native bob should see the remote commit applied")
 	}
 
-	/// p6(ii): the initiator (alice) migrates to native; the acceptor (bob) stays Rust.
-	/// Bob's parked Welcome' (his own §A.3 response, still on the Rust side) is delivered
-	/// straight into native alice's `pqBootstrapJoin` — which unseals it itself, same as
-	/// `processIncoming` — joining Group_B.pq and owing the classical bind in one call. The
-	/// bind then discharges with native alice as the binder (mirrors `assertInitiatorMigrates`).
+	/// p6(ii): the initiator (alice) migrates to native, the acceptor (bob) stays Rust. Bob's
+	/// parked Welcome' is delivered straight into native alice's `pqBootstrapJoin`, joining
+	/// and owing the bind in one call; the bind then discharges with native alice as binder.
 	func testP6InitiatorMigratedHealsA3WithRustAcceptor() throws {
 		let freshAlice = try restoreAndVerify(
 			point: "p6-a3-responded-stalled", side: "initiator")
 		let export = try freshAlice.migrationExport()
 
-		let archive = try SessionMigrator.mintArchive(
+		let archive = try SessionMigrator.mint(
 			kind: .checkpoint, from: export,
-			classicalProvider: classicalProvider, pqProvider: pqProvider)
+			classicalProvider: classicalProvider, pqProvider: pqProvider
+		).archive
 		var nativeAlice = try TwoMLSPQSession.TwoMLSSession.restore(
 			core: nil, checkpoint: archive,
 			classicalProvider: classicalProvider, pqProvider: pqProvider)
@@ -770,12 +757,11 @@ class LegacyRowFixtureTests: XCTestCase {
 			bob.pqPendingOutbound(sealing: .fresh),
 			"expected bob's parked A.3 Welcome' response to survive restore")
 
-		// Native alice's `pqBootstrapJoin` unseals `inbound` itself (like `processIncoming`)
-		// — no separate open step, unlike the Rust-side `openIncoming` + `pqBootstrapBind`.
+		// Native alice's `pqBootstrapJoin` unseals `inbound` itself, unlike the Rust-side
+		// `openIncoming` + `pqBootstrapBind` two-step.
 		_ = try nativeAlice.pqBootstrapJoin(sealedWelcomePrime)
 
-		// Discharge across engines: Rust bob (the peer) offers an Upd, native alice (the
-		// binder) queues + commits it.
+		// Discharge across engines: Rust bob (peer) offers, native alice (binder) commits.
 		_ = try bob.prepareToEncrypt(proposing: nil)
 		let bobUpdFrame = try bob.encrypt(appMessage: Data("p6h2-bob-upd".utf8))
 		let aliceOpened = try nativeAlice.processIncoming(bobUpdFrame.cipherText)
@@ -802,14 +788,11 @@ class LegacyRowFixtureTests: XCTestCase {
 			nativeAlice.pqPendingOutbound(), "native alice should have nothing parked")
 		XCTAssertNil(
 			bob.pqPendingOutbound(sealing: .fresh), "bob should have nothing parked")
-		// The discharge passes the PQ turn from the binder (native alice) to the peer
-		// (Rust bob).
 		XCTAssertFalse(
 			nativeAlice.myPQTurn,
 			"the discharge should pass the PQ turn away from alice")
 		XCTAssertTrue(bob.myPqTurn(), "the discharge should pass the PQ turn to bob")
 
-		// A message each way.
 		_ = try nativeAlice.prepareToEncrypt()
 		let aliceMsg = try nativeAlice.encrypt(Data("p6h2-alice-msg".utf8))
 		let bobGotMsg = try XCTUnwrap(bob.processIncoming(ciphertext: aliceMsg.frame))
@@ -825,7 +808,6 @@ class LegacyRowFixtureTests: XCTestCase {
 		}
 		XCTAssertEqual(aliceMsgDecrypted.applicationMessage, Data("p6h2-bob-msg".utf8))
 
-		// A committing round each way.
 		_ = try nativeAlice.prepareToEncrypt()
 		let aliceUpdFrame = try nativeAlice.encrypt(Data("p6h2-alice-upd".utf8))
 		let bobDecrypted = try XCTUnwrap(
@@ -862,25 +844,23 @@ class LegacyRowFixtureTests: XCTestCase {
 			Data("p6h2-alice-commit2".utf8))
 	}
 
-	/// p4(iii): the initiator (alice) migrates to native; the acceptor (bob) stays Rust.
-	/// p4's shape is earlier than p6's — alice's KP' was parked but bob never responded — so
-	/// native alice's OWN side-band take is what must survive the migration this time, and
-	/// the round runs its FULL A.3 shape: deliver KP' to Rust bob (`pqBootstrapRespond`), his
-	/// Welcome' response back to native alice (`pqBootstrapJoin`), then discharge.
+	/// p4(iii): the initiator (alice) migrates to native, the acceptor (bob) stays Rust. p4 is
+	/// earlier than p6 — alice's KP' was parked but bob never responded — so the round runs
+	/// A.3's full shape: KP' to Rust bob, his Welcome' back to native alice, then discharge.
 	func testP4InitiatorMigratedHealsA3WithRustAcceptor() throws {
 		let freshAlice = try restoreAndVerify(point: "p4-a3-stalled", side: "initiator")
 		let export = try freshAlice.migrationExport()
 		XCTAssertNotNil(
 			export.pendingSideBand, "alice's parked KP' leg should be in the export")
 
-		let archive = try SessionMigrator.mintArchive(
+		let archive = try SessionMigrator.mint(
 			kind: .checkpoint, from: export,
-			classicalProvider: classicalProvider, pqProvider: pqProvider)
+			classicalProvider: classicalProvider, pqProvider: pqProvider
+		).archive
 		var nativeAlice = try TwoMLSPQSession.TwoMLSSession.restore(
 			core: nil, checkpoint: archive,
 			classicalProvider: classicalProvider, pqProvider: pqProvider)
 
-		// The native side-band take: alice still holds her parked KP' after migration.
 		let sealedKp = try XCTUnwrap(
 			nativeAlice.pqPendingOutbound(),
 			"native alice should still hold her parked KP' after migration")
@@ -893,8 +873,7 @@ class LegacyRowFixtureTests: XCTestCase {
 		// Native's `pqBootstrapJoin` unseals `inbound` itself.
 		_ = try nativeAlice.pqBootstrapJoin(sealedWelcomePrime)
 
-		// Discharge across engines: Rust bob (the peer) offers, native alice (the binder)
-		// commits.
+		// Discharge across engines: Rust bob (peer) offers, native alice (binder) commits.
 		_ = try bob.prepareToEncrypt(proposing: nil)
 		let bobUpdFrame = try bob.encrypt(appMessage: Data("p4h-bob-upd".utf8))
 		let aliceOpened = try nativeAlice.processIncoming(bobUpdFrame.cipherText)
@@ -921,14 +900,11 @@ class LegacyRowFixtureTests: XCTestCase {
 			nativeAlice.pqPendingOutbound(), "native alice should have nothing parked")
 		XCTAssertNil(
 			bob.pqPendingOutbound(sealing: .fresh), "bob should have nothing parked")
-		// The discharge passes the PQ turn from the binder (native alice) to the peer
-		// (Rust bob).
 		XCTAssertFalse(
 			nativeAlice.myPQTurn,
 			"the discharge should pass the PQ turn away from alice")
 		XCTAssertTrue(bob.myPqTurn(), "the discharge should pass the PQ turn to bob")
 
-		// A message each way.
 		_ = try nativeAlice.prepareToEncrypt()
 		let aliceMsg = try nativeAlice.encrypt(Data("p4h-alice-msg".utf8))
 		let bobGotMsg = try XCTUnwrap(bob.processIncoming(ciphertext: aliceMsg.frame))
@@ -944,7 +920,6 @@ class LegacyRowFixtureTests: XCTestCase {
 		}
 		XCTAssertEqual(aliceMsgDecrypted.applicationMessage, Data("p4h-bob-msg".utf8))
 
-		// A committing round each way.
 		_ = try nativeAlice.prepareToEncrypt()
 		let aliceUpdFrame = try nativeAlice.encrypt(Data("p4h-alice-upd".utf8))
 		let bobDecrypted = try XCTUnwrap(
@@ -980,12 +955,10 @@ class LegacyRowFixtureTests: XCTestCase {
 			Data("p4h-alice-commit2".utf8))
 	}
 
-	/// p5's A.4 heal, cross-engine: unlike p4/p6's A.3, p5's rows are already fully
-	/// established (both PQ halves live) and mid a ROUTINE A.4 ratchet instead. meta pins
-	/// the initiator as the turn holder with the parked leg (`legParked: true`), so THAT
-	/// side migrates to native; the acceptor stays Rust. Native's side-band take returns
-	/// the parked EK, Rust bob responds with the CT, and native binds it directly
-	/// (`pqRatchetBind` unseals its own input, like `pqBootstrapJoin`).
+	/// p5's A.4 heal, cross-engine: unlike p4/p6's A.3, p5 is already fully established and
+	/// mid a routine A.4 ratchet. Fixture meta pins the initiator as turn holder with the
+	/// parked leg, so that side migrates to native; native's side-band take returns the
+	/// parked EK, Rust bob responds with the CT, and native binds it directly.
 	func testP5A4HealMigratesInitiatorToNative() throws {
 		let freshAlice = try restoreAndVerify(point: "p5-a4-stalled", side: "initiator")
 		let export = try freshAlice.migrationExport()
@@ -993,9 +966,10 @@ class LegacyRowFixtureTests: XCTestCase {
 			export.pendingSideBand, "alice's parked A.4 EK should be in the export")
 		XCTAssertNotNil(export.pqInflight, "the in-flight A.4 round should export")
 
-		let archive = try SessionMigrator.mintArchive(
+		let archive = try SessionMigrator.mint(
 			kind: .checkpoint, from: export,
-			classicalProvider: classicalProvider, pqProvider: pqProvider)
+			classicalProvider: classicalProvider, pqProvider: pqProvider
+		).archive
 		var nativeAlice = try TwoMLSPQSession.TwoMLSSession.restore(
 			core: nil, checkpoint: archive,
 			classicalProvider: classicalProvider, pqProvider: pqProvider)
@@ -1010,12 +984,10 @@ class LegacyRowFixtureTests: XCTestCase {
 		try bob.pqRatchetRespond(ekMsg: openedEk.frame)
 
 		let sealedCt = try XCTUnwrap(bob.pqTakePendingOutbound())
-		// Native's `pqRatchetBind` unseals `inbound` itself. The pinned twomlspq-swift
-		// release (0.2.1) exposes no public PQ-epoch accessor to assert the numeric
-		// advance directly (unlike Rust's `epochs()`) — `pqRatchetBind` succeeding
-		// without error already proves the CT decrypted and verified against the
-		// correct epoch's derived secret, and the round's full discharge plus the
-		// continued messaging below is the completion proof this test relies on.
+		// Native's `pqRatchetBind` unseals `inbound` itself. twomlspq-swift 0.2.1 exposes no
+		// public PQ-epoch accessor to assert the advance directly — a successful bind, plus
+		// the discharge and continued messaging below, is the completion proof this test
+		// relies on.
 		_ = try nativeAlice.pqRatchetBind(sealedCt)
 
 		XCTAssertNil(
@@ -1023,8 +995,8 @@ class LegacyRowFixtureTests: XCTestCase {
 		XCTAssertNil(
 			bob.pqPendingOutbound(sealing: .fresh), "bob should have nothing parked")
 
-		// Discharge the turn holder's own owed bind: the peer (bob) offers, native alice
-		// (the binder) queues + commits it.
+		// Discharge the turn holder's owed bind: bob (peer) offers, native alice (binder)
+		// commits.
 		_ = try bob.prepareToEncrypt(proposing: nil)
 		let bobUpdFrame = try bob.encrypt(appMessage: Data("p5h-bob-upd".utf8))
 		let aliceOpened = try nativeAlice.processIncoming(bobUpdFrame.cipherText)
@@ -1044,13 +1016,11 @@ class LegacyRowFixtureTests: XCTestCase {
 			bobGotCommit.applicationMessage?.appMessageData,
 			Data("p5h-alice-commit".utf8))
 
-		// The discharge passes the PQ turn away from the holder (alice) to the peer (bob).
 		XCTAssertFalse(
 			nativeAlice.myPQTurn,
 			"the discharge should pass the PQ turn away from alice")
 		XCTAssertTrue(bob.myPqTurn(), "the discharge should pass the PQ turn to bob")
 
-		// A message each way.
 		_ = try nativeAlice.prepareToEncrypt()
 		let aliceMsg = try nativeAlice.encrypt(Data("p5h-alice-msg".utf8))
 		let bobGotMsg = try XCTUnwrap(bob.processIncoming(ciphertext: aliceMsg.frame))
@@ -1066,7 +1036,6 @@ class LegacyRowFixtureTests: XCTestCase {
 		}
 		XCTAssertEqual(aliceMsgDecrypted.applicationMessage, Data("p5h-bob-msg".utf8))
 
-		// A committing round each way.
 		_ = try nativeAlice.prepareToEncrypt()
 		let aliceUpdFrame = try nativeAlice.encrypt(Data("p5h-alice-upd".utf8))
 		let bobDecrypted = try XCTUnwrap(
@@ -1102,15 +1071,11 @@ class LegacyRowFixtureTests: XCTestCase {
 			Data("p5h-alice-commit2".utf8))
 	}
 
-	/// An OWED bind — bound (A.3 or A.4) but NOT YET discharged — is itself part of the
-	/// pending-advance state the export carries, independent of any parked side-band leg
-	/// (the p6 shape above already exercises `pendingSideBand`/`pqInflight` together;
-	/// this isolates `owedBind` on a session where NEITHER of those is set). Reaches an
-	/// owed-bind-but-undischarged state via an ordinary A.4 ratchet round stopped right
-	/// after the bind (bob, the turn holder, opens with a plain send; alice responds; bob
-	/// binds the CT — owing the classical bind — with nothing parked on either side once
-	/// bound). Migrate BOB; native must still discharge the owed bind via an ordinary
-	/// committing round, and the peer applies it.
+	/// An owed bind (bound but not yet discharged) is pending-advance state the export
+	/// carries independent of any parked side-band leg — isolated here on a session where
+	/// neither `pendingSideBand` nor `pqInflight` is set. Migrate bob after an ordinary A.4
+	/// bind with nothing parked; native must still discharge the owed bind on an ordinary
+	/// committing round.
 	func testOwedBindCarriesAcrossTheExport() throws {
 		let pair = try RustSessionTestHelpers.bornDedicatedSessionPairAtDischarge()
 		_ = try pair.bob.prepareToEncrypt(proposing: nil)
@@ -1129,15 +1094,16 @@ class LegacyRowFixtureTests: XCTestCase {
 		XCTAssertNil(export.pendingSideBand, "nothing is parked at this point")
 		XCTAssertNil(export.pqInflight, "no A.3/A.4/A.5 round is in flight at this point")
 
-		let archive = try SessionMigrator.mintArchive(
+		let archive = try SessionMigrator.mint(
 			kind: .checkpoint, from: export,
-			classicalProvider: classicalProvider, pqProvider: pqProvider)
+			classicalProvider: classicalProvider, pqProvider: pqProvider
+		).archive
 		var nativeBob = try TwoMLSPQSession.TwoMLSSession.restore(
 			core: nil, checkpoint: archive,
 			classicalProvider: classicalProvider, pqProvider: pqProvider)
 
-		// Discharge across engines: alice (Rust, the peer) offers, native bob (the
-		// binder, who owes the bind) queues + commits it.
+		// Discharge across engines: alice (Rust, peer) offers, native bob (binder, who owes
+		// the bind) commits.
 		_ = try pair.alice.prepareToEncrypt(proposing: nil)
 		let aliceUpdFrame = try pair.alice.encrypt(
 			appMessage: Data("owed-bind-alice-upd".utf8))
@@ -1161,12 +1127,9 @@ class LegacyRowFixtureTests: XCTestCase {
 		XCTAssertTrue(nativeBob.isFullyEstablished, "the discharge should not disturb this")
 	}
 
-	/// Mutation: blank `owedBind` in the export before minting — the discharge round then
-	/// runs with nothing to fold in: native bob commits alice's offered Upd as an ORDINARY
-	/// classical round (a real, successful commit), but with no PQ half riding it, so
-	/// alice's PQ epoch never advances and the ratchet she already completed on her side
-	/// is never acknowledged back to her — the round SUCCEEDS at the classical layer
-	/// while the dropped PQ bind is silently lost rather than surfacing as an error.
+	/// Mutation: blank `owedBind` before minting. The discharge round then succeeds as an
+	/// ordinary classical commit with no PQ half riding it — alice's PQ epoch never
+	/// advances, and the dropped bind is silently lost rather than surfacing as an error.
 	func testBlankedOwedBindLosesTheBindSilently() throws {
 		let pair = try RustSessionTestHelpers.bornDedicatedSessionPairAtDischarge()
 		_ = try pair.bob.prepareToEncrypt(proposing: nil)
@@ -1184,9 +1147,10 @@ class LegacyRowFixtureTests: XCTestCase {
 		XCTAssertNotNil(export.owedBind)
 		export.owedBind = nil
 
-		let archive = try SessionMigrator.mintArchive(
+		let archive = try SessionMigrator.mint(
 			kind: .checkpoint, from: export,
-			classicalProvider: classicalProvider, pqProvider: pqProvider)
+			classicalProvider: classicalProvider, pqProvider: pqProvider
+		).archive
 		var nativeBob = try TwoMLSPQSession.TwoMLSSession.restore(
 			core: nil, checkpoint: archive,
 			classicalProvider: classicalProvider, pqProvider: pqProvider)
@@ -1218,14 +1182,11 @@ class LegacyRowFixtureTests: XCTestCase {
 	}
 	// MARK: - Mutation: blanking the pending-advance state breaks the heal
 
-	/// p6, blanking ONLY `pendingSideBand` (bob's parked Welcome'; `pqInflight` intact).
-	/// A REAL heal attempt, not just a peek: Rust alice still independently holds HER OWN
-	/// parked KP' (the p6 shape keeps a copy on both sides), so re-send it to native bob —
-	/// exactly the retry a host would attempt after a dropped delivery. It cannot recover:
-	/// bob's send.pq is ALREADY founded, so `pqBootstrapRespond`'s idempotent branch needs
-	/// a retained frame to re-serve, and there is none. Alice can therefore never receive
-	/// a fresh Welcome' to bind, and never establishes — proving `pendingSideBand` is
-	/// load-bearing, not `pqPendingOutbound`'s tautological pass-through of it.
+	/// p6, blanking only `pendingSideBand` (`pqInflight` intact). Alice retries her own
+	/// parked KP' — the retry a host would attempt after a dropped delivery — but bob's
+	/// send.pq is already founded, so `pqBootstrapRespond`'s idempotent branch needs a
+	/// retained frame to re-serve and finds none: alice never receives a fresh Welcome' and
+	/// never establishes, proving `pendingSideBand` is load-bearing.
 	func testBlankedPendingSideBandBreaksP6AcceptorHeal() throws {
 		let alice = try restoreAndVerify(
 			point: "p6-a3-responded-stalled", side: "initiator")
@@ -1234,9 +1195,10 @@ class LegacyRowFixtureTests: XCTestCase {
 		var export = try freshBob.migrationExport()
 		export.pendingSideBand = nil
 
-		let archive = try SessionMigrator.mintArchive(
+		let archive = try SessionMigrator.mint(
 			kind: .checkpoint, from: export,
-			classicalProvider: classicalProvider, pqProvider: pqProvider)
+			classicalProvider: classicalProvider, pqProvider: pqProvider
+		).archive
 		var nativeBob = try TwoMLSPQSession.TwoMLSSession.restore(
 			core: nil, checkpoint: archive,
 			classicalProvider: classicalProvider, pqProvider: pqProvider)
@@ -1259,17 +1221,12 @@ class LegacyRowFixtureTests: XCTestCase {
 		)
 	}
 
-	/// The same p6 shape, blanking ONLY `pqInflight` this time (`pendingSideBand` intact).
-	/// This field is NOT what `pqPendingOutbound()`/`pqBootstrapRespond`'s idempotent
-	/// branch read (both key off `pendingSideBand` and `sendGroup.pq`, the real group
-	/// state) — so native bob's own side-band take and re-respond BOTH still work, and
-	/// alice DOES receive and bind a fresh Welcome'. The heal breaks one step later
-	/// instead: bob's `applyBind` (`TwoMLSSession+ClassicalCommit.swift`) explicitly
-	/// switches on `pqInflight`, requiring `.bootstrapResponded`/`.responding`/
-	/// `.rekeyResponded` before it will apply an incoming bind commit at all — with
-	/// `pqInflight` blanked, that switch's `default` arm throws `sessionNotReady` when
-	/// bob tries to fold alice's discharge commit. So the heal still fails, just later
-	/// and differently than blanking `pendingSideBand` does.
+	/// The same p6 shape, blanking only `pqInflight` (`pendingSideBand` intact). This field
+	/// gates neither `pqPendingOutbound()` nor the idempotent respond branch (both key off
+	/// `pendingSideBand`/`sendGroup.pq`), so alice still receives and binds a fresh
+	/// Welcome'. The heal instead breaks at `applyBind`, which switches on `pqInflight` and
+	/// requires `.bootstrapResponded`/`.responding`/`.rekeyResponded` before applying an
+	/// incoming bind commit — blanked, its `default` arm throws `sessionNotReady`.
 	func testBlankedPqInflightBreaksP6AcceptorHealAtTheBindApply() throws {
 		let alice = try restoreAndVerify(
 			point: "p6-a3-responded-stalled", side: "initiator")
@@ -1278,15 +1235,15 @@ class LegacyRowFixtureTests: XCTestCase {
 		var export = try freshBob.migrationExport()
 		export.pqInflight = nil
 
-		let archive = try SessionMigrator.mintArchive(
+		let archive = try SessionMigrator.mint(
 			kind: .checkpoint, from: export,
-			classicalProvider: classicalProvider, pqProvider: pqProvider)
+			classicalProvider: classicalProvider, pqProvider: pqProvider
+		).archive
 		var nativeBob = try TwoMLSPQSession.TwoMLSSession.restore(
 			core: nil, checkpoint: archive,
 			classicalProvider: classicalProvider, pqProvider: pqProvider)
 
-		// Native bob's own side-band take is UNAFFECTED — it reads `pendingSideBand`,
-		// left intact here — and alice binds it successfully.
+		// Reads `pendingSideBand`, left intact — unaffected by the blanked `pqInflight`.
 		let welcomePrimeSealed = try XCTUnwrap(
 			nativeBob.pqPendingOutbound(),
 			"pendingSideBand alone (left untouched here) is what pqPendingOutbound reads"
@@ -1294,8 +1251,8 @@ class LegacyRowFixtureTests: XCTestCase {
 		let opened = try XCTUnwrap(try alice.openIncoming(blob: welcomePrimeSealed))
 		try alice.pqBootstrapBind(welcomeMsg: opened.frame)
 
-		// The discharge round: bob offers, alice commits — bob's own APPLY of that
-		// commit is where the blanked `pqInflight` actually bites.
+		// bob offers, alice commits — bob's own apply of that commit is where the blanked
+		// `pqInflight` bites.
 		_ = try nativeBob.prepareToEncrypt()
 		let bobUpd = try nativeBob.encrypt(Data("p6mut-bob-upd".utf8))
 		let offered = try XCTUnwrap(
@@ -1307,32 +1264,28 @@ class LegacyRowFixtureTests: XCTestCase {
 			error in
 			XCTAssertEqual(error as? TwoMLSPQSession.TwoMLSError, .sessionNotReady)
 		}
-		// Retrying changes nothing — the guard is on bob's own (blanked) state, not
-		// anything about the frame — so bob is durably stuck on this commit, not just
-		// racing a transient condition.
+		// Retrying changes nothing — the guard is on bob's own blanked state, not the
+		// frame — so bob is durably stuck, not racing a transient condition.
 		XCTAssertThrowsError(try nativeBob.processIncoming(aliceCommit.cipherText)) {
 			error in
 			XCTAssertEqual(error as? TwoMLSPQSession.TwoMLSError, .sessionNotReady)
 		}
 	}
 
-	/// The same PAIR of mutations, on the p4 initiator shape — with a genuinely different
-	/// (and instructive) result. p4 migrates alice BEFORE bob ever responds, so alice is
-	/// still pre-join: blanking ONLY `pendingSideBand` does NOT break this heal, because
-	/// native alice's own `pqBootstrapBegin()` re-derives the SAME KP' bytes from her
-	/// still-intact identity material (never a fresh mint) and simply restarts the round
-	/// — bob's pinned commitment still matches it. Unlike p6's acceptor, whose send.pq is
-	/// ALREADY founded and so has no "start over" available to it, the pre-join initiator
-	/// always does. Documented precisely, per the brief, rather than asserting a failure
-	/// that does not happen.
+	/// The same mutation on the p4 initiator shape has the opposite result: alice migrates
+	/// before bob ever responds, so she is still pre-join. Blanking `pendingSideBand` does
+	/// not break the heal — native alice's `pqBootstrapBegin()` re-derives the same KP'
+	/// bytes from her still-intact identity material and simply restarts the round, unlike
+	/// p6's acceptor whose send.pq is already founded and has no "start over" available.
 	func testBlankedPendingSideBandDoesNotBreakP4InitiatorHeal() throws {
 		let freshAlice = try restoreAndVerify(point: "p4-a3-stalled", side: "initiator")
 		var export = try freshAlice.migrationExport()
 		export.pendingSideBand = nil
 
-		let archive = try SessionMigrator.mintArchive(
+		let archive = try SessionMigrator.mint(
 			kind: .checkpoint, from: export,
-			classicalProvider: classicalProvider, pqProvider: pqProvider)
+			classicalProvider: classicalProvider, pqProvider: pqProvider
+		).archive
 		var nativeAlice = try TwoMLSPQSession.TwoMLSSession.restore(
 			core: nil, checkpoint: archive,
 			classicalProvider: classicalProvider, pqProvider: pqProvider)
@@ -1341,8 +1294,7 @@ class LegacyRowFixtureTests: XCTestCase {
 			nativeAlice.pqPendingOutbound(),
 			"the blanked export leaves nothing for native alice's own side-band take")
 
-		// The self-heal: alice is still pre-join and holds the turn, so she can just
-		// restart the bootstrap — `pqBootstrapBegin` re-derives, it does not re-mint.
+		// alice restarts the bootstrap — `pqBootstrapBegin` re-derives, it does not re-mint.
 		let restarted = try nativeAlice.pqBootstrapBegin()
 
 		let bob = try restoreAndVerify(point: "p4-a3-stalled", side: "acceptor")
@@ -1374,22 +1326,20 @@ class LegacyRowFixtureTests: XCTestCase {
 		XCTAssertTrue(bob.myPqTurn(), "the discharge passes the turn to bob")
 	}
 
-	/// The p4 initiator shape, blanking ONLY `pqInflight`. Also does not break the heal:
-	/// `pqBootstrapJoin` never reads `pqInflight` (only `bootstrapKPSecret` and
-	/// `pendingProposal`), and it clears `pqInflight` itself as part of ordinary
-	/// completion regardless of what the export carried — so the blanked value is
-	/// overwritten before it could matter. Contrast p6's acceptor, where the PEER
-	/// (native bob) applying an INCOMING bind is what reads `pqInflight`; here alice is
-	/// the one who JOINS and then COMMITS the discharge herself, never on the receiving
-	/// end of that specific gate.
+	/// The p4 initiator shape, blanking only `pqInflight`. Also harmless: `pqBootstrapJoin`
+	/// only reads `bootstrapKPSecret`/`pendingProposal`, and clears `pqInflight` itself on
+	/// ordinary completion regardless of what the export carried. Contrast p6's acceptor,
+	/// where the peer applying an incoming bind is what reads `pqInflight` — here alice
+	/// joins and commits the discharge herself, never on the receiving end of that gate.
 	func testBlankedPqInflightDoesNotBreakP4InitiatorHeal() throws {
 		let freshAlice = try restoreAndVerify(point: "p4-a3-stalled", side: "initiator")
 		var export = try freshAlice.migrationExport()
 		export.pqInflight = nil
 
-		let archive = try SessionMigrator.mintArchive(
+		let archive = try SessionMigrator.mint(
 			kind: .checkpoint, from: export,
-			classicalProvider: classicalProvider, pqProvider: pqProvider)
+			classicalProvider: classicalProvider, pqProvider: pqProvider
+		).archive
 		var nativeAlice = try TwoMLSPQSession.TwoMLSSession.restore(
 			core: nil, checkpoint: archive,
 			classicalProvider: classicalProvider, pqProvider: pqProvider)

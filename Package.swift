@@ -84,13 +84,11 @@ let package = Package(
 		// maps the Rust migration exports onto. 0.1.1 is the first tag carrying R2
 		// (SessionMigration + the ML-KEM `hpkeSecretKeySize`); its transitive deps
 		// (swift-mls, swift-secret-bytes, swift-crypto, GermConvenience) resolve
-		// automatically.
-		// Temporary revision pin to twomlspq-swift's swift-crypto-5 branch
-		// (germ-network/twomlspq-swift#60); replace with the released version
-		// once it cuts.
+		// automatically. Pinned to unreleased main for the deployed-state migration
+		// inputs; move to the release that ships them before merging.
 		.package(
 			url: "https://github.com/germ-network/twomlspq-swift.git",
-			from: "0.2.1"
+			revision: "dd62668945e85bdfcb26c2c1653cc1c4082c61ef"
 		),
 		// Declared directly (not just transitively through twomlspq-swift) because
 		// the migrate targets import their products. Library deps stay ranged
@@ -99,9 +97,6 @@ let package = Package(
 		// conflicts against a consumer's own tighter pin; twomlspq-swift's own
 		// swift-mls requirement is ranged the same way (the 0.1.1 floor carries
 		// the C0 `Nsk` length check). Exactness belongs to the app-level repo.
-		// Temporary revision pin to swift-mls's swift-crypto-5 branch
-		// (germ-network/swift-mls#103); replace with the released version once
-		// it cuts.
 		.package(
 			url: "https://github.com/germ-network/swift-mls.git",
 			from: "0.1.4"

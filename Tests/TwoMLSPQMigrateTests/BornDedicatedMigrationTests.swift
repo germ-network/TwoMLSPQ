@@ -8,16 +8,15 @@ import TwoMLSPQMigrate
 import TwoMLSPQSession
 import XCTest
 
-// Contract 26 (born-dedicated) migration: a REAL Rust born-dedicated pair, driven through
-// classical convergence (folding the acceptor's catch-up Upd) and the A.3 bootstrap, then
-// the ACCEPTOR's `migrationExport()`
-// is minted into a native archive and shown to keep messaging (and committing) with the Rust
-// peer, in both directions, and to survive a native re-archive/restore. Companion to
+// Contract 26 (born-dedicated) migration: drives a REAL Rust born-dedicated pair through
+// classical convergence and the A.3 bootstrap, mints the ACCEPTOR's `migrationExport()` into
+// a native archive, and confirms it keeps messaging and committing with the Rust peer, in
+// both directions, and survives a native re-archive/restore. Companion to
 // `SessionMigrationTests` (the non-dedicated differential); see `RustSessionTestHelpers` for
 // the shared FFI establishment scaffolding.
 //
-// Suite note: `two_mls_pq` type names collide with this package's wrapper names, so FFI
-// record types are module-qualified throughout.
+// `two_mls_pq` type names collide with this package's wrapper names, so FFI record types are
+// module-qualified throughout.
 
 @available(macOS 26, iOS 26, *)
 final class BornDedicatedMigrationTests: XCTestCase {
@@ -35,19 +34,18 @@ final class BornDedicatedMigrationTests: XCTestCase {
 		XCTAssertFalse(export.owesEstablishmentEnvelope)
 		XCTAssertFalse(export.initiated)
 
-		let archive = try SessionMigrator.mintArchive(
+		let archive = try SessionMigrator.mint(
 			kind: .checkpoint, from: export,
-			classicalProvider: classicalProvider, pqProvider: pqProvider)
+			classicalProvider: classicalProvider, pqProvider: pqProvider
+		).archive
 		var nativeBob = try TwoMLSPQSession.TwoMLSSession.restore(
 			core: nil, checkpoint: archive,
 			classicalProvider: classicalProvider, pqProvider: pqProvider)
 
-		// A message alice -> bob and bob -> alice.
 		try aliceSays(pair.alice, "alice-to-native-bob", to: &nativeBob)
 		try bobSays(&nativeBob, "native-bob-to-alice", to: pair.alice)
 
-		// One committing round EACH way.
-		// (i) alice folds native bob's Upd.
+		// One committing round each way. (i) alice folds native bob's Upd.
 		_ = try nativeBob.prepareToEncrypt()
 		let bobUpdFrame = try nativeBob.encrypt(Data("bob-upd".utf8))
 		let aliceOffered = try XCTUnwrap(
@@ -84,14 +82,10 @@ final class BornDedicatedMigrationTests: XCTestCase {
 		XCTAssertEqual(
 			aliceGotCommit.applicationMessage?.appMessageData, Data("bob-commit".utf8))
 
-		// A message each way, again — `makeSessionArchive` is `internal` (unreachable
-		// here), so re-archive via the return-cadence `StateUpdate` `encrypt()` already
-		// carries (`EncryptResult.update` — the pending-advance state a caller needs to
-		// persist rides every ordinary send, never a separate opt-in step), paired with
-		// the ORIGINAL `.checkpoint` mint. `encrypt` never touches a PQ tree, so this
-		// stays `.core` —
-		// exactly the app's own two-slot persistence shape, and nothing moved the PQ
-		// trees since the mint, so the checkpoint pairs with it cleanly.
+		// Re-archive by pairing the original `.checkpoint` mint with the `.core` `StateUpdate`
+		// that `encrypt()` returns on every send (`makeSessionArchive` itself is `internal`,
+		// unreachable from here). `encrypt` never touches the PQ tree, so that checkpoint
+		// still applies unchanged.
 		try aliceSays(pair.alice, "alice-to-native-bob-2", to: &nativeBob)
 		let latestCore = try bobSaysCapturingCore(
 			&nativeBob, "native-bob-to-alice-2", to: pair.alice)
@@ -106,19 +100,19 @@ final class BornDedicatedMigrationTests: XCTestCase {
 
 	// MARK: - Exercise the exported PQ custody key via a mechanical A.5
 
-	/// A.2/A.4 never sign in recv.pq, so a mechanical A.5 (native bob as initiator) is the
-	/// only round that ever uses the custodied PQ signing key: `pqRekeyBegin` proposes a
-	/// plain (non-rotating) self-Update signed with it into `recvGroup.pq`.
+	/// A.2/A.4 never sign in recv.pq, so this mechanical A.5 round (native bob as initiator)
+	/// is the only path that exercises the custodied PQ signing key, via `pqRekeyBegin`'s
+	/// plain self-Update into `recvGroup.pq`.
 	func testMigratedAcceptorSignsWithCustodiedPQKeyDuringA5Rekey() throws {
-		// The AT-DISCHARGE point, not `bornDedicatedSessionPair`: nothing has sent since
-		// the A.3 bind discharge, so nothing has auto-staged, and `pqRekeyBegin`'s clean
-		// slate precondition holds without needing to drain anything (a drain would
-		// discharge a full round and pass the PQ turn away, defeating the point).
+		// Must start at the AT-DISCHARGE point, not `bornDedicatedSessionPair`: nothing has
+		// sent since the A.3 bind discharge, so `pqRekeyBegin`'s clean-slate precondition
+		// holds without draining anything (a drain would pass the PQ turn away).
 		let pair = try RustSessionTestHelpers.bornDedicatedSessionPairAtDischarge()
 		let export = try pair.bob.migrationExport()
-		let archive = try SessionMigrator.mintArchive(
+		let archive = try SessionMigrator.mint(
 			kind: .checkpoint, from: export,
-			classicalProvider: classicalProvider, pqProvider: pqProvider)
+			classicalProvider: classicalProvider, pqProvider: pqProvider
+		).archive
 		var nativeBob = try TwoMLSPQSession.TwoMLSSession.restore(
 			core: nil, checkpoint: archive,
 			classicalProvider: classicalProvider, pqProvider: pqProvider)
@@ -156,24 +150,24 @@ final class BornDedicatedMigrationTests: XCTestCase {
 			aliceGotCommit.applicationMessage?.appMessageData,
 			Data("a5-bind-commit".utf8))
 
-		// A message each way — the round closed cleanly.
 		try aliceSays(pair.alice, "post-a5-alice", to: &nativeBob)
 		try bobSays(&nativeBob, "post-a5-bob", to: pair.alice)
 	}
 
 	// MARK: Mutations
 
-	func testNilPQLeafCustodyThrowsArchiveInvalid() throws {
+	/// Nulling `pqLeafCustody` doesn't break the mint: `leafKeys` is authoritative for key
+	/// resolution and independently carries the acceptor's recv-PQ custody. Contrast
+	/// `testFlippedPQLeafCustodySigningKeyThrowsArchiveInvalid`, where a present but wrong
+	/// `pqLeafCustody` still fails its own derive-check.
+	func testNilPQLeafCustodyNoLongerBreaksTheMint() throws {
 		let pair = try RustSessionTestHelpers.bornDedicatedSessionPair()
 		var export = try pair.bob.migrationExport()
 		export.pqLeafCustody = nil
-		XCTAssertThrowsError(
-			try SessionMigrator.mintArchive(
+		XCTAssertNoThrow(
+			try SessionMigrator.mint(
 				kind: .checkpoint, from: export,
-				classicalProvider: classicalProvider, pqProvider: pqProvider)
-		) { error in
-			XCTAssertEqual(error as? TwoMLSPQSession.TwoMLSError, .archiveInvalid)
-		}
+				classicalProvider: classicalProvider, pqProvider: pqProvider))
 	}
 
 	func testFlippedPQLeafCustodySigningKeyThrowsArchiveInvalid() throws {
@@ -181,7 +175,7 @@ final class BornDedicatedMigrationTests: XCTestCase {
 		var export = try pair.bob.migrationExport()
 		export.pqLeafCustody?.pqSigningKey[0] ^= 0xFF
 		XCTAssertThrowsError(
-			try SessionMigrator.mintArchive(
+			try SessionMigrator.mint(
 				kind: .checkpoint, from: export,
 				classicalProvider: classicalProvider, pqProvider: pqProvider)
 		) { error in
@@ -189,20 +183,101 @@ final class BornDedicatedMigrationTests: XCTestCase {
 		}
 	}
 
-	// MARK: Negatives — refused before convergence
+	// MARK: Pre-convergence: now mints and drives a native session too
+	//
+	// A born-dedicated acceptor that hasn't installed its establishment envelope, or has
+	// installed but not yet converged, still exports cleanly (`owesEstablishmentEnvelope`
+	// reports the pre-install case; the custody search resolves whatever each leaf currently
+	// presents). These tests mint, restore natively, and keep driving the same protocol
+	// steps the live Rust pair would take next.
 
-	func testPreInstallBobExportThrowsSessionNotReady() throws {
+	func testPreInstallBobExportNowSucceeds() throws {
 		let pair = try RustSessionTestHelpers.bornDedicatedPending()
-		XCTAssertThrowsError(try pair.bob.migrationExport()) { error in
-			XCTAssertEqual(error as? TwoMLSPQBinding.TwoMlsPqError, .SessionNotReady)
+		let export = try pair.bob.migrationExport()
+		XCTAssertTrue(export.owesEstablishmentEnvelope)
+
+		let archive = try SessionMigrator.mint(
+			kind: .checkpoint, from: export,
+			classicalProvider: classicalProvider, pqProvider: pqProvider
+		).archive
+		var nativeBob = try TwoMLSPQSession.TwoMLSSession.restore(
+			core: nil, checkpoint: archive,
+			classicalProvider: classicalProvider, pqProvider: pqProvider)
+
+		// Bob owed his contract-26 handoff pre-migration; native enforces the same
+		// non-emittable gate, so install it before anything can send.
+		let signedEnvelope = Data("bd-signed-establishment-delegation".utf8)
+		_ = try nativeBob.installEstablishmentEnvelope(signedEnvelope)
+
+		// Native bob's first frame carries the `0x0B` handoff staple, so Rust alice pauses
+		// on it; approve it out of band (mirroring `installMockEstablishmentEnvelope`) and
+		// she joins in the same call.
+		_ = try nativeBob.prepareToEncrypt()
+		let firstFrame = try nativeBob.encrypt(Data("bob-first".utf8))
+		let alicePaused = try XCTUnwrap(
+			pair.alice.processIncoming(ciphertext: firstFrame.frame))
+		let pending = try XCTUnwrap(alicePaused.pendingEstablishment)
+		XCTAssertEqual(pending.envelope, signedEnvelope)
+		let aliceResumed = try pair.alice.processIncomingApproved(
+			ciphertext: firstFrame.frame,
+			approvedEnvelopeDigest: Data(SHA256.hash(data: pending.envelope)),
+			approvedWelcomeDigest: Data(SHA256.hash(data: pending.welcome)),
+			expectedCreator: pair.dedicatedId)
+		XCTAssertEqual(
+			aliceResumed?.applicationMessage?.appMessageData, Data("bob-first".utf8))
+
+		_ = try pair.alice.prepareToEncrypt(proposing: nil)
+		let aliceFrame = try pair.alice.encrypt(appMessage: Data("alice-1".utf8))
+		let bobOpened = try nativeBob.processIncoming(aliceFrame.cipherText)
+		guard case .decrypted(let bobDecrypted) = bobOpened else {
+			XCTFail("expected a decrypted application frame, got \(bobOpened)")
+			return
 		}
+		XCTAssertEqual(bobDecrypted.applicationMessage, Data("alice-1".utf8))
 	}
 
-	func testInstalledButUnfoldedBobExportThrowsSessionNotReady() throws {
-		let (pair, _) = try RustSessionTestHelpers.bornDedicatedInstalledUnfolded()
-		XCTAssertThrowsError(try pair.bob.migrationExport()) { error in
-			XCTAssertEqual(error as? TwoMLSPQBinding.TwoMlsPqError, .SessionNotReady)
+	func testInstalledButUnfoldedBobExportNowSucceeds() throws {
+		let (pair, bobUpd) = try RustSessionTestHelpers.bornDedicatedInstalledUnfolded()
+		let export = try pair.bob.migrationExport()
+
+		let minted = try SessionMigrator.mint(
+			kind: .checkpoint, from: export,
+			classicalProvider: classicalProvider, pqProvider: pqProvider)
+		var nativeBob = try TwoMLSPQSession.TwoMLSSession.restore(
+			core: nil, checkpoint: minted.archive,
+			classicalProvider: classicalProvider, pqProvider: pqProvider)
+
+		// Alice folds bob's still-outstanding catch-up Upd (the recv-classical lag
+		// `leafKeys.recvClassical.pending[dedicatedId]` carried across the mint),
+		// converging her copy to his dedicated identity. Bob's install-then-confirm frame is
+		// his first-ever send but lands as a window entry rather than framed, so retry with
+		// the minted window blob on `.ownOfferWindowRequired`.
+		try pair.alice.queueProposal(digest: bobUpd.digest)
+		let alicePrepared = try pair.alice.prepareToEncrypt(proposing: nil)
+		XCTAssertTrue(
+			alicePrepared.didCommit, "alice's fold of bob's catch-up Upd should commit")
+		let aliceCommitFrame = try pair.alice.encrypt(appMessage: Data("alice-commit".utf8))
+		let bobOpened: TwoMLSPQSession.IncomingResult
+		do {
+			bobOpened = try nativeBob.processIncoming(aliceCommitFrame.cipherText)
+		} catch TwoMLSPQSession.TwoMLSError.ownOfferWindowRequired {
+			let window = try XCTUnwrap(
+				minted.ownOfferWindow,
+				"the mint must have returned a window if native demands one")
+			bobOpened = try nativeBob.processIncoming(
+				aliceCommitFrame.cipherText, ownOfferWindow: window.archive)
 		}
+		guard case .decrypted(let bobDecrypted) = bobOpened else {
+			XCTFail("expected a decrypted application frame, got \(bobOpened)")
+			return
+		}
+		XCTAssertEqual(bobDecrypted.applicationMessage, Data("alice-commit".utf8))
+		XCTAssertTrue(
+			bobDecrypted.didApplyRemoteCommit,
+			"native bob should see alice's fold of his catch-up applied")
+
+		try aliceSays(pair.alice, "post-convergence-alice", to: &nativeBob)
+		try bobSays(&nativeBob, "post-convergence-bob", to: pair.alice)
 	}
 
 	// MARK: - Native <-> Rust one-frame helpers (mirrors `RustSessionTestHelpers`)
@@ -228,9 +303,9 @@ final class BornDedicatedMigrationTests: XCTestCase {
 		_ = try bobSaysCapturingCore(&nativeBob, text, to: alice)
 	}
 
-	/// Like `bobSays`, but returns the `EncryptResult`'s own `.core`-kind `StateUpdate`
-	/// archive — the only public way to pull a fresh archive out of a live
-	/// `TwoMLSSession` (`makeSessionArchive` is `internal`).
+	/// Like `bobSays`, but also returns the `EncryptResult`'s `.core` `StateUpdate` archive —
+	/// the only public way to pull a fresh archive out of a live session (`makeSessionArchive`
+	/// is `internal`).
 	@discardableResult
 	private func bobSaysCapturingCore(
 		_ nativeBob: inout TwoMLSPQSession.TwoMLSSession, _ text: String,

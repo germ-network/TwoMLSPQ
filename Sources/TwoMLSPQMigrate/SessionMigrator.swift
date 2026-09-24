@@ -19,6 +19,10 @@ import TwoMLSPQSession
 // ingress restores each snapshot with its half's `CipherSuiteProvider`.
 // Everything cross-module is qualified — both packages define
 // `BlobKind`/`ClientID`-shaped names.
+//
+// `leafKeys` is always mapped and supplied, so the mint never falls back to
+// its identity-keyed conversion. `deployedState` mints into its own blob via
+// `mint(kind:from:...)`, never folded into the session archive.
 
 /// Migrates a legacy Rust session to a native, unsealed session
 /// `SecretArchive` — the app seals before persisting (this inherits the Rust
@@ -26,27 +30,48 @@ import TwoMLSPQSession
 /// the caller owns its sealing).
 @available(iOS 26, macOS 26, *)
 public enum SessionMigrator {
-	/// Map a raw FFI session migration export onto twomlspq-swift's
-	/// `MigratedSession` and mint the archive. Mint a `.checkpoint` for the
-	/// full state (PQ trees inline); a `.core` pairs with it in the app's
-	/// reconcile slots exactly as the native return cadence's blobs do (a
-	/// core alone is never restorable — the mint skips its trial restore).
+	/// The minted session archive, plus the own-offer window's own blob and
+	/// id when the export carried one — paired so a caller can't drop it.
+	public struct MintResult: Sendable {
+		public let archive: SecretArchive
+		public let ownOfferWindow: TwoMLSPQSession.MintedOwnOfferWindow?
+
+		public init(
+			archive: SecretArchive,
+			ownOfferWindow: TwoMLSPQSession.MintedOwnOfferWindow?
+		) {
+			self.archive = archive
+			self.ownOfferWindow = ownOfferWindow
+		}
+	}
+
+	/// Maps a raw FFI session migration export onto twomlspq-swift's inputs
+	/// and mints. `.checkpoint` carries the full state inline; `.core` pairs
+	/// with it in the app's reconcile slots (never restorable alone). An
+	/// own-offer window, if the export carries one, mints into its own blob
+	/// from the same parts, so the two ids always agree.
 	///
-	/// - Throws: `TwoMLSError.archiveInvalid` (from the mint, the checked
-	///   `componentId` narrowing, or a duplicate key in an epoch-keyed export
-	///   list) if any exported part fails its cross-check — the Rust export,
-	///   not this mapping, is the suspect.
-	public static func mintArchive(
+	/// - Throws: `TwoMLSError.archiveInvalid` if any exported part fails its
+	///   cross-check — the Rust export, not this mapping, is the suspect.
+	public static func mint(
 		kind: TwoMLSPQSession.BlobKind,
 		from export: TwoMLSPQBinding.SessionMigrationExport,
 		classicalProvider: any MLS.CipherSuiteProvider,
 		pqProvider: any MLS.CipherSuiteProvider
-	) throws -> SecretArchive {
-		try TwoMLSPQSession.SessionMigration.mintArchive(
-			kind: kind,
-			parts: migratedSession(export),
-			classicalProvider: classicalProvider,
-			pqProvider: pqProvider)
+	) throws -> MintResult {
+		let parts = try migratedSession(export)
+		let deployed = try migratedDeployedState(export.deployedState)
+		let archive = try TwoMLSPQSession.SessionMigration.mintArchive(
+			kind: kind, parts: parts, classicalProvider: classicalProvider,
+			pqProvider: pqProvider, deployedState: deployed)
+		let window: TwoMLSPQSession.MintedOwnOfferWindow?
+		if let ownOffers = deployed?.ownOffers {
+			window = try TwoMLSPQSession.SessionMigration.mintOwnOfferWindow(
+				ownOffers, parts: parts, classicalProvider: classicalProvider)
+		} else {
+			window = nil
+		}
+		return MintResult(archive: archive, ownOfferWindow: window)
 	}
 
 	/// Byte-map the whole export. Every field is verbatim from the export —
@@ -95,6 +120,7 @@ public enum SessionMigrator {
 					digest: $0.digest, message: $0.message)
 			},
 			sendCrossPSKLedger: pskLedger(export.sendCrossPskLedger),
+			rotationCandidate: try export.rotationCandidate.map(rotationCandidate),
 			spawnToken: export.spawnToken,
 			listenRendezvous: epochMap(export.listenRendezvous),
 			recvHeaderKeys: epochMap(export.recvHeaderKeys),
@@ -107,26 +133,112 @@ public enum SessionMigrator {
 			recvLeafPrincipal: try export.pqLeafCustody.map {
 				try recvLeafPrincipal($0, identity: export.identity)
 			},
-			owesEstablishmentEnvelope: export.owesEstablishmentEnvelope)
+			owesEstablishmentEnvelope: export.owesEstablishmentEnvelope,
+			leafKeys: try leafKeys(export.leafKeys),
+			initialAppPayload: export.initialAppPayload)
 	}
 
-	/// The Rust session no longer holds the invitation's classical signer —
-	/// mls-rs drops it at the recv-classical catch-up this export requires —
-	/// so the classical slot carries the identity's own pair instead. That is
-	/// exactly what the converged recv-classical leaf presents.
-	///
-	/// This makes native's classical custody arm for `recvLeafPrincipal`
-	/// (`classicalSigningKey(presenting:)`) unreachable for a session this
-	/// mapper produces: that arm is gated on `recvLeafPrincipal.signatureKey`
-	/// matching the presented key, but this mapper sets it to
-	/// `identity.signatureKey` — the SAME value the identity arm above it
-	/// already matches first. The recv-leaf catch-up arms, which read the
-	/// classical custody key directly, never fire either: they require the
-	/// recv-classical leaf to still lag the canonical identity and to present
-	/// `clientID` (the invitation id), and this export requires that leaf to
-	/// have converged. Only the PQ half of this mixed record is ever read back
-	/// out (`pqSigningKey(presenting:)`'s `recvLeafPrincipal` arm, where
-	/// `pqSignatureKey` is the genuinely different custodied key).
+	/// Always mapped and supplied — the mint never takes its identity-keyed
+	/// fallback for a session this mapper produces.
+	private static func leafKeys(
+		_ keys: TwoMLSPQBinding.SessionMigrationLeafKeys
+	) throws -> TwoMLSPQSession.MigratedLeafKeys {
+		try TwoMLSPQSession.MigratedLeafKeys(
+			sendClassical: groupKeys(keys.sendClassical),
+			recvClassical: groupKeys(keys.recvClassical),
+			sendPQ: groupKeys(keys.sendPq),
+			recvPQ: groupKeys(keys.recvPq))
+	}
+
+	private static func groupKeys(
+		_ keys: TwoMLSPQBinding.SessionMigrationGroupKeys
+	) throws -> TwoMLSPQSession.MigratedGroupKeys {
+		try TwoMLSPQSession.MigratedGroupKeys(
+			current: keys.current.map(leafKey),
+			pending: keys.pending.map(pendingLeafKey))
+	}
+
+	private static func leafKey(
+		_ key: TwoMLSPQBinding.SessionMigrationKeyPair
+	) throws -> TwoMLSPQSession.MigratedLeafKey {
+		try TwoMLSPQSession.MigratedLeafKey(
+			signingKey: SecretBytes(bytes: key.signingKey),
+			signatureKey: key.signatureKey)
+	}
+
+	private static func pendingLeafKey(
+		_ entry: TwoMLSPQBinding.SessionMigrationPendingLeafKey
+	) throws -> TwoMLSPQSession.MigratedPendingLeafKey {
+		try TwoMLSPQSession.MigratedPendingLeafKey(
+			target: entry.target, key: leafKey(entry.key))
+	}
+
+	private static func rotationCandidate(
+		_ candidate: TwoMLSPQBinding.SessionMigrationRotationCandidate
+	) throws -> TwoMLSPQSession.MigratedRotationCandidate {
+		try TwoMLSPQSession.MigratedRotationCandidate(
+			clientID: candidate.targetClientId,
+			signingKey: SecretBytes(bytes: candidate.signingKey),
+			signatureKey: candidate.signatureKey,
+			proposedAtRecvEpoch: candidate.proposedAtRecvEpoch)
+	}
+
+	/// `nil` in, `nil` out — the Rust side only populates this when
+	/// something in it is non-empty or true.
+	private static func migratedDeployedState(
+		_ state: TwoMLSPQBinding.SessionMigrationDeployedState?
+	) throws -> TwoMLSPQSession.MigratedDeployedState? {
+		guard let state else { return nil }
+		return TwoMLSPQSession.MigratedDeployedState(
+			ownOffers: try state.ownOffers.map(ownOfferWindow),
+			pqWedged: state.pqWedged.map(pqWedge),
+			noCustody: noCustody(state.noCustody))
+	}
+
+	private static func ownOfferWindow(
+		_ window: TwoMLSPQBinding.SessionMigrationOwnOfferWindow
+	) throws -> TwoMLSPQSession.MigratedOwnOfferWindow {
+		TwoMLSPQSession.MigratedOwnOfferWindow(
+			epoch: window.epoch, groupID: window.groupId,
+			senderLeafIndex: window.senderLeafIndex,
+			offers: try window.offers.map(ownOffer))
+	}
+
+	private static func ownOffer(
+		_ offer: TwoMLSPQBinding.SessionMigrationOwnOffer
+	) throws -> TwoMLSPQSession.MigratedOwnOffer {
+		try TwoMLSPQSession.MigratedOwnOffer(
+			ref: offer.proposalRef, proposal: offer.proposal,
+			leafSecret: SecretBytes(bytes: offer.leafSecret))
+	}
+
+	private static func pqWedge(
+		_ kind: TwoMLSPQBinding.SessionMigrationPqWedgeKind
+	) -> TwoMLSPQSession.MigratedPQWedge {
+		switch kind {
+		case .bootstrap: return .bootstrap
+		case .ratchet: return .ratchet
+		case .rekey: return .rekey
+		}
+	}
+
+	private static func noCustody(
+		_ flags: TwoMLSPQBinding.SessionMigrationNoCustody
+	) -> Set<TwoMLSPQSession.MigratedGroupRole> {
+		var roles: Set<TwoMLSPQSession.MigratedGroupRole> = []
+		if flags.sendClassical { roles.insert(.sendClassical) }
+		if flags.sendPq { roles.insert(.sendPQ) }
+		if flags.recvClassical { roles.insert(.recvClassical) }
+		if flags.recvPq { roles.insert(.recvPQ) }
+		return roles
+	}
+
+	/// The classical slot always carries the identity's own pair, since the
+	/// export doesn't require convergence and the actual (possibly still
+	/// pre-convergence) key lives in `leafKeys.recvClassical` instead. Only
+	/// the PQ half of this record is ever read back — the classical arm it
+	/// would otherwise feed is already unreachable, gated on the same
+	/// `identity.signatureKey` the identity arm above it matches first.
 	private static func recvLeafPrincipal(
 		_ custody: TwoMLSPQBinding.SessionMigrationPqLeafCustody,
 		identity: TwoMLSPQBinding.SessionMigrationIdentity

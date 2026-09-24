@@ -32,9 +32,10 @@ final class NonDedicatedEarlyExportTests: XCTestCase {
 				+ "parameter, not a staple — he needs it to dedup alice's later re-staples"
 		)
 
-		let archive = try SessionMigrator.mintArchive(
+		let archive = try SessionMigrator.mint(
 			kind: .checkpoint, from: export,
-			classicalProvider: classicalProvider, pqProvider: pqProvider)
+			classicalProvider: classicalProvider, pqProvider: pqProvider
+		).archive
 		var nativeBob = try TwoMLSPQSession.TwoMLSSession.restore(
 			core: nil, checkpoint: archive,
 			classicalProvider: classicalProvider, pqProvider: pqProvider)
@@ -80,19 +81,19 @@ final class NonDedicatedEarlyExportTests: XCTestCase {
 		XCTAssertEqual(bobDecrypted2.applicationMessage, Data("alice-2".utf8))
 	}
 
-	/// Mutation: blank `joinedWelcomeDigest` in the export — the mint still succeeds (the
-	/// field is optional data, not cross-checked at mint time), but the flow it exists to
-	/// support breaks downstream: native bob can no longer recognize alice's re-stapled
-	/// birth welcome as an already-joined repeat, and `processIncoming` throws
-	/// `.unexpectedWelcome` instead of decrypting.
+	/// Blanking `joinedWelcomeDigest` doesn't break the mint (the field isn't cross-checked
+	/// there), but native bob then can't recognize alice's re-stapled birth welcome as an
+	/// already-joined repeat, and `processIncoming` throws `.unexpectedWelcome` instead of
+	/// decrypting.
 	func testNilJoinedWelcomeDigestBreaksTheReStapleDedup() throws {
 		let (aliceSession, bobSession) = try establishNonDedicatedPair()
 		var export = try bobSession.migrationExport()
 		export.joinedWelcomeDigest = nil
 
-		let archive = try SessionMigrator.mintArchive(
+		let archive = try SessionMigrator.mint(
 			kind: .checkpoint, from: export,
-			classicalProvider: classicalProvider, pqProvider: pqProvider)
+			classicalProvider: classicalProvider, pqProvider: pqProvider
+		).archive
 		var nativeBob = try TwoMLSPQSession.TwoMLSSession.restore(
 			core: nil, checkpoint: archive,
 			classicalProvider: classicalProvider, pqProvider: pqProvider)

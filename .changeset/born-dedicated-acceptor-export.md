@@ -2,21 +2,21 @@
 "@germ-network/two-mls-pq": minor
 ---
 
-`TwoMlsPqSession.migrationExport()` now admits a born-dedicated acceptor, once its
-establishment envelope has installed and its recv-classical leaf has caught up, and an
-acceptor still holding its parked return welcome (previously refused on both). The
-recv-PQ leaf a born-dedicated acceptor's session never catches up now exports as a new
-`pqLeafCustody` field, so the app's migrator can seat it correctly on the migrated
-side. `BINDING_CONTRACT_VERSION` bumps 35 → 36 for the new record and field.
+`TwoMlsPqSession.migrationExport()` now exports every reachable session state instead of
+refusing unsettled ones: pre-establishment initiators, born-dedicated acceptors at any point,
+staged rotation candidates, lagging leaves, and parked or wedged PQ rounds. It fails only on
+corrupt data (`ArchiveInvalid`). The export carries per-group signing keys (`leafKeys`), the
+rotation candidate, an own-offer window with its leaf secrets, and deployed-engine flags
+(`deployedState`). `BINDING_CONTRACT_VERSION` bumps 35 → 36.
 
-That catch-up happens only once the peer folds the acceptor's catch-up offer. A caller
-that folds only offers introducing a new client never folds it, so such born-dedicated
-acceptors remain refused until a later release carries unconverged custody.
+`SessionMigrator.mintArchive(kind:from:classicalProvider:pqProvider:)` is removed.
+`SessionMigrator.mint(kind:from:classicalProvider:pqProvider:)` returns a `MintResult`: the
+session archive plus, when present, the minted own-offer window, which the caller must persist
+before the archive.
 
-Also corrects the 0.17.0 changelog's claim that group state written before that
-release ("pre-v35") no longer loads: it does. Sessions written by v0.16.0 restore and
-keep messaging under this engine, pinned by fixtures.
+`SessionError.Code.misroutedFrame` now has disposition `.discardFrame` (was `.callerBug`): an
+ill-timed side-band re-send is normal traffic. This shifts app-side handling and any analytics
+bucketed by disposition.
 
-`SessionError.Code.misroutedFrame` now has disposition `.discardFrame` (was `.callerBug`): an ill-timed
-side-band re-send is normal traffic, and the peer re-sends until answered, so dropping it is lossless.
-This shifts app-side handling and any analytics bucketed by disposition.
+Also corrects the 0.17.0 changelog's claim that pre-v35 group state no longer loads: it does,
+and sessions written by v0.15.0 and v0.16.0 restore and migrate, pinned by fixtures.

@@ -64,11 +64,11 @@ enum RustSessionTestHelpers {
 	}
 
 	/// A born-dedicated pair PRE-INSTALL, raw FFI: alice initiates to bob's invitation, and
-	/// bob `receive`s under a DEDICATED client id (≠ the invitation id) — matching the Rust
-	/// suite's `born_dedicated_pending` (NOT `SessionMigrationTests`' `establishedSessionPair`
-	/// pipelined-A.3 shape: no parallel bootstrap-KP envelope is read here, matching how
-	/// `TwoMlsPqInvitation.receive` is actually driven with a dedicated id). Bob owes his
-	/// establishment envelope; alice still knows him as the invitation identity.
+	/// bob `receive`s under a DEDICATED client id (≠ the invitation id) — unlike
+	/// `SessionMigrationTests`' pipelined-A.3 `establishedSessionPair`, no parallel
+	/// bootstrap-KP envelope is read here, matching how `TwoMlsPqInvitation.receive` is
+	/// actually driven with a dedicated id. Bob owes his establishment envelope; alice
+	/// still knows him as the invitation identity.
 	static func bornDedicatedPending(
 		file: StaticString = #filePath, line: UInt = #line
 	) throws -> BornDedicatedPair {
@@ -106,7 +106,7 @@ enum RustSessionTestHelpers {
 			invitationId: invitationId)
 	}
 
-	/// Contract 26: install the mock delegation on `pair.bob`, returning its bytes.
+	/// Install the mock delegation on `pair.bob`, returning its bytes.
 	@discardableResult
 	static func installMockEstablishmentEnvelope(_ pair: BornDedicatedPair) throws -> Data {
 		let signedEnvelope = Data("bd-signed-establishment-delegation".utf8)
@@ -139,13 +139,39 @@ enum RustSessionTestHelpers {
 		return (pair, bobUpd)
 	}
 
+	/// `bornDedicatedInstalledUnfolded`'s same-id-candidate variant: the mandatory handoff
+	/// frame proposes `Some(pair.dedicatedId)` (`admit_candidate` mints a fresh K′) instead
+	/// of `nil` (a plain identity-signed self-refresh) — a real K′ offer outstanding at
+	/// rest. Neither queues nor commits bob's catch-up Upd.
+	static func bornDedicatedSameIdHandoffUnfolded(
+		file: StaticString = #filePath, line: UInt = #line
+	) throws -> (pair: BornDedicatedPair, bobUpd: QueuedRemoteProposal) {
+		let pair = try bornDedicatedPending(file: file, line: line)
+		let signedEnvelope = try installMockEstablishmentEnvelope(pair)
+		_ = try pair.bob.prepareToEncrypt(
+			proposing: TwoMLSPQBinding.ClientId(bytes: pair.dedicatedId))
+		let confirmB = try pair.bob.encrypt(appMessage: Data("confirm-b".utf8))
+		let paused = try XCTUnwrap(
+			pair.alice.processIncoming(ciphertext: confirmB.cipherText), file: file,
+			line: line)
+		let pending = try XCTUnwrap(paused.pendingEstablishment, file: file, line: line)
+		XCTAssertEqual(pending.envelope, signedEnvelope, file: file, line: line)
+		XCTAssertEqual(pending.welcome.first, 0x01, file: file, line: line)
+		let resumed = try pair.alice.processIncomingApproved(
+			ciphertext: confirmB.cipherText,
+			approvedEnvelopeDigest: Data(SHA256.hash(data: pending.envelope)),
+			approvedWelcomeDigest: Data(SHA256.hash(data: pending.welcome)),
+			expectedCreator: pair.dedicatedId)
+		let bobUpd = try XCTUnwrap(resumed?.proposal, file: file, line: line)
+		return (pair, bobUpd)
+	}
+
 	/// A born-dedicated pair, raw FFI, through classical convergence and the A.3 bootstrap +
-	/// bind discharge — the shape of the Rust suite's `test_dedicated_principal_full_lifecycle`
-	/// up to (not including) its trailing message exchange. Bob holds the PQ turn and NOTHING
-	/// is mid-flight right at return (no message has been sent since the discharge, so
-	/// nothing has auto-staged — contrast `bornDedicatedSessionPair`, whose trailing sends
-	/// legitimately do). NEVER calls `bob`'s `pendingOutbound()` — the app never drains an
-	/// acceptor's parked return welcome, so this pins that shape rather than the drained one.
+	/// bind discharge, up to (not including) a trailing message exchange. Bob holds the PQ
+	/// turn and nothing is mid-flight at return — contrast `bornDedicatedSessionPair`, whose
+	/// trailing sends legitimately auto-stage. Never calls `bob`'s `pendingOutbound()`: the
+	/// app never drains an acceptor's parked return welcome, so this pins that shape rather
+	/// than the drained one.
 	static func bornDedicatedSessionPairAtDischarge(
 		file: StaticString = #filePath, line: UInt = #line
 	) throws -> BornDedicatedPair {
@@ -188,11 +214,10 @@ enum RustSessionTestHelpers {
 	}
 
 	/// `bornDedicatedSessionPairAtDischarge` plus a message each way. Bob's own send here
-	/// legitimately auto-stages a speculative A.4 EK (mirrors Rust's
-	/// `maybe_stage_next_round`, which fires on every turn-holder send) — a caller that
-	/// needs `pqRekeyBegin`'s clean-slate precondition should use the discharge-point
-	/// helper above instead, not drain this one (draining a completed round passes the PQ
-	/// turn away, same as any other bind discharge).
+	/// legitimately auto-stages a speculative A.4 EK (fires on every turn-holder send) — a
+	/// caller needing `pqRekeyBegin`'s clean-slate precondition should use the
+	/// discharge-point helper above instead: draining a completed round passes the PQ turn
+	/// away, same as any other bind discharge.
 	static func bornDedicatedSessionPair(
 		file: StaticString = #filePath, line: UInt = #line
 	) throws -> BornDedicatedPair {
