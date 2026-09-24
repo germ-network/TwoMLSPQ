@@ -134,10 +134,13 @@ the AD of the app message, then header-encrypts the outermost message. Assessmen
   without comparing either against the app message's AD, and the AD is not exposed
   across the FFI. Component-binding today rests on the digest CommProtocol binds
   *inside the encrypted app payload*, not on the AD. Header encryption incidentally
-  restores frame-level splice resistance against network adversaries — the outer
-  AEAD covers all sections of a frame as one unit — but peer-level mix-and-match
-  hardening (checking the AD on receive, as classical does) remains a separate,
-  worthwhile fix, orthogonal to this design.
+  restores frame-level splice resistance against network adversaries: every outbound
+  frame is sealed as one AEAD unit, so an adversary without the header keys never sees
+  a frame's sections to recombine. Like metadata hiding, this is a sender guarantee.
+  The receiver also accepts an already-opened frame (see **Receive rule**), so the
+  property does not extend to anyone who holds opened frames or the keys. Peer-level
+  mix-and-match hardening (checking the AD on receive, as classical does) remains a
+  separate, worthwhile fix, orthogonal to this design.
 - **Verdict: keep the frame format; do not import stapling.** Tagged frames keep
   the atomicity, parse cleanly, and their one real downside — a recognizable
   plaintext container — is exactly what header encryption removes.
@@ -375,9 +378,11 @@ indistinguishable, by construction. An opened-but-unrecognized tag is
 seal if present (`open_or_raw`), so a host may pass the sealed blob straight through
 for the message path and skip the explicit `open_incoming` (it still needs
 `open_incoming` to *route* side-band frames). An already-opened frame passes through —
-it fails AEAD auth under every window key. This is a receiver convenience only; the
+it fails AEAD auth under every window key. This is a receiver convenience only. The
 metadata-hiding property is a sender guarantee (every outbound frame is sealed), so
-accepting an opened frame downgrades nothing an observer sees.
+accepting an opened frame downgrades nothing an observer sees. Splice resistance
+against network adversaries is likewise a sender guarantee: it holds because no frame
+leaves unsealed, not because the receiver insists on the seal.
 
 **Observability caveat:** desyncs that mls-rs would once have surfaced loudly can read
 as a silent `None` here; a host tracking liveness should treat a run of `None`s on a
@@ -462,7 +467,8 @@ Header encryption hides the leading tag byte, so the host cannot route a raw blo
 Provides: metadata confidentiality (everything in the table above), unlinkability of
 stored ciphertexts across epochs and across the two directions, uniform-looking
 blobs, hybrid confidentiality for the metadata layer, whole-frame splice resistance
-against network adversaries, and — because the outer keys are symmetric and shared —
+against network adversaries (a sender guarantee: it follows from sealing every outbound
+frame, and receivers do not enforce it), and — because the outer keys are symmetric and shared —
 the same deniability shape as the inner protocol.
 
 Does not provide: timing obfuscation, or general traffic-analysis resistance beyond the
