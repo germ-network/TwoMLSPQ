@@ -499,6 +499,139 @@ final class RotatedRekeyHealTests: XCTestCase {
 		try alice.pqRekeyApply(msg: response.frame)
 	}
 
+	// MARK: - Rotated non-dedicated native opener announces its id to a Rust responder
+
+	/// Bob migrates and rotates c0 -> c1 natively. c0 is known to Rust alice only through her
+	/// history of bob's ids, not an A.3 pin. Bob's own A.5 then moves his lagging recv-PQ leaf
+	/// c0 -> c1 and announces c1, and Rust alice's responder accepts it. This is the
+	/// plain-rotation twin of the born-dedicated I -> D announce.
+	func testMigratedRotatedOpenerAnnouncesItsIdToRustResponder() throws {
+		let (alice, bob) = try establishedNonDedicatedPair()
+		let archive = try SessionMigrator.mint(
+			kind: .checkpoint, from: try bob.migrationExport(),
+			classicalProvider: classicalProvider, pqProvider: pqProvider
+		).archive
+		var nativeBob = try TwoMLSPQSession.TwoMLSSession.restore(
+			core: nil, checkpoint: archive,
+			classicalProvider: classicalProvider, pqProvider: pqProvider)
+		let c0 = nativeBob.myPrincipalState.clientID
+		XCTAssertEqual(try recvPQLeafID(of: nativeBob), c0)
+
+		let c1 = Data("rrh-bob-c1".utf8)
+		_ = try nativeBob.prepareToEncrypt(rotating: c1)
+		let bobOffer = try nativeBob.encrypt(Data("bob-rotate".utf8))
+		let aliceGot = try XCTUnwrap(alice.processIncoming(ciphertext: bobOffer.frame))
+		try alice.queueProposal(digest: try XCTUnwrap(aliceGot.proposal).digest)
+		XCTAssertTrue(try alice.prepareToEncrypt(proposing: nil).didCommit)
+		let aliceFold = try alice.encrypt(appMessage: Data("alice-fold".utf8))
+		guard case .decrypted = try nativeBob.processIncoming(aliceFold.cipherText) else {
+			return XCTFail("expected native bob to decrypt alice's fold")
+		}
+		XCTAssertEqual(nativeBob.myPrincipalState, .sync(c1))
+
+		// Holding the turn, bob auto-staged an A.4 on alice's fold. Drain it and then alice's
+		// answering A.4, so the turn comes back to bob at a discharge with nothing staged,
+		// the clean slate `pqRekeyBegin` needs.
+		try drainNativeA4(from: &nativeBob, to: alice)
+		try drainRustA4(from: alice, to: &nativeBob)
+		XCTAssertEqual(try recvPQLeafID(of: nativeBob), c0, "the recv-PQ leaf lags")
+
+		XCTAssertTrue(nativeBob.myPQTurn)
+		let begin = try nativeBob.pqRekeyBegin()
+		let announced = try alice.pqRekeyRespond(updMsg: begin.frame)
+		XCTAssertEqual(announced?.bytes, c1)
+		let commitFrame = try XCTUnwrap(alice.pqTakePendingOutbound())
+		_ = try nativeBob.pqRekeyApply(commitFrame)
+		// Alice's copy agrees: applying her Commit' checks the tree it confirms, which holds
+		// bob's c1 leaf.
+		XCTAssertEqual(try recvPQLeafID(of: nativeBob), c1)
+
+		// Bind discharge: alice offers an Upd, native bob (the binder) folds and commits it.
+		_ = try alice.prepareToEncrypt(proposing: nil)
+		let aliceUpd = try alice.encrypt(appMessage: Data("a5-bind-upd".utf8))
+		guard
+			case .decrypted(let bobDecrypted) = try nativeBob.processIncoming(
+				aliceUpd.cipherText)
+		else {
+			return XCTFail("expected native bob to decrypt alice's Upd")
+		}
+		_ = try nativeBob.queueProposal(digest: bobDecrypted.queuedProposal.digest)
+		XCTAssertTrue(try nativeBob.prepareToEncrypt().didCommit)
+		let bobCommit = try nativeBob.encrypt(Data("a5-bind-commit".utf8))
+		let aliceGotCommit = try XCTUnwrap(
+			alice.processIncoming(ciphertext: bobCommit.frame))
+		XCTAssertEqual(
+			aliceGotCommit.applicationMessage?.appMessageData,
+			Data("a5-bind-commit".utf8))
+
+		_ = try alice.prepareToEncrypt(proposing: nil)
+		let aliceMsg = try alice.encrypt(appMessage: Data("post-a5-alice".utf8))
+		guard
+			case .decrypted(let bobGot) = try nativeBob.processIncoming(
+				aliceMsg.cipherText)
+		else {
+			return XCTFail("expected native bob to decrypt alice's message")
+		}
+		XCTAssertEqual(bobGot.applicationMessage, Data("post-a5-alice".utf8))
+	}
+
+	/// Native bob's parked A.4: alice answers, bob binds, and alice's Upd folded by bob
+	/// discharges the bind, passing the turn to alice.
+	private func drainNativeA4(
+		from nativeBob: inout TwoMLSPQSession.TwoMLSSession,
+		to alice: TwoMLSPQBinding.TwoMlsPqSession
+	) throws {
+		let ek = try XCTUnwrap(nativeBob.pqPendingOutbound())
+		try alice.pqRatchetRespond(ekMsg: ek)
+		_ = try nativeBob.pqRatchetBind(try XCTUnwrap(alice.pqTakePendingOutbound()))
+		_ = try alice.prepareToEncrypt(proposing: nil)
+		let aliceUpd = try alice.encrypt(appMessage: Data("a4-bind-upd".utf8))
+		guard
+			case .decrypted(let opened) = try nativeBob.processIncoming(
+				aliceUpd.cipherText)
+		else {
+			return XCTFail("expected native bob to decrypt alice's Upd")
+		}
+		_ = try nativeBob.queueProposal(digest: opened.queuedProposal.digest)
+		XCTAssertTrue(try nativeBob.prepareToEncrypt().didCommit)
+		let bobCommit = try nativeBob.encrypt(Data("a4-bind-commit".utf8))
+		_ = try XCTUnwrap(alice.processIncoming(ciphertext: bobCommit.frame))
+		XCTAssertTrue(alice.myPqTurn())
+	}
+
+	/// Alice's A.4 on her next send: native bob answers, alice binds, and bob's Upd folded by
+	/// alice discharges the bind, passing the turn back to bob.
+	private func drainRustA4(
+		from alice: TwoMLSPQBinding.TwoMlsPqSession,
+		to nativeBob: inout TwoMLSPQSession.TwoMLSSession
+	) throws {
+		_ = try alice.prepareToEncrypt(proposing: nil)
+		let aliceMsg = try alice.encrypt(appMessage: Data("a4-open".utf8))
+		guard case .decrypted = try nativeBob.processIncoming(aliceMsg.cipherText) else {
+			return XCTFail("expected native bob to decrypt alice's message")
+		}
+		let ek = try XCTUnwrap(alice.pqPendingOutbound(sealing: .fresh))
+		let ct = try nativeBob.pqRatchetRespond(ek)
+		try alice.pqRatchetBind(ctMsg: ct.frame)
+		_ = try nativeBob.prepareToEncrypt()
+		let bobUpd = try nativeBob.encrypt(Data("a4-bind-upd".utf8))
+		let offered = try XCTUnwrap(
+			alice.processIncoming(ciphertext: bobUpd.frame)?.proposal)
+		try alice.queueProposal(digest: offered.digest)
+		XCTAssertTrue(try alice.prepareToEncrypt(proposing: nil).didCommit)
+		let aliceCommit = try alice.encrypt(appMessage: Data("a4-bind-commit".utf8))
+		guard case .decrypted = try nativeBob.processIncoming(aliceCommit.cipherText) else {
+			return XCTFail("expected native bob to decrypt alice's discharge")
+		}
+		XCTAssertTrue(nativeBob.myPQTurn)
+	}
+
+	private func recvPQLeafID(of session: TwoMLSPQSession.TwoMLSSession) throws -> Data {
+		let group = try XCTUnwrap(session.recvGroup?.pq)
+		return try TwoMLSPQSession.basicIdentifier(
+			TwoMLSPQSession.TwoMLSSession.ownLeaf(of: group).credential)
+	}
+
 	private func sendPQLeafID(of session: TwoMLSPQSession.TwoMLSSession) throws -> Data {
 		let group = try XCTUnwrap(session.sendGroup?.pq)
 		return try TwoMLSPQSession.basicIdentifier(
