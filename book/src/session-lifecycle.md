@@ -223,7 +223,8 @@ under it (Establishment, above).
 ## Invitations & replayed initial frames
 
 A published key package is backed by a self-contained **`TwoMlsPqInvitation`** (the
-signing identity plus the key package's private material) rather than a live client;
+credential plus the key package's private material, including its signing keys) rather
+than a live client;
 one invitation services many welcomes, deduplicating repeats per remote
 (`DuplicateWelcome`). `receive(welcome, their_classical_kp, bootstrap_kp_commitment,
 spawn_token)` takes an opaque, caller-chosen, replay-stable token for the initial frame

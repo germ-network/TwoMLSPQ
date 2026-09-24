@@ -39,11 +39,10 @@ It does not otherwise depend on CommProtocol's identities and exposes an MLS cli
 of basic credentials.
 
 The app hands TwoMLSPQ the opaque **`ClientId`** of one of its **agents** — identity bytes.
-TwoMLSPQ builds a **`TwoMlsPqPrincipal`** for that ClientId, minting a fresh MLS leaf signing key
-internally. The ClientId is carried as the MLS Basic Credential — identity trust comes
-from the app layer, not an
-external Authentication Service — and the signing key that authenticates the leaf lives
-inside this library and never crosses the boundary. Everything above the ClientId is outside
+TwoMLSPQ builds a **`TwoMlsPqPrincipal`** for that ClientId, and mints the MLS leaf signing
+keys internally. The ClientId is carried as the MLS Basic Credential — identity trust comes
+from the app layer, not an external Authentication Service — and the signing keys that
+authenticate its leaves live inside this library and never cross the boundary. Everything above the ClientId is outside
 this library's boundary.
 
 ## How a session is built

@@ -11,13 +11,16 @@ operations for a credential funnel through the one object.
 TwoMLSPQ deliberately breaks this up into three app-facing objects, each owning
 exactly the state its job needs:
 
-- **`TwoMlsPqPrincipal`** — the principal: a credential-scoped signing identity. Its job
-  is minting key packages and invitations and holding their private material only until it
-  is captured into an invitation (`generate_invitation` purges the principal's own copies).
-  It is not a hub for group operations.
+- **`TwoMlsPqPrincipal`** — the principal: a credential-scoped identity (one MLS Basic
+  Credential). Its job is minting key packages and invitations and holding their private
+  material only until it is captured into an invitation (`generate_invitation` purges the
+  principal's own copies). It is not a hub for group operations. Each half of a key package
+  it mints carries a signing key, and that key is the one its owner signs with in the group
+  the half joins (see [Group Rules](./group-rules.md), rule 4). A principal may use one
+  signing key for every half it mints, or a fresh key per half; both conform.
 - **`TwoMlsPqInvitation`** — a self-contained receiving capability: one published
-  combiner key package's private material, the signing identity, and the
-  consumed-remote replay guard. It turns welcomes into sessions with no live client
+  combiner key package's private material (each half's HPKE and signing keys), the
+  credential it was minted under, and the consumed-remote replay guard. It turns welcomes into sessions with no live client
   and survives restarts through its own archive. TwoMLS manages the key package's
   lifetime itself rather than via mls-rs's on-the-wire last-resort extension: a
   *last-resort* invitation retains its key package to accept many welcomes, while a
@@ -34,7 +37,7 @@ CommProtocol's `Agent` (this crate is CommProtocol-agnostic):
 
 | mls-rs | TwoMLSPQ | role |
 |---|---|---|
-| `Client` | **`TwoMlsPqPrincipal`** | credential-scoped signer; mints invitations & sessions |
+| `Client` | **`TwoMlsPqPrincipal`** | credential-scoped identity; mints key packages, invitations & sessions |
 | `KeyPackage` | **`TwoMlsPqInvitation`** | one published key package's private material |
 | group | **`TwoMlsPqSession`** | one established pairwise channel |
 
