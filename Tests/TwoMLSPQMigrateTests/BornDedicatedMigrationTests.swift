@@ -157,6 +157,69 @@ final class BornDedicatedMigrationTests: XCTestCase {
 		try bobSays(&nativeBob, "post-a5-bob", to: pair.alice)
 	}
 
+	// MARK: - No catch-up A.5 until the peer folds the catch-up offer
+
+	/// A deployed host that never folds a born-dedicated acceptor's catch-up offers (book
+	/// anomaly 3) leaves alice knowing bob only by the invitation id, so she would never
+	/// accept a catch-up A.5 moving I -> D. Native bob keeps ratcheting A.4 until alice folds
+	/// his catch-up offer. His next turn then opens the catch-up, and alice accepts it,
+	/// announcing D.
+	func testMigratedAcceptorRatchetsA4UntilRustFoldsItsCatchUp() throws {
+		let (pair, _) = try RustSessionTestHelpers.bornDedicatedInstalledUnfolded()
+		let alice = pair.alice
+
+		// Bob folds alice's Upd, but alice never folds bob's catch-up offer. She discharges
+		// the A.3 bind with a commit that folds nothing of his.
+		_ = try alice.prepareToEncrypt(proposing: nil)
+		let aliceUpd = try alice.encrypt(appMessage: Data("confirm-a".utf8))
+		let aliceOffer = try XCTUnwrap(
+			pair.bob.processIncoming(ciphertext: aliceUpd.cipherText)?.proposal)
+		try pair.bob.queueProposal(digest: aliceOffer.digest)
+		XCTAssertTrue(try pair.bob.prepareToEncrypt(proposing: nil).didCommit)
+		let bobCommit = try pair.bob.encrypt(appMessage: Data("confirm-b".utf8))
+		_ = try alice.processIncoming(ciphertext: bobCommit.cipherText)
+		let kp = try alice.pqBootstrapBegin(rotating: nil)
+		try pair.bob.pqBootstrapRespond(kpMsg: kp)
+		try alice.pqBootstrapBind(
+			welcomeMsg: try XCTUnwrap(pair.bob.pqTakePendingOutbound()))
+		XCTAssertTrue(try alice.prepareToEncrypt(proposing: nil).didCommit)
+		let discharge = try alice.encrypt(appMessage: Data("a3-discharge".utf8))
+		_ = try pair.bob.processIncoming(ciphertext: discharge.cipherText)
+		XCTAssertTrue(pair.bob.myPqTurn())
+
+		let archive = try SessionMigrator.mint(
+			kind: .checkpoint, from: try pair.bob.migrationExport(),
+			classicalProvider: classicalProvider, pqProvider: pqProvider
+		).archive
+		var nativeBob = try TwoMLSPQSession.TwoMLSSession.restore(
+			core: nil, checkpoint: archive,
+			classicalProvider: classicalProvider, pqProvider: pqProvider)
+
+		// Two full PQ cycles while alice never folds: every turn of bob's opens an A.4.
+		for cycle in 0..<2 {
+			let leg = try bobOpensTurn(&nativeBob, to: alice)
+			XCTAssertEqual(
+				try alice.openIncoming(blob: leg)?.kind,
+				.pqSideBand(kind: .ratchetEphemeralKey),
+				"cycle \(cycle): no catch-up A.5 before alice folds")
+			try completeBobsA4(leg, &nativeBob, with: alice)
+			try completeAlicesA4(alice, with: &nativeBob, foldingBobsOffer: false)
+		}
+
+		// Alice folds bob's catch-up offer at her next discharge, and bob's next turn opens
+		// the catch-up.
+		let leg = try bobOpensTurn(&nativeBob, to: alice)
+		try completeBobsA4(leg, &nativeBob, with: alice)
+		try completeAlicesA4(alice, with: &nativeBob, foldingBobsOffer: true)
+		let catchUp = try bobOpensTurn(&nativeBob, to: alice)
+		XCTAssertEqual(
+			try alice.openIncoming(blob: catchUp)?.kind, .pqSideBand(kind: .rekeyUpdate)
+		)
+		let announced = try alice.pqRekeyRespond(updMsg: catchUp)
+		XCTAssertEqual(announced?.bytes, pair.dedicatedId)
+		_ = try nativeBob.pqRekeyApply(try XCTUnwrap(alice.pqTakePendingOutbound()))
+	}
+
 	// MARK: Mutations
 
 	/// Nulling `pqLeafCustody` doesn't break the mint: `leafKeys` is authoritative for key
@@ -281,6 +344,70 @@ final class BornDedicatedMigrationTests: XCTestCase {
 
 		try aliceSays(pair.alice, "post-convergence-alice", to: &nativeBob)
 		try bobSays(&nativeBob, "post-convergence-bob", to: pair.alice)
+	}
+
+	// MARK: - PQ round helpers
+
+	/// Native bob sends on his PQ turn and returns the side-band leg that send parked.
+	private func bobOpensTurn(
+		_ nativeBob: inout TwoMLSPQSession.TwoMLSSession,
+		to alice: TwoMLSPQBinding.TwoMlsPqSession
+	) throws -> Data {
+		XCTAssertTrue(nativeBob.myPQTurn)
+		_ = try nativeBob.prepareToEncrypt()
+		let frame = try nativeBob.encrypt(Data("bob-turn".utf8))
+		_ = try XCTUnwrap(alice.processIncoming(ciphertext: frame.frame))
+		return try XCTUnwrap(nativeBob.pqPendingOutbound())
+	}
+
+	/// Bob's A.4: alice answers, bob binds, and alice's Upd folded by bob discharges the
+	/// bind, passing the turn to alice.
+	private func completeBobsA4(
+		_ ek: Data, _ nativeBob: inout TwoMLSPQSession.TwoMLSSession,
+		with alice: TwoMLSPQBinding.TwoMlsPqSession
+	) throws {
+		try alice.pqRatchetRespond(ekMsg: ek)
+		_ = try nativeBob.pqRatchetBind(try XCTUnwrap(alice.pqTakePendingOutbound()))
+		_ = try alice.prepareToEncrypt(proposing: nil)
+		let aliceUpd = try alice.encrypt(appMessage: Data("a4-bind-upd".utf8))
+		guard
+			case .decrypted(let opened) = try nativeBob.processIncoming(
+				aliceUpd.cipherText)
+		else {
+			return XCTFail("expected native bob to decrypt alice's Upd")
+		}
+		_ = try nativeBob.queueProposal(digest: opened.queuedProposal.digest)
+		XCTAssertTrue(try nativeBob.prepareToEncrypt().didCommit)
+		let bobCommit = try nativeBob.encrypt(Data("a4-bind-commit".utf8))
+		_ = try XCTUnwrap(alice.processIncoming(ciphertext: bobCommit.frame))
+		XCTAssertTrue(alice.myPqTurn())
+	}
+
+	/// Alice's A.4 on her next send: native bob answers, alice binds, and her discharge
+	/// commit passes the turn back to bob. It folds bob's offer only when asked to.
+	private func completeAlicesA4(
+		_ alice: TwoMLSPQBinding.TwoMlsPqSession,
+		with nativeBob: inout TwoMLSPQSession.TwoMLSSession, foldingBobsOffer: Bool
+	) throws {
+		_ = try alice.prepareToEncrypt(proposing: nil)
+		let aliceMsg = try alice.encrypt(appMessage: Data("a4-open".utf8))
+		guard case .decrypted = try nativeBob.processIncoming(aliceMsg.cipherText) else {
+			return XCTFail("expected native bob to decrypt alice's message")
+		}
+		let ek = try XCTUnwrap(alice.pqPendingOutbound(sealing: .fresh))
+		try alice.pqRatchetBind(ctMsg: try nativeBob.pqRatchetRespond(ek).frame)
+		if foldingBobsOffer {
+			_ = try nativeBob.prepareToEncrypt()
+			let bobOffer = try nativeBob.encrypt(Data("catch-up-offer".utf8))
+			let offered = try XCTUnwrap(
+				alice.processIncoming(ciphertext: bobOffer.frame)?.proposal)
+			try alice.queueProposal(digest: offered.digest)
+		}
+		XCTAssertTrue(try alice.prepareToEncrypt(proposing: nil).didCommit)
+		let aliceCommit = try alice.encrypt(appMessage: Data("a4-bind-commit".utf8))
+		guard case .decrypted = try nativeBob.processIncoming(aliceCommit.cipherText) else {
+			return XCTFail("expected native bob to decrypt alice's discharge")
+		}
 	}
 
 	// MARK: - Native <-> Rust one-frame helpers (mirrors `RustSessionTestHelpers`)
