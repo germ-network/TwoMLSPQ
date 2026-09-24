@@ -3,8 +3,10 @@ import MLSCrypto
 import TwoMLSPQBinding
 import TwoMLSPQCrypto
 import TwoMLSPQMigrate
-import TwoMLSPQSession
 import XCTest
+
+// Testable only to read native own-leaf ids, which have no public accessor.
+@testable import TwoMLSPQSession
 
 // A stuck §A.5 rekey, cross-engine: a deployed Rust party (A) rotates its classical
 // identity, its lagging send-PQ leaf opens §A.5 to catch up in the peer-committed PQ
@@ -437,6 +439,70 @@ final class RotatedRekeyHealTests: XCTestCase {
 		// leave the round — and the same parked Upd' bytes come back byte-identical.
 		let stillParked = try XCTUnwrap(aliceSession.pqPendingOutbound(sealing: .stable))
 		XCTAssertEqual(parkedUpd, stillParked)
+	}
+
+	// MARK: - Native responder carries its own rotation onto its send-PQ leaf
+
+	/// Bob migrates, then rotates natively, and Rust alice's fold of that rotation opens her
+	/// A.5 (her own send-PQ leaf lags her earlier rotation). Native bob's responder Commit'
+	/// carries his current credential, moving his lagging send-PQ leaf to his new id, and
+	/// Rust alice's `pq_rekey_apply` accepts a Commit' whose committer path leaf changes id.
+	func testMigratedNativeResponderCarriesItsRotatedIdToRust() throws {
+		let (alice, bob) = try establishedNonDedicatedPair()
+		let aliceRotated = TwoMLSPQBinding.ClientId(bytes: Data("rrh-alice-rotated".utf8))
+		_ = try alice.prepareToEncrypt(proposing: aliceRotated)
+		let rotateFrame = try alice.encrypt(appMessage: Data("rotate".utf8))
+		let opened = try XCTUnwrap(bob.processIncoming(ciphertext: rotateFrame.cipherText))
+		try bob.queueProposal(digest: try XCTUnwrap(opened.proposal).digest)
+		XCTAssertTrue(try bob.prepareToEncrypt(proposing: nil).didCommit)
+		let canonicalize = try bob.encrypt(appMessage: Data("canonicalize".utf8))
+		_ = try XCTUnwrap(alice.processIncoming(ciphertext: canonicalize.cipherText))
+
+		// Drain the A.4 bob's commit auto-staged, so alice holds the PQ turn at export.
+		let incidentalEk = try XCTUnwrap(bob.pqPendingOutbound(sealing: .fresh))
+		try alice.pqRatchetRespond(ekMsg: incidentalEk)
+		let incidentalCt = try XCTUnwrap(alice.pqTakePendingOutbound())
+		try bob.pqRatchetBind(ctMsg: incidentalCt)
+		try RustSessionTestHelpers.committingRound(binder: bob, peer: alice)
+		XCTAssertTrue(alice.myPqTurn())
+
+		let archive = try SessionMigrator.mint(
+			kind: .checkpoint, from: try bob.migrationExport(),
+			classicalProvider: classicalProvider, pqProvider: pqProvider
+		).archive
+		var nativeBob = try TwoMLSPQSession.TwoMLSSession.restore(
+			core: nil, checkpoint: archive,
+			classicalProvider: classicalProvider, pqProvider: pqProvider)
+		let bobOriginal = nativeBob.myPrincipalState.clientID
+
+		let bobRotated = Data("rrh-bob-rotated".utf8)
+		_ = try nativeBob.prepareToEncrypt(rotating: bobRotated)
+		let bobOffer = try nativeBob.encrypt(Data("bob-rotate".utf8))
+		let aliceGot = try XCTUnwrap(alice.processIncoming(ciphertext: bobOffer.frame))
+		try alice.queueProposal(digest: try XCTUnwrap(aliceGot.proposal).digest)
+		XCTAssertTrue(try alice.prepareToEncrypt(proposing: nil).didCommit)
+		let aliceFold = try alice.encrypt(appMessage: Data("alice-fold".utf8))
+		guard case .decrypted = try nativeBob.processIncoming(aliceFold.cipherText) else {
+			return XCTFail("expected native bob to decrypt alice's fold")
+		}
+		XCTAssertEqual(nativeBob.myPrincipalState, .sync(bobRotated))
+
+		// Alice's fold opens her A.5.
+		let upd = try XCTUnwrap(alice.pqPendingOutbound(sealing: .stable))
+		XCTAssertEqual(
+			try nativeBob.openIncoming(upd)?.kind, .pqSideBand(.rekeyUpd))
+		XCTAssertEqual(try sendPQLeafID(of: nativeBob), bobOriginal)
+
+		let response = try nativeBob.pqRekeyRespond(upd)
+		XCTAssertEqual(response.rotatedCredential, aliceRotated.bytes)
+		XCTAssertEqual(try sendPQLeafID(of: nativeBob), bobRotated)
+		try alice.pqRekeyApply(msg: response.frame)
+	}
+
+	private func sendPQLeafID(of session: TwoMLSPQSession.TwoMLSSession) throws -> Data {
+		let group = try XCTUnwrap(session.sendGroup?.pq)
+		return try TwoMLSPQSession.basicIdentifier(
+			TwoMLSPQSession.TwoMLSSession.ownLeaf(of: group).credential)
 	}
 
 	// MARK: - Shared establishment scaffolding

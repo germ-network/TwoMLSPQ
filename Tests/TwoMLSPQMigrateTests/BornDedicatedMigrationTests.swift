@@ -98,11 +98,12 @@ final class BornDedicatedMigrationTests: XCTestCase {
 		try bobSays(&restoredBob, "restored-bob-to-alice", to: pair.alice)
 	}
 
-	// MARK: - Exercise the exported PQ custody key via a mechanical A.5
+	// MARK: - Exercise the exported PQ custody key via an A.5 catch-up
 
-	/// A.2/A.4 never sign in recv.pq, so this mechanical A.5 round (native bob as initiator)
-	/// is the only path that exercises the custodied PQ signing key, via `pqRekeyBegin`'s
-	/// plain self-Update into `recvGroup.pq`.
+	/// A.2/A.4 never sign in recv.pq, so this A.5 round (native bob as initiator) is the only
+	/// path that exercises the custodied PQ signing key, via `pqRekeyBegin`'s Update into
+	/// `recvGroup.pq`. That leaf still presents the invitation id, so the Update also catches
+	/// it up to bob's dedicated id and announces it.
 	func testMigratedAcceptorSignsWithCustodiedPQKeyDuringA5Rekey() throws {
 		// Must start at the AT-DISCHARGE point, not `bornDedicatedSessionPair`: nothing has
 		// sent since the A.3 bind discharge, so `pqRekeyBegin`'s clean-slate precondition
@@ -126,7 +127,9 @@ final class BornDedicatedMigrationTests: XCTestCase {
 
 		// Rust alice (committer) folds it into an includePath commit on her send-PQ group.
 		let announced = try pair.alice.pqRekeyRespond(updMsg: begin.frame)
-		XCTAssertNil(announced, "the mechanical rekey carries no credential handoff")
+		XCTAssertEqual(
+			announced?.bytes, pair.dedicatedId,
+			"bob's Upd' announces the dedicated id his recv-PQ leaf catches up to")
 		let commitFrame = try XCTUnwrap(pair.alice.pqTakePendingOutbound())
 
 		// Native bob applies alice's Commit' and owes the classical bind.
