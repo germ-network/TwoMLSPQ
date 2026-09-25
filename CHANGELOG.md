@@ -1,5 +1,41 @@
 # @germ-network/two-mls-pq
 
+## 0.21.0
+
+### Minor Changes
+
+- [#147](https://github.com/germ-network/TwoMLSPQ/pull/147) [`baf049d`](https://github.com/germ-network/TwoMLSPQ/commit/baf049d39f8d5f2dcdfc19ed50d28f4f36f96987) Thanks [@germ-mark](https://github.com/germ-mark)! - `TwoMlsPqSession.migrationExport()` now exports every reachable session state instead of
+  refusing unsettled ones: pre-establishment initiators, born-dedicated acceptors at any point,
+  staged rotation candidates, lagging leaves, and parked or wedged PQ rounds. It fails only on
+  corrupt data (`ArchiveInvalid`). The export carries per-group signing keys (`leafKeys`), the
+  rotation candidate, an own-offer window with its leaf secrets, and deployed-engine flags
+  (`deployedState`). A pre-A.3 acceptor's `leafKeys.sendPq` is empty, since A.3 founding mints
+  its own key, and `leafKeys.sendClassical` carries `current` only. Minting requires
+  twomlspq-swift 0.3.0 or later. `BINDING_CONTRACT_VERSION` bumps 35 → 36.
+
+  `SessionMigrator.mintArchive(kind:from:classicalProvider:pqProvider:)` is removed.
+  `SessionMigrator.mint(kind:from:classicalProvider:pqProvider:)` returns a `MintResult`: the
+  session archive plus, when present, the minted own-offer window, which the caller must persist
+  before the archive.
+
+  `SessionError.Code.misroutedFrame` now has disposition `.discardFrame` (was `.callerBug`): an
+  ill-timed side-band re-send is normal traffic. This shifts app-side handling and any analytics
+  bucketed by disposition.
+
+  Also corrects the 0.17.0 changelog's claim that pre-v35 group state no longer loads: it does,
+  and sessions written by v0.15.0 and v0.16.0 restore and migrate, pinned by fixtures.
+
+- [#147](https://github.com/germ-network/TwoMLSPQ/pull/147) [`bd66428`](https://github.com/germ-network/TwoMLSPQ/commit/bd664283b7117062bddd521c2a48bccbcdf6b2b0) Thanks [@germ-mark](https://github.com/germ-mark)! - **Breaking:** the `TwoMLSPQMigrate` product is removed. Its module now ships in the `TwoMLSPQ`
+  product, so `import TwoMLSPQMigrate` (and `import TwoMLSPQBinding`) keep working for any target
+  that depends on `TwoMLSPQ`. On every target that declared it, swap
+  `.product(name: "TwoMLSPQMigrate", package: "TwoMLSPQ")` for
+  `.product(name: "TwoMLSPQ", package: "TwoMLSPQ")`. Imports are unchanged.
+
+  With the binding in two products, an Xcode build could link a second copy into one process, for
+  example the `TwoMLSPQ` product as a shared framework plus `TwoMLSPQMigrate` linked statically into a
+  test bundle. The first callback through the other copy then aborted with "Callback interface
+  failure" (`unexpectedStaleHandle`). The binding now lives in exactly one product.
+
 ## 0.20.1
 
 ### Patch Changes
