@@ -119,6 +119,9 @@ only AFTER HPKE-open, by the authenticated leading tag of the plaintext:
 
 - `ESTABLISHMENT_VECTOR_TAG` (`0x07`) → the establishment reply — four u32-LE
   length-prefixed sections `[app_payload][welcome][return_key_package][stapled_message]`.
+  Each half of the `welcome` section's `APQWelcome` is an RFC 9420 `MLSMessage`
+  (`wire_format = mls_welcome`), and `return_key_package` is an `MLSMessage`
+  (`mls_key_package`), not the bare structs: the form the deployed engine emits and requires.
 - `PQ_BOOTSTRAP_KP_TAG` (`0x13`) → the parallel-delivered A.3 bootstrap KP frame, carried
   verbatim (`[0x13][KP′]`) — the same side-band frame steady-state A.3 uses, only its outer
   framing differs (HPKE envelope here vs. header-sealed side-band later).
