@@ -52,7 +52,7 @@ a host may skip `open_incoming` for the message path. The initiator's initial we
 | `group_id` | every `MLSMessage` | a stable per-direction session identifier — links every message of a direction across epochs, undoing the per-epoch rendezvous rotation for anyone who stores ciphertexts |
 | `epoch` | every `MLSMessage` | commit cadence, message ordering, session age |
 | `content_type` | every PrivateMessage | application vs. proposal vs. commit |
-| `authenticated_data` | every PrivateMessage | the 32-byte per-round proposal hash; on rotation frames and A.5 `Upd'` proposals, the announced `ClientId` |
+| `authenticated_data` | every PrivateMessage | the 32-byte per-round proposal hash; on rotation frames, and on an id-changing A.5 `Upd'` in the deployed-compatible [session profile](./session-lifecycle.md#session-profiles), the announced `ClientId` |
 | Welcome plaintext | APQWelcome (both halves) | cipher suites, `KeyPackageRef`s of the joiner — linkable to published key packages |
 | MLS version / wire format | every `MLSMessage` | protocol fingerprint |
 

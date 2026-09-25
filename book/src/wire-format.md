@@ -315,6 +315,16 @@ Every occupied leaf must advertise the `APQInfo` extension (`0xF0A1`) and the
 `AppDataUpdate` proposal (`0x0008`) types; a leaf that cannot support them is rejected
 rather than silently degraded.
 
+The extension and proposal types these frames use. The extension types sit in RFC 9420's
+private-use range (`0xF000`–`0xFFFF`):
+
+| Type | Value | Kind | Specified in |
+|------|-------|------|--------------|
+| `AppDataUpdate` | `0x0008` | proposal | [group rules](./group-rules.md), rule 7 |
+| `APQInfo` | `0xF0A1` | GroupContext extension | [group rules](./group-rules.md), rule 7 |
+| `AppBinding` | `0xF0A2` | GroupContext extension | [group rules](./group-rules.md), rule 8 |
+| `CorrectProfile` | `0xF0A3` | GroupContext extension; leaf capability entry | [group rules](./group-rules.md), rule 9 |
+
 ## Invariants
 
 The tag values are part of the on-wire protocol; pre-release, a renumber is allowed. When
