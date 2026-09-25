@@ -1,4 +1,4 @@
 ---
 ---
 
-Book-only: state that the §A.1 reply's welcome halves and return key package are MLSMessages; nothing ships.
+Book-only: state that draft-02 pair elements (APQWelcome and APQKeyPackage halves) and the §A.1 return key package travel as RFC 9420 MLSMessages; nothing ships.

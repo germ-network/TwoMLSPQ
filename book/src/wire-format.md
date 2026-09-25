@@ -119,9 +119,10 @@ only AFTER HPKE-open, by the authenticated leading tag of the plaintext:
 
 - `ESTABLISHMENT_VECTOR_TAG` (`0x07`) → the establishment reply — four u32-LE
   length-prefixed sections `[app_payload][welcome][return_key_package][stapled_message]`.
-  Each half of the `welcome` section's `APQWelcome` is an RFC 9420 `MLSMessage`
-  (`wire_format = mls_welcome`), and `return_key_package` is an `MLSMessage`
-  (`mls_key_package`), not the bare structs: the form the deployed engine emits and requires.
+  Each half of the `welcome` section's `APQWelcome` and the `return_key_package` travel in
+  their RFC 9420 `MLSMessage` envelope (`wire_format = mls_welcome` and `mls_key_package`),
+  which describes its own protocol version and content type (see
+  [Draft-02 conformance](#draft-02-conformance-inside-the-frames)).
 - `PQ_BOOTSTRAP_KP_TAG` (`0x13`) → the parallel-delivered A.3 bootstrap KP frame, carried
   verbatim (`[0x13][KP′]`) — the same side-band frame steady-state A.3 uses, only its outer
   framing differs (HPKE envelope here vs. header-sealed side-band later).
@@ -286,9 +287,9 @@ move.
 ## Draft-02 conformance inside the frames
 
 The Germ tags above are the *transport* envelope; inside them the MLS payloads carry
-the `draft-ietf-mls-combiner-02` structures directly. The apq crate conforms to the
-draft, and the Germ frames **enclose** the draft-02 wire shapes rather than replacing
-them.
+the `draft-ietf-mls-combiner-02` structures. The apq crate conforms to the draft, and the
+Germ frames **enclose** the draft-02 wire shapes rather than replacing them, with one
+deviation in how a pair's elements travel (the last bullet below).
 
 - **APQInfo** — a GroupContext extension (type `0xF0A1`) present in both halves of each
   APQ group and carried automatically in every Welcome's GroupInfo. It names both group
@@ -300,7 +301,15 @@ them.
   agree and match the actual post-commit epochs before any app data is decrypted.
 - **Combiner key package** — the `CombinerKeyPackage` payload adopts the draft's §7
   `APQKeyPackage { t_key_package, pq_key_package }` TLS encoding inside Germ's version
-  framing. A key package that does not carry this encoding is rejected outright.
+  framing (`[v=3]`), each half an `opaque<V>` vector. A key package that does not carry
+  this encoding is rejected outright.
+- **Pair elements travel as `MLSMessage`s** — where a draft-02 §7 pair declares a bare
+  `Welcome` or `KeyPackage` field (`APQWelcome`, `APQKeyPackage`), Germ carries each
+  element as its RFC 9420 `MLSMessage` instead (`wire_format = mls_welcome` or
+  `mls_key_package`), which describes its own protocol version and content type. This
+  covers both halves of the combiner key package, each half of every `APQWelcome`, and the
+  §A.1 reply's return key package. Draft-02 does not specify how these structures are
+  transmitted, so this is Germ's choice of the RFC's transport envelope.
 
 Every occupied leaf must advertise the `APQInfo` extension (`0xF0A1`) and the
 `AppDataUpdate` proposal (`0x0008`) types; a leaf that cannot support them is rejected
