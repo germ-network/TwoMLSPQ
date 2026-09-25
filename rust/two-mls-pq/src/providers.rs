@@ -103,6 +103,20 @@ pub(crate) fn pq_envelope_suite(
         .ok_or(TwoMlsPqError::Mls)
 }
 
+/// The suite provider backing classical-half signature-key derivation for the migration
+/// export's per-half custody search — the `classical` facet of the
+/// declared suite, served by the pinned CLASSICAL provider. Mirrors `pq_envelope_suite`
+/// for the other family: both exist because "the EXPECTED half's provider" means a
+/// DIFFERENT provider object per half, even though both ultimately run Ed25519 math.
+pub(crate) fn classical_envelope_suite(
+) -> Result<impl mls_rs::CipherSuiteProvider<Error = impl std::error::Error + Send + Sync + 'static>>
+{
+    use mls_rs::CryptoProvider;
+    classical()
+        .cipher_suite_provider(APQ_SUITE.classical)
+        .ok_or(TwoMlsPqError::Mls)
+}
+
 /// The suite provider backing the header-encryption AEAD — the `header_aead` facet of
 /// the declared suite (`TwoMlsSuite::CURRENT.header_aead()`, the classical half).
 /// **Only the suite's AEAD and CSPRNG are used**

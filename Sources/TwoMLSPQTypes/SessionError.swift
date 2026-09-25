@@ -162,8 +162,8 @@ public struct SessionError: Error, Sendable {
 		/// A different welcome on a live session — a mis-route or unexpected re-invite (same-welcome
 		/// re-deliveries are idempotent, not this).
 		case unexpectedWelcome
-		/// A side-band frame reached `processIncoming`/`forwarded`, or vice versa — a routing bug
-		/// at the call site.
+		/// A frame reached the wrong entry point for its kind, or a side-band frame arrived out of
+		/// turn (an ill-timed re-send). Drop it: the peer keeps re-sending until answered.
 		case misroutedFrame
 		/// An operation was driven out of turn / order (encrypt before prepare, begin off-turn, …).
 		case sequenceViolation
@@ -214,7 +214,7 @@ public struct SessionError: Error, Sendable {
 				return .retryLater
 			case .staleFrame, .duplicateWelcome, .duplicateSideBand,
 				.unopenableFrame, .malformedFrame, .bootstrapKpMismatch,
-				.attachmentComponentUnavailable:
+				.attachmentComponentUnavailable, .misroutedFrame:
 				// A.3 KP′ not matching the signed commitment: drop the bad frame, the session is
 				// intact and the genuine re-stapled KP′ still works. An unavailable attachment
 				// component is the same shape: this one fetch fails, the session is unaffected.
@@ -244,7 +244,7 @@ public struct SessionError: Error, Sendable {
 				// (un-enveloped, or the creator does not match the admitted key) is refused
 				// exactly like any other bad establishment — tear down, do not adopt.
 				return .rejectEstablishment
-			case .misroutedFrame, .sequenceViolation, .sessionNotEstablished,
+			case .sequenceViolation, .sessionNotEstablished,
 				.invalidClientId, .proposalRejected,
 				.unsupportedCipherSuite, .missingWelcome, .sinkAlreadyInstalled,
 				.establishmentEnvelopeConflict, .notImplemented:

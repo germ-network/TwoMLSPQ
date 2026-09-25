@@ -499,7 +499,16 @@ pub fn version() -> String {
 // enabled. Stored group state is unaffected, and a pre-v35-written session archive (down
 // through v0.15.0 (archive layout 3)) still restores here, pinned by the
 // `TwoMLSPQMigrateTests` legacy-row fixtures.
-const BINDING_CONTRACT_VERSION: u64 = 35;
+//
+// v36: the session migration export admits every reachable deployed session (pre-
+// establishment, born-dedicated, staged rotation, lagging or wedged PQ rounds) instead
+// of refusing unsettled state, erroring only on corrupt or impossible data. New Records
+// carry per-group leaf keys, the rotation candidate, the own-offer window, and
+// deployed-engine flags. Fields are appended to `SessionMigrationExport`, so a stale
+// binding/binary pair would mis-read the export buffer; no wire, archive, or
+// error-variant change. The mls-rs pin moves to the fork's integration head for the
+// pending-signer, own-proposal, and pending-placement exports this needs.
+const BINDING_CONTRACT_VERSION: u64 = 36;
 
 /// See `BINDING_CONTRACT_VERSION`. Exported so the Swift layer can verify the
 /// binding it was generated with matches the binary it loaded.

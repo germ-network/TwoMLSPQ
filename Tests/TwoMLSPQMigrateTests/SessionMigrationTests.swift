@@ -32,9 +32,10 @@ final class SessionMigrationTests: XCTestCase {
 		let export = try pair.alice.migrationExport()
 
 		// Migrate alice to the native engine and restore her there.
-		let archive = try SessionMigrator.mintArchive(
+		let archive = try SessionMigrator.mint(
 			kind: .checkpoint, from: export,
-			classicalProvider: classicalProvider, pqProvider: pqProvider)
+			classicalProvider: classicalProvider, pqProvider: pqProvider
+		).archive
 		var nativeAlice = try TwoMLSPQSession.TwoMLSSession.restore(
 			core: nil, checkpoint: archive,
 			classicalProvider: classicalProvider, pqProvider: pqProvider)
@@ -67,12 +68,14 @@ final class SessionMigrationTests: XCTestCase {
 		// Mint both kinds from the ONE export (a core omits the PQ trees; the
 		// reconcile splices them from the checkpoint), then restore from the
 		// pair exactly as the app's two-slot persistence would.
-		let checkpoint = try SessionMigrator.mintArchive(
+		let checkpoint = try SessionMigrator.mint(
 			kind: .checkpoint, from: export,
-			classicalProvider: classicalProvider, pqProvider: pqProvider)
-		let core = try SessionMigrator.mintArchive(
+			classicalProvider: classicalProvider, pqProvider: pqProvider
+		).archive
+		let core = try SessionMigrator.mint(
 			kind: .core, from: export,
-			classicalProvider: classicalProvider, pqProvider: pqProvider)
+			classicalProvider: classicalProvider, pqProvider: pqProvider
+		).archive
 		var nativeAlice = try TwoMLSPQSession.TwoMLSSession.restore(
 			core: core, checkpoint: checkpoint,
 			classicalProvider: classicalProvider, pqProvider: pqProvider)
@@ -105,7 +108,7 @@ final class SessionMigrationTests: XCTestCase {
 		// a bad export/map rather than merely that something decoded.
 		export.identity.signingKey[16] ^= 0xFF
 		XCTAssertThrowsError(
-			try SessionMigrator.mintArchive(
+			try SessionMigrator.mint(
 				kind: .checkpoint, from: export,
 				classicalProvider: classicalProvider, pqProvider: pqProvider)
 		) { error in
@@ -118,7 +121,7 @@ final class SessionMigrationTests: XCTestCase {
 		var torn = try pair.alice.migrationExport()
 		torn.sendGroup.classical[16] ^= 0xFF
 		XCTAssertThrowsError(
-			try SessionMigrator.mintArchive(
+			try SessionMigrator.mint(
 				kind: .checkpoint, from: torn,
 				classicalProvider: classicalProvider, pqProvider: pqProvider))
 	}

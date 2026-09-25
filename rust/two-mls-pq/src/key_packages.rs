@@ -100,7 +100,7 @@ impl TwoMlsPqPrincipal {
     }
 
     /// Generate a fresh KeyPackage for the given cipher suite.
-    /// Returns MLS-encoded bytes suitable for publication.
+    /// Returns the KeyPackage as an RFC 9420 `MLSMessage` (`mls_key_package`), ready to publish.
     /// The corresponding HPKE private key is retained internally for group joins.
     pub fn generate_key_package(&self, suite: Arc<MlsCipherSuite>) -> Result<Vec<u8>> {
         match suite.value() {

@@ -264,7 +264,12 @@ public typealias SideBandSealing = TwoMLSPQTypes.SideBandSealing
 //     `TwoMlsPqSession.migrationExport()`. The consumer lives in `TwoMLSPQMigrate`
 //     (`SessionMigrator`), mapping onto twomlspq-swift's `SessionMigration.mintArchive`.
 //     No wire, API, or error-variant change beyond the new symbols.
-private let expectedBindingContract: UInt64 = 35
+// v36: the session migration export admits every reachable deployed session instead of
+//     refusing unsettled state, erroring only on corrupt or impossible data. New records
+//     carry per-group leaf keys, the rotation candidate, the own-offer window, and
+//     deployed-engine flags, appended to `SessionMigrationExport`'s memberwise init. No
+//     wire or error-variant change.
+private let expectedBindingContract: UInt64 = 36
 
 enum TwoMLSPQBindingContract {
 	static let verified: Void = {

@@ -23,8 +23,10 @@ App
 
 ```
 
-The Swift package has **no external Swift dependencies**. CommProtocol is a sibling under the
-app, not a layer beneath: the two meet in app code, which carries values between them.
+The `TwoMLSPQ` module has **no external Swift dependencies**. The product's migrator module
+(`TwoMLSPQMigrate`) depends on twomlspq-swift, swift-mls and swift-secret-bytes, the native engine
+it mints into. CommProtocol is a sibling under the app, not a layer beneath: the two meet in app
+code, which carries values between them.
 
 Digests cross the Swift API as self-describing tagged `Data` — `[kind][digest]` — that this
 package derives (`PQDigest.over(_:)`) and compares. The kind tag matters: the digest algorithm

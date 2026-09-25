@@ -47,7 +47,7 @@ struct ErrorContractTests {
 			(.apqInfoMismatch, .rejectEstablishment),
 			(.appBindingMismatch, .rejectEstablishment),
 			(.unexpectedWelcome, .rejectEstablishment),
-			(.misroutedFrame, .callerBug),
+			(.misroutedFrame, .discardFrame),
 			(.sequenceViolation, .callerBug),
 			(.sessionNotEstablished, .callerBug),
 			(.invalidClientId, .callerBug),
