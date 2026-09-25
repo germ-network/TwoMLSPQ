@@ -78,18 +78,14 @@ let package = Package(
 			url: "https://github.com/germ-network/autonomous-comm-protocol.git",
 			from: "1.13.0"
 		),
-		// The native-side migrator dependency (GER-2372): twomlspq-swift carries R1's
-		// `InvitationMigration.mintArchive` + `MigratedIdentity` and R2's
-		// `SessionMigration.mintArchive` + `MigratedSession`, which `TwoMLSPQMigrate`
-		// maps the Rust migration exports onto. 0.1.1 is the first tag carrying R2
-		// (SessionMigration + the ML-KEM `hpkeSecretKeySize`); its transitive deps
-		// (swift-mls, swift-secret-bytes, swift-crypto, GermConvenience) resolve
-		// automatically. Pinned to unreleased main for the deployed-state migration
-		// inputs and the empty pre-A.3 send-PQ shape; move to the release that ships
-		// them before merging.
+		// The native engine `TwoMLSPQMigrate` mints into (`InvitationMigration`,
+		// `SessionMigration`). 0.3.0 is the first release that takes the per-group
+		// signing keys and deployed-state inputs this export carries; its transitive
+		// deps (swift-mls, swift-secret-bytes, swift-crypto, GermConvenience) resolve
+		// automatically.
 		.package(
 			url: "https://github.com/germ-network/twomlspq-swift.git",
-			revision: "902feadc916cdfa36676bd627b1098ef9b804142"
+			from: "0.3.0"
 		),
 		// Declared directly (not just transitively through twomlspq-swift) because
 		// the migrate targets import their products. Library deps stay ranged
