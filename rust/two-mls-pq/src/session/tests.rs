@@ -8744,7 +8744,7 @@ fn test_migration_export_carries_superseded_staged_candidate() {
 
 /// After a rotation the send-classical leaf presents the old key until its own next commit:
 /// `current` resolves via the leaf's own signer (differs from `identity`, never `no_custody`),
-/// and `pending` carries the catch-up at `mine.current` with the identity's own key.
+/// and `pending` stays empty, since that commit mints its own fresh key.
 #[cfg(feature = "cryptokit")]
 #[test]
 fn test_migration_export_carries_post_rotation_leaf_lag() {
@@ -8758,14 +8758,9 @@ fn test_migration_export_carries_post_rotation_leaf_lag() {
         current.signature_key, export.identity.signature_key,
         "send-classical genuinely still lags the (already-rotated) identity"
     );
-    let catch_up = send_classical
-        .pending
-        .iter()
-        .find(|p| p.target == new_alice.bytes)
-        .expect("send_classical.pending must carry the generalized catch-up at mine.current");
-    assert_eq!(
-        catch_up.key.signature_key, export.identity.signature_key,
-        "the catch-up entry carries the identity's OWN (current) classical key"
+    assert!(
+        send_classical.pending.is_empty(),
+        "send-classical carries no pending key, even while it lags"
     );
     if let Some(deployed) = export.deployed_state {
         assert!(!deployed.no_custody.send_classical);
@@ -9045,8 +9040,8 @@ fn test_identity_kp_prefers_the_retained_kp_named_in_the_initial_app_payload() {
 }
 
 /// Re-proposing `mine.current` while send-classical lags mints a real same-id candidate K′:
-/// `send_classical.pending[mine.current]` stays the identity's catch-up key (no own offers),
-/// `recv_classical`'s is K′, and it never exports as `rotation_candidate`.
+/// `send_classical.pending` stays empty, `recv_classical`'s `pending[mine.current]` is K′,
+/// and it never exports as `rotation_candidate`.
 #[cfg(feature = "cryptokit")]
 #[test]
 fn test_migration_export_same_id_candidate_send_classical_also_lagging() {
@@ -9076,18 +9071,7 @@ fn test_migration_export_same_id_candidate_send_classical_also_lagging() {
     };
 
     let export = assert_ok!(alice.migration_export());
-    let send_entry = export
-        .leaf_keys
-        .send_classical
-        .pending
-        .iter()
-        .find(|p| p.target == id1.bytes)
-        .expect("send_classical must still carry pending[mine.current]");
-    assert_eq!(
-        send_entry.key.signature_key, export.identity.signature_key,
-        "send_classical has no own offers: only the identity's catch-up key can occupy \
-         mine.current"
-    );
+    assert!(export.leaf_keys.send_classical.pending.is_empty());
     let recv_entry = export
         .leaf_keys
         .recv_classical
@@ -9098,10 +9082,6 @@ fn test_migration_export_same_id_candidate_send_classical_also_lagging() {
     assert_eq!(
         recv_entry.key.signature_key, candidate_key,
         "recv_classical's ONLY real offer at mine.current is the candidate's own K′"
-    );
-    assert_ne!(
-        recv_entry.key.signature_key, send_entry.key.signature_key,
-        "send and recv legitimately disagree at mine.current here"
     );
     assert!(
         export.rotation_candidate.is_none(),
@@ -9755,8 +9735,9 @@ fn test_migration_export_no_custody_on_corrupted_signer() {
     assert!(assert_some!(export.deployed_state).no_custody.recv_pq);
 }
 
-/// Every staged candidate (a full `CANDIDATE_WINDOW`) rides both classical `pending` sets with
-/// the identical key; the newest is also `rotation_candidate`, pinned to the current recv epoch.
+/// Every staged candidate (a full `CANDIDATE_WINDOW`) rides recv-classical's `pending`, and
+/// send-classical's stays empty; the newest is also `rotation_candidate`, pinned to the
+/// current recv epoch.
 #[cfg(feature = "cryptokit")]
 #[test]
 fn test_migration_export_carries_multiple_staged_candidates() {
@@ -9770,7 +9751,7 @@ fn test_migration_export_carries_multiple_staged_candidates() {
     }
     let export = assert_ok!(alice.migration_export());
     let recv_classical = &export.leaf_keys.recv_classical;
-    let send_classical = &export.leaf_keys.send_classical;
+    assert!(export.leaf_keys.send_classical.pending.is_empty());
     let recv_epoch = {
         let inner = alice.lock();
         inner.recv_group.as_ref().unwrap().classical.current_epoch()
@@ -9781,16 +9762,7 @@ fn test_migration_export_carries_multiple_staged_candidates() {
             .iter()
             .find(|p| p.target == id.bytes)
             .expect("candidate missing from recv_classical");
-        let send_entry = send_classical
-            .pending
-            .iter()
-            .find(|p| p.target == id.bytes)
-            .expect("candidate missing from send_classical");
-        assert_eq!(
-            recv_entry.key.signing_key, send_entry.key.signing_key,
-            "candidate {:?}'s key must be identical in both classical sets",
-            id.bytes
-        );
+        assert_eq!(recv_entry.target, id.bytes);
     }
     let newest = ids.last().unwrap();
     let rotation_candidate = assert_some!(export.rotation_candidate);
@@ -11482,41 +11454,11 @@ mod totality_random_walk {
             false,
         );
 
-        // Every target but `mine.current` has the same key in both classical sets; there,
-        // recv_classical may carry a same-id K′ while send_classical carries the identity's.
-        for candidate_target in [
-            &export.leaf_keys.send_classical,
-            &export.leaf_keys.recv_classical,
-        ]
-        .iter()
-        .flat_map(|g| g.pending.iter().map(|p| p.target.clone()))
-        .collect::<std::collections::HashSet<_>>()
-        {
-            if candidate_target == mine_current {
-                continue;
-            }
-            let send_key = export
-                .leaf_keys
-                .send_classical
-                .pending
-                .iter()
-                .find(|p| p.target == candidate_target)
-                .map(|p| &p.key);
-            let recv_key = export
-                .leaf_keys
-                .recv_classical
-                .pending
-                .iter()
-                .find(|p| p.target == candidate_target)
-                .map(|p| &p.key);
-            if let (Some(send_key), Some(recv_key)) = (send_key, recv_key) {
-                assert_eq!(
-                    send_key.signing_key, recv_key.signing_key,
-                    "{label} seed {seed} step {step}: target {candidate_target:?} has \
-                     different keys in send_classical vs recv_classical"
-                );
-            }
-        }
+        // send_classical carries `current` only; its own next commit mints fresh.
+        assert!(
+            export.leaf_keys.send_classical.pending.is_empty(),
+            "{label} seed {seed} step {step}: send_classical carries a pending key"
+        );
         // `rotation_candidate` (never a same-id candidate) matches its pending entries.
         if let Some(candidate) = &export.rotation_candidate {
             assert_ne!(
@@ -11524,14 +11466,13 @@ mod totality_random_walk {
                 "{label} seed {seed} step {step}: a same-id candidate must never export \
                  as rotation_candidate"
             );
-            let matches = [
-                &export.leaf_keys.send_classical,
-                &export.leaf_keys.recv_classical,
-            ]
-            .iter()
-            .flat_map(|g| g.pending.iter())
-            .filter(|p| p.target == candidate.target_client_id)
-            .all(|p| p.key.signing_key == candidate.signing_key);
+            let matches = export
+                .leaf_keys
+                .recv_classical
+                .pending
+                .iter()
+                .filter(|p| p.target == candidate.target_client_id)
+                .all(|p| p.key.signing_key == candidate.signing_key);
             assert!(
                 matches,
                 "{label} seed {seed} step {step}: rotation_candidate's key disagrees with \

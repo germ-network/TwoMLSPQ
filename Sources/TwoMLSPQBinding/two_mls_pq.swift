@@ -1658,7 +1658,7 @@ public protocol TwoMlsPqPrincipalProtocol: AnyObject, Sendable {
     
     /**
      * Generate a fresh KeyPackage for the given cipher suite.
-     * Returns MLS-encoded bytes suitable for publication.
+     * Returns the KeyPackage as an RFC 9420 `MLSMessage` (`mls_key_package`), ready to publish.
      * The corresponding HPKE private key is retained internally for group joins.
      */
     func generateKeyPackage(suite: MlsCipherSuite) throws  -> Data
@@ -1790,7 +1790,7 @@ open func generateInvitation(lastResort: Bool)throws  -> Data  {
     
     /**
      * Generate a fresh KeyPackage for the given cipher suite.
-     * Returns MLS-encoded bytes suitable for publication.
+     * Returns the KeyPackage as an RFC 9420 `MLSMessage` (`mls_key_package`), ready to publish.
      * The corresponding HPKE private key is retained internally for group joins.
      */
 open func generateKeyPackage(suite: MlsCipherSuite)throws  -> Data  {
@@ -6759,7 +6759,7 @@ public func FfiConverterTypeSessionMigrationPskEntry_lower(_ value: SessionMigra
 /**
  * The most recently staged rotation candidate, classical only. Its
  * `signing_key`/`signature_key` must equal the same candidate's `pending`
- * entry in both classical sets. `None` when the newest candidate's id
+ * entry in `recv_classical`. `None` when the newest candidate's id
  * equals `auth.mine`'s current one — a same-id candidate is a self-catch-up
  * mechanism, not a rotation target (see `recv_classical_pending`).
  */
@@ -9186,7 +9186,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_two_mls_pq_checksum_method_twomlspqprincipal_generate_invitation() != 5215) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_two_mls_pq_checksum_method_twomlspqprincipal_generate_key_package() != 11085) {
+    if (uniffi_two_mls_pq_checksum_method_twomlspqprincipal_generate_key_package() != 63432) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_two_mls_pq_checksum_method_twomlspqsession_app_binding() != 59144) {

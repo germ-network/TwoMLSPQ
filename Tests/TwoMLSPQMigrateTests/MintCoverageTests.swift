@@ -125,7 +125,7 @@ final class MintCoverageTests: XCTestCase {
 	// MARK: - 3. Four-candidate export
 
 	/// Four distinct classical candidates staged in a row, none ever folded — each rides
-	/// `send_classical`'s pending set (one entry per candidate other than `mine.current`).
+	/// `recv_classical`'s pending set, and `send_classical`'s stays empty.
 	func testFourCandidateExportMintsAndRestores() throws {
 		let (alice, _) = try establishCardPair()
 
@@ -138,8 +138,9 @@ final class MintCoverageTests: XCTestCase {
 
 		let export = try alice.migrationExport()
 		XCTAssertGreaterThanOrEqual(
-			export.leafKeys.sendClassical.pending.count, 4,
-			"all four staged candidates should ride send-classical's pending set")
+			export.leafKeys.recvClassical.pending.count, 4,
+			"all four staged candidates should ride recv-classical's pending set")
+		XCTAssertTrue(export.leafKeys.sendClassical.pending.isEmpty)
 
 		let minted = try SessionMigrator.mint(
 			kind: .checkpoint, from: export,

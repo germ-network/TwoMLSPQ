@@ -45,10 +45,11 @@
 //!   * generalized catch-up: any own leaf whose presented credential lags
 //!     `auth.mine`'s current one gets a synthesized `pending[mine.current]`
 //!     entry carrying the identity's current key of that half's kind — see
-//!     `catch_up_pending_entry` and `fold_in_catch_up`;
-//!   * every staged rotation candidate rides `pending[candidate id]` in both
-//!     `send_classical` and `recv_classical`, keyed by the same classical key
-//!     — see `send_classical_pending`/`recv_classical_pending`. A candidate
+//!     `catch_up_pending_entry` and `fold_in_catch_up`. `send_classical` is the
+//!     exception: it carries `current` only, since its own next commit mints
+//!     fresh for whatever id it then presents;
+//!   * every staged rotation candidate rides `pending[candidate id]` in
+//!     `recv_classical` — see `recv_classical_pending`. A candidate
 //!     whose id equals `auth.mine`'s current one can leave two
 //!     differently-keyed offers outstanding for that one target (the
 //!     identity's own self-catch-up, and the same-id candidate's
@@ -320,7 +321,7 @@ pub struct SessionMigrationLeafKeys {
 
 /// The most recently staged rotation candidate, classical only. Its
 /// `signing_key`/`signature_key` must equal the same candidate's `pending`
-/// entry in both classical sets. `None` when the newest candidate's id
+/// entry in `recv_classical`. `None` when the newest candidate's id
 /// equals `auth.mine`'s current one — a same-id candidate is a self-catch-up
 /// mechanism, not a rotation target (see `recv_classical_pending`).
 #[derive(Clone, uniffi::Record)]
@@ -928,9 +929,8 @@ fn catch_up_pending_entry<Cfg: mls_rs::client_builder::MlsConfig>(
 }
 
 /// Folds a generalized catch-up entry into a half's real pending — PQ
-/// halves only (classical uses `send_classical_pending`/
-/// `recv_classical_pending`, which resolve the same-id ambiguity this
-/// simpler fold cannot). A real entry already targeting the catch-up's
+/// halves only (recv-classical uses `recv_classical_pending`, which resolves
+/// the same-id ambiguity this simpler fold cannot). A real entry already targeting the catch-up's
 /// target is superseded by it.
 fn fold_in_catch_up(
     mut real_pending: Vec<SessionMigrationPendingLeafKey>,
@@ -942,40 +942,6 @@ fn fold_in_catch_up(
     }
     dedupe_pending(&mut real_pending);
     real_pending
-}
-
-/// `send_classical`'s `pending`: the identity's own catch-up key at
-/// `mine_current` (if the leaf lags), plus every staged candidate other
-/// than `mine_current`. send_classical has no by-reference fold or window,
-/// so a same-id candidate never gets its own entry here — only the
-/// identity's; see `recv_classical_pending` for why recv_classical differs.
-fn send_classical_pending(
-    catch_up: Option<SessionMigrationPendingLeafKey>,
-    candidates: &[Arc<TwoMlsPqPrincipal>],
-    classical_provider: &impl CipherSuiteProvider,
-    mine_current: &[u8],
-) -> Result<Vec<SessionMigrationPendingLeafKey>> {
-    let mut pending: Vec<SessionMigrationPendingLeafKey> = catch_up.into_iter().collect();
-    for candidate in candidates {
-        let target = candidate.client_id().bytes;
-        if target == mine_current {
-            continue;
-        }
-        let (signing_key, signature_key) = candidate_public_key(
-            classical_provider,
-            candidate.combiner().classical_signing_key(),
-        )
-        .ok_or(TwoMlsPqError::ArchiveInvalid)?;
-        pending.push(SessionMigrationPendingLeafKey {
-            target,
-            key: SessionMigrationKeyPair {
-                signing_key,
-                signature_key,
-            },
-        });
-    }
-    dedupe_pending(&mut pending);
-    Ok(pending)
 }
 
 /// `recv_classical`'s `pending`, grouped by target from `framed` (see the
@@ -1586,8 +1552,6 @@ impl TwoMlsPqSession {
         // derives instead of O(1).
         dedupe_secret_bytes(&mut pool);
 
-        let send_classical_catch_up =
-            catch_up_pending_entry(&send_ref.classical, &mine_current, &identity_classical_pair)?;
         let recv_classical_catch_up = match recv_ref {
             Some(recv) => {
                 catch_up_pending_entry(&recv.classical, &mine_current, &identity_classical_pair)?
@@ -1595,9 +1559,9 @@ impl TwoMlsPqSession {
             None => None,
         };
 
-        // send_classical always exists. Resolve custody, then build `pending`
-        // from the generalized catch-up plus every other staged candidate —
-        // see `send_classical_pending`.
+        // send_classical always exists, and carries `current` only: its own next
+        // commit mints a fresh key for whatever id it then presents, so native
+        // needs no pending key in advance (and restore rejects one).
         let (send_classical_leaf, send_classical_no_custody) = {
             let (leaf, no_custody) = resolve_leaf_key(
                 &send_ref.classical,
@@ -1605,16 +1569,10 @@ impl TwoMlsPqSession {
                 &pool,
                 &send_classical.1,
             )?;
-            let pending = send_classical_pending(
-                send_classical_catch_up.clone(),
-                &inner.staged_candidates,
-                &classical_provider,
-                &mine_current,
-            )?;
             (
                 SessionMigrationGroupKeys {
                     current: leaf.current,
-                    pending,
+                    pending: Vec::new(),
                 },
                 no_custody,
             )
