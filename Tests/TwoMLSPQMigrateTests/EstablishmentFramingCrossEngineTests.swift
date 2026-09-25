@@ -103,6 +103,134 @@ final class EstablishmentFramingCrossEngineTests: XCTestCase {
 		XCTAssertTrue(nativeAlice.isEstablished)
 	}
 
+	// MARK: - Sends before establishment
+
+	func testNativePreJoinSendsReachRustAcceptor() throws {
+		let (bobInvitation, their) = try rustInvitation("pxa-bob")
+		var alice = try nativeInitiator("pxa-alice", to: their)
+		let commitment = try alice.bootstrapKPCommitment()
+		_ = try alice.prepareToEncrypt()
+		let e1 = try alice.encrypt(Data("a1".utf8)).frame
+		_ = try alice.prepareToEncrypt()
+		let e2 = try alice.encrypt(Data("a2".utf8)).frame
+		let f2 = try establishmentFrame(bobInvitation.openInitial(blob: e2))
+		let f1 = try establishmentFrame(bobInvitation.openInitial(blob: e1))
+		let bob = try bobInvitation.receive(
+			welcome: try XCTUnwrap(f2.welcome),
+			theirClassicalKeyPackage: try XCTUnwrap(f2.returnKeyPackage),
+			bootstrapKpCommitment: commitment, spawnToken: Data("pxa".utf8),
+			newClientId: nil, expectedRemote: nil, expectedAppBinding: nil)
+		let got2 = try XCTUnwrap(
+			bob.processIncoming(ciphertext: try XCTUnwrap(f2.stapledMessage)))
+		XCTAssertEqual(got2.applicationMessage?.appMessageData, Data("a2".utf8))
+		let got1 = try XCTUnwrap(
+			bob.processIncoming(ciphertext: try XCTUnwrap(f1.stapledMessage)))
+		XCTAssertEqual(got1.applicationMessage?.appMessageData, Data("a1".utf8))
+		_ = try bob.prepareToEncrypt(proposing: nil)
+		let bobFirst = try bob.encrypt(appMessage: Data("b1".utf8)).cipherText
+		_ = try alice.processIncoming(try XCTUnwrap(alice.openIncoming(bobFirst)).frame)
+		XCTAssertTrue(alice.isEstablished)
+		_ = try alice.prepareToEncrypt()
+		let post = try alice.encrypt(Data("a3".utf8)).frame
+		let got3 = try XCTUnwrap(
+			bob.processIncoming(
+				ciphertext: try XCTUnwrap(bob.openIncoming(blob: post)).frame))
+		XCTAssertEqual(got3.applicationMessage?.appMessageData, Data("a3".utf8))
+	}
+
+	func testNativePayloadShapeSendReachesRustAcceptor() throws {
+		let (bobInvitation, their) = try rustInvitation("pxp-bob")
+		let principal = try Principal.generate(
+			clientID: Data("pxp-alice".utf8), classicalProvider: classicalProvider,
+			pqProvider: pqProvider)
+		let est = try TwoMLSSession.initiate(principal: principal, their: their)
+		var alice = est.session
+		_ = try alice.setInitialAppPayload(Data("host-signed".utf8))
+		_ = try alice.prepareToEncrypt()
+		let e = try alice.encrypt(Data("a1".utf8)).frame
+		let f = try establishmentFrame(bobInvitation.openInitial(blob: e))
+		XCTAssertEqual(f.appPayload, Data("host-signed".utf8))
+		XCTAssertNil(f.welcome)
+		let bob = try bobInvitation.receive(
+			welcome: est.welcome,
+			theirClassicalKeyPackage: try MLS.RFC9420.Message.keyPackage(
+				est.returnKeyPackage
+			).mlsEncoded(),
+			bootstrapKpCommitment: try alice.bootstrapKPCommitment(),
+			spawnToken: Data("pxp".utf8),
+			newClientId: nil, expectedRemote: nil, expectedAppBinding: nil)
+		let got = try XCTUnwrap(
+			bob.processIncoming(ciphertext: try XCTUnwrap(f.stapledMessage)))
+		XCTAssertEqual(got.applicationMessage?.appMessageData, Data("a1".utf8))
+	}
+
+	func testRustPreJoinSendReachesNativeAcceptor() throws {
+		let (bobInvitation, rustKP) = try nativeInvitation("pxr-bob")
+		var invitation = bobInvitation
+		let alice = try rustInitiator("pxr-alice", to: rustKP)
+		let commitment = try XCTUnwrap(alice.bootstrapKpCommitment())
+		_ = try alice.prepareToEncrypt(proposing: nil)
+		let e1 = try alice.encrypt(appMessage: Data("r1".utf8)).cipherText
+		let f1 = try nativeEstablishmentFrame(invitation.openInitial(e1))
+		XCTAssertEqual(f1.stapledMessage?.first, 0x09)
+		var bob = try invitation.receive(
+			welcome: try XCTUnwrap(f1.welcome),
+			theirClassicalKeyPackage: try keyPackage(
+				fromMessage: try XCTUnwrap(f1.returnKeyPackage)),
+			bootstrapKPCommitment: commitment, spawnToken: Data("pxr".utf8)
+		).session
+		guard
+			case .preEstablishment(let m) = try bob.processIncoming(
+				try XCTUnwrap(f1.stapledMessage))
+		else { return XCTFail("expected preEstablishment") }
+		XCTAssertEqual(m.applicationMessage, Data("r1".utf8))
+		XCTAssertEqual(
+			m.authenticatedData, try classicalProvider.hash(try XCTUnwrap(f1.welcome)))
+	}
+
+	func testMigratedPreJoinInitiatorSendsWithCarriedPayload() throws {
+		let alice = try TwoMLSPQBinding.TwoMlsPqPrincipal(clientId: Data("pxm-alice".utf8))
+		let bobPrincipal = try TwoMLSPQBinding.TwoMlsPqPrincipal(
+			clientId: Data("pxm-bob".utf8))
+		let bobInvitation = try TwoMLSPQBinding.TwoMlsPqInvitation.restore(
+			archive: bobPrincipal.generateInvitation(lastResort: true))
+		let aliceSession = try TwoMLSPQBinding.TwoMlsPqSession.initiate(
+			client: alice, theirKeyPackage: bobInvitation.combinerKeyPackage(),
+			appBinding: nil)
+		let returnKP = try alice.generateKeyPackage(suite: .init(value: 0x0003))
+		try aliceSession.setInitialAppPayload(payload: Data("pxm-host-signed".utf8))
+		let commitment = try XCTUnwrap(aliceSession.bootstrapKpCommitment())
+		let welcomeA = try XCTUnwrap(aliceSession.initialWelcome())
+		let export = try aliceSession.migrationExport()
+		let archive = try SessionMigrator.mint(
+			kind: .checkpoint, from: export,
+			classicalProvider: classicalProvider, pqProvider: pqProvider
+		).archive
+		var nativeAlice = try TwoMLSSession.restore(
+			core: nil, checkpoint: archive,
+			classicalProvider: classicalProvider, pqProvider: pqProvider)
+		_ = try nativeAlice.prepareToEncrypt()
+		let e = try nativeAlice.encrypt(Data("m1".utf8)).frame
+		let f = try establishmentFrame(bobInvitation.openInitial(blob: e))
+		XCTAssertEqual(f.appPayload, Data("pxm-host-signed".utf8))
+		let bob = try bobInvitation.receive(
+			welcome: welcomeA, theirClassicalKeyPackage: returnKP,
+			bootstrapKpCommitment: commitment, spawnToken: Data("pxm-spawn".utf8),
+			newClientId: nil, expectedRemote: nil, expectedAppBinding: nil)
+		let got = try XCTUnwrap(
+			bob.processIncoming(ciphertext: try XCTUnwrap(f.stapledMessage)))
+		XCTAssertEqual(got.applicationMessage?.appMessageData, Data("m1".utf8))
+		_ = try bob.prepareToEncrypt(proposing: nil)
+		let bobFirst = try bob.encrypt(appMessage: Data("b1".utf8)).cipherText
+		guard
+			case .decrypted(let d) = try nativeAlice.processIncoming(
+				try XCTUnwrap(nativeAlice.openIncoming(bobFirst)).frame)
+		else { return XCTFail("expected native alice to decrypt bob's first frame") }
+		_ = try TwoMLSSession.restore(
+			core: d.update.kind == .core ? d.update.archive : nil, checkpoint: archive,
+			classicalProvider: classicalProvider, pqProvider: pqProvider)
+	}
+
 	// MARK: - The parallel A.3 bootstrap
 
 	func testParallelA3CompletesFromNativeInitiatorToRustAcceptor() throws {
