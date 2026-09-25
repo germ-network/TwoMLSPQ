@@ -82,8 +82,8 @@ frame rides that send's re-staple peek (`pq_pending_outbound`), so the host's ro
   send groups' PQ halves **alone**, so the classical ratchet is never blocked behind a large
   ML-KEM updatePath. It is not a host call either: the session opens it in place of an A.4 when
   either leaf in the PQ half of our receive group lags its owner's canonical principal. When
-  that leaf is ours (a Phase 8 classical rotation moved the session client), our `Upd'`
-  announces our principal as the handoff. When it is the peer's, the peer's responder `Commit'`
+  that leaf is ours (a Phase 8 classical rotation moved the session client), our `Upd'`'s
+  new leaf carries our principal as the handoff. When it is the peer's, the peer's responder `Commit'`
   carries the peer's principal onto its own send-PQ leaf: the reciprocal catch-up. The
   initiator's send auto-stages `Upd'(self)` into the PQ half of the peer's send group (`0x1B`);
   the responder commits it with its own `Commit'` (`pq_rekey_respond`, `0x1D`) — whose updatePath
@@ -202,8 +202,8 @@ moves at its next approved commit (the peer observes `new_sender` on that staple
 message attribution follows). A PQ leaf minted at A.3 is born under its owner's
 then-canonical id; every other PQ leaf catches up over A.5 rounds, one per PQ group, which
 the session self-drives. The rotated party's own
-A.5 announces its *current*, already-canonical principal in the PQ half of the peer's
-send group, and the handoff's new leaf carries that credential. The peer's next turn then
+A.5 carries its *current*, already-canonical principal onto its leaf in the PQ half of
+the peer's send group. The peer's next turn then
 opens the reciprocal A.5, because the rotated party's leaf in the peer's receive group
 still lags. The rotated party answers as responder, and its `Commit'` carries the
 credential onto its own send-PQ leaf. The acceptor's recv-group leaf
@@ -254,6 +254,35 @@ to this crate — the caller picks the convention (Germ's adapter digests the en
 STABLE PREFIX — the app payload, else the bare welcome — so every pre-establishment
 re-staple from the same initiator resolves to the same token).
 
+## Session profiles
+
+The behavior this book specifies is the *correct* profile. A second profile,
+*deployed-compatible*, adds two behaviors that keep a session with the deployed engine
+healthy:
+
+- **Announced id.** An A.5 `Upd'` that changes its leaf's credential id also carries the
+  new id in its authenticated data. A key-only `Upd'` carries none. Deployed hosts read
+  the announced id to trigger reconciliation.
+- **Deferred reciprocal.** The reciprocal A.5 waits until the peer's own A.5 has landed,
+  meaning the peer's leaf in our send-PQ group presents its current canonical id. Until
+  then our turn opens an A.4, so the peer can still run its own round. This is the
+  accommodation for anomaly 5 below. The correct profile opens the reciprocal as soon as
+  the peer's leaf lags.
+
+In both profiles a receiver accepts an `Upd'` whose authenticated data is empty or equals
+the new leaf's credential id, and rejects any other value.
+
+Deployed-compatible is the default and is frozen: it changes only to fix a defect or to
+follow the deployed engine. The profile is chosen once per session, from the two key
+packages ([Group Rules](./group-rules.md), rule 9), and never changes, not even when a peer
+upgrades. A client advertises a profile only once it implements that profile completely.
+The deployed engine advertises none, so every session with it runs deployed-compatible,
+and so does every session created before profiles existed. A session migrated from the
+deployed engine is deployed-compatible too; its groups carry no record. Two clients that both
+advertise the correct profile start in it, with no flag day. A later wire-visible change
+to the correct behavior ships as a new profile with its own extension type, never as a
+change to a shipped one.
+
 ## Shipped anomalies
 
 This book specifies intended behavior. The deployed Rust engine, and the card host it
@@ -295,9 +324,9 @@ engine, or needing an accommodation beyond the spec.
    rejected, and the presented key survives only as its own send-PQ group's signer.
    When it later answers a peer's A.5, its responder `Commit'` replaces that signer,
    and the leaf is orphaned for good: no copy of its key remains.
-   - *Resolution: needs an accommodation.* A conforming peer defers a reciprocal A.5
-     until the peer's own A.5 has succeeded, meaning the peer's leaf in our send-PQ
-     group is current. Against a conforming peer this costs at most one extra round.
+   - *Resolution: needs an accommodation:* the deployed-compatible profile's deferred
+     reciprocal ([Session profiles](#session-profiles)), which every session with the
+     deployed engine runs. Against a conforming peer it costs at most one extra round.
      A conforming engine that takes the party over drops its mis-signed parked `Upd'`
      and re-proposes under the carried key, which heals it. Once the leaf is orphaned,
      nothing heals it.

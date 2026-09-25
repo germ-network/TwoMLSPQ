@@ -22,6 +22,13 @@ HPKE plaintext (see "The §A.1 envelope" below).
 | `PQ_REKEY_UPD_TAG` | `0x1B` | PQ re-key: initiator's `Upd'` proposal |
 | `PQ_REKEY_COMMIT_TAG` | `0x1D` | PQ re-key: the responder's `Commit'` |
 
+Every MLS object a TwoMLSPQ frame carries is a complete RFC 9420 `MLSMessage`, never a
+bare struct: each `APQWelcome` half, every key package (the published halves, the §A.1
+return key package, and the `0x13` KP′), every commit and proposal (including the A.5
+`Upd'` and `Commit'`), and every PrivateMessage (including the `0x09` app staple and the
+`0x17`/`0x19` legs). The envelope describes its own protocol version and content type, so
+a receiver never infers either from the frame tag alone.
+
 There is no bind tag: a round's closing bind is the **message-frame staple** (the
 `APQPrivateMessage` above), not a side-band frame, so every side-band frame is answered by
 its round's next leg.
@@ -314,6 +321,16 @@ deviation in how a pair's elements travel (the last bullet below).
 Every occupied leaf must advertise the `APQInfo` extension (`0xF0A1`) and the
 `AppDataUpdate` proposal (`0x0008`) types; a leaf that cannot support them is rejected
 rather than silently degraded.
+
+The extension and proposal types these frames use. The extension types sit in RFC 9420's
+private-use range (`0xF000`–`0xFFFF`):
+
+| Type | Value | Kind | Specified in |
+|------|-------|------|--------------|
+| `AppDataUpdate` | `0x0008` | proposal | [group rules](./group-rules.md), rule 7 |
+| `APQInfo` | `0xF0A1` | GroupContext extension | [group rules](./group-rules.md), rule 7 |
+| `AppBinding` | `0xF0A2` | GroupContext extension | [group rules](./group-rules.md), rule 8 |
+| `CorrectProfile` | `0xF0A3` | GroupContext extension; leaf capability entry | [group rules](./group-rules.md), rule 9 |
 
 ## Invariants
 

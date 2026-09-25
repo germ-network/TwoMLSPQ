@@ -237,8 +237,8 @@ PQ side-band (see [Session Lifecycle](./session-lifecycle.md)): `my_pq_turn`,
 legs — `pq_ratchet_respond` / `pq_ratchet_bind` and `pq_rekey_respond` / `pq_rekey_apply`. **There
 is no `pq_ratchet_begin` / `pq_rekey_begin`: the session self-drives A.4 and A.5.** On each
 `encrypt`, when it is our turn and the side-band is idle, the session auto-stages the next round's
-opening frame (A.5 on a credential lag — announcing the session's current principal as the handoff
-— else A.4), and the host takes it from `pq_pending_outbound`/`pq_take_pending_outbound` to send
+opening frame (A.5 on a credential lag — carrying the session's current principal onto our leaf
+as the handoff — else A.4), and the host takes it from `pq_pending_outbound`/`pq_take_pending_outbound` to send
 alongside the message. A.3 bootstrap stays host-driven (`pq_bootstrap_begin`, whose `rotating`
 parameter carries the principal credential handoff and must name the session's current principal).
 The A.4 ratchet and A.3 bootstrap have no separate `apply` call: the initiator ingests the

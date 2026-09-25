@@ -76,6 +76,29 @@ reusable layer: an `MlsRules` filter every client is built with
    (the first adopter binds `H(domain-tag ‖ role-ordered did:did)`); the crate never
    interprets the bytes. Leaves advertise the extension type, so a binding-carrying
    group can only ever contain capability-bearing leaves.
+9. **The session profile is chosen from the two key packages and written once.** A
+   session runs one profile for its whole life (see
+   [Session Lifecycle](./session-lifecycle.md#session-profiles)). The default,
+   deployed-compatible, needs no signal. Every other profile has its own extension type,
+   which a classical key package's leaf lists in its capabilities when its client can
+   start a session in that profile: `CorrectProfile` (`0xF0A3`) for the correct profile.
+   A session runs a non-default profile only when both parties' classical key packages
+   advertise it, and runs the newest profile both advertise. Those are the classical half
+   of the acceptor's published combiner key package, which the initiator holds, and the
+   initiator's return key package, which the acceptor receives, so both parties compute
+   the same choice from signed key packages, with no negotiation message. The
+   chosen profile is recorded as a GroupContext extension of that profile's type, with
+   empty contents, written at creation into the classical half of the initiator's send
+   group and riding the Welcome. The default profile records nothing. A record with
+   contents, or more than one record, is rejected. The acceptor checks the recorded
+   profile against its own computation and mirrors it onto its return group, and the
+   initiator requires the return welcome to carry it back unchanged — all
+   `SessionProfileMismatch`, and on the invitation path raised before any invitation
+   state is claimed. PQ halves carry none (a PQ-half record is rejected at every PQ
+   join), and rule 1's GroupContextExtensions ban makes it immutable. As with the
+   AppBinding, leaves keep advertising the recorded type, so a profile-carrying group can
+   only ever contain capability-bearing leaves. The PQ key package's leaf need not list
+   it.
 
 ## Enforcement map
 
@@ -94,6 +117,7 @@ checks each cover ingress the others cannot see.
 | Epoch discipline | — | staple-epoch compare in `process_incoming` (`EpochDesync` / skip) |
 | Identity binding at establishment | — | `expected_remote` pre-claim check; creator-leaf ≡ key-package check at join; A.3 bootstrap KP hash-commitment check (`BootstrapKpMismatch`) |
 | App-state binding at establishment | GCE ban keeps it immutable post-creation | `verify_app_binding` against `expected_app_binding` at `receive`/`accept` (post-join, pre-claim) and against the session's own binding at the initiator's return-welcome join; `verify_pq_half_unbound` at every PQ-half join (the binding lives on the classical halves only); empty bindings rejected at creation and as expectations (all `AppBindingMismatch`); leaf capability advertisement keeps uncapable leaves out of bound groups |
+| Session profile at establishment | GCE ban keeps it immutable post-creation | not implemented in this crate: it advertises no profile, so a conforming peer never records one in a group it shares, and each session it runs is deployed-compatible |
 
 Two properties worth naming:
 
@@ -168,5 +192,5 @@ rebindable view, and the sequences ride the session archive.
 
 A refusal surfaces as `CredentialRejected` and is **retryable** where it arises from
 a staple: the staple re-rides every frame, so approve-and-reprocess recovers the
-round. `new_sender` / `new_recipient` are event hints; 	zxvbbvsv=`their_principal_state()` /
+round. `new_sender` / `new_recipient` are event hints; `their_principal_state()` /
 `my_principal_state()` are the truth.
