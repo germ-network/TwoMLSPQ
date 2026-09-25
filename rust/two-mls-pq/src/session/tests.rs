@@ -5239,10 +5239,14 @@ fn test_initial_envelope_roundtrip_return_welcome_sealed() {
     // Bob's return welcome is symmetric-sealed (Bob has the recv group) and opens on
     // Alice's window to the APQWelcome.
     let welcome_b = assert_some!(bob_s.pending_outbound());
-    assert_ne!(welcome_b.first(), Some(&super::APQ_TAG));
-    assert_eq!(
-        open_frame(&alice_s, &welcome_b).first(),
-        Some(&super::APQ_TAG)
+    let plaintext_welcome_b = open_frame(&alice_s, &welcome_b);
+    assert_eq!(plaintext_welcome_b.first(), Some(&super::APQ_TAG));
+    // Not a first-byte check: offset 0 of a sealed frame is a random nonce, so it
+    // equals any given tag once in 256 draws.
+    let n = plaintext_welcome_b.len().min(16);
+    assert!(
+        !welcome_b.windows(n).any(|w| w == &plaintext_welcome_b[..n]),
+        "the plaintext welcome must not appear in the sealed frame"
     );
 }
 
