@@ -52,9 +52,6 @@ struct DeliveryScheduler {
 	private(set) var sideLanes: [Role: [SideBandLeg]] = [:]
 	/// Offers surfaced to `role` and not yet folded.
 	private(set) var outstandingOffers: [Role: [OfferRecord]] = [:]
-	/// Digests already folded by `role` — an Update is idempotent, so a host never folds
-	/// the same proposal twice even if a reordered/duplicated frame re-offers it.
-	private var foldedOffers: [Role: Set<Data>] = [:]
 	/// The highest RECEIVER-side watermark (the role's own persisted/advanced seq) observed
 	/// when a frame was delivered to it. Gating on this keeps the comparison inside ONE
 	/// engine's seq space — the earlier gate compared the EMITTER's `dependsOnSeq` against the
@@ -83,9 +80,9 @@ struct DeliveryScheduler {
 
 	mutating func offer(_ record: OfferRecord, to role: Role) {
 		// Single-occupancy, latest-wins — both engines surface at most one pending offer
-		// (a new offer replaces the previous), so a host folds only the latest and never a
-		// digest it already folded.
-		guard !(foldedOffers[role]?.contains(record.digest) ?? false) else { return }
+		// (a new offer replaces the previous), so a host folds only the latest.
+		// A re-surfaced digest is live again on both engines; staleness is policed by the
+		// fold liveness gates, not suppressed here.
 		outstandingOffers[role] = [record]
 	}
 
@@ -93,7 +90,6 @@ struct DeliveryScheduler {
 		guard var offers = outstandingOffers[role], !offers.isEmpty else { return nil }
 		let record = offers.removeFirst()
 		outstandingOffers[role] = offers
-		foldedOffers[role, default: []].insert(record.digest)
 		return record
 	}
 
