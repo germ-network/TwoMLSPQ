@@ -85,6 +85,11 @@ struct RunResult {
 	var probeViolations = 0
 	/// Restores that found no legal checkpoint and were skipped (visible, not silent).
 	var restoreSkips = 0
+	/// role -> op of the last `restoreBehindDelivery` that actually FIRED (behind-restore
+	/// attribution for designed-wedge reclassification).
+	var behindRestoredAt: [String: Int] = [:]
+	/// Violations attributable to a behind-restore (designed wedge) — reported, not failed.
+	var designedWedgeViolations: [String] = []
 }
 
 struct RestoreRecord: Sendable {
@@ -140,6 +145,24 @@ struct DifferentialRun {
 		var result = RunResult()
 		for (opIndex, op) in script.ops.enumerated() {
 			execute(op, opIndex: opIndex, into: &result)
+		}
+		// Reclassify violations structurally attributable to a behind-restore as DESIGNED
+		// WEDGE (the negative op asserts clean classification, not convergence).
+		let behindOps = Set(result.behindRestoredAt.values)
+		if !behindOps.isEmpty {
+			let (designed, hard) = result.violations.reduce(
+				into: ([String](), [String]())
+			) {
+				acc, v in
+				let op = DifferentialRun.opIndex(inFinding: v)
+				if let op, behindOps.contains(where: { $0 < op }) {
+					acc.0.append(v)
+				} else {
+					acc.1.append(v)
+				}
+			}
+			result.designedWedgeViolations = designed
+			result.violations = hard
 		}
 		for role in Role.allCases {
 			let s = pair.session(role)
@@ -606,6 +629,7 @@ struct DifferentialRun {
 		}
 		do {
 			try session.restore(toSeq: target)
+			if behind { result.behindRestoredAt[role.rawValue] = opIndex }
 			if ProcessInfo.processInfo.environment["DIFFERENTIAL_DEBUG_RESTORE"] != nil
 			{
 				FileHandle.standardError.write(
@@ -818,6 +842,14 @@ struct DifferentialRun {
 			Data(
 				"DBG deliv dir=\(direction.rawValue) seed=\(seed) op=\(op) role=\(role.rawValue) engine=\(pair.session(role).engine.rawValue) tag=\(tag) firstByte=\(tag.prefix(2)) srcOp=\(srcOp) first=\(first) offer=\(offer) err=\(err)\n"
 					.utf8))
+	}
+
+	/// Extract the first `op N` from a finding/violation string (nil if absent).
+	static func opIndex(inFinding text: String) -> Int? {
+		guard let r = text.range(of: #"op ([0-9]+)"#, options: .regularExpression) else {
+			return nil
+		}
+		return Int(text[r].dropFirst(3))
 	}
 
 	private static func isOpener(_ kind: SideBandKind) -> Bool {

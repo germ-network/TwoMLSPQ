@@ -125,6 +125,7 @@ enum DifferentialChecks {
 		var findings: [String] = []
 		var presenceExcluded = 0
 		var presenceByCall: [String: Int] = [:]
+		var designedWedgeExcluded = 0
 		var summary: String {
 			let detail =
 				presenceByCall.sorted { $0.key < $1.key }.map {
@@ -133,6 +134,8 @@ enum DifferentialChecks {
 				.joined(separator: ",")
 			return
 				"offer-presence-divergences excluded: \(presenceExcluded) [\(detail)]"
+				+ "  designed-wedge findings excluded: \(designedWedgeExcluded)"
+				+ "  failing findings: \(findings.count)"
 		}
 	}
 
@@ -152,6 +155,21 @@ enum DifferentialChecks {
 
 		var cmp = MixedComparison()
 		cmp.findings = swift.violations + rust.violations
+		cmp.designedWedgeExcluded =
+			swift.designedWedgeViolations.count + rust.designedWedgeViolations.count
+		// Behind-restore attribution: `op` postdates a fired behind-restore in either
+		// direction. The negative op asserts CLEAN CLASSIFICATION, so a divergence that is
+		// behind-attributed AND cleanly classified is a DESIGNED-WEDGE outcome.
+		let behindOps =
+			Array(swift.behindRestoredAt.values) + Array(rust.behindRestoredAt.values)
+		func behindAttributed(_ op: Int) -> Bool { behindOps.contains { $0 < op } }
+		// A misparse is never excused: an unclassified `.other`, or an unsupported tag the
+		// error table does not equate.
+		func unclassified(_ o: ComparableOutcome) -> Bool {
+			if o.error == .other { return true }
+			let t = o.errorText ?? ""
+			return t.contains("unsupportedFrameTag") || t.contains("aeadOpenFailed")
+		}
 
 		// Align by (op, role, call). A key present in one direction and absent in the other —
 		// or with a different multiplicity — is normally a divergence, but when the cause is
@@ -212,6 +230,13 @@ enum DifferentialChecks {
 					// presence difference, not a handling one.
 					if presenceDivergent {
 						classifyPresence(key)
+						continue
+					}
+					if behindAttributed(key.op)
+						&& !unclassified(a[i].outcome)
+						&& !unclassified(b[i].outcome)
+					{
+						cmp.designedWedgeExcluded += 1
 						continue
 					}
 					cmp.findings.append(

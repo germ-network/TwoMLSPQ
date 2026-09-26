@@ -232,6 +232,31 @@ engine.
 
 
 
+## Comparison contract: designed-wedge rule (behind-restore outcomes)
+
+`restoreBehindDelivery` is a NEGATIVE op: it asserts **clean classification**, not
+convergence. Once a behind-restore has FIRED for a role, that run's divergences that are
+**structurally attributable** to it are reclassified as **DESIGNED-WEDGE outcomes** —
+counted in the per-run summary line, not failed. Attribution is structural, never run-wide:
+the divergence's op must **postdate** the role's last fired `restoreBehindDelivery` op
+(tracked per role in `RunResult.behindRestoredAt`); a divergence in a window with no
+behind-restore still fails.
+
+What still fails in every run, including designed-wedge runs:
+
+- any **unclassified** error — `errorClass == .other`, `aeadOpenFailed`, or an
+  `unsupportedFrameTag` the error table does not equate. Clean classification is the point
+  of the negative op, so a misparse is never excused;
+- any divergence not behind-attributable (pre-restore handling differences; fresh-decrypt or
+  side-band divergences outside a behind-restore window);
+- all other invariants: no double-apply, persist-before-send, no double-commit-in-flight,
+  per-frame handling.
+
+The summary line reports both counts:
+`seed N offer-presence-divergences excluded: P […]  designed-wedge findings excluded: W  failing findings: F`.
+The suite's failure condition is: any finding that is neither presence-excluded,
+ledger-excused, nor behind-restore-attributed.
+
 ## Comparison contract: handling-only for offers (option a)
 
 The mixed-pair comparison is **handling-only** for offers. Cross-direction
