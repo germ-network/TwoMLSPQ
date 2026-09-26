@@ -267,7 +267,10 @@ final class RustEngineSession: EngineSession {
 	func debugReplicaGuards() -> String? { nil }
 	func offerStillVerifies() -> Bool? { nil }
 	func debugStateLine() -> String {
-		"seq=\(lastStateSeq()) epoch=\(session.epochs().classicalEpoch) pqTurn=\(session.myPqTurn()) wedged=\(session.pqSideBandWedged()) est=\(session.isEstablished()) full=\(session.isFullyEstablished())"
+		// The pin binding exposes no recv-group epoch accessor (send-group `epochs()` only);
+		// the receiver epoch is observable per-delivery from the decrypted message instead.
+		return
+			"seq=\(lastStateSeq()) sendEpoch=\(session.epochs().classicalEpoch) recvEpoch=- pqTurn=\(session.myPqTurn()) wedged=\(session.pqSideBandWedged()) est=\(session.isEstablished()) full=\(session.isFullyEstablished())"
 	}
 	func principalStateIDs() -> (mine: Data?, theirs: Data?) {
 		func id(_ s: TwoMLSPQBinding.PrincipalState) -> Data {
@@ -473,7 +476,13 @@ final class SwiftEngineSession: EngineSession {
 		(session.myPrincipalState.clientID, session.theirPrincipalState.clientID)
 	}
 	func debugStateLine() -> String {
-		"seq=\(lastSeq) epoch=\(session.epochs.classicalEpoch) pqTurn=\(session.myPQTurn) wedged=\(session.pqSideBandWedged) est=\(session.isEstablished) full=\(session.isFullyEstablished)"
+		let recv =
+			session.recvGroup.map {
+				"\(TwoMLSSession.groupEpochs(of: $0).classicalEpoch)"
+			}
+			?? "-"
+		return
+			"seq=\(lastSeq) sendEpoch=\(session.epochs.classicalEpoch) recvEpoch=\(recv) pqTurn=\(session.myPQTurn) wedged=\(session.pqSideBandWedged) est=\(session.isEstablished) full=\(session.isFullyEstablished)"
 	}
 
 	func sideBandLeg() throws -> Data? { session.pqPendingOutbound() }

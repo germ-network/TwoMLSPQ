@@ -342,7 +342,8 @@ struct DifferentialRun {
 				op: opIndex, role: role, tag: frame.bytes.hexPrefix,
 				srcOp: frame.opIndex,
 				first: firstDelivery,
-				offer: step.offeredDigest != nil, err: "-")
+				offer: step.offeredDigest != nil, epoch: step.decryptedEpoch,
+				err: "-")
 			if let digest = step.offeredDigest {
 				scheduler.offer(
 					OfferRecord(
