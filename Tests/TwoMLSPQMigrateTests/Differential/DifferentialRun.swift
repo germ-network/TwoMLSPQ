@@ -844,13 +844,14 @@ struct DifferentialRun {
 	}
 
 	private func debugDeliver(
-		op: Int, role: Role, tag: String, srcOp: Int, first: Bool, offer: Bool, err: String
+		op: Int, role: Role, tag: String, srcOp: Int, first: Bool, offer: Bool,
+		epoch: UInt64? = nil, err: String
 	) {
 		guard ProcessInfo.processInfo.environment["DIFFERENTIAL_DEBUG_DELIVER"] != nil
 		else { return }
 		FileHandle.standardError.write(
 			Data(
-				"DBG deliv dir=\(direction.rawValue) seed=\(seed) op=\(op) role=\(role.rawValue) engine=\(pair.session(role).engine.rawValue) tag=\(tag) firstByte=\(tag.prefix(2)) srcOp=\(srcOp) first=\(first) offer=\(offer) err=\(err)\n"
+				"DBG deliv dir=\(direction.rawValue) seed=\(seed) op=\(op) role=\(role.rawValue) engine=\(pair.session(role).engine.rawValue) tag=\(tag) firstByte=\(tag.prefix(2)) srcOp=\(srcOp) first=\(first) offer=\(offer) epoch=\(epoch.map(String.init) ?? "-") err=\(err)\n"
 					.utf8))
 	}
 

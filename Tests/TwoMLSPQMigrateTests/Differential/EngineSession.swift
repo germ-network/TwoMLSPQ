@@ -66,6 +66,9 @@ struct OutcomeStep: Equatable, Sendable {
 	var errorClass: ErrorClass?
 	/// The raw error description, for diagnostics only (never compared).
 	var errorText: String?
+	/// Diagnostics: the decrypted app message's epoch (the receiver's live receive epoch,
+	/// since the PM was sealed in it) — row-7 receiver-epoch observable.
+	var decryptedEpoch: UInt64?
 }
 
 /// A session's outstanding side-band round kind, normalized across engines.
@@ -346,6 +349,7 @@ final class RustEngineSession: EngineSession {
 		var step = OutcomeStep()
 		if let app = result.applicationMessage {
 			step.appPayloads.append(app.appMessageData)
+			step.decryptedEpoch = app.epoch
 		}
 		if let proposal = result.proposal {
 			step.offeredDigest = proposal.digest
@@ -530,6 +534,7 @@ final class SwiftEngineSession: EngineSession {
 		switch result {
 		case .decrypted(let decrypted):
 			step.appPayloads.append(decrypted.applicationMessage)
+			step.decryptedEpoch = decrypted.epoch
 			step.offeredDigest = decrypted.queuedProposal.digest
 			step.offeredProposing = decrypted.queuedProposal.proposing
 			step.offeredContext = decrypted.queuedProposal.context
