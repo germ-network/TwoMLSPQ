@@ -157,7 +157,17 @@ struct DifferentialRun {
 		return result
 	}
 
+	private mutating func debugState(op: Int) {
+		guard ProcessInfo.processInfo.environment["DIFFERENTIAL_DEBUG_SIDEBAND"] != nil
+		else { return }
+		FileHandle.standardError.write(
+			Data(
+				"DBG state dir=\(direction.rawValue) seed=\(seed) op=\(op) A[\(pair.initiator.debugStateLine())] B[\(pair.acceptor.debugStateLine())]\n"
+					.utf8))
+	}
+
 	private mutating func execute(_ op: DiffOp, opIndex: Int, into result: inout RunResult) {
+		debugState(op: opIndex)
 		switch op {
 		case .send(let role, let payload, let rotate):
 			send(
@@ -206,7 +216,17 @@ struct DifferentialRun {
 		case .handOutSideBand(let role):
 			handOutSideBand(role: role, opIndex: opIndex, into: &result)
 		case .deliverSideBand(let role, let index):
-			guard let leg = scheduler.takeSide(role, index: index) else { return }
+			guard let leg = scheduler.takeSide(role, index: index) else {
+				if ProcessInfo.processInfo.environment[
+					"DIFFERENTIAL_DEBUG_SIDEBAND"] != nil
+				{
+					FileHandle.standardError.write(
+						Data(
+							"DBG sb dir=\(direction.rawValue) seed=\(seed) op=\(opIndex) NOSIDE-LEG role=\(role.rawValue) laneCount=\(scheduler.sideCount(role))\n"
+								.utf8))
+				}
+				return
+			}
 			deliverSideBand(leg: leg, receiver: role, opIndex: opIndex, into: &result)
 		case .crashAndRestore(let role, let depth):
 			debugRestore(op: opIndex, role: role, kind: "crash")
@@ -291,6 +311,7 @@ struct DifferentialRun {
 			let step = try session.processIncoming(frame.bytes)
 			debugDeliver(
 				op: opIndex, role: role, tag: frame.bytes.hexPrefix,
+				srcOp: frame.opIndex,
 				first: firstDelivery,
 				offer: step.offeredDigest != nil, err: "-")
 			if let digest = step.offeredDigest {
@@ -318,6 +339,7 @@ struct DifferentialRun {
 		} catch {
 			debugDeliver(
 				op: opIndex, role: role, tag: frame.bytes.hexPrefix,
+				srcOp: frame.opIndex,
 				first: firstDelivery,
 				offer: false,
 				err:
@@ -442,7 +464,25 @@ struct DifferentialRun {
 		role: Role, opIndex: Int, into result: inout RunResult
 	) {
 		do {
-			guard let leg = try pair.session(role).sideBandLeg() else { return }
+			guard let leg = try pair.session(role).sideBandLeg() else {
+				if ProcessInfo.processInfo.environment[
+					"DIFFERENTIAL_DEBUG_SIDEBAND"] != nil
+				{
+					FileHandle.standardError.write(
+						Data(
+							"DBG sb dir=\(direction.rawValue) seed=\(seed) op=\(opIndex) HANDOUT role=\(role.rawValue) engine=\(pair.session(role).engine.rawValue) NO-LEG\n"
+								.utf8))
+				}
+				return
+			}
+			let kind = try? pair.session(role).openKind(leg)
+			if ProcessInfo.processInfo.environment["DIFFERENTIAL_DEBUG_SIDEBAND"] != nil
+			{
+				FileHandle.standardError.write(
+					Data(
+						"DBG sb dir=\(direction.rawValue) seed=\(seed) op=\(opIndex) HANDOUT role=\(role.rawValue) engine=\(pair.session(role).engine.rawValue) firstByte=\(leg.hexPrefix.prefix(2)) len=\(leg.count) selfOpenKind=\(kind?.rawValue ?? "-") ->lane(\(role.peer.rawValue))\n"
+							.utf8))
+			}
 			scheduler.enqueueSideBand(
 				SideBandLeg(bytes: leg, from: role, opIndex: opIndex), to: role.peer
 			)
@@ -456,8 +496,15 @@ struct DifferentialRun {
 		leg: SideBandLeg, receiver: Role, opIndex: Int, into result: inout RunResult
 	) {
 		let session = pair.session(receiver)
+		let dbg = ProcessInfo.processInfo.environment["DIFFERENTIAL_DEBUG_SIDEBAND"] != nil
 		do {
 			let kind = try session.openKind(leg.bytes)
+			if dbg {
+				FileHandle.standardError.write(
+					Data(
+						"DBG sb dir=\(direction.rawValue) seed=\(seed) op=\(opIndex) DELIVER firstByte=\(leg.bytes.hexPrefix.prefix(2)) len=\(leg.bytes.count) srcRole=\(leg.from.rawValue) srcOp=\(leg.opIndex) receiver=\(receiver.rawValue) engine=\(session.engine.rawValue) openKind=\(kind?.rawValue ?? "nil")\n"
+							.utf8))
+			}
 			if kind == nil {
 				// Not sealable for this receiver — an opaque leg is a scheduler no-op.
 				return
@@ -749,13 +796,13 @@ struct DifferentialRun {
 	}
 
 	private func debugDeliver(
-		op: Int, role: Role, tag: String, first: Bool, offer: Bool, err: String
+		op: Int, role: Role, tag: String, srcOp: Int, first: Bool, offer: Bool, err: String
 	) {
 		guard ProcessInfo.processInfo.environment["DIFFERENTIAL_DEBUG_DELIVER"] != nil
 		else { return }
 		FileHandle.standardError.write(
 			Data(
-				"DBG deliv dir=\(direction.rawValue) seed=\(seed) op=\(op) role=\(role.rawValue) engine=\(pair.session(role).engine.rawValue) tag=\(tag) first=\(first) offer=\(offer) err=\(err)\n"
+				"DBG deliv dir=\(direction.rawValue) seed=\(seed) op=\(op) role=\(role.rawValue) engine=\(pair.session(role).engine.rawValue) tag=\(tag) firstByte=\(tag.prefix(2)) srcOp=\(srcOp) first=\(first) offer=\(offer) err=\(err)\n"
 					.utf8))
 	}
 

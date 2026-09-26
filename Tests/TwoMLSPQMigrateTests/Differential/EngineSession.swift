@@ -131,6 +131,9 @@ protocol EngineSession: AnyObject {
 	func debugHeldOfferDigest() -> Data?
 	/// Diagnostics: this session's own and the peer's canonical client ids.
 	func principalStateIDs() -> (mine: Data?, theirs: Data?)
+	/// Diagnostics: a compact state line (durability seq, send epoch, PQ turn, wedged flag,
+	/// established flags) for the row-3 first-divergent-op search.
+	func debugStateLine() -> String
 	/// Diagnostics: the raw bytes of the offer the Swift engine currently holds (for the
 	/// fold-guard replica). Rust exposes no equivalent.
 	func debugHeldOfferMessage() -> Data?
@@ -260,6 +263,9 @@ final class RustEngineSession: EngineSession {
 	func debugHeldOfferMessage() -> Data? { nil }
 	func debugReplicaGuards() -> String? { nil }
 	func offerStillVerifies() -> Bool? { nil }
+	func debugStateLine() -> String {
+		"seq=\(lastStateSeq()) epoch=\(session.epochs().classicalEpoch) pqTurn=\(session.myPqTurn()) wedged=\(session.pqSideBandWedged()) est=\(session.isEstablished()) full=\(session.isFullyEstablished())"
+	}
 	func principalStateIDs() -> (mine: Data?, theirs: Data?) {
 		func id(_ s: TwoMLSPQBinding.PrincipalState) -> Data {
 			switch s {
@@ -461,6 +467,9 @@ final class SwiftEngineSession: EngineSession {
 	}
 	func principalStateIDs() -> (mine: Data?, theirs: Data?) {
 		(session.myPrincipalState.clientID, session.theirPrincipalState.clientID)
+	}
+	func debugStateLine() -> String {
+		"seq=\(lastSeq) epoch=\(session.epochs.classicalEpoch) pqTurn=\(session.myPQTurn) wedged=\(session.pqSideBandWedged) est=\(session.isEstablished) full=\(session.isFullyEstablished)"
 	}
 
 	func sideBandLeg() throws -> Data? { session.pqPendingOutbound() }
