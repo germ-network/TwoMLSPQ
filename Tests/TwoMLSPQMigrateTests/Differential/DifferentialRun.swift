@@ -620,16 +620,26 @@ struct DifferentialRun {
 				maxDeliveredThisRole: scheduler.maxDeliveredReceiverSeq[role] ?? 0,
 				stateSeqBefore: session.lastStateSeq(),
 				inFlightSeqs: (scheduler.lanes[role] ?? []).map(\.dependsOnSeq)))
-		if ProcessInfo.processInfo.environment["DIFFERENTIAL_DEBUG_RESTORE"] != nil {
-			let inFlight = (scheduler.lanes[role] ?? []).map { String($0.dependsOnSeq) }
-			FileHandle.standardError.write(
-				Data(
-					"DBG restore-detail seed=\(seed) dir=\(direction.rawValue) op=\(opIndex) role=\(role.rawValue) engine=\(session.engine.rawValue) kind=\(call) depth=\(depth) target=\(target) seqBefore=\(session.lastStateSeq()) maxDelivered=\(scheduler.maxDeliveredReceiverSeq[role] ?? 0) legal=\(scheduler.isLegalRestore(role, seq: target)) inFlightSeq=[\(inFlight.joined(separator: ","))]\n"
-						.utf8))
-		}
+		let restoreDebug =
+			ProcessInfo.processInfo.environment["DIFFERENTIAL_DEBUG_RESTORE"] != nil
+		let targetForDebug = target
+		let seqBeforeForDebug = session.lastStateSeq()
 		do {
 			try session.restore(toSeq: target)
 			if behind { result.behindRestoredAt[role.rawValue] = opIndex }
+			// Dumped AFTER the attempt, so it reports only restores that FIRED — the same
+			// set `behindRestoredAt` records. (Dumping before the attempt made an offline
+			// analysis count throwing/short-circuiting restores and over-estimate the
+			// behind-restore attribution window.)
+			if restoreDebug {
+				let inFlight = (scheduler.lanes[role] ?? []).map {
+					String($0.dependsOnSeq)
+				}
+				FileHandle.standardError.write(
+					Data(
+						"DBG restore-detail seed=\(seed) dir=\(direction.rawValue) op=\(opIndex) role=\(role.rawValue) engine=\(session.engine.rawValue) kind=\(call) depth=\(depth) target=\(targetForDebug) seqBefore=\(seqBeforeForDebug) maxDelivered=\(scheduler.maxDeliveredReceiverSeq[role] ?? 0) legal=\(scheduler.isLegalRestore(role, seq: targetForDebug)) inFlightSeq=[\(inFlight.joined(separator: ","))] FIRED=true\n"
+							.utf8))
+			}
 			if ProcessInfo.processInfo.environment["DIFFERENTIAL_DEBUG_RESTORE"] != nil
 			{
 				FileHandle.standardError.write(

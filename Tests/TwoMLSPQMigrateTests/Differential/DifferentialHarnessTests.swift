@@ -126,6 +126,7 @@ enum DifferentialChecks {
 		var presenceExcluded = 0
 		var presenceByCall: [String: Int] = [:]
 		var designedWedgeExcluded = 0
+		var behindOps: [Int] = []
 		var summary: String {
 			let detail =
 				presenceByCall.sorted { $0.key < $1.key }.map {
@@ -135,7 +136,7 @@ enum DifferentialChecks {
 			return
 				"offer-presence-divergences excluded: \(presenceExcluded) [\(detail)]"
 				+ "  designed-wedge findings excluded: \(designedWedgeExcluded)"
-				+ "  failing findings: \(findings.count)"
+				+ "  failing findings: \(findings.count)  behindOps=\(behindOps.sorted())"
 		}
 	}
 
@@ -162,6 +163,7 @@ enum DifferentialChecks {
 		// behind-attributed AND cleanly classified is a DESIGNED-WEDGE outcome.
 		let behindOps =
 			Array(swift.behindRestoredAt.values) + Array(rust.behindRestoredAt.values)
+		cmp.behindOps = behindOps
 		func behindAttributed(_ op: Int) -> Bool { behindOps.contains { $0 < op } }
 		// A misparse is never excused: an unclassified `.other`, or an unsupported tag the
 		// error table does not equate.
