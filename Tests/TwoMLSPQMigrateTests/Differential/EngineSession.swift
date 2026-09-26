@@ -112,6 +112,9 @@ protocol EngineSession: AnyObject {
 	func lastStateSeq() -> UInt64
 	/// Every blob this session has handed back so far (for legal restore points).
 	func recordedBlobs() -> [RecordedBlob]
+	/// The highest durability seq the host has actually PERSISTED for this session — what
+	/// "persist before send" must be checked against.
+	func maxPersistedSeq() -> UInt64
 
 	@discardableResult func prepareToEncrypt(proposing: Data?) throws -> PrepareOutcome
 	func encrypt(_ payload: Data) throws -> EmittedFrame
@@ -210,6 +213,7 @@ final class RustEngineSession: EngineSession {
 	func sendEpoch() -> UInt64 { session.epochs().classicalEpoch }
 	func lastStateSeq() -> UInt64 { max(lastSeq, session.stateSeq()) }
 	func recordedBlobs() -> [RecordedBlob] { sink.recorded() }
+	func maxPersistedSeq() -> UInt64 { sink.recorded().map(\.seq).max() ?? 0 }
 
 	func prepareToEncrypt(proposing: Data?) throws -> PrepareOutcome {
 		let result = try session.prepareToEncrypt(
@@ -398,6 +402,7 @@ final class SwiftEngineSession: EngineSession {
 	func sendEpoch() -> UInt64 { session.epochs.classicalEpoch }
 	func lastStateSeq() -> UInt64 { lastSeq }
 	func recordedBlobs() -> [RecordedBlob] { metas }
+	func maxPersistedSeq() -> UInt64 { metas.map(\.seq).max() ?? 0 }
 
 	func prepareToEncrypt(proposing: Data?) throws -> PrepareOutcome {
 		let result = try session.prepareToEncrypt(rotating: proposing)

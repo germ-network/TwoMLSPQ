@@ -77,6 +77,32 @@ struct RunResult {
 	var violations: [String] = []
 	/// Sites where this direction had no live offer (queueProposal) or no frame to deliver.
 	var presenceLimited: Set<PresenceSite> = []
+	/// Per-restore record for the row-3 wedge analysis.
+	var restores: [RestoreRecord] = []
+	/// End-of-run state per role, for convergence ("heals") checks.
+	var endState: [String: RoleEndState] = [:]
+	/// Whether any probe in this run reported a violation (quiescence failure = wedge).
+	var probeViolations = 0
+}
+
+struct RestoreRecord: Sendable {
+	let op: Int
+	let role: String
+	let kind: String
+	let depth: UInt64
+	let targetSeq: UInt64
+	let legalThisRole: Bool
+	let legalOtherRole: Bool
+	let maxDeliveredThisRole: UInt64
+	let stateSeqBefore: UInt64
+	let inFlightSeqs: [UInt64]
+}
+
+struct RoleEndState: Sendable {
+	let stateSeq: UInt64
+	let sendEpoch: UInt64
+	let fullyEstablished: Bool
+	let heldOffer: String
 }
 
 @available(macOS 26, iOS 26, *)
@@ -112,6 +138,21 @@ struct DifferentialRun {
 		var result = RunResult()
 		for (opIndex, op) in script.ops.enumerated() {
 			execute(op, opIndex: opIndex, into: &result)
+		}
+		for role in Role.allCases {
+			let s = pair.session(role)
+			result.endState[role.rawValue] = RoleEndState(
+				stateSeq: s.lastStateSeq(), sendEpoch: s.sendEpoch(),
+				fullyEstablished: s.isFullyEstablished(),
+				heldOffer: s.debugHeldOfferDigest()?.hexPrefix ?? "-")
+		}
+		if ProcessInfo.processInfo.environment["DIFFERENTIAL_DEBUG_RESTORE"] != nil {
+			let a = result.endState[Role.a.rawValue]!
+			let b = result.endState[Role.b.rawValue]!
+			FileHandle.standardError.write(
+				Data(
+					"DBG runend seed=\(seed) dir=\(direction.rawValue) probeViolations=\(result.probeViolations) A(seq=\(a.stateSeq) epoch=\(a.sendEpoch) full=\(a.fullyEstablished) offer=\(a.heldOffer)) B(seq=\(b.stateSeq) epoch=\(b.sendEpoch) full=\(b.fullyEstablished) offer=\(b.heldOffer))\n"
+						.utf8))
 		}
 		return result
 	}
@@ -207,6 +248,16 @@ struct DifferentialRun {
 		do {
 			let prep = try session.prepareToEncrypt(proposing: proposing)
 			let frame = try session.encrypt(Data(payload.utf8))
+			// Persist-before-send: the emitter must have persisted the state this frame
+			// depends on BEFORE sending it. A violation here is the harness wedging on the
+			// emitter's behalf.
+			let persisted = session.maxPersistedSeq()
+			let persistViolation = session.lastStateSeq() > persisted
+			if persistViolation {
+				result.violations.append(
+					"persist-before-send: emitter \(role.rawValue) sent seq \(session.lastStateSeq()) > persisted \(persisted) at op \(opIndex)"
+				)
+			}
 			scheduler.enqueue(
 				FrameRecord(
 					bytes: frame.bytes, from: role, opIndex: opIndex,
@@ -215,7 +266,8 @@ struct DifferentialRun {
 					// `update.stateSeq` is the just-bumped one, so neither is used raw here.
 					dependsOnSeq: session.lastStateSeq(),
 					isCommit: prep.didCommit,
-					epoch: session.sendEpoch()),
+					epoch: session.sendEpoch(),
+					persistViolation: persistViolation),
 				to: role.peer)
 			if scheduler.commitEpochsInFlight(role.peer).count > 1 {
 				result.violations.append(
@@ -472,8 +524,34 @@ struct DifferentialRun {
 			return
 		}
 
+		let otherRole = role.peer
+		result.restores.append(
+			RestoreRecord(
+				op: opIndex, role: role.rawValue, kind: behind ? "behind" : "crash",
+				depth: depth, targetSeq: target,
+				legalThisRole: scheduler.isLegalRestore(role, seq: target),
+				legalOtherRole: scheduler.isLegalRestore(
+					otherRole,
+					seq: scheduler.maxDeliveredDependsOnSeq[otherRole] ?? 0),
+				maxDeliveredThisRole: scheduler.maxDeliveredDependsOnSeq[role] ?? 0,
+				stateSeqBefore: session.lastStateSeq(),
+				inFlightSeqs: (scheduler.lanes[role] ?? []).map(\.dependsOnSeq)))
+		if ProcessInfo.processInfo.environment["DIFFERENTIAL_DEBUG_RESTORE"] != nil {
+			let inFlight = (scheduler.lanes[role] ?? []).map { String($0.dependsOnSeq) }
+			FileHandle.standardError.write(
+				Data(
+					"DBG restore-detail seed=\(seed) dir=\(direction.rawValue) op=\(opIndex) role=\(role.rawValue) engine=\(session.engine.rawValue) kind=\(call) depth=\(depth) target=\(target) seqBefore=\(session.lastStateSeq()) maxDelivered=\(scheduler.maxDeliveredDependsOnSeq[role] ?? 0) legal=\(scheduler.isLegalRestore(role, seq: target)) inFlightSeq=[\(inFlight.joined(separator: ","))]\n"
+						.utf8))
+		}
 		do {
 			try session.restore(toSeq: target)
+			if ProcessInfo.processInfo.environment["DIFFERENTIAL_DEBUG_RESTORE"] != nil
+			{
+				FileHandle.standardError.write(
+					Data(
+						"DBG postrestore seed=\(seed) dir=\(direction.rawValue) op=\(opIndex) role=\(role.rawValue) stateSeq=\(session.lastStateSeq()) sendEpoch=\(session.sendEpoch()) heldOffer=\(session.debugHeldOfferDigest()?.hexPrefix ?? "-") maxPersisted=\(session.maxPersistedSeq())\n"
+							.utf8))
+			}
 			record(opIndex, role, call, OutcomeStep(), into: &result)
 			if behind {
 				assertCleanClassification(
@@ -513,6 +591,7 @@ struct DifferentialRun {
 	// MARK: - Probe / quiescence
 
 	private mutating func probe(opIndex: Int, into result: inout RunResult) {
+		let violationsBefore = result.violations.count
 		drainQuiescent(opIndex: opIndex, into: &result)
 
 		let aEstablished = pair.initiator.isFullyEstablished()
@@ -531,6 +610,14 @@ struct DifferentialRun {
 				"probe: round-trip asymmetry a->b=\(aToB) b->a=\(bToA) at op \(opIndex)"
 			)
 		}
+		if !aToB && !bToA {
+			// Quiescence requires a fresh round-trip to LAND. Both directions failing is not
+			// symmetry — it is a wedge (a symmetric pair of failures previously passed).
+			result.violations.append(
+				"probe: quiescent round-trip FAILED both directions at op \(opIndex) — wedge"
+			)
+		}
+		if result.violations.count > violationsBefore { result.probeViolations += 1 }
 	}
 
 	/// A full quiescence drain: repeatedly fold every outstanding offer and drain the

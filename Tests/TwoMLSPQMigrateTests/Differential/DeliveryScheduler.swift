@@ -16,6 +16,9 @@ struct FrameRecord: Sendable {
 	let isCommit: Bool
 	/// The sender's group epoch at emission (classical send epoch).
 	let epoch: UInt64
+	/// Persist-before-send violation: the emitter's durability seq at emission exceeded the
+	/// highest blob the HOST had persisted for it — the harness wedging on its own behalf.
+	let persistViolation: Bool
 }
 
 struct SideBandLeg: Sendable {
