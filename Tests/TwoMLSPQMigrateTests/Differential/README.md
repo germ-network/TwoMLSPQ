@@ -1,0 +1,382 @@
+# Randomized differential harness (GER-2566 item 1)
+
+A seeded, randomized harness that drives operation sequences on Swift↔Rust session pairs,
+checks convergence, and operationalizes "no state is ever unreceivable" as re-staple
+healing. A failing run prints a reproducible op script (seed + script blob + binding
+contract version + Rust crate sha).
+
+It lives in this test target and drives both engines in-process: the Rust engine through
+the UniFFI binding (`TwoMLSPQBinding`), the Swift engine through `TwoMLSSession` from the
+`twomlspq-swift` package dependency that this repo already pins. Cross-delivery is live —
+every frame either engine produces is decoded by the other.
+
+## The deployed-pin swap
+
+The differential reference is the **deployed production pin: `two-mls-pq@c501f9d`,
+mls-rs `b43703f`** — the pin `RustWireVectors.swift` already compares golden vectors
+against. Not origin/main Rust. Two bindings cannot coexist in one module, so the pin run
+swaps the pin's binding + xcframework into the working tree and runs only the differential
+suite:
+
+```
+just differential-deployed
+```
+
+which runs `scripts/differentialDeployed.sh`:
+
+1. `git worktree add /tmp/ger-2566-pin c501f9d` (outside `~/tmp/worktrees/agent` — build scratch).
+2. `scripts/buildIosDynamic.sh` there → the pin's `buildIos/` + `bindings/`.
+3. Copy the pin's `two_mls_pq.swift` and `TwoMLSPQ.xcframework` into this tree, stashing
+   main's.
+4. `TWOMLSPQ_LOCAL_XCFRAMEWORK=1 TWOMLSPQ_PIN_BINDING=1 DIFFERENTIAL_DEPLOYED_PIN=1
+   swift test --filter DifferentialHarnessTests`.
+5. A trap restores main's binding + xcframework on exit, so an interrupted run never leaves
+   the tree swapped.
+
+`TWOMLSPQ_PIN_BINDING=1` is required because the pin's binding predates the
+migration-export FFI: `TwoMLSPQMigrate` and every suite that imports it cannot compile
+against the pin (they use `migrationExport()` / `SessionMigration*`, main-only). Under this
+flag `Package.swift` drops those targets/suites, leaving the Rust-free `TwoMLSPQTests`
+suites plus the differential harness — all the pin run needs. The stub source
+`Sources/TwoMLSPQMigrate/PinStub.swift` keeps the migrate target non-empty.
+
+Without `DIFFERENTIAL_DEPLOYED_PIN=1` every differential test is **skipped**, so the
+standard `swift test` under main's binding stays green — the swap never breaks the main
+suite. `DIFFERENTIAL_SEED_MAX` (default 60) widens the sweep.
+
+## The API-intersection constraint (legal subset)
+
+The harness facade (`EngineSession.swift`) compiles against BOTH the swapped pin binding
+and main's. It may only use the API surface present in both.
+
+**Verified by diffing the two bindings' public surfaces** (`git show c501f9d:Sources/
+TwoMLSPQBinding/two_mls_pq.swift` vs main's vendored copy):
+
+- The public method surface of `TwoMlsPqSession`, `TwoMlsPqInvitation`, and
+  `TwoMlsPqPrincipal` is **identical** in both bindings — the pin's is a strict subset of
+  main's, and every pin method exists in main.
+- The only main-only additions are `migrationExport()` and the `SessionMigration*` record
+  types + their `FfiConverterType…` helpers. **The facade never touches either.**
+- The `binding_contract_version()` function returns **33 at the pin** and **36 at main**;
+  the uniffi *scaffolding* version constant is `30` in both (unrelated to the contract
+  function). The ledger records 33, and `bindingContractMatchesLedger` fail-fasts the pin
+  run if the linked binary is not the pin build (e.g. the released v0.10.0 binary).
+
+So the legal subset the facade uses is the entire session/invitation/principal surface
+*except* `migrationExport` / `SessionMigration*`.
+
+## Running
+
+```
+# Standard suite (differential tests skip without the env var):
+TWOMLSPQ_LOCAL_XCFRAMEWORK=1 swift test
+
+# Differential sweep against the deployed pin:
+just differential-deployed
+DIFFERENTIAL_SEED_MAX=250 just differential-deployed      # wider sweep
+
+# Against a local main-binding build instead of the pin (expected-signal run; see below):
+TWOMLSPQ_LOCAL_XCFRAMEWORK=1 DIFFERENTIAL_DEPLOYED_PIN=1 \
+  DIFFERENTIAL_SEED_MAX=5 swift test --filter DifferentialHarnessTests
+```
+
+## Replaying a seed
+
+A failing run prints:
+
+```
+Differential repro:
+  seed=<N>
+  contract=<binding contract version> rustSha=<pin sha>
+  script=<compact JSON op-script blob>
+```
+
+Replay it exactly with:
+
+```
+DIFFERENTIAL_REPLAY_SEED=<N> \
+DIFFERENTIAL_REPLAY_BLOB='<the script=… JSON>' \
+TWOMLSPQ_LOCAL_XCFRAMEWORK=1 DIFFERENTIAL_DEPLOYED_PIN=1 \
+  swift test --filter replayScript
+```
+
+The same script always reproduces the same op sequence. The *engines'* randomness (key
+generation, ML-KEM) stays live, so comparison is semantic, never byte-level.
+
+## Adding an op
+
+1. Add a case to `DiffOp` (`DiffOp.swift`) carrying only what the op needs; use a negative
+   `index` for "from the back" so the generator need not know lane lengths.
+2. Handle it in `DifferentialRun.execute` and, if it touches an engine, drive it through
+   an `EngineSession` method (never a raw binding call — see the API-intersection
+   constraint).
+3. **Check the API subset first:** the new op must be expressible through methods present
+   in both bindings. If it needs a pin-missing accessor, drive around it or drop it from
+   the op set.
+4. Optionally weight it into `ScriptGenerator`'s phases.
+
+## Ledgering a divergence
+
+`DifferentialResources/DivergenceLedger.json` records the known engine divergences from
+`book/src/session-lifecycle.md` (shipped anomalies 1/2/3/5) plus the C1/C2
+deployed-compatible behaviors. A mixed-pair mismatch whose `field` + `engine` + `calls`
+matches an entry is **recorded, not failed**; the entry states the healing condition.
+Anything else is a finding and fails the test.
+
+To ledger a newly-understood divergence, add an entry:
+
+```json
+{
+  "id": "…", "anomaly": "…", "title": "…",
+  "engines": ["rust", "swift"],
+  "fields": ["remoteCommitApplied"],
+  "calls": ["deliver", "sideBandSend"],
+  "healing": "…"
+}
+```
+
+`fields` are `ComparableOutcome` field names (`appPayloads`, `joined`,
+`pendingEstablishment`, `offeredDigest`, `remoteCommitApplied`, `errorClass`); `calls` are
+the transcript `call` labels in `DifferentialRun`; `engines` names the engine(s) whose
+behavior the entry documents. Matching is narrow on all three axes, and a mixed-pair
+mismatch is excused only when **both** engines involved are documented (AND). A
+single-engine entry therefore documents a divergence without suppressing a two-engine
+mismatch that could equally be a regression on the other engine. Do **not** let a ledger
+entry absorb engine-behavior mismatches you have not actually root-caused — file a finding
+instead.
+
+## Design notes / current scope
+
+- **Pair topologies:** mixed pairs (Swift↔Rust, both directions) at full seed count are the
+  differential legs; the harness compares the two directions' transcripts. Pure pairs
+  (Swift↔Swift, Rust↔Rust) on a 1-in-5 subset are oracles for attributing a mismatch to
+  engine vs script.
+- **Alignment:** transcripts are compared grouped by (op, role, call), not raw index, so an
+  op that no-ops in one direction does not shift every later comparison.
+- **Establishment** happens before the randomized script (plain §A.1 + the parallel A.3
+  bootstrap, both directions, up to fully established), so the DSL is a steady-state op
+  set. `Topology.bornDedicated` is carried in the DSL but the generator currently emits
+  only `.plain`; born-dedicated establishment is deferred.
+- **`prepareToEncrypt(proposing:)` is a parameter, not a separate op** — rotation is a
+  mid-script randomizable parameter on both engines.
+- **Side-band (A.4/A.5) opens inside `encrypt`** on both engines; the scheduler models it
+  with a separate side-band lane, peeked via `pqPendingOutbound` and routed by
+  `openIncoming` kind.
+- **Healing invariant:** after any fault sequence a `probe` (a FULL quiescence drain — every
+  outstanding offer folded, side-band and main lanes drained to empty, looped to a fixpoint —
+  plus one round-trip each way) must succeed, or both sides classify identically; and no
+  direction may have two distinct commit epochs in flight. On the double-commit invariant:
+  the generator constructs the closest reachable window (a commit queued undelivered, then
+  the peer proposes a *rotation* via `sendRotating` and the committing role folds it), but
+  the invariant is a SAFETY property this harness cannot drive to violation — a second commit
+  needs a second authorization change, and the peer cannot author one until it learns of the
+  first commit, which must stay undelivered for the window to exist. It is therefore a
+  scheduler assertion that holds, not an exercised path. `crashAndRestore` picks only legal
+  restore points through `isLegalRestore` (`seq` ≥ every delivered frame's `dependsOnSeq`)
+  and asserts the gate; `restoreBehindDelivery` is the negative test whose expectation is
+  clean classification, checked by re-delivering the last-seen frame after the restore — a
+  CLEAN re-apply or clean ignore is HEALING, not a violation (the plan's nil→ignored rule);
+  only an error that is actually thrown and classifies `.other` (unrecognised) fails.
+- **Durability watermark is engine-symmetric:** `FrameRecord.dependsOnSeq` is each engine's
+  `lastStateSeq()` at emit, not Rust's raw `encrypt.dependsOnSeq` (an earlier persisted seq)
+  nor Swift's `update.stateSeq` (the just-bumped one) — the two encode different points, so
+  mixing them would make the legality gate asymmetric.
+
+## Current status
+
+Under the pin swap (`just differential-deployed`, verified locally against the c501f9d
+xcframework, 12 seeds):
+
+- `bindingContractMatchesLedger` **passes** — the linked binding reports contract 33.
+- `purePairOracles` **passes** (never vacuous: it always runs at least the last seed).
+- `mixedPairDifferential` **reports findings and fails** on the current seed range, and
+  `replayScript` with the same blob **reproduces the identical findings** (it runs the full
+  two-direction comparison, not just per-direction violations). The findings are real
+  engine differences in what each engine exposes, **not** suppressed. Making the mixed legs
+  a green gate requires root-causing and ledgering these or narrowing the op set.
+
+Findings surfaced so far (the ledger holds the excused ones):
+
+- **Offer surfacing (primary).** On a delivered frame Swift always surfaces a
+  `queuedProposal` (its `DecryptResult.queuedProposal` is non-optional), while the deployed
+  Rust engine surfaces `proposal` only sometimes (its field is optional) — so one direction
+  has an offer to fold and the other does not. This surfaces both as `queueProposal` count
+  differences AND as `offeredDigest` (`hadOffer`) mismatches on plain `deliver` /
+  `probeRoundTrip` — the latter were previously swallowed by the over-broad `c1` entry and
+  now **fail**, which is the point. (The pin Rust sets `proposal: Some` unconditionally on
+  the main decrypt path, `messaging.rs:1655`; the divergence is on edge paths, still to be
+  root-caused.)
+- **Auto-staged side-band leg presence** and **side-band leg openability** — reported as
+  *consequences* of the offer-surfacing primary divergence, not independent findings (fault
+  injection shows their call-count signatures cascade from it). Still failing until
+  root-caused.
+- **Post-restore frame handling (fourth class).** After a restore, a `probeRoundTrip` /
+  `deliver` can show `remoteCommitApplied` Swift=true vs Rust=false, or Rust surfacing
+  `DecryptionFailed` / `unsupportedFrameTag(...)` where Swift applies cleanly. Surfaced by
+  the now-wired restore dimension; un-ledgered and failing.
+- **Rotation guard (fixed in the harness).** Swift `prepareToEncrypt(rotating:)` throws
+  `.rotationInFlight` for a concurrent rotation where Rust accepts it; the harness now
+  proposes rotations only from a clean slate, and the divergence is ledgered as
+  `rotation-in-flight-guard`.
+- **Stale-frame error surface (equated).** Swift can leak an underlying MLS
+  `generationAlreadyConsumed` where Rust classifies `StaleFrame`; equated in the error
+  table.
+- **Proposal-fold rejection.** Swift `.proposalRejected` / Rust `ProposalRejected` fire on
+  different ops when folding a catch-up Upd; ledgered under anomaly 3.
+
+**Ledger matching is engine-attributed and conservative.** A mismatch is attributed to the
+engine at that role in each direction, and it is excused only when **both** sides are
+documented (AND, not OR). A single-engine entry therefore documents a known divergence but
+does not suppress a two-engine mismatch that could equally be a regression on the other
+engine.
+
+
+
+## Comparison contract: designed-wedge rule (behind-restore outcomes)
+
+`restoreBehindDelivery` is a NEGATIVE op: it asserts **clean classification**, not
+convergence. Once a behind-restore has FIRED for a role, that run's divergences that are
+**structurally attributable** to it are reclassified as **DESIGNED-WEDGE outcomes** —
+counted in the per-run summary line, not failed. Attribution is structural, never run-wide:
+the divergence's op must **postdate** the role's last fired `restoreBehindDelivery` op
+(tracked per role in `RunResult.behindRestoredAt`); a divergence in a window with no
+behind-restore still fails.
+
+What still fails in every run, including designed-wedge runs:
+
+- any **unclassified** error — `errorClass == .other` only (a genuinely unrecognised class, or
+  a no-error wrong behaviour). Clean classification is the point of the negative op, so a
+  misparse is never excused. Text-mapped equivalences in the error table:
+  `generationAlreadyConsumed` ↔ `StaleFrame` (`.stale`), and `aeadOpenFailed` ↔
+  `DecryptionFailed` (`.decryptionFailed`). `unsupportedFrameTag(_)` is treated as a
+  **classified clean rejection** (the engine recognised the shape was wrong and refused), not
+  a misparse;
+- any divergence not behind-attributable (pre-restore handling differences; fresh-decrypt or
+  side-band divergences outside a behind-restore window);
+- all other invariants: no double-apply, persist-before-send, no double-commit-in-flight,
+  per-frame handling.
+
+The summary line reports both counts:
+`seed N offer-presence-divergences excluded: P […]  designed-wedge findings excluded: W  failing findings: F`.
+The suite's failure condition is: any finding that is neither presence-excluded,
+ledger-excused, nor behind-restore-attributed.
+
+## Comparison contract: handling-only for offers (option a)
+
+The mixed-pair comparison is **handling-only** for offers. Cross-direction
+offer/frame-**presence** divergence is excluded and counted, because it is a harness/model
+property (the two directions' frames differ, and rotation gating consults engine state), not
+an engine-handling difference:
+
+- `queueProposal` / `deliver` **call-count differences** are classified
+  `offer-presence-divergence` — a fold/deliver count difference is by construction a
+  presence difference (the op folds or delivers whatever is present), so a differing
+  multiplicity means different numbers of live offers/queued frames, never different
+  handling of the same one.
+- **`offeredDigest` (hadOffer) mismatches** are classified `offer-presence-divergence` —
+  digests are compared as PRESENCE only (values are content-dependent and differ between
+  runs by construction), so a mismatch here is presence, not handling.
+- A mismatch at a site where one direction was presence-limited
+  (`RunResult.presenceLimited`, recorded where a direction had no live offer or no frame to
+  deliver) is excluded the same way.
+
+Everything else still fails: per-frame **handling** (both directions had the
+frame/offer) — payloads, `remoteCommitApplied`, `errorClass`, the probe invariants, and the
+side-band cascades. Each run prints a summary line:
+`seed N offer-presence-divergences excluded: K [deliver=…,queueProposal=…,probeRoundTrip=…]`
+— visible as a known state-divergence symptom, never failing and never burying a real
+finding. **Presence comparison stays live in the pure-pair oracles**, where it is meaningful
+(within one engine). Engine-state-independent rotation scheduling is filed as a follow-up
+(option b).
+
+## Row 2 — surfacing divergence classified (no independent divergence)
+
+Instrumented every `deliver` (`DIFFERENTIAL_DEBUG_DELIVER`, with the run's `direction` tag so
+pure-pair oracle runs cannot pollute the counts):
+
+| bucket | definition | sites |
+|---|---|---|
+| A duplicate-app | frame already delivered to that role (`first=false`) | frame-level: no divergence in behaviour — **both engines reject with `.stale` and NO offer** (Swift `generationAlreadyConsumed`, Rust `StaleFrame`), 4 Swift / 5 Rust |
+| B fresh-decrypt | first delivery of the frame | **0 mismatches** — every fresh delivery decrypted and surfaced an offer on BOTH engines (Swift 408, Rust 325) |
+| C non-app | side-band/welcome/bookkeeping | **0 mismatches** |
+
+The app-consumption model is therefore **directly validated**: a re-delivered app frame fails
+to decrypt in both engines, neither re-surfaces its offer, and both classify `.stale`.
+
+There is **no per-frame surfacing divergence**: for every delivered frame, `(offerSurfaced,
+errorClass)` is identical in both engines. So row 2 closes as *no independent divergence*.
+
+What remains are *direction-level* delivery-count differences (the `X call count differs`
+findings). They are NOT per-frame decrypt/surfacing differences, they are NOT restore-adjacent
+in the early window, and they begin exactly where the script first uses an
+engine-state-gated rotation send — the rotation-heavy phase and the double-commit window
+(first one-direction-only deliver site at op 64/65 in seed 1, the `sendRotating dc-0-open`
+op). The leading harness-side cause is that `send(rotate:)` / the fold-liveness gates consult
+ENGINE state (`hasPendingRotation()`, sender epoch, `offerStillVerifies()`), so the two
+directions legitimately differ in *whether an offer exists to fold* — an offer-PRESENCE
+difference, not an offer-HANDLING difference. Recommendation: treat offer-presence
+divergence as expected (exclude it from the differential) or make rotation gating
+engine-state-independent.
+
+## Fold-legality root-cause (GER-2583 finding #1)
+
+Instrumentation: `DIFFERENTIAL_DEBUG_FOLDS=1` dumps, at every `queueProposal`, the offer's
+digest/proposing/context/sender/isCatchUp, the op it was surfaced at, the folder's send
+epoch and the SENDER's send epoch at surface time, the folder's own/peer canonical ids, the
+engine's currently-held offer digest, and the outcome/error class.
+
+Mechanism found (12 pin seeds). The fold count differences were **not** fold-legality in
+the first instance — they are the primary OFFER-SURFACING divergence: on many `deliver`
+calls the Swift engine surfaces a `queuedProposal` while the deployed Rust engine surfaces
+`proposal: nil`, so one direction has an offer to fold and the other has none
+(`queueProposal` count 1 vs 0). That is the un-root-caused surfacing divergence the README
+already tracks, and it must keep failing.
+
+Where folds DID diverge in outcome, the first-divergent-op analysis split them:
+
+1. **Harness folding non-live offers (case a) — fixed.** Most fold rejections were the
+   harness feeding the engine an offer that was no longer live:
+   - a stale record kept after a delivery that surfaced NO offer (Rust's `proposal` is
+     optional; Swift's is not) — now the harness treats a nil offer as authoritative and
+     clears its record (`discardOffer`);
+   - an offer parked across the SENDER's own later commit — now gated by the sender's
+     send-epoch at surface time;
+   - a SUPERSEDED rotation candidate (offer proposes `rot-b-0` while the peer's canonical is
+     already `rot-b-2`, surfaced late from a parked/re-delivered frame) — now gated by
+     folding only promptly (age ≤ 1 op) and only offers naming the peer's canonical id or a
+     genuinely new id.
+   After these fixes the Rust engine no longer rejects any fold (13 → 0), and fold-outcome
+   rejections fell 63 → 17.
+2. **Residual rejections bisected — ALL harness (case a), fixed.** A guard-sequence replica
+   (`FoldGuardReplica.swift`, `DIFFERENTIAL_DEBUG_GUARDS`) ran the Swift engine's
+   `validateOfferedUpdate` checks individually on each dumped offered proposal. Every
+   residual rejection failed at the FIRST guard after decode —
+   **`verifying(proposal:) → wrongEpoch(expected: N, actual: N-1)`** — i.e. the harness was
+   folding an offer staged at the PREVIOUS group epoch, which no host would fold. The
+   advertise/`validatePolicy`/`verifySignature` guards were never reached.
+   **This corrects the earlier "anomaly-3 (proposing == theirs)" attribution: the cause was
+   epoch mismatch, not the catch-up-Upd shape.**
+   Fixed by gating folds on the engine's own "still foldable" answer
+   (`offerStillVerifies()`): fold rejections **17 → 0**.
+
+**Advert evidence (the Rust-side rule-8 question).** Running the replica on every offered
+peer leaf (`DIFFERENTIAL_DEBUG_ADVERTS`; a Swift folder's peer is always the deployed Rust
+engine) shows all 152 surveyed leaves at `replicaVerdict=all-pass` advertising
+`extensions=[0xF0A1,0xF0A2] proposals=[0x0008]` — i.e. **APQInfo (`0xF0A1`), AppBinding
+(`0xF0A2`) and the `AppDataUpdate` proposal (`0x0008`) are all present**; `0xF0A3` (profile)
+is absent, which is correct for `deployedCompatible`. So the leading hypothesis — that the
+deployed Rust Update leaves omit the APQ capability and Swift's rule-8 check rejects them —
+is **refuted**: the deployed leaves advertise everything rule 8 requires.
+
+**Conclusion: the fold-legality divergence was entirely case (a) — a harness artifact — now
+fixed.** No Swift over-strictness and no Rust advert gap is evidenced. `proposalRejected`
+was never the advert family (those throw `leafCapabilityUnadvertised`); it was
+`verifying`'s epoch check on a stale offer.
+
+## Running against main's binding (expected-signal, not a failure)
+
+Without a pin build, running the differential legs under main's local binding is useful
+signal: main's Rust/contract differ from the deployed pin the ledger describes. The
+`bindingContractMatchesLedger` test fails (36 vs 33, expected) and the mixed-pair legs
+report the seeds that diverge — those are main-era divergences, not harness bugs. The
+reference result is the `just differential-deployed` run.

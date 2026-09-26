@@ -1,0 +1,143 @@
+{
+  "bindingContractVersion": 33,
+  "pin": {
+    "twoMlsPqSha": "c501f9d",
+    "mlsRsSha": "b43703f"
+  },
+  "note": "Engine divergences from book/src/session-lifecycle.md:256 (shipped anomalies 1/2/3/5) plus the C1/C2 deployed-compatible behaviors. A mixed-pair mismatch whose field+engine+call matches an entry is RECORDED, not failed; the entry states the healing condition. Anything else is a finding.",
+  "entries": [
+    {
+      "id": "anomaly-1-wrong-trigger",
+      "anomaly": "1",
+      "title": "Deployed Rust opens A.5 on its own send-PQ leaf lag and never opens the reciprocal",
+      "engines": [
+        "rust"
+      ],
+      "fields": [
+        "remoteCommitApplied",
+        "offeredDigest"
+      ],
+      "calls": [
+        "deliverSideBand",
+        "probeRoundTrip"
+      ],
+      "healing": "Healed by spec behavior: the deployed responder Commit' carries its current credential, so a conforming peer's reciprocal A.5 completes the catch-up and the loop stops."
+    },
+    {
+      "id": "anomaly-2-born-dedicated-pq-leaf",
+      "anomaly": "2",
+      "title": "Deployed born-dedicated acceptor never catches up its leaf in the initiator's send-PQ group",
+      "engines": [
+        "rust"
+      ],
+      "fields": [
+        "remoteCommitApplied"
+      ],
+      "calls": [
+        "deliverSideBand"
+      ],
+      "healing": "Healed once the acceptor runs a conforming engine; the peer cannot heal it, since only the acceptor's own Upd' moves that leaf."
+    },
+    {
+      "id": "anomaly-3-catch-up-upds-propose-sender",
+      "anomaly": "3",
+      "title": "Folding a caught-up/catch-up Upd: the deployed engine accepts or rejects where the conforming engine differs (proposing == sender)",
+      "engines": [
+        "rust"
+      ],
+      "fields": [
+        "offeredDigest",
+        "errorClass"
+      ],
+      "calls": [
+        "deliver",
+        "probeRoundTrip",
+        "queueProposal"
+      ],
+      "healing": "Healed by the peer's host: a conforming engine marks such an offer as a catch-up, which the host approves without authorizing a new credential."
+    },
+    {
+      "id": "anomaly-5-unchecked-join",
+      "anomaly": "5",
+      "title": "Deployed A.3 bind joins signing with its current PQ key, not the KP' key its leaf presents",
+      "engines": [
+        "rust"
+      ],
+      "fields": [
+        "remoteCommitApplied",
+        "errorClass"
+      ],
+      "calls": [
+        "deliverSideBand"
+      ],
+      "healing": "Needs an accommodation: the deployed-compatible profile's deferred reciprocal (C2). Once the leaf is orphaned, nothing heals it."
+    },
+    {
+      "id": "c1-announced-id-reconciliation",
+      "anomaly": "C1",
+      "title": "Deployed-compatible responder returns the announced id; a conforming session with the deployed engine logs it",
+      "engines": [
+        "rust",
+        "swift"
+      ],
+      "fields": [
+        "offeredDigest"
+      ],
+      "calls": [
+        "deliverSideBand"
+      ],
+      "healing": "Compatibility behavior, not a defect: the announced id is read to trigger reconciliation; both profiles accept an Upd' whose authenticated data is empty or equals the new leaf's credential id. Scoped to deliverSideBand ONLY: the announced id is a side-band (A.5) behavior, so this entry must never excuse a hadOffer mismatch on the plain message path (that is the un-root-caused offer-surfacing divergence, and it must fail)."
+    },
+    {
+      "id": "c2-deferred-reciprocal",
+      "anomaly": "C2",
+      "title": "The reciprocal A.5 waits until the peer's own A.5 has landed",
+      "engines": [
+        "rust",
+        "swift"
+      ],
+      "fields": [
+        "remoteCommitApplied"
+      ],
+      "calls": [
+        "deliverSideBand"
+      ],
+      "healing": "Compatibility behavior: against a conforming peer it costs at most one extra round. A conforming engine taking the party over drops its mis-signed parked Upd' and re-proposes under the carried key."
+    },
+    {
+      "id": "approved-handoff-payload-asymmetry",
+      "anomaly": "harness",
+      "title": "On an approved handoff frame Rust surfaces the stapled app payload while Swift's .joined carries none",
+      "engines": [
+        "rust",
+        "swift"
+      ],
+      "fields": [
+        "appPayloads",
+        "joined"
+      ],
+      "calls": [
+        "deliverApproved"
+      ],
+      "healing": "Canonical rule: payloads accumulate separately from `joined`. Scoped to the `deliverApproved` call ONLY — the approved-handoff path this harness does not yet drive (born-dedicated/approved driving is deferred), so the entry is INERT today and cannot swallow signal. When that path lands, the plan's mandate is that this asymmetry surfaces as a finding first, not that it is suppressed; re-evaluate this entry then."
+    },
+    {
+      "id": "rotation-in-flight-guard",
+      "anomaly": "1",
+      "title": "The conforming Swift engine refuses a second rotation while one is un-canonicalized (.rotationInFlight); the deployed Rust engine permits it",
+      "engines": [
+        "swift",
+        "rust"
+      ],
+      "fields": [
+        "errorClass"
+      ],
+      "calls": [
+        "send",
+        "restore",
+        "deliverSideBand"
+      ],
+      "healing": "Rotation-trigger family (anomaly 1). The deployed engine's lazy staging admits a candidate with no in-flight guard; a conforming host proposes a rotation only when none is outstanding, so against the deployed engine this surfaces as a permitted rotation it would otherwise defer."
+    }
+  ]
+}

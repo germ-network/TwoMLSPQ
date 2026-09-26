@@ -33,6 +33,13 @@ let twoMLSPQrs: Target =
 		checksum: "897071cf3ba8fd278c205aa13dcea3303dc01195167dc39e7eabc7510db51dee"
 	)
 
+// The deployed-pin differential run (scripts/differentialDeployed.sh) swaps in the pin's
+// binding, which predates the migration-export FFI — so `TwoMLSPQMigrate` and every test
+// that imports it cannot compile against it. Setting TWOMLSPQ_PIN_BINDING=1 drops those
+// (the migrate target keeps only its stub), leaving the FFI-level suites plus the
+// differential harness, which is all the pin run needs.
+let pinBinding = ProcessInfo.processInfo.environment["TWOMLSPQ_PIN_BINDING"] != nil
+
 let package = Package(
 	name: "TwoMLSPQ",
 	// Import/link floors. The PQ backend's ML-KEM paths additionally require
@@ -143,7 +150,11 @@ let package = Package(
 				// lives in swift-mls's MLSCrypto, its `MLS` namespace in MLSCodec.
 				.product(name: "MLSCrypto", package: "swift-mls"),
 				.product(name: "MLSCodec", package: "swift-mls"),
-			]
+			],
+			// The two migrators are main-only FFI; the pin binding cannot compile them,
+			// so the pin run leaves only the stub.
+			exclude: pinBinding
+				? ["InvitationMigrator.swift", "SessionMigrator.swift"] : []
 		),
 		// The concrete/FFI-level suites: raw-FFI invitation flows and the total
 		// TwoMlsPqError → SessionError mapping (`@testable` for the internal error bridge +
@@ -164,15 +175,31 @@ let package = Package(
 		.testTarget(
 			name: "TwoMLSPQMigrateTests",
 			dependencies: [
-				"TwoMLSPQMigrate",
+				(pinBinding ? nil : "TwoMLSPQMigrate") as Target.Dependency?,
 				"TwoMLSPQBinding",
 				.product(name: "TwoMLSPQSession", package: "twomlspq-swift"),
 				.product(name: "TwoMLSPQCrypto", package: "twomlspq-swift"),
 				.product(name: "MLSCrypto", package: "swift-mls"),
 				.product(name: "MLSCodec", package: "swift-mls"),
 				.product(name: "MLSProfileRFC9420", package: "swift-mls"),
-			],
-			resources: [.copy("Fixtures")]
+			].compactMap { $0 },
+			// Every suite but the differential harness imports TwoMLSPQMigrate (main-only
+			// FFI); the pin run excludes them along with the migrator dependency.
+			exclude: ["Differential/README.md"]
+				+ (pinBinding
+					? [
+						"BornDedicatedMigrationTests.swift",
+						"DeployedStateMigrationTests.swift",
+						"EstablishmentFramingCrossEngineTests.swift",
+						"InvitationMigrationTests.swift",
+						"LegacyRowFixtureTests.swift",
+						"MintCoverageTests.swift",
+						"NonDedicatedEarlyExportTests.swift",
+						"RotatedRekeyHealTests.swift",
+						"SessionMigrationTests.swift",
+						"SessionProfileCrossEngineTests.swift",
+					] : []),
+			resources: [.copy("Fixtures"), .copy("DifferentialResources")]
 		),
 	],
 	swiftLanguageModes: [.v6]
