@@ -165,10 +165,12 @@ enum DifferentialChecks {
 		func behindAttributed(_ op: Int) -> Bool { behindOps.contains { $0 < op } }
 		// A misparse is never excused: an unclassified `.other`, or an unsupported tag the
 		// error table does not equate.
+		// `unsupportedFrameTag(_)` is a CLASSIFIED clean rejection — the engine recognised
+		// the shape is wrong and refused — and `aeadOpenFailed` now equates to Rust's
+		// `DecryptionFailed`. Only a genuinely unclassified `.other` (or a no-error wrong
+		// behaviour) stays unclassified.
 		func unclassified(_ o: ComparableOutcome) -> Bool {
-			if o.error == .other { return true }
-			let t = o.errorText ?? ""
-			return t.contains("unsupportedFrameTag") || t.contains("aeadOpenFailed")
+			o.error == .other
 		}
 
 		// Align by (op, role, call). A key present in one direction and absent in the other —

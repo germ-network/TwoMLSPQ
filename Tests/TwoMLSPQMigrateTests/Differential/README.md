@@ -244,9 +244,13 @@ behind-restore still fails.
 
 What still fails in every run, including designed-wedge runs:
 
-- any **unclassified** error — `errorClass == .other`, `aeadOpenFailed`, or an
-  `unsupportedFrameTag` the error table does not equate. Clean classification is the point
-  of the negative op, so a misparse is never excused;
+- any **unclassified** error — `errorClass == .other` only (a genuinely unrecognised class, or
+  a no-error wrong behaviour). Clean classification is the point of the negative op, so a
+  misparse is never excused. Text-mapped equivalences in the error table:
+  `generationAlreadyConsumed` ↔ `StaleFrame` (`.stale`), and `aeadOpenFailed` ↔
+  `DecryptionFailed` (`.decryptionFailed`). `unsupportedFrameTag(_)` is treated as a
+  **classified clean rejection** (the engine recognised the shape was wrong and refused), not
+  a misparse;
 - any divergence not behind-attributable (pre-restore handling differences; fresh-decrypt or
   side-band divergences outside a behind-restore window);
 - all other invariants: no double-apply, persist-before-send, no double-commit-in-flight,

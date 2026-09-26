@@ -598,9 +598,12 @@ func errorClass(_ error: Error) -> ErrorClass? {
 		default: return .other
 		}
 	}
-	// The Swift engine sometimes surfaces an underlying MLS error un-wrapped (`generation
-	// AlreadyConsumed`), where Rust classifies the same condition as `StaleFrame` — equate
-	// them so the difference is not mistaken for a divergence.
-	if String(describing: error).contains("generationAlreadyConsumed") { return .stale }
+	let text = String(describing: error)
+	// The Swift engine sometimes surfaces an underlying MLS error un-wrapped, where Rust
+	// classifies the same condition with its own case — equate them by text so the
+	// difference is not mistaken for a divergence.
+	if text.contains("generationAlreadyConsumed") { return .stale }
+	// Same rejection as Rust's `DecryptionFailed`: AEAD open failure.
+	if text.contains("aeadOpenFailed") { return .decryptionFailed }
 	return nil
 }
