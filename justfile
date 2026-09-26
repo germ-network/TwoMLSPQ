@@ -51,6 +51,14 @@ build-ios:
 swift-test *ARGS:
     bash scripts/swiftTestLocal.sh {{ARGS}}
 
+# The randomized differential harness against the DEPLOYED production pin
+# (two-mls-pq@c501f9d, mls-rs b43703f). Builds the pin's binding + xcframework in a worktree,
+# swaps them into the tree, runs only the differential suite, then restores main's binding.
+# Extra args pass through to `swift test`; `DIFFERENTIAL_SEED_MAX` widens the sweep.
+# See Tests/TwoMLSPQMigrateTests/Differential/README.md.
+differential-deployed *ARGS:
+    bash scripts/differentialDeployed.sh {{ARGS}}
+
 # Requires `cargo install mdbook` (and optionally mdbook-mermaid; see book/book.toml).
 book:
     mdbook build book
