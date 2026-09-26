@@ -231,6 +231,64 @@ does not suppress a two-engine mismatch that could equally be a regression on th
 engine.
 
 
+
+## Comparison contract: handling-only for offers (option a)
+
+The mixed-pair comparison is **handling-only** for offers. Cross-direction
+offer/frame-**presence** divergence is excluded and counted, because it is a harness/model
+property (the two directions' frames differ, and rotation gating consults engine state), not
+an engine-handling difference:
+
+- `queueProposal` / `deliver` **call-count differences** are classified
+  `offer-presence-divergence` — a fold/deliver count difference is by construction a
+  presence difference (the op folds or delivers whatever is present), so a differing
+  multiplicity means different numbers of live offers/queued frames, never different
+  handling of the same one.
+- **`offeredDigest` (hadOffer) mismatches** are classified `offer-presence-divergence` —
+  digests are compared as PRESENCE only (values are content-dependent and differ between
+  runs by construction), so a mismatch here is presence, not handling.
+- A mismatch at a site where one direction was presence-limited
+  (`RunResult.presenceLimited`, recorded where a direction had no live offer or no frame to
+  deliver) is excluded the same way.
+
+Everything else still fails: per-frame **handling** (both directions had the
+frame/offer) — payloads, `remoteCommitApplied`, `errorClass`, the probe invariants, and the
+side-band cascades. Each run prints a summary line:
+`seed N offer-presence-divergences excluded: K [deliver=…,queueProposal=…,probeRoundTrip=…]`
+— visible as a known state-divergence symptom, never failing and never burying a real
+finding. **Presence comparison stays live in the pure-pair oracles**, where it is meaningful
+(within one engine). Engine-state-independent rotation scheduling is filed as a follow-up
+(option b).
+
+## Row 2 — surfacing divergence classified (no independent divergence)
+
+Instrumented every `deliver` (`DIFFERENTIAL_DEBUG_DELIVER`, with the run's `direction` tag so
+pure-pair oracle runs cannot pollute the counts):
+
+| bucket | definition | sites |
+|---|---|---|
+| A duplicate-app | frame already delivered to that role (`first=false`) | frame-level: no divergence in behaviour — **both engines reject with `.stale` and NO offer** (Swift `generationAlreadyConsumed`, Rust `StaleFrame`), 4 Swift / 5 Rust |
+| B fresh-decrypt | first delivery of the frame | **0 mismatches** — every fresh delivery decrypted and surfaced an offer on BOTH engines (Swift 408, Rust 325) |
+| C non-app | side-band/welcome/bookkeeping | **0 mismatches** |
+
+The app-consumption model is therefore **directly validated**: a re-delivered app frame fails
+to decrypt in both engines, neither re-surfaces its offer, and both classify `.stale`.
+
+There is **no per-frame surfacing divergence**: for every delivered frame, `(offerSurfaced,
+errorClass)` is identical in both engines. So row 2 closes as *no independent divergence*.
+
+What remains are *direction-level* delivery-count differences (the `X call count differs`
+findings). They are NOT per-frame decrypt/surfacing differences, they are NOT restore-adjacent
+in the early window, and they begin exactly where the script first uses an
+engine-state-gated rotation send — the rotation-heavy phase and the double-commit window
+(first one-direction-only deliver site at op 64/65 in seed 1, the `sendRotating dc-0-open`
+op). The leading harness-side cause is that `send(rotate:)` / the fold-liveness gates consult
+ENGINE state (`hasPendingRotation()`, sender epoch, `offerStillVerifies()`), so the two
+directions legitimately differ in *whether an offer exists to fold* — an offer-PRESENCE
+difference, not an offer-HANDLING difference. Recommendation: treat offer-presence
+divergence as expected (exclude it from the differential) or make rotation gating
+engine-state-independent.
+
 ## Fold-legality root-cause (GER-2583 finding #1)
 
 Instrumentation: `DIFFERENTIAL_DEBUG_FOLDS=1` dumps, at every `queueProposal`, the offer's

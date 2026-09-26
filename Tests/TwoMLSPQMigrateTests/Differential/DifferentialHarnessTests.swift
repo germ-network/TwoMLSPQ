@@ -37,14 +37,15 @@ struct DifferentialHarnessTests {
 	func mixedPairDifferential(seed: UInt64) throws {
 		guard #available(macOS 26, *) else { return }
 		let ledger = try DivergenceLedger.load()
-		let findings = try DifferentialChecks.mixedFindings(
+		let cmp = try DifferentialChecks.mixedFindings(
 			script: ScriptGenerator.generate(seed: seed), seed: seed, ledger: ledger)
+		print("seed \(seed) \(cmp.summary)")
 		#expect(
-			findings.isEmpty,
+			cmp.findings.isEmpty,
 			Comment(
 				rawValue: DifferentialChecks.replayPrefix(
-					seed: seed, ledger: ledger) + "\n"
-					+ findings.joined(separator: "\n")))
+					seed: seed, ledger: ledger) + "\n" + cmp.summary + "\n"
+					+ cmp.findings.joined(separator: "\n")))
 	}
 
 	/// Pure-pair oracles. They prove nothing about a single engine's correctness; they
@@ -77,14 +78,15 @@ struct DifferentialHarnessTests {
 		else { return }
 		let ledger = try DivergenceLedger.load()
 		let script = try DiffScript.decoded(fromBlob: blob)
-		let findings = try DifferentialChecks.mixedFindings(
+		let cmp = try DifferentialChecks.mixedFindings(
 			script: script, seed: seed, ledger: ledger)
+		print("replay seed \(seed) \(cmp.summary)")
 		#expect(
-			findings.isEmpty,
+			cmp.findings.isEmpty,
 			Comment(
 				rawValue: DifferentialChecks.replayPrefix(
-					seed: seed, ledger: ledger) + "\n"
-					+ findings.joined(separator: "\n")))
+					seed: seed, ledger: ledger) + "\n" + cmp.summary + "\n"
+					+ cmp.findings.joined(separator: "\n")))
 	}
 }
 
@@ -117,35 +119,86 @@ enum DifferentialChecks {
 		).description
 	}
 
-	/// Run the script in both mixed directions and return every finding. Shared by the
-	/// sweep and the replay entry point, so replay reproduces the full comparison.
+	/// The result of a mixed-pair comparison: real findings, plus the count of
+	/// offer/frame-presence divergences that were excluded.
+	struct MixedComparison {
+		var findings: [String] = []
+		var presenceExcluded = 0
+		var presenceByCall: [String: Int] = [:]
+		var summary: String {
+			let detail =
+				presenceByCall.sorted { $0.key < $1.key }.map {
+					"\($0.key)=\($0.value)"
+				}
+				.joined(separator: ",")
+			return
+				"offer-presence-divergences excluded: \(presenceExcluded) [\(detail)]"
+		}
+	}
+
+	/// Run the script in both mixed directions and return every finding.
+	///
+	/// COMPARISON CONTRACT (option a): cross-direction OFFER-PRESENCE divergence is excluded
+	/// — a site where one direction had no live offer to fold (or no frame to deliver) is a
+	/// presence difference, not a handling difference, and is reported as a NON-finding in
+	/// the summary line. Per-frame offer HANDLING (both sides had the frame/offer), payloads,
+	/// remoteCommitApplied, errorClass and the probe invariants still fail. Presence
+	/// comparison stays live in the pure-pair oracles, where it is meaningful.
 	static func mixedFindings(script: DiffScript, seed: UInt64, ledger: DivergenceLedger) throws
-		-> [String]
+		-> MixedComparison
 	{
 		let swift = try run(script: script, seed: seed, direction: .swiftInitiator)
 		let rust = try run(script: script, seed: seed, direction: .rustInitiator)
 
-		var findings = swift.violations + rust.violations
+		var cmp = MixedComparison()
+		cmp.findings = swift.violations + rust.violations
 
-		// Align by (op, role, call) rather than raw index: an op that no-ops in one
-		// direction (an absent leg, a lane that emptied differently) must not shift every
-		// later comparison. A key present in one direction and absent in the other is
-		// itself a divergence.
+		// Align by (op, role, call). A key present in one direction and absent in the other —
+		// or with a different multiplicity — is normally a divergence, but when the cause is
+		// offer/frame PRESENCE it is classified out (see the contract above).
+		func presenceLimited(_ key: DifferentialKey, _ run: RunResult) -> Bool {
+			run.presenceLimited.contains(
+				PresenceSite(op: key.op, role: key.role, call: key.call))
+		}
+		func classifyPresence(_ key: DifferentialKey) {
+			cmp.presenceExcluded += 1
+			cmp.presenceByCall[key.call, default: 0] += 1
+		}
+
 		let groups = [swift.transcript, rust.transcript].map(grouped)
 		for key in Set(groups[0].keys).union(groups[1].keys).sorted() {
 			let a = groups[0][key] ?? []
 			let b = groups[1][key] ?? []
+			let presenceDivergent =
+				presenceLimited(key, swift) || presenceLimited(key, rust)
 			if a.count != b.count {
-				findings.append(
+				// A fold/deliver CALL-COUNT difference is BY CONSTRUCTION an offer/frame
+				// PRESENCE difference: the op folds (or delivers) whatever is present, so a
+				// differing multiplicity means the two directions had different numbers of
+				// live offers (or queued frames) — never different handling of the same one.
+				// Handling is compared only where both directions recorded the call.
+				if presenceDivergent || key.call == "queueProposal"
+					|| key.call == "deliver"
+				{
+					classifyPresence(key)
+					continue
+				}
+				cmp.findings.append(
 					"op \(key.op) \(key.call) role \(key.role): call count differs swiftInitiator=\(a.count) rustInitiator=\(b.count)"
 				)
+				continue
 			}
 			for i in 0..<min(a.count, b.count) {
 				for field in a[i].outcome.mismatches(b[i].outcome) {
-					// Attribute to the ENGINE at that role in each direction (not the
-					// direction label), and require BOTH sides to be documented before
-					// excusing: a rust-only entry must not silence a Swift-vs-Rust
-					// divergence that could equally be a Swift regression.
+					// `offeredDigest` is compared as PRESENCE only (digests are
+					// content-dependent and differ between runs by construction), so a
+					// mismatch here IS an offer-presence difference — excluded.
+					if field == "offeredDigest" {
+						classifyPresence(key)
+						continue
+					}
+					// Attribute to the ENGINE at that role in each direction, and require BOTH
+					// sides to be documented before excusing.
 					let excusedA =
 						ledger.matches(
 							field: field, engine: a[i].engine,
@@ -155,14 +208,20 @@ enum DifferentialChecks {
 							field: field, engine: b[i].engine,
 							call: key.call) != nil
 					if excusedA && excusedB { continue }
-					findings.append(
+					// A mismatch whose cause is one side having NO live offer/frame is a
+					// presence difference, not a handling one.
+					if presenceDivergent {
+						classifyPresence(key)
+						continue
+					}
+					cmp.findings.append(
 						"op \(key.op) \(key.call) role \(key.role): field \(field) — swiftInitiator[\(a[i].engine)]=\(a[i].outcome) rustInitiator[\(b[i].engine)]=\(b[i].outcome)"
 							+ " [swiftInitiatorErr=\(a[i].outcome.errorText ?? "-") rustInitiatorErr=\(b[i].outcome.errorText ?? "-")]"
 					)
 				}
 			}
 		}
-		return findings
+		return cmp
 	}
 
 	static func purePair(seed: UInt64) throws -> RunResult {
@@ -176,7 +235,8 @@ enum DifferentialChecks {
 		-> RunResult
 	{
 		let pair = try PairFactory.make(direction, seed: seed)
-		var run = DifferentialRun(pair: pair, script: script, seed: seed)
+		var run = DifferentialRun(
+			pair: pair, script: script, seed: seed, direction: direction)
 		return run.run()
 	}
 

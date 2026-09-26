@@ -62,10 +62,21 @@ struct ComparableOutcome: Equatable, Sendable {
 	}
 }
 
+/// A transcript site where a direction had NO live offer to fold, or no frame to deliver —
+/// i.e. an offer/frame-PRESENCE limitation, not a handling difference. Used to classify
+/// cross-direction count differences as expected noise rather than findings.
+struct PresenceSite: Hashable, Sendable {
+	let op: Int
+	let role: String
+	let call: String
+}
+
 struct RunResult {
 	var transcript: [TranscriptEntry] = []
 	/// Healing-invariant and probe violations, each with a one-line description.
 	var violations: [String] = []
+	/// Sites where this direction had no live offer (queueProposal) or no frame to deliver.
+	var presenceLimited: Set<PresenceSite> = []
 }
 
 @available(macOS 26, iOS 26, *)
@@ -73,6 +84,7 @@ struct DifferentialRun {
 	let pair: Pair
 	let script: DiffScript
 	let seed: UInt64
+	let direction: Direction
 
 	private var scheduler = DeliveryScheduler()
 	private var rotationCounter = 0
@@ -82,11 +94,18 @@ struct DifferentialRun {
 	/// Every peer client id seen proposed to each role — a fold is only applied to an offer
 	/// naming the peer's CURRENT canonical id or a genuinely NEW id, never a superseded one.
 	private var seenPeerIDs: [Role: Set<Data>] = [:]
+	/// Frame bytes already delivered to each role — a repeat is a protocol-legal re-delivery
+	/// (duplicate), whose rejection rides on app-message consumption, not ciphertext dedup.
+	private var deliveredFrames: [Role: Set<Data>] = [:]
+	private var debugDeliveries:
+		[(op: Int, role: String, engine: String, first: Bool, offer: Bool, err: String)] =
+			[]
 
-	init(pair: Pair, script: DiffScript, seed: UInt64) {
+	init(pair: Pair, script: DiffScript, seed: UInt64, direction: Direction) {
 		self.pair = pair
 		self.script = script
 		self.seed = seed
+		self.direction = direction
 	}
 
 	mutating func run() -> RunResult {
@@ -121,11 +140,21 @@ struct DifferentialRun {
 			}
 			fold(offer: offer, role: role, opIndex: opIndex, into: &result)
 		case .deliver(let role, let index):
-			guard let frame = scheduler.takeMain(role, index: index) else { return }
+			guard let frame = scheduler.takeMain(role, index: index) else {
+				markPresence(
+					op: opIndex, role: role, call: "deliver", into: &result)
+				debugDeliverNoFrame(op: opIndex, role: role)
+				return
+			}
 			deliver(role: role, frame: frame, opIndex: opIndex, into: &result)
 		case .deliverAll(let role):
+			let before = result.transcript.count
 			while let frame = scheduler.takeMain(role, index: 0) {
 				deliver(role: role, frame: frame, opIndex: opIndex, into: &result)
+			}
+			if result.transcript.count == before {
+				markPresence(
+					op: opIndex, role: role, call: "deliver", into: &result)
 			}
 		case .drop(let role, let index):
 			scheduler.drop(role, index: index)
@@ -139,10 +168,12 @@ struct DifferentialRun {
 			guard let leg = scheduler.takeSide(role, index: index) else { return }
 			deliverSideBand(leg: leg, receiver: role, opIndex: opIndex, into: &result)
 		case .crashAndRestore(let role, let depth):
+			debugRestore(op: opIndex, role: role, kind: "crash")
 			restore(
 				role: role, depth: depth, opIndex: opIndex, behind: false,
 				into: &result)
 		case .restoreBehindDelivery(let role, let depth):
+			debugRestore(op: opIndex, role: role, kind: "behind")
 			restore(
 				role: role, depth: depth, opIndex: opIndex, behind: true,
 				into: &result)
@@ -201,9 +232,15 @@ struct DifferentialRun {
 		role: Role, frame: FrameRecord, opIndex: Int, into result: inout RunResult
 	) {
 		lastDelivered[role] = frame
+		let firstDelivery = !(deliveredFrames[role]?.contains(frame.bytes) ?? false)
+		deliveredFrames[role, default: []].insert(frame.bytes)
 		do {
 			let session = pair.session(role)
 			let step = try session.processIncoming(frame.bytes)
+			debugDeliver(
+				op: opIndex, role: role, tag: frame.bytes.hexPrefix,
+				first: firstDelivery,
+				offer: step.offeredDigest != nil, err: "-")
 			if let digest = step.offeredDigest {
 				scheduler.offer(
 					OfferRecord(
@@ -227,6 +264,13 @@ struct DifferentialRun {
 			}
 			record(opIndex, role, "deliver", step, into: &result)
 		} catch {
+			debugDeliver(
+				op: opIndex, role: role, tag: frame.bytes.hexPrefix,
+				first: firstDelivery,
+				offer: false,
+				err:
+					"\(errorClass(error)?.rawValue ?? "nil"):\(String(describing: error).prefix(40))"
+			)
 			record(opIndex, role, "deliver", error, into: &result)
 		}
 	}
@@ -273,6 +317,7 @@ struct DifferentialRun {
 			|| senderEpochNow != offer.senderSendEpochAtOffer
 			|| stillVerifiable == false
 		{
+			markPresence(op: opIndex, role: role, call: "queueProposal", into: &result)
 			scheduler.discardOffer(role)
 			if ProcessInfo.processInfo.environment["DIFFERENTIAL_DEBUG_FOLDS"] != nil {
 				FileHandle.standardError.write(
@@ -514,9 +559,15 @@ struct DifferentialRun {
 				}
 			}
 			for role in Role.allCases {
+				let beforeDrain = result.transcript.count
 				while let frame = scheduler.takeMain(role, index: 0) {
 					deliver(
 						role: role, frame: frame, opIndex: opIndex,
+						into: &result)
+				}
+				if result.transcript.count == beforeDrain {
+					markPresence(
+						op: opIndex, role: role, call: "deliver",
 						into: &result)
 				}
 			}
@@ -583,6 +634,42 @@ struct DifferentialRun {
 				opIndex: opIndex, role: role, engine: pair.session(role).engine,
 				call: call,
 				outcome: ComparableOutcome(step)))
+	}
+
+	private func markPresence(
+		op: Int, role: Role, call: String, into result: inout RunResult
+	) {
+		result.presenceLimited.insert(
+			PresenceSite(op: op, role: role.rawValue, call: call))
+	}
+
+	private func debugRestore(op: Int, role: Role, kind: String) {
+		guard ProcessInfo.processInfo.environment["DIFFERENTIAL_DEBUG_DELIVER"] != nil
+		else { return }
+		FileHandle.standardError.write(
+			Data(
+				"DBG restore seed=\(seed) op=\(op) role=\(role.rawValue) kind=\(kind)\n"
+					.utf8))
+	}
+
+	private func debugDeliverNoFrame(op: Int, role: Role) {
+		guard ProcessInfo.processInfo.environment["DIFFERENTIAL_DEBUG_DELIVER"] != nil
+		else { return }
+		FileHandle.standardError.write(
+			Data(
+				"DBG deliv dir=\(direction.rawValue) seed=\(seed) op=\(op) role=\(role.rawValue) engine=\(pair.session(role).engine.rawValue) NO-FRAME\n"
+					.utf8))
+	}
+
+	private func debugDeliver(
+		op: Int, role: Role, tag: String, first: Bool, offer: Bool, err: String
+	) {
+		guard ProcessInfo.processInfo.environment["DIFFERENTIAL_DEBUG_DELIVER"] != nil
+		else { return }
+		FileHandle.standardError.write(
+			Data(
+				"DBG deliv dir=\(direction.rawValue) seed=\(seed) op=\(op) role=\(role.rawValue) engine=\(pair.session(role).engine.rawValue) tag=\(tag) first=\(first) offer=\(offer) err=\(err)\n"
+					.utf8))
 	}
 
 	private static func isOpener(_ kind: SideBandKind) -> Bool {
