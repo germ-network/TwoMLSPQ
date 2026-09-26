@@ -55,8 +55,12 @@ struct DeliveryScheduler {
 	/// Digests already folded by `role` — an Update is idempotent, so a host never folds
 	/// the same proposal twice even if a reordered/duplicated frame re-offers it.
 	private var foldedOffers: [Role: Set<Data>] = [:]
-	/// The highest `dependsOnSeq` among frames already delivered to `role`.
-	private(set) var maxDeliveredDependsOnSeq: [Role: UInt64] = [:]
+	/// The highest RECEIVER-side watermark (the role's own persisted/advanced seq) observed
+	/// when a frame was delivered to it. Gating on this keeps the comparison inside ONE
+	/// engine's seq space — the earlier gate compared the EMITTER's `dependsOnSeq` against the
+	/// RECEIVER's checkpoint seqs, which are different counters (and different spaces across
+	/// engines), so it almost never found a legal candidate.
+	private(set) var maxDeliveredReceiverSeq: [Role: UInt64] = [:]
 
 	func mainCount(_ role: Role) -> Int { lanes[role]?.count ?? 0 }
 	func sideCount(_ role: Role) -> Int { sideLanes[role]?.count ?? 0 }
@@ -113,9 +117,12 @@ struct DeliveryScheduler {
 		}
 		let frame = lane[i]
 		lanes[role] = lane.enumerated().filter { $0.offset != i }.map(\.element)
-		maxDeliveredDependsOnSeq[role] = max(
-			maxDeliveredDependsOnSeq[role] ?? 0, frame.dependsOnSeq)
 		return frame
+	}
+
+	/// Record the RECEIVER's own watermark observed at a delivery to `role`.
+	mutating func noteDeliveredReceiverSeq(_ role: Role, seq: UInt64) {
+		maxDeliveredReceiverSeq[role] = max(maxDeliveredReceiverSeq[role] ?? 0, seq)
 	}
 
 	mutating func takeSide(_ role: Role, index: Int) -> SideBandLeg? {
@@ -160,6 +167,6 @@ struct DeliveryScheduler {
 	/// Whether restoring `role` to `seq` keeps every already-delivered frame receivable —
 	/// the gate `crashAndRestore` picks its targets through, and asserts against.
 	func isLegalRestore(_ role: Role, seq: UInt64) -> Bool {
-		seq >= (maxDeliveredDependsOnSeq[role] ?? 0)
+		seq >= (maxDeliveredReceiverSeq[role] ?? 0)
 	}
 }

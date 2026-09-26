@@ -85,7 +85,23 @@ enum ScriptGenerator {
 			switch Int.random(in: 0..<7, using: &rng) {
 			case 0, 1:
 				ops.append(.handOutSideBand(role: role))
-				ops.append(.deliverSideBand(role: role.peer, index: 0))
+				// The CT receiver binds, and drives the discharge.
+				let bound = role.peer
+				ops.append(.deliverSideBand(role: bound, index: 0))
+				// Bind discharge, modelled as ordinary scheduler-composed ops (no monolithic
+				// op): the BOUND side offers an Upd, the peer folds and commits, the bound
+				// side applies. Without this the A.4 round never completes, the PQ turn never
+				// passes, and the responder's leg is re-handed-out (and double-applied).
+				ops.append(
+					.send(role: bound, payload: "disch-\(i)-upd", rotate: false)
+				)
+				ops.append(.deliverAll(role: bound.peer))
+				ops.append(.queueProposal(role: bound.peer))
+				ops.append(
+					.send(
+						role: bound.peer, payload: "disch-\(i)-commit",
+						rotate: false))
+				ops.append(.deliverAll(role: bound))
 			case 2:
 				ops.append(.deliverAll(role: role))
 			case 3:

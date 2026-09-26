@@ -83,6 +83,8 @@ struct RunResult {
 	var endState: [String: RoleEndState] = [:]
 	/// Whether any probe in this run reported a violation (quiescence failure = wedge).
 	var probeViolations = 0
+	/// Restores that found no legal checkpoint and were skipped (visible, not silent).
+	var restoreSkips = 0
 }
 
 struct RestoreRecord: Sendable {
@@ -306,9 +308,13 @@ struct DifferentialRun {
 		lastDelivered[role] = frame
 		let firstDelivery = !(deliveredFrames[role]?.contains(frame.bytes) ?? false)
 		deliveredFrames[role, default: []].insert(frame.bytes)
+		// The receiver's OWN watermark BEFORE this frame is applied — the state a restore
+		// must not rewind past for this frame to remain receivable. Same engine, same space.
+		let receiverPreSeq = pair.session(role).lastStateSeq()
 		do {
 			let session = pair.session(role)
 			let step = try session.processIncoming(frame.bytes)
+			scheduler.noteDeliveredReceiverSeq(role, seq: receiverPreSeq)
 			debugDeliver(
 				op: opIndex, role: role, tag: frame.bytes.hexPrefix,
 				srcOp: frame.opIndex,
@@ -541,7 +547,7 @@ struct DifferentialRun {
 		role: Role, depth: UInt64, opIndex: Int, behind: Bool, into result: inout RunResult
 	) {
 		let session = pair.session(role)
-		let delivered = scheduler.maxDeliveredDependsOnSeq[role] ?? 0
+		let delivered = scheduler.maxDeliveredReceiverSeq[role] ?? 0
 		let checkpoints =
 			session.recordedBlobs()
 			.filter { $0.kind == .checkpoint }
@@ -551,6 +557,14 @@ struct DifferentialRun {
 		let call = behind ? "restoreBehind" : "restore"
 
 		guard !checkpoints.isEmpty else {
+			result.restoreSkips += 1
+			if ProcessInfo.processInfo.environment["DIFFERENTIAL_DEBUG_RESTORE"] != nil
+			{
+				FileHandle.standardError.write(
+					Data(
+						"DBG restore-skip seed=\(seed) dir=\(direction.rawValue) op=\(opIndex) role=\(role.rawValue) engine=\(session.engine.rawValue) kind=\(call) reason=no-legal-checkpoint receiverWatermark=\(scheduler.maxDeliveredReceiverSeq[role] ?? 0) mySeq=\(session.lastStateSeq()) checkpoints=\(session.recordedBlobs().filter { $0.kind == .checkpoint }.map(\.seq).sorted())\n"
+							.utf8))
+			}
 			record(opIndex, role, call, OutcomeStep(), into: &result)
 			return
 		}
@@ -565,7 +579,7 @@ struct DifferentialRun {
 		// delivered frame's dependency (that is what restoreBehindDelivery is for).
 		if !behind && !scheduler.isLegalRestore(role, seq: target) {
 			result.violations.append(
-				"restore offered an illegal point (seq \(target) < delivered \(scheduler.maxDeliveredDependsOnSeq[role] ?? 0)) at op \(opIndex)"
+				"restore offered an illegal point (seq \(target) < delivered \(scheduler.maxDeliveredReceiverSeq[role] ?? 0)) at op \(opIndex)"
 			)
 			record(opIndex, role, call, OutcomeStep(), into: &result)
 			return
@@ -579,15 +593,15 @@ struct DifferentialRun {
 				legalThisRole: scheduler.isLegalRestore(role, seq: target),
 				legalOtherRole: scheduler.isLegalRestore(
 					otherRole,
-					seq: scheduler.maxDeliveredDependsOnSeq[otherRole] ?? 0),
-				maxDeliveredThisRole: scheduler.maxDeliveredDependsOnSeq[role] ?? 0,
+					seq: scheduler.maxDeliveredReceiverSeq[otherRole] ?? 0),
+				maxDeliveredThisRole: scheduler.maxDeliveredReceiverSeq[role] ?? 0,
 				stateSeqBefore: session.lastStateSeq(),
 				inFlightSeqs: (scheduler.lanes[role] ?? []).map(\.dependsOnSeq)))
 		if ProcessInfo.processInfo.environment["DIFFERENTIAL_DEBUG_RESTORE"] != nil {
 			let inFlight = (scheduler.lanes[role] ?? []).map { String($0.dependsOnSeq) }
 			FileHandle.standardError.write(
 				Data(
-					"DBG restore-detail seed=\(seed) dir=\(direction.rawValue) op=\(opIndex) role=\(role.rawValue) engine=\(session.engine.rawValue) kind=\(call) depth=\(depth) target=\(target) seqBefore=\(session.lastStateSeq()) maxDelivered=\(scheduler.maxDeliveredDependsOnSeq[role] ?? 0) legal=\(scheduler.isLegalRestore(role, seq: target)) inFlightSeq=[\(inFlight.joined(separator: ","))]\n"
+					"DBG restore-detail seed=\(seed) dir=\(direction.rawValue) op=\(opIndex) role=\(role.rawValue) engine=\(session.engine.rawValue) kind=\(call) depth=\(depth) target=\(target) seqBefore=\(session.lastStateSeq()) maxDelivered=\(scheduler.maxDeliveredReceiverSeq[role] ?? 0) legal=\(scheduler.isLegalRestore(role, seq: target)) inFlightSeq=[\(inFlight.joined(separator: ","))]\n"
 						.utf8))
 		}
 		do {
