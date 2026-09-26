@@ -774,6 +774,13 @@ struct DifferentialRun {
 			_ = try session.prepareToEncrypt(proposing: nil)
 			let frame = try session.encrypt(Data("probe-\(role.rawValue)".utf8))
 			let step = try peer.processIncoming(frame.bytes)
+			if ProcessInfo.processInfo.environment["DIFFERENTIAL_DEBUG_DELIVER"] != nil
+			{
+				FileHandle.standardError.write(
+					Data(
+						"DBG rt dir=\(direction.rawValue) seed=\(seed) op=\(opIndex) senderRole=\(role.rawValue) receiverRole=\(role.peer.rawValue) receiverEngine=\(peer.engine.rawValue) senderSendEpoch=\(session.sendEpoch()) recvEpoch=\(step.decryptedEpoch.map(String.init) ?? "-") payloadBytes=\(step.appPayloads.map(\.count)) hadOffer=\(step.offeredDigest != nil) commitApplied=\(step.remoteCommitApplied) err=\(step.errorClass?.rawValue ?? "-")\n"
+							.utf8))
+			}
 			if let digest = step.offeredDigest {
 				scheduler.offer(
 					OfferRecord(
@@ -790,6 +797,13 @@ struct DifferentialRun {
 			record(opIndex, role.peer, "probeRoundTrip", step, into: &result)
 			return step.appPayloads.contains(Data("probe-\(role.rawValue)".utf8))
 		} catch {
+			if ProcessInfo.processInfo.environment["DIFFERENTIAL_DEBUG_DELIVER"] != nil
+			{
+				FileHandle.standardError.write(
+					Data(
+						"DBG rt dir=\(direction.rawValue) seed=\(seed) op=\(opIndex) senderRole=\(role.rawValue) receiverRole=\(role.peer.rawValue) receiverEngine=\(peer.engine.rawValue) senderSendEpoch=\(session.sendEpoch()) recvEpoch=- hadOffer=false commitApplied=false err=\(String(describing: error))\n"
+							.utf8))
+			}
 			record(opIndex, role.peer, "probeRoundTrip", error, into: &result)
 			return false
 		}
