@@ -230,6 +230,62 @@ documented (AND, not OR). A single-engine entry therefore documents a known dive
 does not suppress a two-engine mismatch that could equally be a regression on the other
 engine.
 
+
+## Fold-legality root-cause (GER-2583 finding #1)
+
+Instrumentation: `DIFFERENTIAL_DEBUG_FOLDS=1` dumps, at every `queueProposal`, the offer's
+digest/proposing/context/sender/isCatchUp, the op it was surfaced at, the folder's send
+epoch and the SENDER's send epoch at surface time, the folder's own/peer canonical ids, the
+engine's currently-held offer digest, and the outcome/error class.
+
+Mechanism found (12 pin seeds). The fold count differences were **not** fold-legality in
+the first instance — they are the primary OFFER-SURFACING divergence: on many `deliver`
+calls the Swift engine surfaces a `queuedProposal` while the deployed Rust engine surfaces
+`proposal: nil`, so one direction has an offer to fold and the other has none
+(`queueProposal` count 1 vs 0). That is the un-root-caused surfacing divergence the README
+already tracks, and it must keep failing.
+
+Where folds DID diverge in outcome, the first-divergent-op analysis split them:
+
+1. **Harness folding non-live offers (case a) — fixed.** Most fold rejections were the
+   harness feeding the engine an offer that was no longer live:
+   - a stale record kept after a delivery that surfaced NO offer (Rust's `proposal` is
+     optional; Swift's is not) — now the harness treats a nil offer as authoritative and
+     clears its record (`discardOffer`);
+   - an offer parked across the SENDER's own later commit — now gated by the sender's
+     send-epoch at surface time;
+   - a SUPERSEDED rotation candidate (offer proposes `rot-b-0` while the peer's canonical is
+     already `rot-b-2`, surfaced late from a parked/re-delivered frame) — now gated by
+     folding only promptly (age ≤ 1 op) and only offers naming the peer's canonical id or a
+     genuinely new id.
+   After these fixes the Rust engine no longer rejects any fold (13 → 0), and fold-outcome
+   rejections fell 63 → 17.
+2. **Residual rejections bisected — ALL harness (case a), fixed.** A guard-sequence replica
+   (`FoldGuardReplica.swift`, `DIFFERENTIAL_DEBUG_GUARDS`) ran the Swift engine's
+   `validateOfferedUpdate` checks individually on each dumped offered proposal. Every
+   residual rejection failed at the FIRST guard after decode —
+   **`verifying(proposal:) → wrongEpoch(expected: N, actual: N-1)`** — i.e. the harness was
+   folding an offer staged at the PREVIOUS group epoch, which no host would fold. The
+   advertise/`validatePolicy`/`verifySignature` guards were never reached.
+   **This corrects the earlier "anomaly-3 (proposing == theirs)" attribution: the cause was
+   epoch mismatch, not the catch-up-Upd shape.**
+   Fixed by gating folds on the engine's own "still foldable" answer
+   (`offerStillVerifies()`): fold rejections **17 → 0**.
+
+**Advert evidence (the Rust-side rule-8 question).** Running the replica on every offered
+peer leaf (`DIFFERENTIAL_DEBUG_ADVERTS`; a Swift folder's peer is always the deployed Rust
+engine) shows all 152 surveyed leaves at `replicaVerdict=all-pass` advertising
+`extensions=[0xF0A1,0xF0A2] proposals=[0x0008]` — i.e. **APQInfo (`0xF0A1`), AppBinding
+(`0xF0A2`) and the `AppDataUpdate` proposal (`0x0008`) are all present**; `0xF0A3` (profile)
+is absent, which is correct for `deployedCompatible`. So the leading hypothesis — that the
+deployed Rust Update leaves omit the APQ capability and Swift's rule-8 check rejects them —
+is **refuted**: the deployed leaves advertise everything rule 8 requires.
+
+**Conclusion: the fold-legality divergence was entirely case (a) — a harness artifact — now
+fixed.** No Swift over-strictness and no Rust advert gap is evidenced. `proposalRejected`
+was never the advert family (those throw `leafCapabilityUnadvertised`); it was
+`verifying`'s epoch check on a stale offer.
+
 ## Running against main's binding (expected-signal, not a failure)
 
 Without a pin build, running the differential legs under main's local binding is useful

@@ -24,13 +24,31 @@ struct SideBandLeg: Sendable {
 	let opIndex: Int
 }
 
+/// A proposal a peer surfaced to `role`, with the full shape needed to decide whether it is
+/// still foldable (its `context` must equal the folder's current `proposalContext()`).
+struct OfferRecord: Sendable, Equatable {
+	let digest: Data
+	let proposing: Data?
+	let context: Data?
+	let sender: Data?
+	let isCatchUp: Bool?
+	/// The op that surfaced it, and the folder's send epoch at surface time.
+	let offeredAtOp: Int
+	let offeredAtSendEpoch: UInt64
+	/// The SENDER's (peer's) send epoch when the offer was surfaced. If the sender has
+	/// committed since, the offer predates an epoch move and is no longer live.
+	let senderSendEpochAtOffer: UInt64
+	/// The engine that surfaced it (the peer of the folding role).
+	let surfacedBy: EngineIdentity
+}
+
 struct DeliveryScheduler {
 	/// Frames awaiting delivery to `role` (i.e. produced by `role.peer`).
 	private(set) var lanes: [Role: [FrameRecord]] = [:]
 	/// Side-band legs awaiting delivery to `role`.
 	private(set) var sideLanes: [Role: [SideBandLeg]] = [:]
-	/// Digests offered to `role` and not yet folded.
-	private(set) var outstandingOffers: [Role: [Data]] = [:]
+	/// Offers surfaced to `role` and not yet folded.
+	private(set) var outstandingOffers: [Role: [OfferRecord]] = [:]
 	/// Digests already folded by `role` — an Update is idempotent, so a host never folds
 	/// the same proposal twice even if a reordered/duplicated frame re-offers it.
 	private var foldedOffers: [Role: Set<Data>] = [:]
@@ -56,20 +74,26 @@ struct DeliveryScheduler {
 		sideLanes[role, default: []].append(leg)
 	}
 
-	mutating func offer(_ digest: Data, to role: Role) {
+	mutating func offer(_ record: OfferRecord, to role: Role) {
 		// Single-occupancy, latest-wins — both engines surface at most one pending offer
 		// (a new offer replaces the previous), so a host folds only the latest and never a
 		// digest it already folded.
-		guard !(foldedOffers[role]?.contains(digest) ?? false) else { return }
-		outstandingOffers[role] = [digest]
+		guard !(foldedOffers[role]?.contains(record.digest) ?? false) else { return }
+		outstandingOffers[role] = [record]
 	}
 
-	mutating func popOffer(_ role: Role) -> Data? {
+	mutating func popOffer(_ role: Role) -> OfferRecord? {
 		guard var offers = outstandingOffers[role], !offers.isEmpty else { return nil }
-		let digest = offers.removeFirst()
+		let record = offers.removeFirst()
 		outstandingOffers[role] = offers
-		foldedOffers[role, default: []].insert(digest)
-		return digest
+		foldedOffers[role, default: []].insert(record.digest)
+		return record
+	}
+
+	/// Forget an outstanding offer without folding it (used to drop an offer the folder can
+	/// no longer legally apply).
+	mutating func discardOffer(_ role: Role) {
+		outstandingOffers[role] = []
 	}
 
 	/// Resolves an op's index against a lane: 0-based from the front, negative from the

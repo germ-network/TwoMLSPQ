@@ -79,6 +79,9 @@ struct DifferentialRun {
 	/// The most recent frame delivered to each role, for the restoreBehindDelivery negative
 	/// test's re-delivery probe.
 	private var lastDelivered: [Role: FrameRecord] = [:]
+	/// Every peer client id seen proposed to each role — a fold is only applied to an offer
+	/// naming the peer's CURRENT canonical id or a genuinely NEW id, never a superseded one.
+	private var seenPeerIDs: [Role: Set<Data>] = [:]
 
 	init(pair: Pair, script: DiffScript, seed: UInt64) {
 		self.pair = pair
@@ -105,13 +108,18 @@ struct DifferentialRun {
 				role: role, payload: payload, rotate: true, forceRotate: true,
 				opIndex: opIndex, into: &result)
 		case .queueProposal(let role):
-			guard let digest = scheduler.popOffer(role) else { return }
-			do {
-				try pair.session(role).queueProposal(digest: digest)
-				record(opIndex, role, "queueProposal", OutcomeStep(), into: &result)
-			} catch {
-				record(opIndex, role, "queueProposal", error, into: &result)
+			guard let offer = scheduler.popOffer(role) else {
+				if ProcessInfo.processInfo.environment["DIFFERENTIAL_DEBUG_FOLDS"]
+					!= nil
+				{
+					FileHandle.standardError.write(
+						Data(
+							"DBG fold seed=\(seed) op=\(opIndex) role=\(role.rawValue) folderEngine=\(pair.session(role).engine.rawValue) NO-OFFER\n"
+								.utf8))
+				}
+				return
 			}
+			fold(offer: offer, role: role, opIndex: opIndex, into: &result)
 		case .deliver(let role, let index):
 			guard let frame = scheduler.takeMain(role, index: index) else { return }
 			deliver(role: role, frame: frame, opIndex: opIndex, into: &result)
@@ -194,11 +202,142 @@ struct DifferentialRun {
 	) {
 		lastDelivered[role] = frame
 		do {
-			let step = try pair.session(role).processIncoming(frame.bytes)
-			if let digest = step.offeredDigest { scheduler.offer(digest, to: role) }
+			let session = pair.session(role)
+			let step = try session.processIncoming(frame.bytes)
+			if let digest = step.offeredDigest {
+				scheduler.offer(
+					OfferRecord(
+						digest: digest, proposing: step.offeredProposing,
+						context: step.offeredContext,
+						sender: step.offeredSender,
+						isCatchUp: step.offerIsCatchUp,
+						offeredAtOp: opIndex,
+						offeredAtSendEpoch: session.sendEpoch(),
+						senderSendEpochAtOffer: pair.session(role.peer)
+							.sendEpoch(),
+						surfacedBy: session.engine),
+					to: role)
+			} else {
+				// The engine reported NO offer on this frame, which is authoritative: the
+				// offer it previously held is gone (a plain Update that canonicalized, an
+				// idempotent re-ride, …). Keeping our older record would make the harness fold
+				// an offer the engine no longer holds — the fidelity gap behind most spurious
+				// fold-rejections (Rust's `proposal` is optional, Swift's is not).
+				scheduler.discardOffer(role)
+			}
 			record(opIndex, role, "deliver", step, into: &result)
 		} catch {
 			record(opIndex, role, "deliver", error, into: &result)
+		}
+	}
+
+	/// Fold a surfaced offer, with an optional diagnostic dump (`DIFFERENTIAL_DEBUG_FOLDS`)
+	/// of the attempt's legality inputs: the offer's shape, the folder's current context and
+	/// send epoch, and the outcome. This is what classifies a fold divergence as stale /
+	/// consumed / catch-up / genuinely-valid.
+	private mutating func fold(
+		offer: OfferRecord, role: Role, opIndex: Int, into result: inout RunResult
+	) {
+		let session = pair.session(role)
+		// Liveness gate (host-faithful): an offer surfaced before the SENDER's last commit
+		// predates an epoch move and is no longer foldable. A well-behaved host folds promptly
+		// and drops such a stale offer rather than feeding it to the engine, so the harness
+		// does too — folding it would manufacture a fold-legality divergence that is a harness
+		// artifact, not an engine one.
+		let senderEpochNow = pair.session(role.peer).sendEpoch()
+		// A host folds an offer promptly, before its own later state can supersede it. An
+		// offer that has sat while the folder committed (its own commit can canonicalize a
+		// LATER candidate, e.g. rot-b-1 while the parked offer proposes rot-b-0) is no longer
+		// live even though the engine still holds it — folding it manufactures a reject that
+		// is a harness artifact. So: fold only in the op that surfaced it or the next one.
+		let isSuperseded = opIndex - offer.offeredAtOp > 1
+		// A well-behaved host never authorises a SUPERSEDED candidate: an offer whose
+		// `proposing` id the peer has already moved past (neither its current canonical id
+		// nor a new one) is stale, however recently it was surfaced (an old parked frame can
+		// be re-delivered late). Folding it is a harness artifact — the engine rightly
+		// refuses it as a rollback.
+		let theirs = session.principalStateIDs().theirs
+		let seen = seenPeerIDs[role] ?? []
+		let proposingIsStaleCandidate =
+			offer.proposing != nil && offer.proposing != theirs
+			&& seen.contains(offer.proposing!)
+		if let proposing = offer.proposing {
+			seenPeerIDs[role, default: []].insert(proposing)
+		}
+		// The residual fold rejects were `verifying(proposal:) → wrongEpoch(expected: N,
+		// actual: N-1)`: an offer staged at the PREVIOUS group epoch, which no host would
+		// fold. `offerStillVerifies()` is the engine's own "is this still foldable" answer
+		// (nil where the engine exposes no equivalent).
+		let stillVerifiable = session.offerStillVerifies()
+		if isSuperseded || proposingIsStaleCandidate
+			|| senderEpochNow != offer.senderSendEpochAtOffer
+			|| stillVerifiable == false
+		{
+			scheduler.discardOffer(role)
+			if ProcessInfo.processInfo.environment["DIFFERENTIAL_DEBUG_FOLDS"] != nil {
+				FileHandle.standardError.write(
+					Data(
+						"DBG fold seed=\(seed) op=\(opIndex) role=\(role.rawValue) folderEngine=\(session.engine.rawValue) NOT-LIVE atOp=\(offer.offeredAtOp) superseded=\(isSuperseded) senderEpochThen=\(offer.senderSendEpochAtOffer) senderEpochNow=\(senderEpochNow) stillVerifies=\(stillVerifiable.map(String.init) ?? "-")\n"
+							.utf8))
+			}
+			record(opIndex, role, "queueProposal", OutcomeStep(), into: &result)
+			return
+		}
+		let contextNow = session.proposalContext()
+		let contextMatch = (contextNow == offer.context)
+		if ProcessInfo.processInfo.environment["DIFFERENTIAL_DEBUG_FOLDS"] != nil {
+			let line =
+				"DBG fold seed=\(seed) op=\(opIndex) role=\(role.rawValue) folderEngine=\(session.engine.rawValue)"
+				+ " offeredBy=\(offer.surfacedBy.rawValue) atOp=\(offer.offeredAtOp)"
+				+ " sendEpoch=\(session.sendEpoch()) offeredAtEpoch=\(offer.offeredAtSendEpoch)"
+				+ " digest=\(offer.digest.hexPrefix) proposing=\(offer.proposing?.hexPrefix ?? "-")"
+				+ " sender=\(offer.sender?.hexPrefix ?? "-")"
+				+ " ctxMatch=\(contextMatch) ctxNow=\(contextNow?.hexPrefix ?? "-")"
+				+ " ctxOffer=\(offer.context?.hexPrefix ?? "-")"
+				+ " isCatchUp=\(offer.isCatchUp.map(String.init) ?? "-")"
+				+ " proposingEqSender=\(offer.proposing != nil && offer.proposing == offer.sender)"
+				+ " heldNow=\(session.debugHeldOfferDigest()?.hexPrefix ?? "nil")"
+				+ " heldMatchesFolded=\(session.debugHeldOfferDigest() == offer.digest)"
+				+ " mine=\(session.principalStateIDs().mine?.hexPrefix ?? "-")"
+				+ " theirs=\(session.principalStateIDs().theirs?.hexPrefix ?? "-")"
+				+ " proposingEqTheirs=\(offer.proposing != nil && offer.proposing == session.principalStateIDs().theirs)"
+				+ " proposingEqMine=\(offer.proposing != nil && offer.proposing == session.principalStateIDs().mine)\n"
+			FileHandle.standardError.write(Data(line.utf8))
+		}
+		if ProcessInfo.processInfo.environment["DIFFERENTIAL_DEBUG_ADVERTS"] != nil,
+			let replica = session.debugReplicaGuards()
+		{
+			FileHandle.standardError.write(
+				Data(
+					"DBG advert seed=\(seed) op=\(opIndex) role=\(role.rawValue) engine=\(session.engine.rawValue) offeredBy=\(offer.surfacedBy.rawValue) \(replica)\n"
+						.utf8))
+		}
+		do {
+			try session.queueProposal(digest: offer.digest)
+			if ProcessInfo.processInfo.environment["DIFFERENTIAL_DEBUG_FOLDS"] != nil {
+				FileHandle.standardError.write(
+					Data(
+						"DBG fold seed=\(seed) op=\(opIndex) role=\(role.rawValue) OUTCOME=ok\n"
+							.utf8))
+			}
+			record(opIndex, role, "queueProposal", OutcomeStep(), into: &result)
+		} catch {
+			if ProcessInfo.processInfo.environment["DIFFERENTIAL_DEBUG_FOLDS"] != nil {
+				FileHandle.standardError.write(
+					Data(
+						"DBG fold seed=\(seed) op=\(opIndex) role=\(role.rawValue) OUTCOME=err class=\(errorClass(error)?.rawValue ?? "nil") text=\(String(describing: error))\n"
+							.utf8))
+				if ProcessInfo.processInfo.environment["DIFFERENTIAL_DEBUG_GUARDS"]
+					!= nil,
+					let replica = session.debugReplicaGuards()
+				{
+					FileHandle.standardError.write(
+						Data(
+							"DBG guards seed=\(seed) op=\(opIndex) role=\(role.rawValue) engine=\(session.engine.rawValue) \(replica)\n"
+								.utf8))
+				}
+			}
+			record(opIndex, role, "queueProposal", error, into: &result)
 		}
 	}
 
@@ -361,17 +500,10 @@ struct DifferentialRun {
 		while true {
 			let before = scheduler.queuedUnits()
 			for role in Role.allCases {
-				while let digest = scheduler.popOffer(role) {
-					do {
-						try pair.session(role).queueProposal(digest: digest)
-						record(
-							opIndex, role, "queueProposal",
-							OutcomeStep(), into: &result)
-					} catch {
-						record(
-							opIndex, role, "queueProposal", error,
-							into: &result)
-					}
+				while let offer = scheduler.popOffer(role) {
+					fold(
+						offer: offer, role: role, opIndex: opIndex,
+						into: &result)
 				}
 			}
 			for role in Role.allCases {
@@ -409,7 +541,17 @@ struct DifferentialRun {
 			let frame = try session.encrypt(Data("probe-\(role.rawValue)".utf8))
 			let step = try peer.processIncoming(frame.bytes)
 			if let digest = step.offeredDigest {
-				scheduler.offer(digest, to: role.peer)
+				scheduler.offer(
+					OfferRecord(
+						digest: digest, proposing: step.offeredProposing,
+						context: step.offeredContext,
+						sender: step.offeredSender,
+						isCatchUp: step.offerIsCatchUp,
+						offeredAtOp: opIndex,
+						offeredAtSendEpoch: peer.sendEpoch(),
+						senderSendEpochAtOffer: session.sendEpoch(),
+						surfacedBy: peer.engine),
+					to: role.peer)
 			}
 			record(opIndex, role.peer, "probeRoundTrip", step, into: &result)
 			return step.appPayloads.contains(Data("probe-\(role.rawValue)".utf8))
@@ -449,4 +591,9 @@ struct DifferentialRun {
 		case .bootstrapWelcome, .ratchetCT, .rekeyCommit: return false
 		}
 	}
+}
+
+extension Data {
+	/// A short hex prefix for diagnostic dumps.
+	var hexPrefix: String { map { String(format: "%02x", $0) }.prefix(12).joined() }
 }

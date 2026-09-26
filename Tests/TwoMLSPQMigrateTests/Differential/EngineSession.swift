@@ -7,6 +7,10 @@ import SecretBytes
 import TwoMLSPQBinding
 import TwoMLSPQSession
 
+// Testable only to read the Swift engine's internal currently-held offer, for the
+// fold-staleness diagnostic (no public accessor exists).
+@testable import TwoMLSPQSession
+
 // The unified session facade. One protocol over the Swift engine (`TwoMLSSession`, the
 // twomlspq-swift dependency) and the Rust engine (`TwoMLSPQBinding.TwoMlsPqSession`),
 // mapping both onto a normalized `OutcomeStep` so the runner can compare them op by op.
@@ -50,6 +54,12 @@ struct OutcomeStep: Equatable, Sendable {
 	var pendingEstablishment = false
 	/// The peer's staged proposal digest, when one was surfaced.
 	var offeredDigest: Data?
+	/// Diagnostics only (never compared): the surfaced offer's full shape, so a fold can be
+	/// classified as stale / consumed / catch-up.
+	var offeredProposing: Data?
+	var offeredContext: Data?
+	var offeredSender: Data?
+	var offerIsCatchUp: Bool?
 	/// Whether this call applied a remote commit.
 	var remoteCommitApplied = false
 	/// The error class, when the call threw.
@@ -110,6 +120,23 @@ protocol EngineSession: AnyObject {
 		_ frame: Data, envelope: Data, welcome: Data, creator: Data
 	) throws -> OutcomeStep
 	func queueProposal(digest: Data) throws
+	/// This session's SEND-group classical context — the value an offer's `context` field
+	/// must equal for the offer to be foldable here (a mismatch means the offer came from a
+	/// stale send-group epoch).
+	func proposalContext() -> Data?
+	/// Diagnostics: the digest of the offer the engine currently holds, or nil if none/unknown.
+	func debugHeldOfferDigest() -> Data?
+	/// Diagnostics: this session's own and the peer's canonical client ids.
+	func principalStateIDs() -> (mine: Data?, theirs: Data?)
+	/// Diagnostics: the raw bytes of the offer the Swift engine currently holds (for the
+	/// fold-guard replica). Rust exposes no equivalent.
+	func debugHeldOfferMessage() -> Data?
+	/// Diagnostics: run the fold-guard replica on the currently-held offer, returning a
+	/// one-line report. Nil when unavailable (Rust, or nothing held).
+	func debugReplicaGuards() -> String?
+	/// Whether the engine still holds an offer that VERIFIES at the current group epoch —
+	/// a host's "is this still foldable" check. Nil when the engine exposes no equivalent.
+	func offerStillVerifies() -> Bool?
 
 	// Side-band. `sideBandLeg` peeks the pending outbound (an auto-staged A.4/A.5 leg or
 	// a parked A.3 welcome'); `sideBandRespond` answers a peer's opener leg and returns this
@@ -223,6 +250,22 @@ final class RustEngineSession: EngineSession {
 		drainSink()
 	}
 
+	func proposalContext() -> Data? { session.proposalContext() }
+	/// The Rust binding exposes no held-offer accessor; the fold outcome itself reports it.
+	func debugHeldOfferDigest() -> Data? { nil }
+	func debugHeldOfferMessage() -> Data? { nil }
+	func debugReplicaGuards() -> String? { nil }
+	func offerStillVerifies() -> Bool? { nil }
+	func principalStateIDs() -> (mine: Data?, theirs: Data?) {
+		func id(_ s: TwoMLSPQBinding.PrincipalState) -> Data {
+			switch s {
+			case .sync(let c): return c.bytes
+			case .pending(let old, _): return old.bytes
+			}
+		}
+		return (id(session.myPrincipalState()), id(session.theirPrincipalState()))
+	}
+
 	func sideBandLeg() throws -> Data? {
 		let leg = session.pqPendingOutbound(sealing: .fresh)
 		drainSink()
@@ -294,7 +337,12 @@ final class RustEngineSession: EngineSession {
 		if let app = result.applicationMessage {
 			step.appPayloads.append(app.appMessageData)
 		}
-		if let proposal = result.proposal { step.offeredDigest = proposal.digest }
+		if let proposal = result.proposal {
+			step.offeredDigest = proposal.digest
+			step.offeredProposing = proposal.proposing.bytes
+			step.offeredContext = proposal.context
+			step.offeredSender = proposal.sender.bytes
+		}
 		if result.remoteCommit != nil { step.remoteCommitApplied = true }
 		if result.pendingEstablishment != nil { step.pendingEstablishment = true }
 		return step
@@ -384,6 +432,32 @@ final class SwiftEngineSession: EngineSession {
 		record(try session.queueProposal(digest: digest))
 	}
 
+	func proposalContext() -> Data? { session.proposalContext() }
+	func debugHeldOfferDigest() -> Data? { session.offeredProposal?.digest }
+	func debugHeldOfferMessage() -> Data? { session.offeredProposal?.message }
+	func offerStillVerifies() -> Bool? {
+		guard let message = session.offeredProposal?.message,
+			let send = session.sendGroup?.classical,
+			let msg = try? MLS.RFC9420.Message(mlsEncoded: message),
+			case .publicMessage(let pub) = msg
+		else { return false }
+		return (try? send.verifying(classicalProvider, proposal: pub)) != nil
+	}
+	func debugReplicaGuards() -> String? {
+		guard let message = session.offeredProposal?.message else { return nil }
+		let r = FoldGuardReplica.run(
+			message: message, session: session, classicalProvider: classicalProvider)
+		let failing =
+			r.checks.filter { !$0.ok }.map { "\($0.name)(\($0.detail))" }.joined(
+				separator: "; ")
+		let advert = r.checks.last { $0.name == "leaf-advertised" }?.detail ?? ""
+		let pres = r.checks.last { $0.name == "presentation-changed" }?.detail ?? ""
+		return "replicaVerdict=\(r.verdict) failing=[\(failing)] \(advert) \(pres)"
+	}
+	func principalStateIDs() -> (mine: Data?, theirs: Data?) {
+		(session.myPrincipalState.clientID, session.theirPrincipalState.clientID)
+	}
+
 	func sideBandLeg() throws -> Data? { session.pqPendingOutbound() }
 
 	func sideBandRespond(_ opener: Data) throws -> Data? {
@@ -443,6 +517,9 @@ final class SwiftEngineSession: EngineSession {
 		case .decrypted(let decrypted):
 			step.appPayloads.append(decrypted.applicationMessage)
 			step.offeredDigest = decrypted.queuedProposal.digest
+			step.offeredProposing = decrypted.queuedProposal.proposing
+			step.offeredContext = decrypted.queuedProposal.context
+			step.offerIsCatchUp = decrypted.queuedProposal.isCatchUp
 			step.remoteCommitApplied = decrypted.didApplyRemoteCommit
 		case .joined:
 			step.joined = true
