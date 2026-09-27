@@ -597,7 +597,16 @@ func errorClass(_ error: Error) -> ErrorClass? {
 			return .unopenable
 		case .sessionNotReady, .notEstablished: return .notReady
 		case .rotationInFlight: return .rotationInFlight
-		default: return .other
+		default:
+			// `messageFromUnretainedEpoch` is the classified fold (GER-2587) of what
+			// crossed unmapped; the deployed engine reports the identical calls as
+			// `DecryptionFailed`. Matched by text, not a typed case: it exists only on
+			// twomlspq-swift main (post-#97/#98), and this table must also compile
+			// against the released tag.
+			if String(describing: swift).contains("messageFromUnretainedEpoch") {
+				return .decryptionFailed
+			}
+			return .other
 		}
 	}
 	if let rust = error as? TwoMlsPqError {
@@ -606,8 +615,14 @@ func errorClass(_ error: Error) -> ErrorClass? {
 		case .DuplicateWelcome, .DuplicateSideBand: return .duplicate
 		case .EpochDesync: return .epochDesync
 		case .DecryptionFailed: return .decryptionFailed
-		case .UnexpectedWelcome, .MissingWelcome, .InvalidKeyPackage, .Mls:
+		case .UnexpectedWelcome, .MissingWelcome, .InvalidKeyPackage:
 			return .unopenable
+		// The pin's own binding docs define `Mls` as "a frame that never parsed" — an
+		// unparseable blob, which per the book's receive rule is indistinguishable from
+		// an out-of-window sealed frame and garbage. It is the receive family, not a tag
+		// rejection; Swift's post-GER-2586 never-opened funnel surfaces the same sites as
+		// `decryptionFailed`.
+		case .Mls: return .decryptionFailed
 		case .SessionNotReady, .SessionNotEstablished: return .notReady
 		default: return .other
 		}
