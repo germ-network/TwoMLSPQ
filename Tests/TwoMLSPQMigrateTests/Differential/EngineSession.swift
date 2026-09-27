@@ -299,7 +299,11 @@ final class RustEngineSession: EngineSession {
 		default:
 			return nil
 		}
-		let leg = session.pqTakePendingOutbound()
+		// Peek, never take: the respond path parks its leg exactly as Swift's
+		// `pqRatchetRespond` does (which returns its CT and keeps the leg parked), so a later
+		// `handOutSideBand` sees a leg on BOTH engines. Taking here would strand the round's
+		// only carrier and manufacture a Swift-leg/Rust-none count difference.
+		let leg = session.pqPendingOutbound(sealing: .fresh)
 		drainSink()
 		return leg
 	}

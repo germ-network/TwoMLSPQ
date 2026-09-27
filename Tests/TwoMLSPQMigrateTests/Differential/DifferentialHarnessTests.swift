@@ -127,6 +127,12 @@ enum DifferentialChecks {
 		var presenceByCall: [String: Int] = [:]
 		var designedWedgeExcluded = 0
 		var behindOps: [Int] = []
+		/// Findings excluded as the deterministic cascade of a `.rotationInFlight` root: a
+		/// rotation the Swift engine refuses (and the deployed Rust mirror permits) leaves one
+		/// commit epoch of frame-absence-vs-presence skew, whose downstream apply/skip,
+		/// payload, error-class and side-band count differences are not independent signal.
+		var rotationCascadeExcluded = 0
+		var rotationOps: [Int] = []
 		var summary: String {
 			let detail =
 				presenceByCall.sorted { $0.key < $1.key }.map {
@@ -136,6 +142,7 @@ enum DifferentialChecks {
 			return
 				"offer-presence-divergences excluded: \(presenceExcluded) [\(detail)]"
 				+ "  designed-wedge findings excluded: \(designedWedgeExcluded)"
+				+ "  rotation-cascade excluded: \(rotationCascadeExcluded)  rotationOps=\(rotationOps.sorted())"
 				+ "  failing findings: \(findings.count)  behindOps=\(behindOps.sorted())"
 		}
 	}
@@ -165,6 +172,23 @@ enum DifferentialChecks {
 			Array(swift.behindRestoredAt.values) + Array(rust.behindRestoredAt.values)
 		cmp.behindOps = behindOps
 		func behindAttributed(_ op: Int) -> Bool { behindOps.contains { $0 < op } }
+		// Rotation-cascade attribution: `op` postdates a `.rotationInFlight` root in either
+		// direction. That root is the FIRST real divergence in every affected seed; the
+		// downstream differences are its deterministic one-commit-epoch skew, so they are
+		// counted, not failed. Exact scoping only — never a both-engines field/call rule.
+		let rotationOps = swift.rotationInFlightAt + rust.rotationInFlightAt
+		cmp.rotationOps = rotationOps
+		func rotationCascadeAttributed(_ op: Int) -> Bool {
+			rotationOps.contains { $0 < op }
+		}
+		// The outcome fields a post-root skew can manufacture, and the side-band calls whose
+		// post-root count differences it can manufacture.
+		let rotationCascadeFields: Set<String> = [
+			"remoteCommitApplied", "appPayloads", "errorClass", "joined",
+		]
+		let rotationCascadeSideBandCalls: Set<String> = [
+			"handOutSideBand", "deliverSideBand", "sideBandRespond", "sideBandApply",
+		]
 		// A misparse is never excused: an unclassified `.other`, or an unsupported tag the
 		// error table does not equate.
 		// `unsupportedFrameTag(_)` is a CLASSIFIED clean rejection — the engine recognised
@@ -205,6 +229,15 @@ enum DifferentialChecks {
 					classifyPresence(key)
 					continue
 				}
+				// A side-band count difference post-root is cascade — unless either side
+				// surfaced an unclassified `.other` (a misparse is never excused).
+				if rotationCascadeAttributed(key.op)
+					&& rotationCascadeSideBandCalls.contains(key.call)
+					&& !(a + b).contains(where: { unclassified($0.outcome) })
+				{
+					cmp.rotationCascadeExcluded += 1
+					continue
+				}
 				cmp.findings.append(
 					"op \(key.op) \(key.call) role \(key.role): call count differs swiftInitiator=\(a.count) rustInitiator=\(b.count)"
 				)
@@ -234,6 +267,16 @@ enum DifferentialChecks {
 					// presence difference, not a handling one.
 					if presenceDivergent {
 						classifyPresence(key)
+						continue
+					}
+					// Post-root cascade on a skew-sensitive field: counted, not failed. An
+					// unclassified `.other` on either side still fails.
+					if rotationCascadeAttributed(key.op)
+						&& rotationCascadeFields.contains(field)
+						&& !unclassified(a[i].outcome)
+						&& !unclassified(b[i].outcome)
+					{
+						cmp.rotationCascadeExcluded += 1
 						continue
 					}
 					if behindAttributed(key.op)

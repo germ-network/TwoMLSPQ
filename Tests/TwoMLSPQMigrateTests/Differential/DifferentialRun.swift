@@ -88,6 +88,10 @@ struct RunResult {
 	/// role -> op of the last `restoreBehindDelivery` that actually FIRED (behind-restore
 	/// attribution for designed-wedge reclassification).
 	var behindRestoredAt: [String: Int] = [:]
+	/// Ops whose `send` threw `.rotationInFlight` — the root of the one-commit-epoch cascade
+	/// (Swift refuses a rotation the deployed Rust mirror permits). Everything after a root in
+	/// this direction is downstream of that single frame-absence-vs-presence event.
+	var rotationInFlightAt: [Int] = []
 	/// Violations attributable to a behind-restore (designed wedge) — reported, not failed.
 	var designedWedgeViolations: [String] = []
 }
@@ -331,6 +335,9 @@ struct DifferentialRun {
 			}
 			record(opIndex, role, "send", OutcomeStep(), into: &result)
 		} catch {
+			if errorClass(error) == .rotationInFlight {
+				result.rotationInFlightAt.append(opIndex)
+			}
 			debugSend(
 				"ERR class=\(errorClass(error)?.rawValue ?? "nil") text=\(String(describing: error).prefix(60))"
 			)
