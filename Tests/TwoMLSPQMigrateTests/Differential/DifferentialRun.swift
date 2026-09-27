@@ -209,7 +209,7 @@ struct DifferentialRun {
 				{
 					FileHandle.standardError.write(
 						Data(
-							"DBG fold seed=\(seed) op=\(opIndex) role=\(role.rawValue) folderEngine=\(pair.session(role).engine.rawValue) NO-OFFER\n"
+							"DBG fold dir=\(direction.rawValue) seed=\(seed) op=\(opIndex) role=\(role.rawValue) folderEngine=\(pair.session(role).engine.rawValue) NO-OFFER\n"
 								.utf8))
 				}
 				return
@@ -290,8 +290,18 @@ struct DifferentialRun {
 		} else {
 			proposing = nil
 		}
+		let epochBefore = session.sendEpoch()
+		func debugSend(_ rest: String) {
+			guard ProcessInfo.processInfo.environment["DIFFERENTIAL_DEBUG_SENDS"] != nil
+			else { return }
+			FileHandle.standardError.write(
+				Data(
+					"DBG send dir=\(direction.rawValue) seed=\(seed) op=\(opIndex) role=\(role.rawValue) engine=\(session.engine.rawValue) proposing=\(proposing.map { String(decoding: $0, as: UTF8.self) } ?? "-") epoch=\(epochBefore)->\(session.sendEpoch()) \(rest)\n"
+						.utf8))
+		}
 		do {
 			let prep = try session.prepareToEncrypt(proposing: proposing)
+			debugSend("didCommit=\(prep.didCommit)")
 			let frame = try session.encrypt(Data(payload.utf8))
 			// Persist-before-send: the emitter must have persisted the state this frame
 			// depends on BEFORE sending it. A violation here is the harness wedging on the
@@ -321,6 +331,9 @@ struct DifferentialRun {
 			}
 			record(opIndex, role, "send", OutcomeStep(), into: &result)
 		} catch {
+			debugSend(
+				"ERR class=\(errorClass(error)?.rawValue ?? "nil") text=\(String(describing: error).prefix(60))"
+			)
 			record(opIndex, role, "send", error, into: &result)
 		}
 	}
@@ -426,7 +439,7 @@ struct DifferentialRun {
 			if ProcessInfo.processInfo.environment["DIFFERENTIAL_DEBUG_FOLDS"] != nil {
 				FileHandle.standardError.write(
 					Data(
-						"DBG fold seed=\(seed) op=\(opIndex) role=\(role.rawValue) folderEngine=\(session.engine.rawValue) NOT-LIVE atOp=\(offer.offeredAtOp) superseded=\(isSuperseded) senderEpochThen=\(offer.senderSendEpochAtOffer) senderEpochNow=\(senderEpochNow) stillVerifies=\(stillVerifiable.map(String.init) ?? "-")\n"
+						"DBG fold dir=\(direction.rawValue) seed=\(seed) op=\(opIndex) role=\(role.rawValue) folderEngine=\(session.engine.rawValue) NOT-LIVE atOp=\(offer.offeredAtOp) superseded=\(isSuperseded) senderEpochThen=\(offer.senderSendEpochAtOffer) senderEpochNow=\(senderEpochNow) stillVerifies=\(stillVerifiable.map(String.init) ?? "-")\n"
 							.utf8))
 			}
 			record(opIndex, role, "queueProposal", OutcomeStep(), into: &result)
@@ -436,7 +449,7 @@ struct DifferentialRun {
 		let contextMatch = (contextNow == offer.context)
 		if ProcessInfo.processInfo.environment["DIFFERENTIAL_DEBUG_FOLDS"] != nil {
 			let line =
-				"DBG fold seed=\(seed) op=\(opIndex) role=\(role.rawValue) folderEngine=\(session.engine.rawValue)"
+				"DBG fold dir=\(direction.rawValue) seed=\(seed) op=\(opIndex) role=\(role.rawValue) folderEngine=\(session.engine.rawValue)"
 				+ " offeredBy=\(offer.surfacedBy.rawValue) atOp=\(offer.offeredAtOp)"
 				+ " sendEpoch=\(session.sendEpoch()) offeredAtEpoch=\(offer.offeredAtSendEpoch)"
 				+ " digest=\(offer.digest.hexPrefix) proposing=\(offer.proposing?.hexPrefix ?? "-")"
@@ -466,7 +479,7 @@ struct DifferentialRun {
 			if ProcessInfo.processInfo.environment["DIFFERENTIAL_DEBUG_FOLDS"] != nil {
 				FileHandle.standardError.write(
 					Data(
-						"DBG fold seed=\(seed) op=\(opIndex) role=\(role.rawValue) OUTCOME=ok\n"
+						"DBG fold dir=\(direction.rawValue) seed=\(seed) op=\(opIndex) role=\(role.rawValue) OUTCOME=ok\n"
 							.utf8))
 			}
 			record(opIndex, role, "queueProposal", OutcomeStep(), into: &result)
@@ -474,7 +487,7 @@ struct DifferentialRun {
 			if ProcessInfo.processInfo.environment["DIFFERENTIAL_DEBUG_FOLDS"] != nil {
 				FileHandle.standardError.write(
 					Data(
-						"DBG fold seed=\(seed) op=\(opIndex) role=\(role.rawValue) OUTCOME=err class=\(errorClass(error)?.rawValue ?? "nil") text=\(String(describing: error))\n"
+						"DBG fold dir=\(direction.rawValue) seed=\(seed) op=\(opIndex) role=\(role.rawValue) OUTCOME=err class=\(errorClass(error)?.rawValue ?? "nil") text=\(String(describing: error))\n"
 							.utf8))
 				if ProcessInfo.processInfo.environment["DIFFERENTIAL_DEBUG_GUARDS"]
 					!= nil,
