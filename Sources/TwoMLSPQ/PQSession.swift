@@ -745,6 +745,27 @@ public struct PQSession {
 		}
 	}
 
+	/// Whether one of this session's header receive-window keys (either family)
+	/// authenticated `blob` — i.e. the frame was sealed by the peer of THIS
+	/// session. `false` for an out-of-window or foreign frame (a sibling's frame
+	/// never authenticates, deterministically). A PURE READ: no state mutation, no
+	/// persistence push. Never throws.
+	///
+	/// Every blob-dependent throw on this path fires only AFTER a receive-window
+	/// key authenticated the blob (an unrecognized inner tag is `DecryptionFailed`;
+	/// a malformed length prefix is `Mls`) — the ownership evidence is the
+	/// authenticated header, not the classified inner frame, so such a throw
+	/// answers `true`. The one blob-independent pre-auth throw (a header-AEAD
+	/// config failure) would answer `true` for every blob and is caught by the
+	/// owner/sibling tests.
+	public func opensHeader(_ blob: Data) -> Bool {
+		do {
+			return try base.openIncoming(blob: blob) != nil
+		} catch {
+			return true
+		}
+	}
+
 	/// Approve a staged remote proposal by its digest.
 	///
 	/// `digest` must be the bytes this package emitted (`PQQueuedRemoteProposal.digest`, or
