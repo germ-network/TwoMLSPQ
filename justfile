@@ -54,7 +54,9 @@ swift-test *ARGS:
 # The randomized differential harness against the DEPLOYED production pin
 # (two-mls-pq@c501f9d, mls-rs b43703f). Builds the pin's binding + xcframework in a worktree,
 # swaps them into the tree, runs only the differential suite, then restores main's binding.
-# Extra args pass through to `swift test`; `DIFFERENTIAL_SEED_MAX` widens the sweep.
+# The Swift engine leg resolves twomlspq-swift MAIN by default; TWOMLSPQ_SWIFT_LOCAL=release
+# falls back to the released tag. Extra args pass through to `swift test`;
+# `DIFFERENTIAL_SEED_MAX` widens the sweep.
 # See Tests/TwoMLSPQMigrateTests/Differential/README.md.
 differential-deployed *ARGS:
     bash scripts/differentialDeployed.sh {{ARGS}}

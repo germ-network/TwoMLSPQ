@@ -25,13 +25,29 @@ just differential-deployed
 which runs `scripts/differentialDeployed.sh`:
 
 1. `git worktree add /tmp/ger-2566-pin c501f9d` (outside `~/tmp/worktrees/agent` — build scratch).
-2. `scripts/buildIosDynamic.sh` there → the pin's `buildIos/` + `bindings/`.
-3. Copy the pin's `two_mls_pq.swift` and `TwoMLSPQ.xcframework` into this tree, stashing
+2. Fetch/reset the **twomlspq-swift main** scratch checkout (default
+   `/tmp/ger-2583-swift-main/twomlspq-swift`; override with `TWOMLSPQ_SWIFT_MAIN`) and point
+   `TWOMLSPQ_SWIFT_LOCAL` at it, so `Package.swift` resolves the Swift engine from main rather
+   than the released tag.
+3. `scripts/buildIosDynamic.sh` there → the pin's `buildIos/` + `bindings/`.
+4. Copy the pin's `two_mls_pq.swift` and `TwoMLSPQ.xcframework` into this tree, stashing
    main's.
-4. `TWOMLSPQ_LOCAL_XCFRAMEWORK=1 TWOMLSPQ_PIN_BINDING=1 DIFFERENTIAL_DEPLOYED_PIN=1
+5. `TWOMLSPQ_LOCAL_XCFRAMEWORK=1 TWOMLSPQ_PIN_BINDING=1 DIFFERENTIAL_DEPLOYED_PIN=1
    swift test --filter DifferentialHarnessTests`.
-5. A trap restores main's binding + xcframework on exit, so an interrupted run never leaves
-   the tree swapped.
+6. A trap restores main's binding + xcframework (+ `Package.resolved`, which the redirect
+   rewrites) on exit, so an interrupted run never leaves the tree swapped.
+
+**Swift engine leg: main by default.** The deployed-pin run drives the Rust reference at the
+pin and the Swift engine at twomlspq-swift **main**, so engine changes merged ahead of the
+released tag are visible to the differential. Set `TWOMLSPQ_SWIFT_LOCAL=release` (or an empty
+value) to skip the redirect and resolve the released tag instead — that is the pre/post
+comparison mode.
+
+**Leaf-name gotcha.** The local checkout's leaf directory **must** be named `twomlspq-swift`
+(e.g. `/tmp/ger-2583-swift-main/twomlspq-swift`): SwiftPM derives the package identity from
+the leaf, and the `.product(name: …, package: "twomlspq-swift")` references resolve by that
+identity, so any other leaf name fails resolution with "unknown package". The script
+sanity-checks the name and fails loudly otherwise.
 
 `TWOMLSPQ_PIN_BINDING=1` is required because the pin's binding predates the
 migration-export FFI: `TwoMLSPQMigrate` and every suite that imports it cannot compile
@@ -71,9 +87,12 @@ So the legal subset the facade uses is the entire session/invitation/principal s
 # Standard suite (differential tests skip without the env var):
 TWOMLSPQ_LOCAL_XCFRAMEWORK=1 swift test
 
-# Differential sweep against the deployed pin:
+# Differential sweep against the deployed pin (Swift engine = twomlspq-swift main):
 just differential-deployed
 DIFFERENTIAL_SEED_MAX=250 just differential-deployed      # wider sweep
+
+# Pre/post comparison: same run against the RELEASED twomlspq-swift tag instead of main:
+TWOMLSPQ_SWIFT_LOCAL=release just differential-deployed
 
 # Against a local main-binding build instead of the pin (expected-signal run; see below):
 TWOMLSPQ_LOCAL_XCFRAMEWORK=1 DIFFERENTIAL_DEPLOYED_PIN=1 \

@@ -40,6 +40,21 @@ let twoMLSPQrs: Target =
 // differential harness, which is all the pin run needs.
 let pinBinding = ProcessInfo.processInfo.environment["TWOMLSPQ_PIN_BINDING"] != nil
 
+// The deployed-pin differential run (scripts/differentialDeployed.sh) drives engine MAIN, so
+// it sets TWOMLSPQ_SWIFT_LOCAL to a local twomlspq-swift checkout and this manifest swaps the
+// ranged remote dependency for a path one. "release" or empty keep the released tag, for
+// pre/post comparison runs. The checkout's leaf directory MUST be named `twomlspq-swift`:
+// SwiftPM derives the package identity from the leaf, and the `.product(package:
+// "twomlspq-swift")` references below resolve by that identity.
+let swiftLocal = ProcessInfo.processInfo.environment["TWOMLSPQ_SWIFT_LOCAL"]
+	.flatMap { $0.isEmpty || $0 == "release" ? nil : $0 }
+let twomlspqSwiftDependency: Package.Dependency = swiftLocal.map {
+	.package(path: $0)
+} ?? .package(
+	url: "https://github.com/germ-network/twomlspq-swift.git",
+	from: "0.3.0"
+)
+
 let package = Package(
 	name: "TwoMLSPQ",
 	// Import/link floors. The PQ backend's ML-KEM paths additionally require
@@ -88,11 +103,9 @@ let package = Package(
 		// `SessionMigration`). 0.3.0 is the first release that takes the per-group
 		// signing keys and deployed-state inputs this export carries; its transitive
 		// deps (swift-mls, swift-secret-bytes, swift-crypto, GermConvenience) resolve
-		// automatically.
-		.package(
-			url: "https://github.com/germ-network/twomlspq-swift.git",
-			from: "0.3.0"
-		),
+		// automatically. Redirected to a local main checkout when TWOMLSPQ_SWIFT_LOCAL
+		// is set (see above).
+		twomlspqSwiftDependency,
 		// Declared directly (not just transitively through twomlspq-swift) because
 		// the migrate targets import their products. Library deps stay ranged
 		// (`upToNextMinor`) — an exact pin here is what forces a coordinated
